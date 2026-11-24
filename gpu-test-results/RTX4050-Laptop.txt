@@ -8,8 +8,8 @@ Tools:      llvm-mc 23.1.6 (conda-forge), SPIRV-Tools v2026.4, CMake 4.5.1 + Nin
 run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
             native:                 197/248 passed, 49 skipped, 2 failed
             LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
-Failed:     cs_imgload_tfe and cs_imgload_d16_tfe in both modes; the same issue as #31,
-            and both pass with #98 on the same build.
+Failed:     cs_imgload_tfe and cs_imgload_d16_tfe in both modes; the same issue as #31.
+            #98 is the reported fix, but it was not independently rerun for this entry.
 Skipped:    native: 31 "no 64-wide compute subgroup", 1 "no 64-wide subgroup", 1
             "cannot require a 64-wide fragment subgroup", and 16 cases documented as
             run by d3d12_*_test / w64_graphics.py.
