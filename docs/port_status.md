@@ -94,6 +94,13 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   32-bit APU addresses, as VIctory asserts; Leonida's 120-byte struct wrote 24
   bytes past the title's (both put `xmaContextArray` at +0x38). With both
   merges the title runs about 11 s before the slot-26 crash.
+- BCPack merged from `port/bcpack` (`gta6rt_bcpack`, ported from VIctory's
+  victory-formats): bit-exact with VIctory's Rust decoder on all 105,845 BCPack
+  chunks of the package (BC1/3/4/5/6H/7, 16.4 GB decoded), 59-61 MB/s per core.
+  At run time the format tables come from `LEONIDA_BCPACK_TABLES` (on this
+  machine `victory\crates\victory-formats\src\bcpack-tables.bin`, git-ignored)
+  or a `bcpack-tables.bin` next to `gta6rt.exe`; without them BCPack requests
+  fail with `ERROR_INVALID_DATA`.
 - The title asks the device for three interfaces it does not know
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
