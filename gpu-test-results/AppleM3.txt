@@ -20,8 +20,10 @@ Failed:     cs_fma_fused: word 7 (f16) reads 0x00000000, want 0x00007351. The kn
             take); the Apple M4 result in #564 reads the same pixel.
             cs_imgatomic_ext: 6 of 64 sint words differ; first word 32 reads 0x0badf00d, want 0x00000101.
             0x0badf00d is the initial value of the swap row, so 6 sint words still hold it after the
-            image_atomic_swap. The fixture is from 367d91ef (GPU-IMG-ATOMIC-EXT); it is not in
-            EXPECTED_FAILURES or in the Known problems table.
+            image_atomic_swap; the volume keeps every fill, so none of the six 3D ops runs. Not
+            Mac-specific: it fails the same way on KosmicKrisp and llvmpipe (Mesa 26.3.1) on this machine,
+            passes at 367d91ef where it was added, and first fails at #939 (the volume UAV tag). #1518 adds
+            the tag to the fixture and it then passes on MoltenVK, KosmicKrisp and llvmpipe.
 Repeats:    the three fail the same way every time: 4 full native runs, 1 full LEONIDA_W64_EMULATE=1 run,
             then 20 runs of each with --filter (20/20 failed, same words). cs_dpp_cmp passed 20/20.
 check.py only: ps_ij_computed and ps_interp_f16_high report "vk_harness failed or returned no pixels":
