@@ -128,6 +128,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
+    shims/dstorage_xs.cpp
+    src/bcpack_decode_stub.cpp  # BCPack requests fail until the decoder is ported (src/bcpack_decode.h)
   )
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -268,6 +270,22 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(file_system_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
+
+  # DirectStorage (XCRDAPI.dll) without game files: a synthetic file opened as a GAME: path and read through a queue,
+  # zlib streams built by the test, status arrays, failures, the scheduler, and physical-page destinations (xmem).
+  add_executable(dstorage_xs_test
+    test/dstorage_xs_test.cpp
+    shims/dstorage_xs.cpp
+    shims/file_system.cpp
+    shims/xmem.cpp
+    shims/registry.cpp
+    src/bcpack_decode_stub.cpp
+  )
+  target_include_directories(dstorage_xs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dstorage_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dstorage_xs_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dstorage_xs_test PRIVATE /OPT:NOREF)
+  target_link_libraries(dstorage_xs_test PRIVATE psapi)
 
   # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
   add_executable(int3_skip_test
@@ -1130,6 +1148,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
+  endif()
+  if(WIN32 AND TARGET dstorage_xs_test)
+    add_test(NAME dstorage_xs COMMAND dstorage_xs_test)
   endif()
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
