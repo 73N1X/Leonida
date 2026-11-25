@@ -39,6 +39,18 @@ set(expect_at_quick_exit_exit "${ctors};${handlers}")
 set(code_at_quick_exit_exit 16)
 set(expect_at_quick_exit__exit "${ctors}")
 set(code_at_quick_exit__exit 17)
+# The exit lock serializes cleanup: a second thread's _cexit waits for main's drain (its own thread_local destructor
+# then runs, and the table is empty), and a registration from a second thread during a quick_exit drain waits too,
+# so the handler it registers never runs.
+set(expect_concurrent_cexit "${ctors};slow handler started;ctor thread_local second;second _cexit entered;slow handler done;${handlers};dtor thread_local second;second _cexit returned;after _cexit")
+set(code_concurrent_cexit 18)
+set(expect_quick_exit_register "${ctors};quick slow started;second registering;quick slow done;at_quick_exit one")
+set(code_quick_exit_register 19)
+# A handler that throws: terminate(), so abort() and its exit code 3; the handlers after it do not run.
+set(expect_quick_exit_throw "${ctors};quick throw")
+set(code_quick_exit_throw 3)
+set(expect_exit_throw "${ctors};atexit throw")
+set(code_exit_throw 3)
 
 # The program's own lines, in order, without the prefix; everything gta6rt prints is dropped.
 function(guest_lines output result)
@@ -56,7 +68,8 @@ endfunction()
 
 set(failures "")
 set(modes return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit thread_local_exit thread_local_cexit
-  at_quick_exit at_quick_exit_exit at_quick_exit__exit)
+  at_quick_exit at_quick_exit_exit at_quick_exit__exit concurrent_cexit quick_exit_register quick_exit_throw
+  exit_throw)
 list(LENGTH modes mode_count)
 foreach(mode IN LISTS modes)
   execute_process(COMMAND ${RUNNER} "${GUEST}" ${mode}

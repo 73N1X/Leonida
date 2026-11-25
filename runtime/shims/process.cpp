@@ -11,7 +11,12 @@
 //     shares with gta6rt. exit() runs it newest first, as the CRT does, before the run ends; _exit(), _Exit(),
 //     quick_exit(), ExitProcess() and abort() do not. _cexit() runs it and returns, _c_exit() returns. A second
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
-//     CRT's exit lock;
+//     CRT's exit lock. Registration and the cleanup of exit(), quick_exit() and _cexit() (the thread-local
+//     callback, the table's drain and, for _cexit(), the stream flush) hold one lock of the run's own, as the UCRT's
+//     exit lock serializes them: a second thread in _cexit(), or registering while a drain runs, waits for that
+//     cleanup; the exiting thread may register from a handler (the lock is recursive). The lock is released before
+//     the run ends. A handler that lets a C++ exception escape terminates the run as the UCRT's terminate() would:
+//     abort(), exit code 3;
 //   - the game's at_quick_exit registrations (_crt_at_quick_exit) go to a second table of the run's own, which
 //     quick_exit() runs newest first; exit(), _exit() and _Exit() do not;
 //   - the EXE's thread-local destructor callback (_register_thread_local_exe_atexit_callback, which the EXE's CRT
@@ -88,7 +93,12 @@ std::string narrow(const std::wstring& w) {
     return s;
 }
 
+void release_cleanup_lock();
+
 [[noreturn]] void end_run(int code) {
+    // A handler may end the run from inside a drain: the cleanup lock it holds is released before the thread parks,
+    // so the host (and a later run_entry) can take it.
+    release_cleanup_lock();
     // Read before signalling: once g_done is set, run_entry can return and clear g_running while the host is still
     // finishing the run (main.cpp's "game exited" line and cleanup), which this thread must not cut short.
     const bool running = g_running;
@@ -109,14 +119,38 @@ std::string narrow(const std::wstring& w) {
 using AtexitFn = void(__cdecl*)();
 using OnexitFn = int(__cdecl*)();
 using TlsCallback = void(NTAPI*)(PVOID, DWORD, PVOID);  // _tls_callback_type
-std::mutex g_atexit_lock;
+// The run's cleanup lock, as the UCRT's exit lock: registration takes it, and a cleanup (exit, quick_exit, _cexit)
+// holds it from before the thread-local callback through the table's drain, so two threads never clean up at once
+// and a registration from another thread waits for the drain. Recursive, so the exiting thread may register from a
+// handler. t_cleanup_held counts this thread's holds: end_run releases them all before the thread parks.
+std::recursive_mutex g_cleanup_lock;
+thread_local unsigned t_cleanup_held = 0;
 std::vector<AtexitFn> g_atexit;
 std::vector<AtexitFn> g_at_quick_exit;
 std::atomic<TlsCallback> g_thread_local_exit{nullptr};
 std::atomic<DWORD> g_exiting_thread{0};
 
+struct CleanupLock {
+    CleanupLock() {
+        g_cleanup_lock.lock();
+        ++t_cleanup_held;
+    }
+    ~CleanupLock() {
+        --t_cleanup_held;
+        g_cleanup_lock.unlock();
+    }
+    CleanupLock(const CleanupLock&) = delete;
+    CleanupLock& operator=(const CleanupLock&) = delete;
+};
+void release_cleanup_lock() {
+    while (t_cleanup_held) {
+        --t_cleanup_held;
+        g_cleanup_lock.unlock();
+    }
+}
+
 bool register_in(std::vector<AtexitFn>& table, AtexitFn fn) {
-    std::lock_guard<std::mutex> lock(g_atexit_lock);
+    CleanupLock lock;
     try {
         table.push_back(fn);
     } catch (const std::bad_alloc&) {
@@ -126,25 +160,39 @@ bool register_in(std::vector<AtexitFn>& table, AtexitFn fn) {
 }
 bool register_atexit(AtexitFn fn) { return register_in(g_atexit, fn); }
 
-// Newest first. A handler registered while the handlers run goes on the end and so runs next, as in the UCRT.
-void run_handlers(std::vector<AtexitFn>& table) {
+void __cdecl game_abort();
+
+// A guest cleanup callback. A C++ exception it lets escape would unwind into the runtime; the UCRT's exit calls
+// terminate() if one throws, and its default handler aborts: exit code 3, and the remaining handlers do not run.
+// A thread_local destructor is noexcept, so one that throws reaches the game's own terminate() before this catch;
+// that abort() is the game's import, game_abort, and ends the run with the same code.
+template <typename Call>
+void guarded(const char* what, Call&& call) {
+    try {
+        call();
+    } catch (...) {
+        std::fprintf(stderr, "[rt] process: a %s threw a C++ exception; terminating as the UCRT does\n", what);
+        game_abort();
+    }
+}
+
+// Newest first, with the cleanup lock held throughout (the caller took it). A handler registered while the handlers
+// run goes on the end and so runs next, as in the UCRT.
+void run_handlers(std::vector<AtexitFn>& table, const char* what) {
     for (;;) {
-        AtexitFn fn;
-        {
-            std::lock_guard<std::mutex> lock(g_atexit_lock);
-            if (table.empty()) return;
-            fn = table.back();
-            table.pop_back();
-        }
-        fn();
+        if (table.empty()) return;
+        const AtexitFn fn = table.back();
+        table.pop_back();
+        guarded(what, fn);
     }
 }
 // exit() and _cexit(): the exiting thread's thread_local destructors first (the UCRT calls the registered callback
 // with DLL_PROCESS_DETACH; a second call finds the thread's list empty), then the atexit handlers and static
-// destructors.
+// destructors. The caller holds the cleanup lock.
 void run_atexit_handlers() {
-    if (const TlsCallback callback = g_thread_local_exit.load()) callback(nullptr, DLL_PROCESS_DETACH, nullptr);
-    run_handlers(g_atexit);
+    if (const TlsCallback callback = g_thread_local_exit.load())
+        guarded("thread-local destructor", [&] { callback(nullptr, DLL_PROCESS_DETACH, nullptr); });
+    run_handlers(g_atexit, "atexit handler");
 }
 
 // UCRT: int _crt_atexit(_PVFV), 0 on success. MSVC's atexit() and the static destructors of an EXE reach it.
@@ -171,13 +219,18 @@ bool take_exit_lock() {
     DWORD owner = 0;
     if (g_exiting_thread.compare_exchange_strong(owner, self)) return true;
     if (owner != self) {
+        release_cleanup_lock();  // parked for good: a drain it was in must not keep the owner waiting
         for (;;) Sleep(INFINITE);
     }
     return false;
 }
-// exit(): the game's handlers and static destructors, then the end of the run.
+// exit(): the game's handlers and static destructors, then the end of the run. The cleanup lock is taken after the
+// exit lock (a thread parked by the latter holds nothing) and released by end_run.
 void __cdecl game_exit(int code) {
-    if (take_exit_lock()) run_atexit_handlers();
+    if (take_exit_lock()) {
+        CleanupLock lock;
+        run_atexit_handlers();
+    }
     end_run(code);
 }
 // _exit(), _Exit(): the end of the run without any handler.
@@ -187,11 +240,17 @@ void __cdecl game_underscore_exit(int code) {
 }
 // quick_exit(): the at_quick_exit handlers, newest first, then the end of the run without the atexit handlers.
 void __cdecl game_quick_exit(int code) {
-    if (take_exit_lock()) run_handlers(g_at_quick_exit);
+    if (take_exit_lock()) {
+        CleanupLock lock;
+        run_handlers(g_at_quick_exit, "quick_exit handler");
+    }
     end_run(code);
 }
-// _cexit() runs the handlers and flushes the streams, then returns; _c_exit() only returns.
+// _cexit() runs the handlers and flushes the streams, then returns; _c_exit() only returns. The flush is inside the
+// cleanup lock, as the UCRT's _cexit flushes under its exit lock. A second thread's _cexit() waits for the first's
+// cleanup, then finds the table empty.
 void __cdecl game_cexit() {
+    CleanupLock lock;
     run_atexit_handlers();
     std::fflush(nullptr);
 }
@@ -484,7 +543,7 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
 
 int run_entry(void* entry, size_t stack_bytes) {
     {
-        std::lock_guard<std::mutex> lock(g_atexit_lock);
+        CleanupLock lock;
         g_atexit.clear();  // a run never sees the handlers of an earlier one
         g_at_quick_exit.clear();
     }
