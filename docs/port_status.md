@@ -76,6 +76,15 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
     results with a computed EXEC mask.
   - `ms_wave_info_s3`: (-1,-1,-1,-1) instead of (0.0078,0.0078,0.5,1.0);
     driver-dependent per docs/testing.md.
+- Shader stage (`make_game.py --stages shaders`, work folder
+  `G:\gta6port\leonida-work`, llvm-mc 21.1.8, 54 min on 6 jobs): all 26,503
+  shaders of `shaders.rpf` translated and pass `spirv-val`; 52 of 52
+  `XboxBvhBuilder.dll` programs; 18 of 29 FidelityFX (`fspx`) programs (11
+  not translated, open). Wave64 emulation is on (32-wide subgroups). Wave64
+  VS/PS/GS on 32-wide subgroups: about 5,060 tier A, 100 tier B and 8,250 tier
+  C (not exact on this GPU; `wave64_graphics_reasons` in the index lists why):
+  the likeliest source of graphical glitches, and what VIctory's per-program
+  wave64 handling addresses. 14 GB of SPIR-V.
 - Real title on `gta6rt --run`, host D3D12 proxy and `LEONIDA_D3D12=vulkan`
   alike: DirectStorage (merged from `port/dstorage`, ported from VIctory's
   `dstorage.rs`) opens the title's 12 archives; the Vulkan device is created on
