@@ -12,7 +12,10 @@
 //   thread_local_exit   a thread_local object of the main thread, then exit(13): it ends first, then the handlers
 //   thread_local_cexit  the same object, then _cexit(): the same order, and main then returns 14
 // The thread_local destructor reaches the CRT through _register_thread_local_exe_atexit_callback, which the EXE's
-// startup calls only when the image has one (this program has one in every mode, constructed only in the last two).
+// startup calls only when the image has one (this program has one in every mode, constructed only where used).
+//   at_quick_exit    two at_quick_exit handlers, then quick_exit(15): they run newest first, the atexit ones do not
+//   at_quick_exit_exit  the same handlers, then exit(16): only the atexit handlers run
+//   at_quick_exit__exit the same handlers, then _exit(17): none runs
 // One handler registers another while the handlers run: it must still run, next.
 #include <windows.h>
 #include <process.h>  // _cexit, _c_exit
@@ -64,6 +67,9 @@ DWORD WINAPI quick_exit_thread(void*) {
     _exit(7);
 }
 
+void quick_one() { say("at_quick_exit one"); }
+void quick_two() { say("at_quick_exit two"); }
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -100,6 +106,13 @@ int main(int argc, char** argv) {
         _c_exit();
         say("after _c_exit");
         return 12;
+    }
+    if (!std::strncmp(mode, "at_quick_exit", 13)) {
+        std::at_quick_exit(quick_one);
+        std::at_quick_exit(quick_two);
+        if (!std::strcmp(mode, "at_quick_exit")) std::quick_exit(15);
+        if (!std::strcmp(mode, "at_quick_exit_exit")) std::exit(16);
+        if (!std::strcmp(mode, "at_quick_exit__exit")) _exit(17);
     }
     return 3;
 }

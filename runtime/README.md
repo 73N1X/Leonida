@@ -594,16 +594,17 @@ It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game's `atexit` handlers and static destructors go to a table of the run's own (the CRT's process-wide one is
 shared with gta6rt): `exit` and a return from `main` run them newest first before the run ends, `_cexit` runs them and
-returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `run_tiny_atexit` runs a stand-in
+returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. The game's `at_quick_exit`
+handlers (`_crt_at_quick_exit`) go to a second table of the run's own, which `quick_exit` runs newest first, and its
+thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) is the run's too: `exit` and `_cexit`
+call it for the exiting thread before the `atexit` handlers, as the UCRT does. `run_tiny_atexit` runs a stand-in
 program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
 holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). The
-executable's thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) is kept by the run too:
-the host UCRT accepts one per process and fast-fails the second, and gta6rt's own startup registers the first. `exit`
-and `_cexit` call it once, as `(nullptr, DLL_PROCESS_DETACH, nullptr)`, before the atexit handlers, as the UCRT does,
-so the leaving thread's `thread_local` objects end before the static ones; `_exit`, `quick_exit`, `ExitProcess` and
-`abort` do not. Other threads' `thread_local` objects end through the loader's thread-detach notification, which calls
-the same function from the executable's TLS directory. `run_tiny_atexit` covers `exit` and `_cexit` with a
-`thread_local` object. `at_quick_exit` handlers are not covered (`quick_exit` runs none).
+thread-local destructor callback cannot stay with the host CRT: the host UCRT accepts one per process and fast-fails
+the second, and gta6rt's own startup registers the first. `exit` and `_cexit` call it as
+`(nullptr, DLL_PROCESS_DETACH, nullptr)`, so the leaving thread's `thread_local` objects end before the static ones;
+`_exit`, `quick_exit`, `ExitProcess` and `abort` do not. Other threads' `thread_local` objects end through the
+loader's thread-detach notification, which calls the same function from the executable's TLS directory.
 `run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks

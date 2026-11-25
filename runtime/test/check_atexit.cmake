@@ -32,6 +32,13 @@ set(expect_thread_local_exit "${ctors};ctor thread_local;dtor thread_local;${han
 set(code_thread_local_exit 13)
 set(expect_thread_local_cexit "${ctors};ctor thread_local;dtor thread_local;${handlers};after _cexit")
 set(code_thread_local_cexit 14)
+# at_quick_exit handlers: quick_exit runs them newest first and nothing else; exit and _exit do not run them.
+set(expect_at_quick_exit "${ctors};at_quick_exit two;at_quick_exit one")
+set(code_at_quick_exit 15)
+set(expect_at_quick_exit_exit "${ctors};${handlers}")
+set(code_at_quick_exit_exit 16)
+set(expect_at_quick_exit__exit "${ctors}")
+set(code_at_quick_exit__exit 17)
 
 # The program's own lines, in order, without the prefix; everything gta6rt prints is dropped.
 function(guest_lines output result)
@@ -48,7 +55,10 @@ function(guest_lines output result)
 endfunction()
 
 set(failures "")
-foreach(mode return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit thread_local_exit thread_local_cexit)
+set(modes return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit thread_local_exit thread_local_cexit
+  at_quick_exit at_quick_exit_exit at_quick_exit__exit)
+list(LENGTH modes mode_count)
+foreach(mode IN LISTS modes)
   execute_process(COMMAND ${RUNNER} "${GUEST}" ${mode}
     WORKING_DIRECTORY "${guest_dir}" TIMEOUT 60
     RESULT_VARIABLE native_code OUTPUT_VARIABLE native_out ERROR_VARIABLE native_err)
@@ -74,4 +84,4 @@ endforeach()
 if(failures)
   message(FATAL_ERROR "atexit/termination differences:${failures}")
 endif()
-message(STATUS "tiny_atexit: 10 termination paths match the Windows sequence")
+message(STATUS "tiny_atexit: ${mode_count} termination paths match the Windows sequence")
