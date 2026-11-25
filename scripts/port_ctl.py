@@ -134,7 +134,8 @@ def cmd_start(args, p):
     log = os.path.join(p["logs"], f"{name}.log")
     cmd = [exe, "run", title, "--execute", "--console", args.console]
     flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    with open(log, "w", encoding="utf-8") as out:
+    # The runtime writes its own bytes here; newline only keeps the repository's line-ending rule.
+    with open(log, "w", encoding="utf-8", newline="\n") as out:
         proc = subprocess.Popen(cmd, cwd=args.game, env=env, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, creationflags=flags)
     state = {
