@@ -22,6 +22,8 @@ work folders outside the repository (`G:\gta6port` on the test machine).
 | `runtime/`, `tools/`, `make_game.py`, `Build.bat` | Leonida: the product |
 | `victory/` | DexNom/VIctory subtree with full history, the patch source. A background poller fetches `victory/main` every 15 minutes and speaks up only when new commits exist; they are then merged with `python -I scripts/sync_victory.py --merge` and reviewed for fixes to port |
 | `scripts/sync_victory.py` | Fetches `victory/main`, lists new commits, merges them with `git subtree pull` |
+| remote `victory7900` | avatarmanz/VIctory-7900XTX, a second patch source (fetch only, not merged: it diverges from DexNom's line, 408 commits ahead and 334 behind at the time of adding; much of its recent work is frame time). Also polled every 15 minutes in the background. Port from it commit by commit (`git show victory7900/main:<path>`) |
+| `tools/victory_saves.py` | Converts a VIctory data folder's saves and local storage into gta6rt's layout, so a save made under VIctory skips the first-boot screens |
 | `scripts/port_ctl.py` | Drives a reference run of VIctory's runtime (start, pad presses from a file, frame captures, fps lines, stop) |
 
 ## Test machine
@@ -126,6 +128,15 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
   either.
+
+## Saves for testing
+
+The user's own save (first-time setup and legal screens done, two story
+saves), made under VIctory, is kept outside the repository:
+- original: `G:\gta6port\saves\manual-save`; working copy for VIctory runs:
+  `VICTORY_DATA_DIR=G:\gta6port\data-save`;
+- converted for gta6rt: `LEONIDA_SAVE_DIR=G:\gta6port\leonida-saves` with
+  `--overlay G:\gta6port\leonida-overlay-save` (its local storage).
 
 ## Reference run of VIctory's runtime on this machine (host D3D12)
 
