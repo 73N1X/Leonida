@@ -141,7 +141,11 @@ struct SHAPE_XMA_CONTEXT {
     uint32_t reserved1 : 6;
     uint32_t loopStartOffset : 26;
     uint32_t loopEndOffset : 6;
-    uint32_t reserved[10];
+    // The bit fields above fill five dwords (the third holds 24 bits, so currentByteOffset starts a new one) = 20
+    // bytes. The GDK's size is 64, so 11 reserved dwords follow, not 10 (with 10 the struct was 60 bytes and the
+    // assert below failed on MSVC). The shim reads no field, only the size: it is the stride of the context arrays
+    // the title indexes, so the size is what has to be right. Where the GDK puts the extra dword is not measured.
+    uint32_t reserved[11];
 };
 static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
 
@@ -162,7 +166,9 @@ struct SHAPE_PCM_CONTEXT {
     uint32_t reserved6 : 15;
     uint32_t format : 2;
     uint32_t reserved7 : 14;
-    uint32_t reserved[1];
+    // Six dwords of bit fields (24 bytes); the GDK's size is 32, so two reserved dwords, not one (28 bytes failed
+    // the assert below). As for SHAPE_XMA_CONTEXT, only the size (the array stride) is used.
+    uint32_t reserved[2];
 };
 static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE_PCM_CONTEXT is 32 bytes per GDK");
 

@@ -25,6 +25,9 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "d3d12_com.h"  // rt::d3d12::create_console_descriptor_heap for slot 14 (Vulkan device only)
+#endif
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -1590,6 +1593,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     void* created = nullptr;
     HRESULT hr = E_INVALIDARG;
     bool console_extended = false;
+#ifdef LEONIDA_VULKAN_DEVICE
     if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
         (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
@@ -1606,9 +1610,14 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
                 hr = rt::d3d12::create_console_descriptor_heap(
                     self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                     __uuidof(ID3D12DescriptorHeap), &created);
+                // Only a device from create_vulkan_device* takes the console address; on the host's D3D12 device
+                // (LEONIDA_D3D12 not "vulkan") the helper refuses it, and the PC call below makes the heap from the
+                // 16-byte PC desc and ignores the address/size tail, as this slot did before.
+                if (hr == E_INVALIDARG && !created) console_extended = false;
             }
         }
     }
+#endif
     if (!console_extended)
         hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;

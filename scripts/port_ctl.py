@@ -172,6 +172,20 @@ def newest_png(folder, since):
     return best.path if best else None
 
 
+def shrink(path, width):
+    """A copy of the capture `width` pixels wide beside it (needs Pillow); the capture itself otherwise."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+    with Image.open(path) as im:
+        height = max(1, round(im.height * width / im.width))
+        small = im.resize((width, height), Image.LANCZOS)
+    out = path[:-4] + f"-w{width}.png"
+    small.save(out)
+    return out
+
+
 def cmd_shot(args, p):
     state = load_state(p)
     seq = state.get("shot_seq", 0) + 1
@@ -185,6 +199,8 @@ def cmd_shot(args, p):
         found = newest_png(folder, since)
         if found:
             time.sleep(0.5)  # let the writer finish
+            if args.small:
+                found = shrink(found, args.small)
             print(found)
             return 0
         time.sleep(0.25)
@@ -279,6 +295,8 @@ def main():
 
     s = sub.add_parser("shot", help="save the next presented frame and print its path")
     s.add_argument("--timeout", type=float, default=30.0)
+    s.add_argument("--small", type=int, default=0, metavar="WIDTH",
+                   help="also write a copy this many pixels wide and print its path (needs Pillow)")
 
     s = sub.add_parser("fps", help="latest frame-rate lines of the run's log")
     s.add_argument("--count", type=int, default=5)

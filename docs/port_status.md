@@ -1,66 +1,87 @@
-# Port status: Leonida + VIctory merge
+# Port status: Leonida, patched from VIctory
 
-This is the working log of the merged port. Leonida is the base repository. The
-DexNom/VIctory runtime (Rust, Direct3D 12) is merged in as a git subtree under
-`victory/` because it already runs the title past boot. Leonida's own runtime
-(`runtime/`, D3D12 → Vulkan) does not boot the title yet.
+Leonida is the base: its runtime (`runtime/`: the `gta6rt` PE loader, the GDK
+shims and the D3D12.X-on-Vulkan layer) is what runs the title, and its shader
+pipeline (`tools/rdna2spirv.py`, RDNA2 → SPIR-V) is what translates the
+shaders. The game renders through **Vulkan**.
 
-Nothing from the game is in this repository. All runs read the user's own
-package in place, and every derived file (shader cache, saves, captures,
-logs) lives in the work folder outside the repository (`G:\gta6port` on the
-test machine).
+DexNom/VIctory (Rust, host Direct3D 12) already runs the title past boot. It is
+kept in this repository as a git subtree under `victory/` **only as the source
+of patches**: what it learned about the title (loader, system calls, memory
+model, GPU behaviour, shader rules) is ported into Leonida's code. Its runtime
+is used only as a reference to compare against, never as the shipped runtime.
+
+Nothing from the game is in this repository. Runs read the user's own package
+in place; everything derived (shaders, caches, saves, captures, logs) lives in
+work folders outside the repository (`G:\gta6port` on the test machine).
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `victory/` | DexNom/VIctory, subtree with full history. Updated with `python -I scripts/sync_victory.py --merge` |
-| `scripts/sync_victory.py` | Fetches `victory/main`, reports new commits, merges them with `git subtree pull` |
-| `scripts/port_ctl.py` | Starts a run, presses stand-in pad keys from a file, saves frames on request, reads the fps lines, stops the run |
-| `runtime/`, `tools/`, `make_game.py` | Leonida's own runtime, shader translator and asset tools, unchanged |
+| `runtime/`, `tools/`, `make_game.py`, `Build.bat` | Leonida: the product |
+| `victory/` | DexNom/VIctory subtree with full history, the patch source. Updated with `python -I scripts/sync_victory.py --merge` (checked every 15 minutes) |
+| `scripts/sync_victory.py` | Fetches `victory/main`, lists new commits, merges them with `git subtree pull` |
+| `scripts/port_ctl.py` | Drives a reference run of VIctory's runtime (start, pad presses from a file, frame captures, fps lines, stop) |
 
 ## Test machine
 
-Windows 11 Pro 26200, NVIDIA GeForce RTX 4060 Ti 16 GB (driver 616.64), AMD
-Ryzen 5 7600X (6 cores, 12 threads), 31 GB RAM. Package: Xbox Series, in
-`Documents\GTA6`.
+Windows 11 Pro 26200, NVIDIA GeForce RTX 4060 Ti 16 GB (driver 616.64,
+Vulkan 1.4.351), AMD Ryzen 5 7600X (6 cores, 12 threads), 31 GB RAM. Package:
+Xbox Series 1.0.2.1 in `Documents\GTA6` (`make_game.py --check`: all 108
+files present).
 
-## Build and run
+Vulkan on this GPU: every extension the design needs is exposed:
+`VK_EXT_descriptor_buffer`, `VK_EXT_mesh_shader`, `VK_EXT_external_memory_host`
+(minImportedHostPointerAlignment 4 KiB), `VK_EXT_shader_object`,
+`VK_EXT_graphics_pipeline_library`, `VK_KHR_ray_query`,
+`VK_KHR_acceleration_structure`, `VK_EXT_device_generated_commands`,
+`VK_KHR_fragment_shader_barycentric`, `VK_EXT_mutable_descriptor_type`,
+maintenance5-9, buffer device address, sparse binding. Subgroup size 32 only.
+Memory: a 15.7 GiB device-local heap that is also host-visible (resizable BAR
+is on), so title GPU memory can live in VRAM and still be written by the CPU.
 
-```powershell
-cd victory
-cargo build --locked --release -p victory --features diagnostics --bins
-$env:VICTORY_GAME_DIR = "$HOME\Documents\GTA6"; $env:VICTORY_CACHE_DIR = "G:\gta6port\cache"
-.\target\release\victory.exe warm          # translate every shader ahead of time
-cd ..
-python -I scripts/port_ctl.py start --name run1
-python -I scripts/port_ctl.py press Enter
-python -I scripts/port_ctl.py shot
-python -I scripts/port_ctl.py fps
-python -I scripts/port_ctl.py stop
-```
+## Build notes for this machine
 
-The BCPack format tables VIctory needs are not tracked. They are restored
-from VIctory's own history (commit `2849477`, the one `Initialize-FormatTables.ps1`
-pins) and checked against the pinned SHA-256:
+- The `cmake` that PowerShell finds first is devkitPro's MSYS2 build, which has
+  no Visual Studio generators. Use the native one:
+  `%LOCALAPPDATA%\Programs\CMake\bin\cmake.exe -S runtime -B runtime/build -G "Visual Studio 17 2022" -A x64`.
+- The Vulkan device is compiled into `gta6rt` only when Vulkan headers are found
+  (Vulkan SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON`).
+- The shader stage needs `llvm-mc` with the AMDGPU target
+  (`scripts\build_llvm_mc.ps1`) and `spirv-as` / `spirv-val` (Vulkan SDK).
 
-```sh
-git show 2849477415a46f5a079c85cf3e64a3dff32f713c:crates/victory-formats/src/bcpack-tables.bin > victory/crates/victory-formats/src/bcpack-tables.bin
-```
+## Reference run of VIctory's runtime on this machine (host D3D12)
 
-## Changes on top of VIctory
+- Shader warm-up: 25,745 shaders translated, 13 refused; 2,700 compute
+  pipelines, 31 refused by the NVIDIA driver (`E_INVALIDARG`): console wave64
+  programs whose cross-lane code spans both 32-lane halves keep `WaveSize(64)`,
+  which a 32-lane GPU cannot run. Leonida's round-based wave64 emulation
+  (docs/design.md) is the fix to carry over.
+- Boot, start screen and first-time setup screens: 30 fps, 20-60 draws/frame.
+- Stops at the "Legal Terms & Policies" screen: the Terms of Service row is
+  skipped by every navigation input (D-pad, left stick, short and long
+  presses), so Confirm stays disabled. Unresolved; nothing failing shows in
+  the logs. Not reported upstream.
+- Two D3D12.X pipeline-creation methods are not implemented (console-ABI
+  slots `0x218` and `0x1c8`); the title goes without those pipelines.
 
-- The stand-in pad command file (`VICTORY_MOVEMENT_FILE`) accepts every key of
-  the stand-in pad's table, not only the stick directions, so menus can be
-  driven from a script (`victory-hle/src/modules/gameinput/movement.rs`).
+## Changes on top of the merged sources
 
-## Results
+- `victory/`: the stand-in pad command file (`VICTORY_MOVEMENT_FILE`) takes
+  every key of the stand-in pad's table, so menus can be driven by a script;
+  the user-facing name is Leonida instead of DexNom Runtime.
 
-(Measurements are added here as runs are made.)
+## Open items, in order
 
-## Open items
-
-1. Baseline run on the RTX 4060 Ti: boot, menus, first world frames, fps.
-2. Find what bounds world frame time on this machine and cut it (target: 30 fps).
-3. Black areas in shadow (ray-traced lighting does not run by default).
-4. Hook the VIctory build into Leonida's `Build.bat` / `make_game.py`.
+1. Build `gta6rt` and run it on the real executable (`--dry-run`, `--init`,
+   `--run`); list where it first fails.
+2. Port VIctory's loader and system-call fixes into Leonida's shims until the
+   title boots and presents frames.
+3. Vulkan rendering of menus, then the world: port the GPU-side fixes VIctory
+   needed, using Leonida's Vulkan layer.
+4. Shaders: install the shader-stage tools, translate the corpus, port the
+   translator rules VIctory needed (wave64 on 32-lane GPUs, sampler selection,
+   vertex output interpolation and signature order, ...).
+5. Frame time: title GPU memory in host-visible VRAM or imported host memory
+   with buffer device addresses, instead of per-frame copies. Target 30 fps.
