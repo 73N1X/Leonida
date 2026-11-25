@@ -554,7 +554,7 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
-        if (!graphics_pipeline_ && unregistered_pipeline_) return;  // a stub mesh pipeline's draw: nothing to run
+        if (stub_kind_ == StubPipelineKind::mesh) return;  // a mesh stub's draw: nothing to run
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
         if (!graphics_.layout->mesh_ok) {
@@ -1583,6 +1583,7 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     bool unregistered_pipeline_ = false;  // the bound PSO has no pipeline here (a stub): see set_pipeline
+    StubPipelineKind stub_kind_ = StubPipelineKind::none;  // which stub the bound PSO is, if it is one
     std::uintptr_t graphics_pipeline_ = 0;
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
@@ -1665,10 +1666,13 @@ private:
         graphics_pipeline_ = graphics_pipeline_id(state);
         if (compute_pipeline_) request_pipeline_build(compute_pipeline_, 0, false);  // starts its build, if asynchronous
         // A pipeline this device never registered: a LEONIDA_STUB_PIPELINES compute or mesh stub (its translated
-        // shader is missing), or one from another device. Its draws (record_draw, DispatchMesh) and dispatches
-        // (record_dispatch) are not recorded, so the list still closes.
+        // shader is missing), or one from another device. A mesh stub's draws (DispatchMesh) are not recorded, so the
+        // list still closes, when this list's device made the stub; a draw with any other unregistered PSO fails the
+        // list, as before the stubs. Dispatches with an unregistered PSO are not recorded either (record_dispatch,
+        // D3D-482).
         unregistered_pipeline_ = state && !compute_pipeline_ && !graphics_pipeline_;
-        if (unregistered_pipeline_)
+        stub_kind_ = unregistered_pipeline_ ? stub_pipeline_kind(state, attached_device()) : StubPipelineKind::none;
+        if (unregistered_pipeline_ && stub_kind_ == StubPipelineKind::none)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
@@ -2119,7 +2123,6 @@ private:
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ && unregistered_pipeline_) return;  // a stub pipeline's draw: nothing to run
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or every bound viewport empty: D3D12 rasterizes
