@@ -1,5 +1,15 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
+// Which method each slot of the device, queue, list and fence is comes from the slot tables in d3d12_xs_slots.h,
+// taken from VIctory (victory/crates/victory-gpu, which runs the title) and Leonida's own measurements, each entry
+// with its source. The layout switch is VIctory's (device.rs:149-168): a device created as ID3D12Device11, as the
+// title's is, has the console layouts (queue slots from 14 and list slots from 59 two later, the console's own
+// methods past them, and a fence value address at fence slot 12); a device created as any other interface keeps the
+// PC order its queues and fences forwarded before, and its slot 12 hands out the PC list, for Leonida's own tests
+// that drive the proxies through the PC C++ interfaces. Lists from slot 73, and from slot 12 in the console layout,
+// are console list proxies. The comments below describe the slots measured before the tables; the tables supersede
+// them where they differ (slot 48 takes the console queue description, slots 78-81 are VIctory's frame clock).
+//
 // Measured Xbox device deviations used here (vtable indices, x64):
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
@@ -12,12 +22,13 @@
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
 //             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
 //             in the console call (public HLE; the PC six-argument form differs).
-//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
-//             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
-//             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
-// The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
-// be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
-// LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
+//   slots 78-81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX: VIctory's frame clock
+//             (frame.rs), answered per device before the PC vtable is indexed (80 and 81 are outside a PC
+//             ID3D12Device11 table, so they are checked before the beyond-table refusal).
+// The slots 48/73/78-81 are the public HLE Freminet/ScarlettX's observation, which VIctory's table confirms on the
+// title (device.rs:437, 445, 451-454), and can be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT,
+// LEONIDA_XS_FRAME_INTERVAL_SLOT, LEONIDA_XS_SCHEDULE_EVENT_SLOT, LEONIDA_XS_WAIT_EVENT_SLOT and
+// LEONIDA_XS_FRAME_STATISTICS_SLOT (3..127; anything else is logged once and ignored).
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -42,10 +53,12 @@
 // keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
-// heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
-// modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
+// (46) and EnqueueMakeResident (50). List proxies are unwrapped by ExecuteCommandLists, and unwrap the heap proxies
+// given to their SetDescriptorHeaps and the allocators given to Reset. QueryInterface answers only the modelled
+// interfaces; one the real object has but the proxy does not model is logged once and refused.
 #pragma once
+
+#include "d3d12_xs_slots.h"
 
 #include <d3d12.h>
 
@@ -108,12 +121,40 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
 
-// True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
-// measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
-// handles for the allocator proxy.
+// True for slots the proxy handles itself rather than forwarding verbatim in the PC layout: IUnknown (0-2), 8 and 75
+// (queue proxies), 9 (allocator proxies), 12 (lists), 14, 25/26 (struct returns), 31/34/35/45/46/50 (proxies
+// unwrapped), 32 and 36 (fence proxies), the Xbox routes 48/73/78-81 at their configured indices, 62, 67, 76, 108,
+// 127 and 133. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
+// slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy. With `console_layout`, the same
+// for a device created as ID3D12Device11: every slot from 44 on is handled there (refused when no source names it).
 bool device_slot_overridden(unsigned slot);
+bool device_slot_overridden(unsigned slot, bool console_layout);
+
+// True when `device` (the proxy or its DXGI pointer) was created as ID3D12Device11: its queues, fences, allocators and
+// lists have the console layouts (d3d12_xs_slots.h).
+bool device_proxy_console_layout(const void* device);
+// True for a queue, fence or allocator proxy of such a device.
+bool command_object_proxy_console_layout(const void* object);
+
+// Console queue slot 32, PresentX(plane count, planes, parameters): what the device's queues call. `queue` is the real
+// queue behind the proxy the title presented on; `planes` and `parameters` are the title's (the layouts are
+// rt::d3d12::XboxPresentPlaneParameters and XboxPresentParameters, shims/xbox_present.h). Without a handler PresentX
+// is accepted and nothing is shown, as VIctory does (queue.rs:757-841 always answers S_OK). Leonida's
+// XboxPresentation is the intended handler, but its FramePacer hands out its own tokens and models only the origin
+// event, while the device's frame calls (78-81) are VIctory's clock; attaching it is left to whoever owns the window.
+using PresentHandler = HRESULT (*)(void* context, ID3D12CommandQueue* queue, std::uint32_t plane_count,
+                                   const void* planes, const void* parameters);
+// `device` is the proxy or its DXGI pointer; false (nothing set) for anything else. A null handler detaches.
+bool set_present_handler(void* device, PresentHandler handler, void* context);
+
+// A page pool the device's console slot 74 registered and slot 75 has not removed: its first address and page count
+// (64 KiB pages). For console queue slot 31 (CopyPageMappingsBatchX, still open) and the tests.
+bool device_page_pool(const void* device, std::uint64_t handle, std::uint64_t* address, std::uint32_t* pages);
+
+// The frame tokens the device's WaitFrameEventX (slot 80) handed out so far, and the last tick a wait for event
+// `kind` ended on (kinds from 2 on share one, as in V frame.rs:91-97). Test helpers.
+std::uint64_t device_frames_begun(const void* device);
+std::uint64_t device_frame_last_tick(const void* device, unsigned kind);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.
@@ -168,17 +209,21 @@ bool list_slot_first_call_seen(unsigned slot);
 // Heap slots 0-2, 7 (GetDevice -> device proxy) and 9/10 (handle conversion).
 bool heap_slot_overridden(unsigned slot);
 
-// Console list slot mapping: returns PC vtable slot or ~0u if console-only / unforwarded.
+// The PC list slot a console list slot reaches (the list table in d3d12_xs_slots.h), or kListNotForwarded for one the
+// proxy answers itself (ignored, not implemented yet, or not named by any source). Slots 0-2 and 7 are the proxy's
+// own (IUnknown, GetDevice) and also give kListNotForwarded.
 inline constexpr unsigned kListNotForwarded = ~0u;
 inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
-    if (slot <= 26) return slot;               // PC order, measured
-    if (slot <= 30) return kListNotForwarded;  // console-only extras
-    if (slot <= 59) return slot - 4;           // PC chain, shifted +4
-    if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
-    if (slot == 61) return 59;                 // ExecuteIndirect (Package)
-    if (slot == 85) return 16;                 // CopyTextureRegionX -> CopyTextureRegion
-    if (slot == 146) return 80;                // D3D12_BARRIER_GROUP (Package; PC GCL7)
-    return kListNotForwarded;
+    const slots::ListSlot entry = slots::console_list_slot(slot);
+    switch (entry.method) {
+        case slots::ListMethod::forward:
+        case slots::ListMethod::reset:
+        case slots::ListMethod::heaps:
+        case slots::ListMethod::typed:
+            return entry.pc;
+        default:
+            return kListNotForwarded;
+    }
 }
 
 
