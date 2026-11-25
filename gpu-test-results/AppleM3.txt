@@ -62,8 +62,8 @@ Open pull requests run here against the same test programs (MoltenVK = MVK, Kosm
             #1426 (computed I/J under --bary-fallback): ps_ij_computed and ps_interp_f16_high still
             "vk_harness failed" on MVK; the fallback needs a geometry stage, which Metal does not have.
             #1212 and #137 (NaN-pattern constants in image_bvh): cs_bvh and cs_bvh32 pass on KK and MVK.
-            ps_ssharp: no open pull request found; Metal samplers take no LOD bias (old #7587, indexed in
-            #18).
+            #1774 (--explicit-lod-bias, the S# LOD bias in the shader on MoltenVK): ps_ssharp passes on MVK;
+            with all of the above merged, MVK has no failure left.
 
 All of them together, on main 57ba40bd6 with #1444, #1518, #1724, #822, #1212, #1673, #1657, #1412 and
 #1375 merged (#822 and #1444 conflict in runtime/test/shaders/build.py: each adds a block at the same place,
