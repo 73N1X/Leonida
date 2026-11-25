@@ -878,7 +878,7 @@ struct ComputePipeline {
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
     std::uint64_t estimate = 0;  // large: the bytes of memory its compile is expected to take
     // Told at every dispatch that names this pipeline, built or not, with variant 0 (pipeline_order.h records the first
-    // one). Null: nobody is told. Called while a submission is prepared: it must not block, take a lock or allocate.
+    // one). Null: nobody is told. Called while a submission is prepared: it must never block or allocate (the only lock it may take is a non-blocking try_lock, on the first request of a pipeline and of a variant).
     void (*requested)(void*, std::uint32_t variant) = nullptr;
     void* request_context = nullptr;
 };

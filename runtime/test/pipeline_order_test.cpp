@@ -505,6 +505,74 @@ void test_key_is_one_word() {
     CHECK(read.sessions[0].records[0].key.rfind("a_b_c_d", 0) == 0);
 }
 
+// A process killed in the middle of a line leaves no newline; the next session must not stick to the cut line.
+void test_cut_file_then_new_session() {
+    const auto path = scratch("cutfile.log");
+    {
+        po::Recorder r(config(path));
+        CHECK(request(r, 1));
+        CHECK(request(r, 2));
+        CHECK(r.flush() == 2);
+    }
+    std::string text = slurp(path);
+    CHECK(!text.empty() && text.back() == '\n');
+    text.resize(text.size() - 7);  // the last record line cut short, no newline
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << text;
+    }
+    {
+        po::Recorder r(config(path));
+        CHECK(request(r, 3));
+        CHECK(request(r, 4));
+        CHECK(r.flush() == 2);
+    }
+    const auto read = po::parse(slurp(path));
+    CHECK(read.sessions.size() == 2);
+    if (read.sessions.size() == 2) {
+        CHECK(read.sessions[0].records.size() == 1 && read.sessions[0].records[0].key == key_of(1));
+        CHECK(read.sessions[1].records.size() == 2);
+        if (read.sessions[1].records.size() == 2) {
+            CHECK(read.sessions[1].records[0].key == key_of(3));
+            CHECK(read.sessions[1].records[1].key == key_of(4));
+        }
+    }
+    CHECK(read.bad_lines == 1);  // the cut line itself, skipped
+}
+
+// The writer stops at a slot still being filled, so the file keeps the order of asking.
+void test_flush_stops_at_unpublished() {
+    const auto path = scratch("holdback.log");
+    po::Recorder r(config(path));
+    const std::string ka = key_of(10), kb = key_of(11);
+    const auto a = r.claim(po::key_hash(ka), 0);
+    const auto b = r.claim(po::key_hash(kb), 0);
+    CHECK(a && b);
+    r.publish(b, kb, 'c', false, 0, po::unknown_ms);
+    CHECK(r.flush() == 0);  // B is published but A, asked first, is not yet
+    r.publish(a, ka, 'c', false, 0, po::unknown_ms);
+    CHECK(r.flush() == 2);
+    const auto read = po::parse(slurp(path));
+    CHECK(read.sessions.size() == 1 && read.sessions[0].records.size() == 2);
+    if (read.sessions.size() == 1 && read.sessions[0].records.size() == 2) {
+        CHECK(read.sessions[0].records[0].key == ka);
+        CHECK(read.sessions[0].records[1].key == kb);
+    }
+}
+
+// A session line of a version this reader does not know is not read as one of this one.
+void test_unknown_session_version() {
+    const std::string known = po::format_session(0x10de, 0x2504);
+    CHECK(po::parse(known).sessions.size() == 1);
+    // The same line with version 2 and a good checksum: the checksum is the one of the text before " *".
+    std::string body = "S 2 10de 2504";
+    char sum[16];
+    std::snprintf(sum, sizeof(sum), " *%08x\n", po::checksum(body));
+    const auto read = po::parse(body + sum);
+    CHECK(read.sessions.empty());
+    CHECK(read.bad_lines == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -526,6 +594,9 @@ int main() {
     test_thread_writes();
     test_counts_and_report();
     test_key_is_one_word();
+    test_cut_file_then_new_session();
+    test_flush_stops_at_unpublished();
+    test_unknown_session_version();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

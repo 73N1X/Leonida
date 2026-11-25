@@ -158,7 +158,7 @@ int main() {
     // 5: graphics built, both targets bound: variant 0.  6: graphics not built, slot 1 unbound: variant 2.
     graphics[5] = graphics_pipeline(5, true);
     graphics[6] = graphics_pipeline(6, false);
-    
+
     CommandList list;
     list.dispatch({1, {}, 1, 1, 1});
     list.dispatch({2, {}, 1, 1, 1});

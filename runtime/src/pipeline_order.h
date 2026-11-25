@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #ifdef _WIN32
 #include <share.h>
 #endif
@@ -452,8 +453,6 @@ private:
         char kind = 'c';
         bool ready = false;
         char key[key_chars] = {};
-        bool written = false;       // writer thread only
-        bool build_written = false; // writer thread only
     };
 
     static std::size_t table_size(std::size_t capacity) {
@@ -488,7 +487,6 @@ private:
             r.ready = s.ready;
             out += format_record(r);
             ++lines;
-            s.written = true;
             if (r.build_ms == unknown_ms) waiting_.push_back(cursor_);
             ++cursor_;
         }
@@ -527,6 +525,15 @@ private:
         return lines;
     }
 
+    static bool ends_with_newline(const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        if (!in || in.tellg() <= 0) return true;
+        in.seekg(-1, std::ios::end);
+        char last = '\n';
+        in.get(last);
+        return last == '\n';
+    }
+
     bool open() {
         std::error_code ec;
         if (config_.path.empty()) return false;
@@ -549,6 +556,12 @@ private:
 #endif
         if (!f) return false;
         file_.reset(f);
+        // A process killed in the middle of a line leaves no newline: the next session's line would stick to it and
+        // the reader would file this run's records under the previous one. The reader skips empty lines.
+        if (!new_file_ && !ends_with_newline(config_.path) && std::fputc('\n', f) == EOF) {
+            file_.reset();
+            return false;
+        }
         return true;
     }
 

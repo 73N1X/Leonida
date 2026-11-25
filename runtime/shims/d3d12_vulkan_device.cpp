@@ -8272,7 +8272,7 @@ public:
     void set_order_key(leonida::cached_pso::Key key) { order_key_ = std::move(key); }
 
     // pipeline_order.h: the first dispatch or draw that names a pipeline and variant. Runs while a submission is
-    // prepared, so it takes no lock and allocates nothing: the first-time test is one compare-and-swap.
+    // prepared, so it never blocks and allocates nothing: the first-time test is one compare-and-swap (the readiness callbacks only try_lock, without waiting, on the first request of a pipeline and variant).
     static void order_requested(void* self, std::uint32_t variant) {
         static_cast<PipelineState*>(self)->order_request(variant);
     }
@@ -17194,9 +17194,13 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
         return false;
     }
     bool wrote = false;
+    // After the cache write, so that the order log's final append (a join and a write) never delays the cache. It
+    // appends the last lines and prints the counts; no cache file is touched.
+    const auto close_order_logs = [] {
+        for (DeviceState* d : exit_cache_devices) d->close_order_log();
+    };
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (DeviceState* d : exit_cache_devices) {
-        d->close_order_log();  // appends the last lines and prints the counts; no cache file is touched
         if (!d->context || !d->pipeline_cache_handle) continue;
         // A build still running (a large one takes minutes; at a crash the faulting thread may be inside one) is
         // given until the deadline, then the cache is written without it. Unlike at teardown, the previous file is
@@ -17229,10 +17233,12 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
                                      [&] { return write->done; })) {
             std::fprintf(stderr, "[rt] d3d12: pipeline cache still being written after %u ms at exit; the process "
                                  "ends without waiting for it\n", kExitCacheWriteMs);
+            close_order_logs();
             return wrote;  // the device list stays as it is: the write still uses this device
         }
         wrote = true;
     }
+    close_order_logs();
     return wrote;
 }
 

@@ -2424,7 +2424,7 @@ Pipeline creation:
   with `S 1 <vendor hex> <device hex>`. Each line ends with an FNV-1a checksum: a cut or damaged line is skipped on
   read, never fatal. The hook sits in replay's `ComputePipeline::requested` / `GraphicsPipeline::requested`, called
   where a submission is prepared, also for a handle that exists already (a warm-up build, a cached one); the
-  recorder decides "first" with one compare-and-swap in a table made at start, takes no lock and allocates nothing,
+  recorder decides "first" with one compare-and-swap in a table made at start, never blocks and allocates nothing (a non-blocking `try_lock` on the first request of a pipeline and of a variant),
   and a thread of its own appends every 250 ms, so a killed process loses at most that. The record holds 8192 lines
   per run (the rest is counted, not kept); a file past 8 MiB is set aside as `pipeline_order.log.prev`. At exit (the
   exit cache save, or the device's release) one line gives the counts: `[rt] pipeline-order: requested N, already
