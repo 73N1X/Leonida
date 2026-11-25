@@ -1115,12 +1115,18 @@ def _region_has_cycle(region, succ):
     return False
 
 
-def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset()):
+def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset(), loops=None):
     """Find safe lane-local `s_cbranch_execz`/`nz` regions to fold inline under --wave64-emulate.
 
     Allows read-only regions (including regions with internal scalar-counted loops) AND acyclic
     single-write-per-domain regions (at most one store/atomic touching `"mem"` or `"lds"` with no
     other access to that domain inside the region).
+
+    `loops` is rdna2spirv's --loop-limit state `(counted edge -> counter, block -> counters it resets, blocks that
+    leave the program at the cap)`. A fold runs only in the active lanes, with a block numbering of its own: a loop
+    inside the region keeps its counter (rdna2spirv counts its edges in that numbering), but no counted edge may
+    leave the head or the region, no block of it may leave the program at the cap, and a one-block region (emitted
+    without its branch) may not loop.
 
     Returns `(folds, fold_chain, absorbed)`:
       - `folds`: dict `head_block -> {"run": int, "skip": int, "region": frozenset[int],
@@ -1319,8 +1325,20 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
 
     # Validate innermost regions first so nested s_cbranch_execz/nz inside an outer region are already verified.
     candidates.sort(key=lambda item: (item[0], item[1]))
+    loop_edges, _, loop_exits = loops if loops is not None else ({}, {}, frozenset())
+    counted_to = collections.defaultdict(set)
+    for u, w in loop_edges:
+        counted_to[u].add(w)
     valid = {}
     for _, b, run, skip, region, mem_stats in candidates:
+        # --loop-limit (see the docstring): a counted edge out of the region, or a lane leaving the program at the cap
+        # from inside it, needs the program's own block numbers and the scheduler.
+        if b in counted_to or not loop_exits.isdisjoint(region):
+            continue
+        if any(not counted_to[u] <= region for u in region if u in counted_to):
+            continue
+        if len(region) == 1 and run in counted_to:
+            continue
         ok = True
         for u in region:
             tkind, top = terms[u]
@@ -1478,8 +1496,13 @@ def _dirty_conflicts(dirty, reads, writes):
             or any((k, "r") in dirty or (k, "w") in dirty for k in writes))
 
 
-def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes):
+def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes,
+                              exits=frozenset()):
     """Plan structured --wave64-emulate emission eliminating the giant global round-loop OpSwitch.
+
+    `exits` are the blocks that leave the program when a loop reaches --loop-limit (rdna2spirv's loop_exits): each
+    counts as an early `s_endpgm`, so a wave that stops there is left to a scheduler, which counts it done, instead
+    of skipping a barrier the other waves wait at, and `%pc` may hold the end (-1) after it.
 
     - Single-wave workgroups (`x_lanes == 64`): every reducible CFG emits 100% inline structured SPIR-V
       with direct workgroup barriers (`0` OpSwitch cases, `0` x_spill variables, `0` scheduler atomics).
@@ -1534,7 +1557,7 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
     for b in eff_blocks:
         tail = chain_of[b][-1]
         s = set(eff_succ[b])
-        if not s:
+        if not s or tail in exits:
             s.add(-1)
         elif tail not in folds and len(raw_edges[tail]) == 1:
             last = active_blocks[tail][-1] if active_blocks[tail] else None
@@ -1629,7 +1652,7 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
                 for k in fd["mem_writes"]:
                     gen_dirty |= _DIRTY_LDS_W if k == "lds" else _DIRTY_MEM_W
         sb_has_sbarrier[b] = has_sb
-        sb_has_endpgm[b] = has_end
+        sb_has_endpgm[b] = has_end or any(cur in exits for cur in chain)
         sb_may_barrier[b] = may_bar
         sb_mem_stats[b] = (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)
         sb_clears_dirty[b] = clears_dirty

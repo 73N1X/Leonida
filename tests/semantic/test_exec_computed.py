@@ -42,6 +42,25 @@ class ExecComputed(unittest.TestCase):
                 old = self.OLD_PREFIX[name]
                 self.assertNotEqual(got[:len(old)], old)
 
+    def test_wave64_emulated_words(self):
+        # --wave64-emulate takes the same EXEC write (exec_half_write), with no subgroup operation.
+        from test_wave64_emulate_opt import run_emulated_workgroup
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        name = "cs_w64_exec_computed"
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        saved = support.rdna2spirv.WAVE64_EMULATE
+        support.rdna2spirv.WAVE64_EMULATE = True
+        try:
+            spv = support.translate_fixture(name, fssm=bytes(header))
+            self.assertTrue(support.rdna2spirv.translate.last_gen.emulate)
+        finally:
+            support.rdna2spirv.WAVE64_EMULATE = saved
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        memory, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28,
+                                           memory=memory)
+        self.assertEqual([memory[4 * i] for i in range(8)], self.WANT[name][1])
+
     def test_words_follow_from_the_masks(self):
         # Plain-Python reference: word = set lanes << 8 | lowest lane of each case's resulting EXEC.
         def word(m):

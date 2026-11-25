@@ -41,6 +41,32 @@ def translate_lines(name, lines, dxbc=STUB_DXBC, fssm=None):
     return translate_listing(name, text.encode("utf-8"), dxbc, fssm)
 
 
+def asm_fixture(name):
+    """The instruction and label lines of the hand-written tests/semantic/fixtures/<name>.asm (comments dropped)."""
+    with open(os.path.join(HERE, "fixtures", name + ".asm"), encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith(";")]
+
+
+def resolve_labels(lines, size=4):
+    """Instruction lines with `name:` labels, in the form translate_lines takes: every instruction gets a `size`-byte
+    placeholder encoding (the translator places instructions by their encodings) and a branch to a label gets its
+    signed dword offset from the next instruction (RDNA2 SOPP: target = PC + 4 + 4 * SIMM16)."""
+    labels, placed, pc = {}, [], 0
+    for line in lines:
+        if line.endswith(":"):
+            labels[line[:-1]] = pc
+            continue
+        placed.append((line, pc))
+        pc += size
+    out = []
+    for line, at in placed:
+        words = line.split()
+        if words[0].startswith(("s_branch", "s_cbranch_")) and len(words) == 2 and words[1] in labels:
+            line = f"{words[0]} {(labels[words[1]] - at - size) // 4}"
+        out.append(f"{line} ; encoding: [{','.join(['0x00'] * size)}]")
+    return out
+
+
 def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None):
     """SPIR-V assembly text for a listing in the translator's input format (bytes of a .s file)."""
     with tempfile.TemporaryDirectory() as tmp:

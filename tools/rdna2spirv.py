@@ -102,6 +102,12 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 F16_HALVES = False
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
+# --loop-limit: a loop runs at most this many times per entry into it, by stage (0 = no cap); then a conditional back
+# edge takes its other way out and a jump back leaves the program (a pixel is discarded). The console runs a loop as
+# long as its data says, and data the host has not got yet reads as zeros: VIctory saw such loops run ~4 billion
+# times and lose the GPU (victory/crates/victory-shader/src/emit/lower.rs, LOOP_LIMIT and count_iteration; commit
+# 15b0091e8, the per-stage values from 570a941e9). docs/design.md "Loop iteration cap".
+LOOP_LIMITS = {"ps": 128, "vs": 256, "gs": 256, "ms": 256, "cs": 4096}
 
 
 # The heap base as one %ulong, in the entry block of %main: the push constants don't change during the invocation, and
@@ -373,6 +379,11 @@ class Gen:
         self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
+        self.loop_limit = 0        # --loop-limit of this stage: passes per entry into a loop (0 = no cap)
+        self.loop_edges = {}       # (block, successor) -> its loop's counter (%lc<k>): the counted edges
+        self.loop_resets = {}      # block -> the counters it sets to 0: it is outside their loop, with an edge in
+        self.loop_exits = set()    # blocks whose every way on is a counted edge: at the cap they leave the program
+        self.loop_count = 0        # counters %lc0.. declared
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
@@ -426,6 +437,89 @@ class Gen:
                 self.x_tok[reg] = val
             elif s.endswith("= OpLabel"):
                 self.x_gen += 1
+
+    # ---- loop iteration cap (--loop-limit) ----
+    def loop_next(self, u, taken, fall, cond, pc_of):
+        """The %pc value block u leaves: `taken` where `cond` holds (cond None: always), else `fall` (None: the
+        program ends); pc_of(b) is block b's number, pc_of(None) the end. A counted edge (loop_edges) is taken only
+        while its loop's counter %lc<k> + 1 is below the limit, and taking it counts it, so a loop's first block runs
+        at most loop_limit times per entry (the blocks in loop_resets set the counter to 0). A branch whose way is
+        blocked takes its other way (VIctory's rule: a back edge is taken only below the limit), and a block with no
+        way left leaves the program (loop_abort). Every lane of a wave runs the same blocks (votes and SCC are the
+        wave's), so their counters agree: one per wave. Returns (pc id, the bool that picks `taken`, or None when
+        the block has one way)."""
+        kt = self.loop_edges.get((u, taken)) if taken is not None else None
+        kf = self.loop_edges.get((u, fall)) if fall is not None and cond is not None else None
+        if kt is None and kf is None:              # no counted edge: what the translation always emitted
+            if cond is None:
+                return pc_of(taken), None
+            r = self.tmp()
+            self.emit(f"{r} = OpSelect %uint {cond} {pc_of(taken)} {pc_of(fall)}")
+            return r, cond
+        if cond is None or taken == fall:          # both ways are the same edge
+            fall, kf, cond_used = taken, None, None
+        else:
+            cond_used = cond
+        steps = {}
+        for k in dict.fromkeys(x for x in (kt, kf) if x is not None):
+            c, c1, ok = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{c} = OpLoad %uint %lc{k}")
+            self.emit(f"{c1} = OpIAdd %uint {c} {self.cu(1)}")
+            self.emit(f"{ok} = OpULessThan %bool {c1} {self.cu(self.loop_limit)}")
+            steps[k] = (c, c1, ok)
+        if cond_used is None:                      # one way, counted: on below the limit, else out of the program
+            ok = steps[kt][2]
+            self.emit(f"OpStore %lc{kt} {steps[kt][1]}")
+            r = self.tmp()
+            self.emit(f"{r} = OpSelect %uint {ok} {pc_of(taken)} {pc_of(None)}")
+            self.loop_abort(ok)
+            return r, None
+        sel = self.tmp()
+        if kf is None:                             # taken only below the limit
+            self.emit(f"{sel} = OpLogicalAnd %bool {cond_used} {steps[kt][2]}")
+        elif kt is None:                           # fall only below the limit
+            nf = self.tmp()
+            self.emit(f"{nf} = OpLogicalNot %bool {steps[kf][2]}")
+            self.emit(f"{sel} = OpLogicalOr %bool {cond_used} {nf}")
+        else:                                      # both counted: the way cond picks, else the other one
+            nf = self.tmp()
+            self.emit(f"{nf} = OpLogicalNot %bool {steps[kf][2]}")
+            self.emit(f"{sel} = OpSelect %bool {cond_used} {steps[kt][2]} {nf}")
+        r = self.tmp()
+        self.emit(f"{r} = OpSelect %uint {sel} {pc_of(taken)} {pc_of(fall)}")
+        if kt is not None and kf is not None:
+            live, out = self.tmp(), self.tmp()
+            self.emit(f"{live} = OpLogicalOr %bool {steps[kt][2]} {steps[kf][2]}")
+            self.emit(f"{out} = OpSelect %uint {live} {r} {pc_of(None)}")
+            self.loop_abort(live)
+            r = out
+        if kt is not None and kt == kf:
+            self.emit(f"OpStore %lc{kt} {steps[kt][1]}")
+        else:
+            if kt is not None:
+                v = self.tmp()
+                self.emit(f"{v} = OpSelect %uint {sel} {steps[kt][1]} {steps[kt][0]}")
+                self.emit(f"OpStore %lc{kt} {v}")
+            if kf is not None:
+                v = self.tmp()
+                self.emit(f"{v} = OpSelect %uint {sel} {steps[kf][0]} {steps[kf][1]}")
+                self.emit(f"OpStore %lc{kf} {v}")
+        return r, sel
+
+    def loop_abort(self, live):
+        """The lane leaves the program at the cap unless `live`: %done (the round schedulers stop running it and,
+        since it no longer counts, the other waves' barrier rounds go on without it) and, in a pixel shader,
+        %lc_kill, which discards the pixel at the end (after OpEndInvocationInterlockEXT, as every exit)."""
+        dead, d0, d1 = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{dead} = OpLogicalNot %bool {live}")
+        self.emit(f"{d0} = OpLoad %bool %done")
+        self.emit(f"{d1} = OpLogicalOr %bool {d0} {dead}")
+        self.emit(f"OpStore %done {d1}")
+        if self.stage == "ps":
+            k0, k1 = self.tmp(), self.tmp()
+            self.emit(f"{k0} = OpLoad %bool %lc_kill")
+            self.emit(f"{k1} = OpLogicalOr %bool {k0} {dead}")
+            self.emit(f"OpStore %lc_kill {k1}")
 
     # ---- register access ----
     def reg_ptr(self, kind, r):
@@ -1604,11 +1698,36 @@ class Gen:
         lane_masks.step(st, self.cur_ins)
         return st.get("vcc") in lane_masks.MASK_KINDS
 
+    def exec_number_bit(self, a, val):
+        """`val` as this lane's EXEC bit (0 / ~0) when a scalar op that reads no lane mask writes it to exec_lo or
+        exec_hi: then it is a number, the same in every lane, and lane L takes its bit L mod 32, as a constant does
+        (SHADER-1264). Testing it for non-zero turned on the whole half: `s_lshl_b32 exec_lo, 1, s5`, `s_add_u32
+        exec_lo, s4, 0xf0`, `s_bfm_b32 exec_lo, s6, s7` (cs_w32_exec_computed / cs_w64_exec_computed: 8192 8192
+        8192 on an RTX 4060 Ti under LEONIDA_W64_EMULATE=1 and on the CPU). A result already in that form (a bitwise
+        op that read its operands through mask_src) is 0 or ~0 in each lane, and bit L of that is the same bit, so
+        it is unchanged, and such ops are left alone (no code added); an op that reads a lane mask (EXEC, VCC, an
+        SGPR lane_masks.py found holding one) and a VALU op keep the old reading."""
+        ins = self.cur_ins
+        if a["k"] != "special" or a.get("t") not in ("exec_lo", "exec_hi") or ins is None or \
+                not base_op(ins["op"]).startswith("s_") or \
+                any(self.is_mask_op(x) or self.any_mask_word(x) for x in ins["args"][1:]):
+            return val
+        if base_op(ins["op"]) in self.MASK_SOP2_B32 + ("s_not_b32",) and \
+                all(self._maskable_b32(x) for x in ins["args"][1:]):
+            return val                     # sop2_b32_srcs / s_not_b32 read it through mask_src: 0 / ~0 already
+        sh, shr, bit, r = (self.tmp() for _ in range(4))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {val} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
     def dst(self, a, val, *, eager=False):
         if a.get("sdwa_dst") and a["k"] == "vgpr":
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
+        val = self.exec_number_bit(a, val)
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
             self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
             return
@@ -2164,6 +2283,23 @@ class Gen:
                 kind, args = "BITMASK_PERM", []
                 and_m, or_m, xor_m = off & 0x1F, (off >> 5) & 0x1F, (off >> 10) & 0x1F
         self.uses_subgroup = True
+        if self.stage == "ps":
+            # A swizzle that stays in the quad (QUAD_PERM, or masks that keep lane bits 2-4: VIctory's test in
+            # lower.rs) is a quad operation in a pixel shader, so a helper lane across a triangle edge is read as on
+            # hardware (VIctory 921d8d3b4; quad_read). pattern[q] = the source of quad position q.
+            masks = {"SWAP": (0x1F, 0, args[0] if args else 0), "REVERSE": (0x1F, 0, (args[0] - 1) if args else 0),
+                     "BROADCAST": ((~(args[0] - 1) & 0x1F, args[1], 0) if len(args) > 1 else None),
+                     "BITMASK_PERM": (and_m, or_m, xor_m)}.get(kind)
+            pattern = None
+            if kind == "QUAD_PERM":
+                pattern = tuple(args)
+            elif masks and masks[0] & 0x1C == 0x1C and masks[1] & 0x1C == 0 and masks[2] < 4:
+                pattern = tuple((((q & masks[0]) | masks[1]) ^ masks[2]) & 3 for q in range(4))
+            if pattern is not None:
+                value = self.tmp()
+                self.emit(f"{value} = OpSelect %uint {self.active_b()} {self.src_u(a[1])} {self.cu(0)}")
+                self.dst(a[0], self.quad_read(value, pattern))
+                return
         lane = self.tmp()
         self.sub_lane(lane)
         if kind == "BITMASK_PERM":
@@ -5374,6 +5510,26 @@ class Gen:
         self.uses_subgroup = self.uses_ballot = True
         return first
 
+    def helper_own_value(self, ballot, own, first):
+        """v_readfirstlane_b32 in a pixel shader: `first` (the value of the first lane on in EXEC), except in an
+        active lane that its own `ballot` of EXEC leaves out, which takes its own value `own` (VIctory 060195536).
+        Only a helper invocation a driver keeps out of subgroup operations can be such a lane: Vulkan leaves it to
+        the implementation whether helpers join a ballot or a shuffle (only quad and derivative operations must see
+        them). On the console whole-quad mode puts helpers in EXEC, so a waterfall loop (read the first lane's
+        value, run the lanes that hold it, take them out of EXEC) serves them too; a helper left out instead reads
+        an empty or foreign first lane, never matches, and the loop spins: in VIctory such loops ran to the
+        iteration limit in every draw until DEVICE_HUNG ~200 s into the world. With its own value a helper matches
+        in the first pass; what it computes only feeds derivatives and quad reads, and its stores are dropped. A
+        driver that does include helpers sees them in the ballot, so nothing changes there."""
+        self.uses_subgroup = self.uses_ballot = True
+        first = self.eager("%uint", first)            # read in an OpSelect arm below: every lane must run it
+        bit, out, left, r = (self.tmp() for _ in range(4))
+        self.emit(f"{bit} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {self.subgroup_lane()}")
+        self.emit(f"{out} = OpLogicalNot %bool {bit}")
+        self.emit(f"{left} = OpLogicalAnd %bool {out} {self.active_b()}")
+        self.emit(f"{r} = OpSelect %uint {left} {own} {first}")
+        return r
+
     def ballot_lsb_by_words(self, bal):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
@@ -6171,6 +6327,49 @@ class Gen:
         self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {lo_in}")
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
         return lo, hi
+
+    def quad_read(self, v, pattern=None, pos=None):
+        """`v` of another invocation of this one's quad, by quad operations (pixel shaders: quad-confined DPP and
+        ds_swizzle). `pattern` gives the source position for destination positions 0..3 of every quad; else `pos` is
+        a per-lane id 0..3. The invocations of a fragment quad all join a quad operation, helpers too: Vulkan keeps
+        a helper active for quad (and derivative) operations, while a subgroup shuffle or ballot need not see it, so
+        a read of a pixel across a triangle edge can come back undefined or 0 (VIctory 921d8d3b4: on an RX 7900 XTX
+        its wave reads gave 32 wrong pixels at a shared triangle edge, its quad reads none). Quad position = subgroup
+        lane & 3, the 2x2 order RDNA2 uses (lane % 4 = (x & 1) + 2 (y & 1), measured, see "Whole-quad mode"). Each
+        result goes through `eager`, so every invocation runs the operation (SHADER-529)."""
+        self.uses_subgroup = self.uses_quad = True
+        swaps = {(1, 0, 3, 2): 0, (2, 3, 0, 1): 1, (3, 2, 1, 0): 2}      # QuadSwap Direction: horizontal, vertical, diagonal
+        if pattern is not None:
+            pattern = tuple(pattern)
+            if pattern == (0, 1, 2, 3):
+                return v
+            r = self.tmp()
+            if len(set(pattern)) == 1:
+                self.emit(f"{r} = OpGroupNonUniformQuadBroadcast %uint {self.cu(3)} {v} {self.cu(pattern[0])}")
+                return self.eager("%uint", r)
+            if pattern in swaps:
+                self.emit(f"{r} = OpGroupNonUniformQuadSwap %uint {self.cu(3)} {v} {self.cu(swaps[pattern])}")
+                return self.eager("%uint", r)
+            q = self.tmp()
+            self.emit(f"{q} = OpBitwiseAnd %uint {self.subgroup_lane()} {self.cu(3)}")
+            pos = self.cu(pattern[0])
+            for i in (1, 2, 3):
+                e, nxt = self.tmp(), self.tmp()
+                self.emit(f"{e} = OpIEqual %bool {q} {self.cu(i)}")
+                self.emit(f"{nxt} = OpSelect %uint {e} {self.cu(pattern[i])} {pos}")
+                pos = nxt
+        reads = []
+        for n in range(4):
+            r = self.tmp()
+            self.emit(f"{r} = OpGroupNonUniformQuadBroadcast %uint {self.cu(3)} {v} {self.cu(n)}")
+            reads.append(self.eager("%uint", r))
+        out = reads[0]
+        for n in (1, 2, 3):
+            e, nxt = self.tmp(), self.tmp()
+            self.emit(f"{e} = OpIEqual %bool {pos} {self.cu(n)}")
+            self.emit(f"{nxt} = OpSelect %uint {e} {reads[n]} {out}")
+            out = nxt
+        return out
 
     def quad_any(self, v):
         """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
@@ -7262,6 +7461,28 @@ class Gen:
                     self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
                     active = both
                 src_ok = active
+        elif self.stage == "ps" and (quad is not None or
+                                     (dpp8 is not None and all(((s ^ i) & 4) == 0 for i, s in enumerate(dpp8)))):
+            # quad_perm, and a dpp8 whose every lane reads from its own quad, in a pixel shader: quad operations, which
+            # read a helper lane across a triangle edge as the hardware does (VIctory 921d8d3b4; quad_read). Its
+            # active bit, which decides fi / bound_ctrl, comes through the quad too: a ballot need not see a helper.
+            if quad is not None:
+                pattern = tuple(quad)
+            else:
+                lo, hi = tuple(s & 3 for s in dpp8[:4]), tuple(s & 3 for s in dpp8[4:])
+                pattern = lo if lo == hi else None
+            pos = None
+            if pattern is None:
+                pos = self.tmp()
+                self.emit(f"{pos} = OpBitwiseAnd %uint {src_local} {self.cu(3)}")
+            if fi:
+                src_ok = "%true"
+            else:
+                on, bit = self.tmp(), self.tmp()
+                self.emit(f"{on} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"{bit} = OpINotEqual %bool {self.quad_read(on, pattern, pos)} {self.cu(0)}")
+                src_ok = bit
+            shuffled = self.quad_read(src_val, pattern, pos) if src.get("k") == "vgpr" else src_val
         else:
             sgl = self.subgroup_lane()
             sg_group = self.tmp()
@@ -7586,7 +7807,7 @@ class Gen:
                 self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
                 self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave32_first_running_lane()}")
                 self.g_shuffle(r, v, first)
-                self.dst(a[0], r)
+                self.dst(a[0], self.helper_own_value(ballot, v, r))
                 return
             if self.emulate:
                 # The wave's active lanes as two mask words and every lane's value, in one round.
@@ -7614,7 +7835,7 @@ class Gen:
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
-            self.dst(a[0], r)
+            self.dst(a[0], self.helper_own_value(bal, v, r) if self.stage == "ps" else r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
                     "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
@@ -7623,6 +7844,7 @@ class Gen:
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
+            self.mimg_status(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             self._validate_unary_f16(op, ins["op"], a, mods)
             sel, dhi = self.opsel_bits(mods, 1)
@@ -8037,6 +8259,8 @@ class Gen:
         elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") \
                 or op in self.IMG_ATOMICS or op in self.IMG_ATOMICS_EXTRA:
             self.image_misc(op, a, mods)
+            if op == "image_load_mip":
+                self.mimg_status(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
             # Cube face selection (standard table): major axis Z if |z|>=|x| and |z|>=|y|, else Y if |y|>=|x|,
             # else X.   face: +X0 -X1 +Y2 -Y3 +Z4 -Z5
@@ -14072,6 +14296,23 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
+    def mimg_status(self, op, a, mods):
+        """An MIMG read with `tfe` or `lwe` returns one more dword after its data, the fetch status, at
+        vdata[data dwords] (RDNA2 ISA, MIMG TFE/LWE; SHADER-1266): non-zero for a texel that is not resident (TFE)
+        or whose LOD the resource's minimum clamped (LWE). Without sparse residency every texel a Vulkan view can
+        read is resident, and the translation applies no LOD warning, so the status is 0, written like the data
+        (active lanes only). Data dwords: one per dmask bit (four for a gather), halved and rounded up under d16
+        (two 16-bit values per VGPR). Before, the status VGPR kept its old value: cs_imgload_tfe and
+        cs_imgload_d16_tfe moved every texel by the 1000 they seed it with, and vk_store_test exited 1 on an RTX
+        4060 Ti. No listing of the 1.0.2.1 corpus uses tfe or lwe."""
+        if not any(m in mods for m in ("tfe", "lwe")) or not a or a[0]["k"] != "vgpr":
+            return
+        dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+        count = 4 if op.startswith("image_gather4") else bin(int(dm.split(":")[1], 0) & 0xF).count("1")
+        if "d16" in mods:
+            count = (count + 1) // 2
+        self.dst({"k": "vgpr", "r": a[0]["r"] + count, "n": 1}, self.cu(0))
+
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
         if a and a[0]["k"] != "vgpr":      # `off`, an SGPR or a constant where the VGPR range of the data goes
@@ -15881,7 +16122,11 @@ def assemble(gen):
           "%scc = OpVariable %_ptr_Function_uint Function %c0",
           *(["%mode_r16 = OpVariable %_ptr_Function_uint Function %c0"] if gen.round_mode else []),
           "%active = OpVariable %_ptr_Function_bool Function %true",
-          *[f"{var} = OpVariable {ptr} Function" for var, ptr in gen.eager_vars]]
+          *[f"{var} = OpVariable {ptr} Function" for var, ptr in gen.eager_vars],
+          # --loop-limit: each loop's passes since it was entered, and (pixel) whether the lane left at the cap.
+          *[f"%lc{k} = OpVariable %_ptr_Function_uint Function %c0" for k in range(gen.loop_count)],
+          *(["%lc_kill = OpVariable %_ptr_Function_bool Function %false"]
+            if gen.stage == "ps" and gen.loop_exits else [])]
     if gen.vm_latch:
         fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
                "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
@@ -16227,13 +16472,14 @@ def assemble(gen):
               "%ms_cend = OpLabel",
               "OpBranch %ms_pend", "%ms_pend = OpLabel"]
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
-    if gen.uses_active and gen.stage == "ps":
+    loop_kill = gen.stage == "ps" and bool(gen.loop_exits)
+    if (gen.uses_active or loop_kill) and gen.stage == "ps":
         # A pixel is written when its lane was on in EXEC at the last `vm` export the path ran (if it ran one) and
         # at the last export to its color target (measured on RDNA2 with one target; docs/design.md, EXEC). With
         # several targets the pixel stays when any of them got an export from the lane: Vulkan can't skip one
         # attachment per pixel, so the others keep what the lane exported before (or the initial value). Without a
         # latch EXEC can't have changed since those exports, so EXEC at the end is the same mask; a path with no
-        # export at all also goes by EXEC at the end.
+        # export at all also goes by EXEC at the end. A lane that left a loop at --loop-limit is discarded.
         keep, latched = "%act_end", ""
         if gen.vm_latch:
             keep = "%vm_keep"
@@ -16251,6 +16497,11 @@ def assemble(gen):
                 any_set, any_on = f"%col_any_set_{t}", f"%col_any_on_{t}"
             latched += (f"         %col_part = OpSelect %bool {any_set} {any_on} %no_col\n"
                         "         %vm_keep = OpLogicalAnd %bool %vm_part %col_part\n")
+        if loop_kill:
+            latched += ("         %lc_killed = OpLoad %bool %lc_kill\n"
+                        "         %lc_alive = OpLogicalNot %bool %lc_killed\n"
+                        f"         %lc_keep = OpLogicalAnd %bool {keep} %lc_alive\n")
+            keep = "%lc_keep"
         tail = end_lock + ("         %act_end = OpLoad %bool %active\n" + latched +
                 "         OpSelectionMerge %live None\n"
                 f"         OpBranchConditional {keep} %live %dead\n"
@@ -17626,14 +17877,32 @@ def translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    g.loop_limit = LOOP_LIMITS.get(stage, 0)
+    if g.loop_limit:
+        # --loop-limit: a counter per loop (cfg_structure.loop_counters bounds every cycle, reducible or not), and the
+        # blocks that leave the program at the cap: every way on from them is counted.
+        for k, (counted, resets, _) in enumerate(cfg_structure.loop_counters(succ)):
+            g.loop_count = k + 1
+            for e in counted:
+                g.loop_edges[e] = k
+            for u in sorted(resets):
+                g.loop_resets.setdefault(u, []).append(k)
+        for u, edges in enumerate(raw_edges):
+            last = next((i for i in blocks[u] if base_op(i["op"]) == "s_endpgm" or base_op(i["op"]) in BRANCHES),
+                        None)
+            to_end = last is not None and base_op(last["op"]) not in ("s_endpgm", "s_branch") and len(edges) < 2
+            if edges and not to_end and all((u, w) in g.loop_edges for w in edges):
+                g.loop_exits.add(u)
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
-            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
+            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes,
+            loops=(g.loop_edges, g.loop_resets, frozenset(g.loop_exits)))
         if STRUCTURED:
             g.emulate_plan = wave64_emulate_opt.plan_structured_emulation(
-                blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes)
+                blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes,
+                exits=g.loop_exits)
     g.fit_shared_memory()
     g.exec_changes = any(g.may_write_exec(ins) for blk in blocks for ins in blk)
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
@@ -17698,16 +17967,21 @@ def translate(path):
                                 uterm = ("br", op)
                                 break
                             g.insn(ins)
+                        # --loop-limit: a loop inside the region counts in the region's numbering (sub_pc); only
+                        # the active lanes run it (find_local_exec_folds keeps counted edges and exits out of it).
+                        for k in g.loop_resets.get(u, ()):
+                            g.emit(f"OpStore %lc{k} {g.cu(0)}")
+                        sub_pc = lambda b: g.cu(idx_of.get(b, sub_end) if b is not None else sub_end)  # noqa: E731
                         uedges = raw_edges[u]
                         if uterm is None or uterm[0] == "end":
-                            nxt = idx_of.get(uedges[0], sub_end) if (uterm is None and uedges) else sub_end
-                            g.emit(f"OpStore %pc {g.cu(nxt)}")
+                            if uterm is None and uedges:
+                                g.emit(f"OpStore %pc {g.loop_next(u, uedges[0], None, None, sub_pc)[0]}")
+                            else:
+                                g.emit(f"OpStore %pc {g.cu(sub_end)}")
                         elif uterm[1] == "s_branch":
-                            g.emit(f"OpStore %pc {g.cu(idx_of.get(uedges[0], sub_end))}")
+                            g.emit(f"OpStore %pc {g.loop_next(u, uedges[0], None, None, sub_pc)[0]}")
                         else:
                             uop = uterm[1]
-                            utgt = g.cu(idx_of.get(uedges[0], sub_end))
-                            ufall = g.cu(idx_of.get(uedges[1], sub_end) if len(uedges) > 1 else sub_end)
                             if uop in ("s_cbranch_execz", "s_cbranch_execnz"):
                                 uact = g.active_b()
                                 if uop == "s_cbranch_execz":
@@ -17717,8 +17991,7 @@ def translate(path):
                                     ucond = uact
                             else:
                                 ucond = branch_condition(g, uop)
-                            ur = g.tmp()
-                            g.emit(f"{ur} = OpSelect %uint {ucond} {utgt} {ufall}")
+                            ur, _ = g.loop_next(u, uedges[0], uedges[1] if len(uedges) > 1 else None, ucond, sub_pc)
                             g.emit(f"OpStore %pc {ur}")
                     elif it[0] == "guard":
                         v, c, do, end = g.tmp(), g.tmp(), g.tmp(), g.tmp()
@@ -17796,6 +18069,8 @@ def translate(path):
                     term, body = ("br", op, index[target(ins)]), blocks[cur][:k]
                     break
             g.insns(body)
+            for k in g.loop_resets.get(cur, ()):
+                g.emit(f"OpStore %lc{k} {g.cu(0)}")         # --loop-limit: on the way into loop k
             if cur in folds:
                 emit_folded_region(folds[cur])
                 if cur in fold_chain:
@@ -17814,13 +18089,17 @@ def translate(path):
                 break
             edges = raw_edges[cur]
             fall = (edges[0] if edges else None) if term is None else (edges[1] if len(edges) > 1 else None)
+            # The number of block b in %pc; past the end (None) = len(blocks), the default -> done.
+            pc_of = lambda b: g.cu(b if b is not None else len(blocks))          # noqa: E731
             # Every block leaves the number of the block to run next in %pc (len(blocks) = none: the program is over),
             # and its possible successors in g.succ for cfg_structure.
             if term is None or term[0] == "end":
                 nxt = fall if term is None else None
-                g.emit(f"OpStore %pc {g.cu(nxt if nxt is not None else len(blocks))}")
                 if nxt is None:
+                    g.emit(f"OpStore %pc {pc_of(None)}")
                     g.emit("OpStore %done %true")
+                else:
+                    g.emit(f"OpStore %pc {g.loop_next(cur, nxt, None, None, pc_of)[0]}")
                 if mini_set is not None and (nxt is None or nxt not in mini_set):
                     g.emit("OpStore %x_ldone %true")
                 g.succ.append(succ[n] if cur != n else ([nxt] if nxt is not None else []))
@@ -17828,16 +18107,15 @@ def translate(path):
                 _, op, _ = term
                 tgt = edges[0]
                 if op == "s_branch":
-                    g.emit(f"OpStore %pc {g.cu(tgt)}")
+                    g.emit(f"OpStore %pc {g.loop_next(cur, tgt, None, None, pc_of)[0]}")
                     if mini_set is not None and tgt not in mini_set:
                         g.emit("OpStore %x_ldone %true")
                     g.succ.append(succ[n] if cur != n else [tgt])
                 else:
                     marks0, body0 = len(g.x_marks), len(g.body)
                     cond = branch_condition(g, op)
-                    alt = g.cu(fall) if fall is not None else g.cu(len(blocks))   # past the end = default -> done
-                    r = g.tmp()
-                    g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
+                    # --loop-limit: `cond` becomes the bool that really picks tgt (a counted way may be blocked).
+                    r, cond = g.loop_next(cur, tgt, fall, cond, pc_of)
                     g.emit(f"OpStore %pc {r}")
                     if g.emulate and not g.emulate_inline and op in (
                             "s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
@@ -18396,6 +18674,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
         m["wave64_exchange"] = "workgroup"
         m["subgroup_size"] = None
+    if g.loop_count:
+        # --loop-limit: the cap this module's loops were translated with (the translation depends on it, like "fma"),
+        # and how many loop counters it has.
+        m["loop_limit"] = g.loop_limit
+        m["capped_loops"] = g.loop_count
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if "SignedZeroInfNanPreserve" in caps:
@@ -18717,6 +19000,20 @@ def _shard_arg(text):
     return si, sn
 
 
+def _loop_limit_arg(text):
+    """--loop-limit PS,VS,CS (pixel; vertex, geometry and mesh; compute) or one N for all: passes per entry into a
+    loop, 0 = no cap for that kind."""
+    parts = text.split(",")
+    try:
+        values = [int(p, 0) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected PS,VS,CS or N (whole numbers), not {text!r}") from None
+    if len(values) not in (1, 3) or any(not 0 <= v <= 0xFFFFFFFF for v in values):
+        raise argparse.ArgumentTypeError(f"expected PS,VS,CS or N, each 0..4294967295, not {text!r}")
+    ps, vs, cs = values * 3 if len(values) == 1 else values
+    return {"ps": ps, "vs": vs, "gs": vs, "ms": vs, "cs": cs}
+
+
 def _depth_arg(text):
     """--max-structured-depth N: 0 (never fall back to the dispatch loop) or a positive nesting depth."""
     try:
@@ -18816,6 +19113,13 @@ def main():
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
+    ap.add_argument("--loop-limit", type=_loop_limit_arg, metavar="PS,VS,CS",
+                    default=dict(LOOP_LIMITS),
+                    help="a loop runs at most this many times per entry, for pixel; vertex, geometry and mesh; "
+                         "compute shaders (or one number for all; 0 = no cap; default %s): then a conditional back "
+                         "edge takes its other way out and a jump back leaves the program, a pixel discarded (data "
+                         "the host has not mirrored reads as zeros and can make a loop run billions of times; "
+                         "metadata: loop_limit)" % ",".join(str(LOOP_LIMITS[s]) for s in ("ps", "vs", "cs")))
     a = ap.parse_args()
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
@@ -18834,6 +19138,8 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
+    LOOP_LIMITS.clear()
+    LOOP_LIMITS.update(a.loop_limit)
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
