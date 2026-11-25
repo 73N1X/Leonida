@@ -68,9 +68,19 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
 - `gta6rt` with the Vulkan device (`runtime\build-vk`, Vulkan SDK 1.4.363.1):
   builds; `run_tiny_frame` (a stand-in title creating the console device on
   Vulkan, clear + readback, through `gta6rt --run`) passes on the RTX 4060 Ti.
-- GPU test suite (`scripts\run_gpu_tests.py`, `LEONIDA_W64_EMULATE=1`):
-  226 of 248 passed, 17 skipped (run by other tests, or need 64-wide fragment
-  subgroups), 5 failed:
+- Shader rules merged from `port/shader-rules` (from VIctory): loop iteration
+  cap (128 PS / 256 VS,GS,MS / 4096 CS, `--loop-limit`), quad operations and
+  helper lanes in pixel shaders, computed EXEC writes and the `tfe`/`lwe`
+  status dword. GPU suite after the merge: 230 of 248 pass, 17 skipped; only
+  `ms_wave_info_s3` still fails (driver-dependent, see below).
+- VS -> PS linking census (`tools\vs_ps_link_census.py`): 323 readable pairs,
+  292 link the same by number and by signature row, 31 differ; in 19 the pixel
+  shader reads a subset of the vertex outputs, so linking by number reads the
+  wrong outputs. Open: link by signature row (docs/design.md lists what it
+  needs). Per-program wave64 emulation tiers are open too.
+- GPU test suite before the shader rules (`scripts\run_gpu_tests.py`,
+  `LEONIDA_W64_EMULATE=1`): 226 of 248 passed, 17 skipped (run by other
+  tests, or need 64-wide fragment subgroups), 5 failed:
   - `cs_imgload_tfe`, `cs_imgload_d16_tfe`: the program exits with an error
     (texture-fail status of image loads; partially resident textures use it).
   - `cs_w32_exec_computed` (`8192 8192 8192 7682 512 4100 0 3`) and
