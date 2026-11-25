@@ -36,7 +36,10 @@ KosmicKrisp (Mesa 26.3.1, Homebrew), same machine, commit and test programs, thr
 VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json); subgroup 32..32:
 run_gpu_tests.py: 187/263 passed, 71 skipped, 5 failed
             220/263 passed, 38 skipped, 5 failed (LEONIDA_W64_EMULATE=1)
+check.py:   177 of 231 pass, 48 skipped (with #1444's build.py output)
 ctest:      85/85 passed
+check.py only: cs_fmt_all word 293: expected 0x80007c01, got 0x80007e00 (an f16 signalling NaN stored
+            quiet); it passes on MoltenVK, and run_gpu_tests.py does not run it yet (#800).
 Failed:     cs_bvh and cs_bvh32: out[3] reads 0x7fc00000 (2143289344), want 0xffffffff. The known
             KosmicKrisp row of docs/testing.md (nir_to_msl prints a float-typed NaN-range constant as NAN).
             cs_imgatomic_ext: the same words as on MoltenVK (#1518).
@@ -61,3 +64,15 @@ Open pull requests run here against the same test programs (MoltenVK = MVK, Kosm
             #1212 and #137 (NaN-pattern constants in image_bvh): cs_bvh and cs_bvh32 pass on KK and MVK.
             ps_ssharp: no open pull request found; Metal samplers take no LOD bias (old #7587, indexed in
             #18).
+
+All of them together, on main 57ba40bd6 with #1444, #1518, #1724, #822, #1212, #1673, #1657, #1412 and
+#1375 merged (#822 and #1444 conflict in runtime/test/shaders/build.py: each adds a block at the same place,
+kept both), test programs rebuilt from that tree:
+MoltenVK:   build.py 296/296 translated and valid; check.py 186 of 231 pass, 44 skipped, 1 failed;
+            run_gpu_tests.py 194/263 passed, 68 skipped, 1 failed (227/263 with LEONIDA_W64_EMULATE=1);
+            the one failure is ps_ssharp.
+KosmicKrisp: check.py 180 of 231 pass, 47 skipped; run_gpu_tests.py 189/263 passed, 71 skipped, 3 failed
+            (222/263 emulated): cs_fma_fused (from #1724), ps_cndmask_sign_mods, ps_valu16_mad_sel;
+            check.py also cs_fmt_all.
+ctest:      88/88 passed. Python: translator suite 489 files, 6292 tests, 0 failed; standard-library
+            loop 499 files, 0 failed; pytest files 1912 passed, 18 skipped, 0 failed.
