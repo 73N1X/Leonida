@@ -35,6 +35,15 @@ DEFAULT_GAME = os.environ.get("LEONIDA_GAME_DIR", os.path.expanduser(r"~\Documen
 TITLE_EXE = "game_scarlett_master.exe"
 
 FPS_RE = re.compile(r"(\d+(?:\.\d+)?) fps, (\d+(?:\.\d+)?) ms/frame")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def read_log(log):
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            return [ANSI_RE.sub("", ln) for ln in f]
+    except OSError:
+        return []
 
 
 def paths(work):
@@ -184,12 +193,7 @@ def cmd_shot(args, p):
 
 
 def fps_lines(log, count):
-    try:
-        with open(log, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return []
-    hits = [ln.rstrip() for ln in lines if FPS_RE.search(ln)]
+    hits = [ln.rstrip() for ln in read_log(log) if FPS_RE.search(ln)]
     return hits[-count:]
 
 
@@ -230,11 +234,7 @@ def cmd_status(args, p):
           f"up {int(up // 60)}:{int(up % 60):02d}")
     for line in fps_lines(state["log"], 3):
         print("  " + summarize(line))
-    try:
-        with open(state["log"], encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        lines = []
+    lines = read_log(state["log"])
     bad = [ln.rstrip() for ln in lines if re.search(r"\b(ERROR|WARN)\b|panicked|crash|DEVICE_HUNG|DEVICE_REMOVED", ln)]
     for line in bad[-args.warnings:]:
         print("  ! " + line[:300])

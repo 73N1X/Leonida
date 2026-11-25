@@ -2,7 +2,7 @@
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("DexNom Runtime requires Windows.");
+    eprintln!("Leonida requires Windows.");
 }
 
 #[cfg(windows)]
