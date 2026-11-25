@@ -30,3 +30,34 @@ check.py only: ps_ij_computed and ps_interp_f16_high report "vk_harness failed o
             the device has no PerVertexKHR inputs, as on the Apple M5 Pro.
 Skipped:    33 "full 64-wide compute subgroups unavailable" (the wave64 compute tests), 5 mesh fixtures
             (no VK_EXT_mesh_shader), 16 fixtures the d3d12_* tests run, and 14 others (see the run log).
+
+KosmicKrisp (Mesa 26.3.1, Homebrew), same machine, commit and test programs, through the Vulkan loader
+(LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib,
+VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json); subgroup 32..32:
+run_gpu_tests.py: 187/263 passed, 71 skipped, 5 failed
+            220/263 passed, 38 skipped, 5 failed (LEONIDA_W64_EMULATE=1)
+ctest:      85/85 passed
+Failed:     cs_bvh and cs_bvh32: out[3] reads 0x7fc00000 (2143289344), want 0xffffffff. The known
+            KosmicKrisp row of docs/testing.md (nir_to_msl prints a float-typed NaN-range constant as NAN).
+            cs_imgatomic_ext: the same words as on MoltenVK (#1518).
+            ps_cndmask_sign_mods: 4096/4096 pixels, (0,0) reads 0x7fc00000 0x7fc00000 0x80000001 0x7fc00000,
+            want 0xff800001 0x7f800001 0x80000001 0x7f800001.
+            ps_valu16_mad_sel: 4096/4096 pixels, (0,0) channel 2 reads 0x7fc00000, want 0xffffffff.
+            Both from 2026-11-23, both pass on MoltenVK and llvmpipe here, and both look like the measured
+            KosmicKrisp NaN canonicalization in docs/testing.md; check.py allows it for ps_nan_payload
+            only, and neither fixture is in that table yet.
+            cs_fma_fused passes on KosmicKrisp ("1/7 f32 fused, 6/7 split ... f16 exact"), and so do
+            ps_ssharp, cs_imgatomic and cs_imgatomic3d.
+
+Open pull requests run here against the same test programs (MoltenVK = MVK, KosmicKrisp = KK):
+            #1444 (build.py text-only fixtures): build.py and check.py as above.
+            #1518 (cs_imgatomic_ext volume tag): passes on MVK, KK and llvmpipe.
+            #1724 (cs_fma_fused f16 operands at run time): passes on MVK 20/20, but on KK word 7 then
+            reads 0x00007352, want 0x00007351 (20/20), where main passes; llvmpipe passes either way.
+            #822 (check.py f16 interpolation fallback from the device): ps_interp_f16_high ok and
+            ps_ij_computed SKIP ("computed I/J pairs need PerVertexKHR inputs") on MVK.
+            #1426 (computed I/J under --bary-fallback): ps_ij_computed and ps_interp_f16_high still
+            "vk_harness failed" on MVK; the fallback needs a geometry stage, which Metal does not have.
+            #1212 and #137 (NaN-pattern constants in image_bvh): cs_bvh and cs_bvh32 pass on KK and MVK.
+            ps_ssharp: no open pull request found; Metal samplers take no LOD bias (old #7587, indexed in
+            #18).
