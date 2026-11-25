@@ -277,10 +277,11 @@ Current limits, by design:
   (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
   overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
   requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
-  and events. BCPack requests are decoded by `src/bcpack.cpp` (BC1, BC3, BC4, BC5, BC6H and BC7; BC2 has no decoder
-  yet and returns `E_NOTIMPL`), followed by the optional macro-unshuffle (swizzle), and physical page numbers resolve
-  through `xmem` when the request runs. These paths are on by default; `LEONIDA_DSTORAGE_EXTENDED=0` makes requests
-  that use BCPack, swizzle or physical page lists return `E_NOTIMPL`.
+  and events. BCPack requests are decoded by `src/bcpack.cpp` (BC1, BC3, BC4, BC5, BC6H and BC7; BC2 requests fail
+  with `E_NOTIMPL` because no decoder is available yet), followed by the optional macro-unshuffle (swizzle), and
+  physical page numbers resolve through `xmem` when the request runs. These paths are on by default; with
+  `LEONIDA_DSTORAGE_EXTENDED=0`, requests that use BCPack, swizzle or physical page lists fail with `E_NOTIMPL`
+  when the queue processes them.
   See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
