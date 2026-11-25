@@ -20,7 +20,7 @@ work folders outside the repository (`G:\gta6port` on the test machine).
 | Path | What |
 |---|---|
 | `runtime/`, `tools/`, `make_game.py`, `Build.bat` | Leonida: the product |
-| `victory/` | DexNom/VIctory subtree with full history, the patch source. Updated with `python -I scripts/sync_victory.py --merge` (checked every 15 minutes) |
+| `victory/` | DexNom/VIctory subtree with full history, the patch source. A background poller fetches `victory/main` every 15 minutes and speaks up only when new commits exist; they are then merged with `python -I scripts/sync_victory.py --merge` and reviewed for fixes to port |
 | `scripts/sync_victory.py` | Fetches `victory/main`, lists new commits, merges them with `git subtree pull` |
 | `scripts/port_ctl.py` | Drives a reference run of VIctory's runtime (start, pad presses from a file, frame captures, fps lines, stop) |
 
@@ -50,6 +50,11 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   (Vulkan SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON`).
 - The shader stage needs `llvm-mc` with the AMDGPU target
   (`scripts\build_llvm_mc.ps1`) and `spirv-as` / `spirv-val` (Vulkan SDK).
+  `build_llvm_mc.ps1` takes the first `cmake` on PATH, so put the native one
+  first: `$env:Path = "$env:LOCALAPPDATA\Programs\CMake\bin;" + $env:Path`.
+- Vulkan SDK 1.4.363.1 (LunarG, signed installer, SHA-256
+  `C02932BD9A968B22D404536108ADAACAC908C081CD6B0113F5BFEFC523DD0A6A`) installs to
+  `C:\VulkanSDK\1.4.363.1`; it needs an elevated (UAC) install.
 
 ## Reference run of VIctory's runtime on this machine (host D3D12)
 
