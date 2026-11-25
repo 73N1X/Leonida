@@ -137,6 +137,11 @@ public:
     void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
+    // LEONIDA_COMPAT_DIR for a run-time LoadLibrary / GetModuleHandle (shims::BundledModuleOps::compat_module): the
+    // same DLL, and the same handle, a static import of `dll_lower` binds to. owns_compat_handle: whether `module` is
+    // one of them.
+    void* runtime_compat_module(const std::string& dll_lower, bool load, bool& handled);
+    bool owns_compat_handle(void* module) const;
 
 private:
     void initialise(Module& m);
@@ -153,6 +158,10 @@ private:
     // owns every import of that DLL; `out` is the export, or null when the DLL lacks it. Caller holds mutex_.
     bool resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                         bool by_ordinal, void*& out);
+    // The compat DLL for `key` (lower-case DLL name), `dll` its file name in compat_dir_: its handle, loaded by
+    // Windows first when `load`. `exists`: the folder holds it (or it is loaded already). Null with `error` (a Windows
+    // error code) when Windows refused the file, or when it is not loaded and `load` is false. Caller holds mutex_.
+    void* compat_handle(const std::string& key, const std::string& dll, bool load, bool& exists, uint32_t& error);
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);

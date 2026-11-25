@@ -111,8 +111,10 @@ bundled package DLLs and the host, and the DLL owns all of its module's imports:
 the unimplemented thunk, not to a shim, so one console DLL is never served by two implementations that do not share
 state. The binding is reported as `host`, and `[rt] compat: <dll> -> <path>` is printed once per DLL. A file in the
 folder that Windows refuses to load stops the run with the error code. Unset or empty: no change. The DLLs stay
-loaded for the process lifetime. Only static imports go through this step; a run-time `LoadLibrary` of the same name
-does not yet.
+loaded for the process lifetime. A run-time `LoadLibrary` of the same name (from a mapped image, through
+`shims/library_loader.cpp`) gets the same DLL and handle, ahead of the shim; `GetModuleHandle` answers it once loaded,
+`GetProcAddress` on it gives only its own exports, and `FreeLibrary` leaves it loaded. A file Windows refuses to load
+there fails that `LoadLibrary` with Windows' error instead of stopping the run.
 
 It exists for drop-in implementations of console DLLs that have no shim here, such as the `AcpHal`, `chad`, `xapu`
 and `XCRDAPI` crates of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later).

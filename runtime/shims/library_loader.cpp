@@ -12,6 +12,10 @@
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
 // other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
+//
+// A module whose DLL is in LEONIDA_COMPAT_DIR comes first, as for static imports: LoadLibrary returns that DLL (the
+// handle the Loader's static imports use), GetModuleHandle returns it once loaded and NULL before, GetProcAddress on
+// it gives only its own exports, and FreeLibrary leaves it loaded.
 #include <windows.h>
 
 #include <cstdio>
@@ -141,6 +145,16 @@ constexpr DWORD kDataFileLoadFlags =
 
 HMODULE load_shim_or_bundled(const std::string& path, DWORD flags, bool& handled) {
     handled = false;
+    // LEONIDA_COMPAT_DIR first, as for static imports (rt::Loader::resolve): a drop-in DLL owns its module, so a
+    // run-time load gets the same Windows-loaded DLL, never the shim. Its handle is a real module handle.
+    if (const std::string dll = module_name(path); !dll.empty()) {
+        bool compat = false;
+        void* h = compat_module(dll, true, compat);
+        if (compat) {
+            handled = true;
+            return reinterpret_cast<HMODULE>(h);
+        }
+    }
     if (HMODULE h = owned_handle(path)) {
         handled = true;
         return h;
@@ -200,10 +214,20 @@ HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     return LoadLibraryExW(name, file, flags);
 }
 
+// A LEONIDA_COMPAT_DIR module answers GetModuleHandle as Windows would for it: its handle once loaded, else NULL. It is
+// never the shim's pseudo-handle (`handled` is set when the folder holds the DLL).
+HMODULE compat_loaded(const std::string& path, bool& handled) {
+    handled = false;
+    const std::string dll = module_name(path);
+    return dll.empty() ? nullptr : reinterpret_cast<HMODULE>(compat_module(dll, false, handled));
+}
+
 // GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
 // bundled package module already mapped by the native loader.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
     if (name) {
+        bool compat = false;
+        if (HMODULE h = compat_loaded(name, compat); compat) return h;
         if (HMODULE h = owned_handle(name)) return h;
         const std::string dll = module_name(name);
         if (!dll.empty())
@@ -216,6 +240,8 @@ HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
     if (name) {
         if (ascii_basename(name)) {
             const std::string path = narrow(name);
+            bool compat = false;
+            if (HMODULE h = compat_loaded(path, compat); compat) return h;
             if (HMODULE h = owned_handle(path)) return h;
             const std::string dll = module_name(path);
             if (!dll.empty())
@@ -267,7 +293,9 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    if (module) {
+    // A LEONIDA_COMPAT_DIR module's exports are its own: a name it lacks is not filled in from the shim of the same
+    // module name, as for its static imports.
+    if (module && !owns_compat_module_handle(module)) {
         const DWORD error = GetLastError();
         const std::string dll = host_module_name(module);
         void* shim = dll.empty() ? nullptr : find(dll, what);
@@ -280,6 +308,9 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
+    // A run-time load of a LEONIDA_COMPAT_DIR module hands out the Loader's own reference, which static imports may
+    // be bound through: compat modules stay for the process lifetime.
+    if (owns_compat_module_handle(module)) return TRUE;
     return FreeLibrary(module);
 }
 

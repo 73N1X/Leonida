@@ -1341,6 +1341,14 @@ void* bundled_load_w(void* ctx, const std::wstring& basename, uint32_t flags, bo
     return static_cast<Loader*>(ctx)->load_runtime_module_w(basename, flags, handled);
 }
 
+void* bundled_compat_module(void* ctx, const std::string& dll_lower, bool load, bool& handled) {
+    return static_cast<Loader*>(ctx)->runtime_compat_module(dll_lower, load, handled);
+}
+
+bool bundled_owns_compat_handle(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->owns_compat_handle(module);
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
@@ -1348,6 +1356,8 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_owns_handle,
     &bundled_find_loaded_w,
     &bundled_load_w,
+    &bundled_compat_module,
+    &bundled_owns_compat_handle,
 };
 
 // Marks what a run-time load maps as a dynamic load for as long as it is in scope (the caller holds the mutex).
@@ -2040,35 +2050,74 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     return reinterpret_cast<void*>(p);
 }
 
+void* Loader::compat_handle(const std::string& key, const std::string& dll, bool load, bool& exists,
+                            uint32_t& error) {
+    exists = false;
+    error = ERROR_SUCCESS;
+    if (compat_dir_.empty() || key.empty() || key.find_first_of("/\\:") != std::string::npos) return nullptr;
+    if (auto it = compat_modules_.find(key); it != compat_modules_.end()) {
+        exists = true;
+        return it->second;
+    }
+    const std::filesystem::path candidate = compat_dir_ / std::filesystem::path(dll);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(candidate, ec)) return nullptr;
+    exists = true;
+    if (!load) return nullptr;
+    // The full path, with the compat folder on the DLL's own search path for its dependencies; never the game
+    // folder. Windows maps it, so its CRT, TLS and SEH work as for any host DLL.
+    // A file Windows cannot map (truncated, wrong machine, not a PE image) otherwise raises a modal "Bad Image"
+    // box and LoadLibraryExW does not return until someone clicks it: a headless run would hang on a failure
+    // that the caller reports anyway. The mode is this thread's, and goes back as it was.
+    DWORD previous_mode = 0;
+    const bool mode_set = SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &previous_mode) != 0;
+    HMODULE h = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    error = h ? ERROR_SUCCESS : GetLastError();
+    if (mode_set) SetThreadErrorMode(previous_mode, nullptr);
+    if (!h) return nullptr;
+    compat_modules_.emplace(key, h);
+    std::fprintf(stderr, "[rt] compat: %s -> %s\n", dll.c_str(), path_utf8(candidate).c_str());
+    return h;
+}
+
 bool Loader::resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                             bool by_ordinal, void*& out) {
     out = nullptr;
-    if (compat_dir_.empty() || key.empty() || key.find_first_of("/\\:") != std::string::npos) return false;
-    HMODULE h = nullptr;
-    if (auto it = compat_modules_.find(key); it != compat_modules_.end()) {
-        h = static_cast<HMODULE>(it->second);
-    } else {
-        const std::filesystem::path candidate = compat_dir_ / std::filesystem::path(dll);
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(candidate, ec)) return false;
-        // The full path, with the compat folder on the DLL's own search path for its dependencies; never the game
-        // folder. Windows maps it, so its CRT, TLS and SEH work as for any host DLL.
-        // A file Windows cannot map (truncated, wrong machine, not a PE image) otherwise raises a modal "Bad Image"
-        // box and LoadLibraryExW does not return until someone clicks it: a headless run would hang on a failure
-        // that is reported right below anyway. The mode is this thread's, and goes back as it was.
-        DWORD previous_mode = 0;
-        const bool mode_set = SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &previous_mode) != 0;
-        h = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        const DWORD load_error = h ? ERROR_SUCCESS : GetLastError();
-        if (mode_set) SetThreadErrorMode(previous_mode, nullptr);
-        if (!h)
-            throw std::runtime_error("LEONIDA_COMPAT_DIR: " + path_utf8(candidate) + " exists but Windows could not " +
-                                     "load it (error " + std::to_string(load_error) + ")");
-        compat_modules_.emplace(key, h);
-        std::fprintf(stderr, "[rt] compat: %s -> %s\n", dll.c_str(), path_utf8(candidate).c_str());
-    }
+    bool exists = false;
+    uint32_t error = ERROR_SUCCESS;
+    HMODULE h = static_cast<HMODULE>(compat_handle(key, dll, true, exists, error));
+    if (!exists) return false;
+    if (!h)
+        throw std::runtime_error("LEONIDA_COMPAT_DIR: " + path_utf8(compat_dir_ / std::filesystem::path(dll)) +
+                                 " exists but Windows could not load it (error " + std::to_string(error) + ")");
     out = reinterpret_cast<void*>(GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str()));
     return true;
+}
+
+void* Loader::runtime_compat_module(const std::string& dll_lower, bool load, bool& handled) {
+    std::lock_guard lock(mutex_);
+    bool exists = false;
+    uint32_t error = ERROR_SUCCESS;
+    void* h = compat_handle(dll_lower, dll_lower, load, exists, error);
+    handled = exists;
+    if (exists && !h && load) {
+        // As a LoadLibrary of a file Windows refuses: null and its error, never the shim (the player put the DLL
+        // there to own the module).
+        std::fprintf(stderr, "[rt] compat: %s exists but Windows could not load it (error %u, run-time load)\n",
+                     path_utf8(compat_dir_ / std::filesystem::path(dll_lower)).c_str(), error);
+        SetLastError(error);
+    } else if (exists && !h) {
+        SetLastError(ERROR_MOD_NOT_FOUND);  // GetModuleHandle of a module nothing has loaded yet
+    }
+    return h;
+}
+
+bool Loader::owns_compat_handle(void* module) const {
+    if (!module) return false;
+    std::lock_guard lock(mutex_);
+    for (const auto& [key, h] : compat_modules_)
+        if (h == module) return true;
+    return false;
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {

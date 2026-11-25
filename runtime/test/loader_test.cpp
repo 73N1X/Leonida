@@ -1444,6 +1444,92 @@ void test_compat_modules() {
         while (HMODULE h = GetModuleHandleW(p.c_str())) FreeLibrary(h);
 }
 
+// LEONIDA_COMPAT_DIR at run time: a mapped image's LoadLibrary / GetModuleHandle / GetProcAddress / FreeLibrary go
+// through shims/library_loader.cpp, which must give the compat DLL ahead of the shim, as static imports get it.
+void test_compat_runtime_loads() {
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR);
+    using ModuleW = HMODULE(WINAPI*)(LPCWSTR);
+    using ProcA = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    using FreeLib = BOOL(WINAPI*)(HMODULE);
+    const auto load_w = reinterpret_cast<LoadW>(rt::shims::find("kernel32.dll", "LoadLibraryW"));
+    const auto module_w = reinterpret_cast<ModuleW>(rt::shims::find("kernel32.dll", "GetModuleHandleW"));
+    const auto proc = reinterpret_cast<ProcA>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    const auto free_lib = reinterpret_cast<FreeLib>(rt::shims::find("kernel32.dll", "FreeLibrary"));
+    if (!load_w || !module_w || !proc || !free_lib) {
+        failed("LEONIDA_COMPAT_DIR at run time", "the library_loader shims are not registered");
+        return;
+    }
+    const std::filesystem::path compat = g_dir / "compat_rt";
+    std::filesystem::create_directories(compat);
+    const auto dll_path = compat / "testshim.dll";
+    write_image_as(make_os_dll(0x1C0000000), "compat_rt/testshim.dll");  // has Answer, not the shim's F
+    write_image_as(std::vector<uint8_t>(64, 0x5A), "compat_rt/testbad.dll");
+    struct Reset {
+        ~Reset() { SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr); }
+    } reset;
+    try {
+        {
+            const char* what = "without LEONIDA_COMPAT_DIR a run-time load of a shim's module gives the shim";
+            SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr);
+            rt::Loader loader(g_dir);
+            HMODULE h = load_w(L"testshim.dll");
+            if (!h) failed(what, "LoadLibraryW returned NULL");
+            else if (proc(h, "F") != reinterpret_cast<FARPROC>(&test_shim_function)) failed(what, "F is not the shim's");
+            else pass(what);
+        }
+        SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.c_str());
+        rt::Loader loader(g_dir);
+        {
+            const char* what = "with LEONIDA_COMPAT_DIR GetModuleHandle of a compat module not loaded yet is NULL";
+            if (module_w(L"testshim.dll")) failed(what, "it returned a handle (the shim's?)");
+            else pass(what);
+        }
+        HMODULE h = load_w(L"TestShim.dll");
+        {
+            const char* what = "with LEONIDA_COMPAT_DIR a run-time LoadLibrary gives the drop-in DLL";
+            if (!h) failed(what, "LoadLibraryW returned NULL");
+            else if (h != GetModuleHandleW(dll_path.c_str())) failed(what, "the handle is not the compat DLL's");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "a run-time compat module answers GetModuleHandle, with or without the extension";
+            if (module_w(L"testshim.dll") != h || module_w(L"TESTSHIM") != h) failed(what, "another handle came back");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "GetProcAddress on a run-time compat module gives its own exports, never the shim's";
+            const FARPROC answer = proc(h, "Answer");
+            if (!answer || reinterpret_cast<int (*)()>(answer)() != 42) failed(what, "Answer is missing or wrong");
+            else if (proc(h, "F")) failed(what, "F, which the DLL lacks, resolved (to the shim?)");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "a static import of the same module binds to the run-time handle's export";
+            rt::Module& m = loader.load(write_image(make_import_image("testshim.dll", "Answer")));
+            void* bound = *reinterpret_cast<void**>(m.base + 0x1180);
+            if (bound != reinterpret_cast<void*>(GetProcAddress(h, "Answer"))) failed(what, "another export was bound");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "FreeLibrary leaves a compat module loaded (static imports may use it)";
+            if (!free_lib(h) || GetModuleHandleW(dll_path.c_str()) != h) failed(what, "the DLL was unloaded");
+            else pass(what);
+        }
+        {
+            const char* what = "a compat file Windows cannot load fails that LoadLibrary, without the shim or a throw";
+            SetLastError(ERROR_SUCCESS);
+            HMODULE bad = load_w(L"testbad.dll");
+            const DWORD error = GetLastError();
+            if (bad) failed(what, "LoadLibraryW returned a handle");
+            else if (error == ERROR_SUCCESS) failed(what, "no Windows error was set");
+            else pass(what);
+        }
+    } catch (const std::exception& e) {
+        failed("LEONIDA_COMPAT_DIR at run time", e.what());
+    }
+    while (HMODULE h = GetModuleHandleW(dll_path.c_str())) FreeLibrary(h);
+}
+
 }  // namespace
 
 int main() {
@@ -1491,6 +1577,7 @@ int main() {
         test_unwind_registration();
         test_lookup_during_loads();
         test_compat_modules();
+        test_compat_runtime_loads();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());
