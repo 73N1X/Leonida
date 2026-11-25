@@ -1698,11 +1698,36 @@ class Gen:
         lane_masks.step(st, self.cur_ins)
         return st.get("vcc") in lane_masks.MASK_KINDS
 
+    def exec_number_bit(self, a, val):
+        """`val` as this lane's EXEC bit (0 / ~0) when a scalar op that reads no lane mask writes it to exec_lo or
+        exec_hi: then it is a number, the same in every lane, and lane L takes its bit L mod 32, as a constant does
+        (SHADER-1264). Testing it for non-zero turned on the whole half: `s_lshl_b32 exec_lo, 1, s5`, `s_add_u32
+        exec_lo, s4, 0xf0`, `s_bfm_b32 exec_lo, s6, s7` (cs_w32_exec_computed / cs_w64_exec_computed: 8192 8192
+        8192 on an RTX 4060 Ti under LEONIDA_W64_EMULATE=1 and on the CPU). A result already in that form (a bitwise
+        op that read its operands through mask_src) is 0 or ~0 in each lane, and bit L of that is the same bit, so
+        it is unchanged, and such ops are left alone (no code added); an op that reads a lane mask (EXEC, VCC, an
+        SGPR lane_masks.py found holding one) and a VALU op keep the old reading."""
+        ins = self.cur_ins
+        if a["k"] != "special" or a.get("t") not in ("exec_lo", "exec_hi") or ins is None or \
+                not base_op(ins["op"]).startswith("s_") or \
+                any(self.is_mask_op(x) or self.any_mask_word(x) for x in ins["args"][1:]):
+            return val
+        if base_op(ins["op"]) in self.MASK_SOP2_B32 + ("s_not_b32",) and \
+                all(self._maskable_b32(x) for x in ins["args"][1:]):
+            return val                     # sop2_b32_srcs / s_not_b32 read it through mask_src: 0 / ~0 already
+        sh, shr, bit, r = (self.tmp() for _ in range(4))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {val} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
     def dst(self, a, val, *, eager=False):
         if a.get("sdwa_dst") and a["k"] == "vgpr":
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
+        val = self.exec_number_bit(a, val)
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
             self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
             return
@@ -7819,6 +7844,7 @@ class Gen:
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
+            self.mimg_status(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             self._validate_unary_f16(op, ins["op"], a, mods)
             sel, dhi = self.opsel_bits(mods, 1)
@@ -8233,6 +8259,8 @@ class Gen:
         elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") \
                 or op in self.IMG_ATOMICS or op in self.IMG_ATOMICS_EXTRA:
             self.image_misc(op, a, mods)
+            if op == "image_load_mip":
+                self.mimg_status(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
             # Cube face selection (standard table): major axis Z if |z|>=|x| and |z|>=|y|, else Y if |y|>=|x|,
             # else X.   face: +X0 -X1 +Y2 -Y3 +Z4 -Z5
@@ -14267,6 +14295,23 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, cur)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
+
+    def mimg_status(self, op, a, mods):
+        """An MIMG read with `tfe` or `lwe` returns one more dword after its data, the fetch status, at
+        vdata[data dwords] (RDNA2 ISA, MIMG TFE/LWE; SHADER-1266): non-zero for a texel that is not resident (TFE)
+        or whose LOD the resource's minimum clamped (LWE). Without sparse residency every texel a Vulkan view can
+        read is resident, and the translation applies no LOD warning, so the status is 0, written like the data
+        (active lanes only). Data dwords: one per dmask bit (four for a gather), halved and rounded up under d16
+        (two 16-bit values per VGPR). Before, the status VGPR kept its old value: cs_imgload_tfe and
+        cs_imgload_d16_tfe moved every texel by the 1000 they seed it with, and vk_store_test exited 1 on an RTX
+        4060 Ti. No listing of the 1.0.2.1 corpus uses tfe or lwe."""
+        if not any(m in mods for m in ("tfe", "lwe")) or not a or a[0]["k"] != "vgpr":
+            return
+        dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+        count = 4 if op.startswith("image_gather4") else bin(int(dm.split(":")[1], 0) & 0xF).count("1")
+        if "d16" in mods:
+            count = (count + 1) // 2
+        self.dst({"k": "vgpr", "r": a[0]["r"] + count, "n": 1}, self.cu(0))
 
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
