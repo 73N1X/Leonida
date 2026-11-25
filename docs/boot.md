@@ -98,7 +98,8 @@ Useful switches:
   `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work (see
   [cpu_features.md](cpu_features.md#hosts-without-avx) for what works on a host without AVX).
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
-  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
+  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on). It is
+  read when the trace opens.
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
@@ -135,7 +136,16 @@ Useful switches:
 * `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
   package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
   for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
-  empty directory for the local game-save provider.
+  empty directory for the local game-save provider. The title's `T:` drive (its temporary drive,
+  where it writes its crash dump `T:\<guid>.dmp` and crash log) is a folder of each process's own inside the overlay,
+  `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (the process's start time in UTC and its id).
+  The folder is reserved with a create-only `CreateDirectoryW` when `gta6rt` starts the title (or on the first `T:`
+  call): when that name already exists, as after a reused process id in the same millisecond, it takes `-2`, `-3`,
+  ... (up to 1000 names), so a run never writes into a folder that existed before it. The startup line names it
+  (`console paths: GAME: -> ..., writes -> ..., T: -> ...`).
+  Folders of earlier runs are kept, so a run's crash files can be read after it stops; delete them by hand. With
+  one folder for every run, a `CREATE_NEW` of a name an earlier run had left failed with `ERROR_FILE_EXISTS` (80)
+  and no report landed (old upstream issue 7913).
 
 ### Under Wine on Linux
 
