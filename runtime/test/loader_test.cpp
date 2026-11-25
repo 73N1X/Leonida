@@ -1309,8 +1309,8 @@ std::string written_images_blocked() {
 }
 
 // A DLL Windows' own loader accepts (LEONIDA_COMPAT_DIR loads with LoadLibraryExW, not with rt::Loader): no entry
-// point, no imports, one export "Answer" (ordinal 1) whose code returns 42.
-std::vector<uint8_t> make_os_dll(uint64_t image_base) {
+// point, no imports, one export "Answer" (ordinal 1) whose code returns `answer` (42 unless a case tells two apart).
+std::vector<uint8_t> make_os_dll(uint64_t image_base, uint8_t answer = 42) {
     auto img = make_image();
     std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
     auto* nt = nt_of(img);
@@ -1339,11 +1339,37 @@ std::vector<uint8_t> make_os_dll(uint64_t image_base) {
     *reinterpret_cast<uint32_t*>(img.data() + 0x320) = 0x1160;
     *reinterpret_cast<uint16_t*>(img.data() + 0x340) = 0;
     std::memcpy(img.data() + 0x360, "Answer\0", 7);
-    const uint8_t code[] = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};  // mov eax, 42; ret
+    const uint8_t code[] = {0xB8, answer, 0x00, 0x00, 0x00, 0xC3};  // mov eax, answer; ret
     std::memcpy(img.data() + 0x380, code, sizeof(code));
     auto& dir = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     dir.VirtualAddress = 0x1000;
     dir.Size = 0x170;
+    return img;
+}
+
+// make_os_dll with one import, `dll`!`symbol` by name, which Windows resolves when it loads the DLL. The section
+// grows to 0x400 bytes for the import tables at RVA 0x1200, and is writable: Windows fills the address table in place.
+std::vector<uint8_t> make_os_importer_dll(uint64_t image_base, const char* dll, const char* symbol) {
+    auto img = make_os_dll(image_base);
+    img.resize(0x600, 0);
+    auto* nt = nt_of(img);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    sec->Misc.VirtualSize = 0x400;
+    sec->SizeOfRawData = 0x400;
+    sec->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    nt->OptionalHeader.SizeOfCode = 0x400;
+    auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + 0x400);  // then the zero descriptor
+    d->OriginalFirstThunk = 0x1240;
+    d->FirstThunk = 0x1260;
+    d->Name = 0x1280;
+    *reinterpret_cast<uint64_t*>(img.data() + 0x440) = 0x12A0;  // lookup table -> hint/name
+    *reinterpret_cast<uint64_t*>(img.data() + 0x460) = 0x12A0;  // address table, before binding
+    std::memcpy(img.data() + 0x480, dll, std::strlen(dll) + 1);
+    *reinterpret_cast<uint16_t*>(img.data() + 0x4A0) = 0;
+    std::memcpy(img.data() + 0x4A2, symbol, std::strlen(symbol) + 1);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    dir.VirtualAddress = 0x1200;
+    dir.Size = 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
     return img;
 }
 
@@ -1530,6 +1556,138 @@ void test_compat_runtime_loads() {
     while (HMODULE h = GetModuleHandleW(dll_path.c_str())) FreeLibrary(h);
 }
 
+// Run-time LEONIDA_COMPAT_DIR cases where Windows itself decides: LoadLibraryEx flags, a path naming another file of a
+// compat module's name, a name outside ASCII, and a compat DLL that Windows loaded as another compat DLL's dependency.
+void test_compat_runtime_edges() {
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR);
+    using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+    using LoadExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+    using ModuleW = HMODULE(WINAPI*)(LPCWSTR);
+    using ProcA = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    const auto load_w = reinterpret_cast<LoadW>(rt::shims::find("kernel32.dll", "LoadLibraryW"));
+    const auto load_ex_a = reinterpret_cast<LoadExA>(rt::shims::find("kernel32.dll", "LoadLibraryExA"));
+    const auto load_ex_w = reinterpret_cast<LoadExW>(rt::shims::find("kernel32.dll", "LoadLibraryExW"));
+    const auto module_w = reinterpret_cast<ModuleW>(rt::shims::find("kernel32.dll", "GetModuleHandleW"));
+    const auto proc = reinterpret_cast<ProcA>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    if (!load_w || !load_ex_a || !load_ex_w || !module_w || !proc) {
+        failed("LEONIDA_COMPAT_DIR at run time (edges)", "the library_loader shims are not registered");
+        return;
+    }
+    const std::filesystem::path compat = g_dir / "compat_edges";
+    const std::filesystem::path other = g_dir / "compat_edges_other";
+    const std::filesystem::path dep = g_dir / "compat_dep";
+    for (const auto& d : {compat, other, dep}) std::filesystem::create_directories(d);
+    write_image_as(make_os_dll(0x1D0000000, 42), "compat_edges/testpath.dll");
+    write_image_as(make_os_dll(0x1E0000000, 43), "compat_edges_other/testpath.dll");
+    const auto wide_dll = compat / L"tëstcompat.dll";  // write_image_as takes a narrow name
+    {
+        const auto img = make_os_dll(0x1F0000000, 44);
+        std::ofstream out(wide_dll, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(img.data()), static_cast<long long>(img.size()));
+    }
+    write_image_as(make_os_dll(0x200000000), "compat_dep/testshim.dll");  // has Answer, not the shim's F
+    write_image_as(make_os_importer_dll(0x210000000, "testshim.dll", "Answer"), "compat_dep/depimporter.dll");
+    const auto path_dll = compat / "testpath.dll";
+    const auto other_dll = other / "testpath.dll";
+    const auto dep_shim = dep / "testshim.dll";
+    const auto dep_importer = dep / "depimporter.dll";
+    const auto answer = [](HMODULE h) {
+        const FARPROC f = h ? GetProcAddress(h, "Answer") : nullptr;
+        return f ? reinterpret_cast<int (*)()>(f)() : -1;
+    };
+    struct Reset {
+        ~Reset() { SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr); }
+    } reset;
+    try {
+        SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.c_str());
+        {
+            rt::Loader loader(g_dir);
+            {
+                const char* what = "LoadLibraryExA/W of a compat module with DONT_RESOLVE_DLL_REFERENCES is refused";
+                SetLastError(ERROR_SUCCESS);
+                const HMODULE a = load_ex_a("testpath.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                const DWORD error_a = GetLastError();
+                SetLastError(ERROR_SUCCESS);
+                const HMODULE w = load_ex_w(L"testpath.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                const DWORD error_w = GetLastError();
+                if (a || w) failed(what, "a handle came back");
+                else if (error_a != ERROR_NOT_SUPPORTED || error_w != ERROR_NOT_SUPPORTED)
+                    failed(what, "errors " + std::to_string(error_a) + " and " + std::to_string(error_w));
+                else if (GetModuleHandleW(path_dll.c_str())) failed(what, "the DLL was loaded anyway");
+                else pass(what);
+            }
+            const HMODULE h = load_w(L"testpath");
+            {
+                const char* what = "DONT_RESOLVE_DLL_REFERENCES is refused for a compat module already loaded too";
+                SetLastError(ERROR_SUCCESS);
+                const HMODULE again = load_ex_w(L"testpath.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                if (!h) failed(what, "the plain LoadLibraryW failed");
+                else if (again || GetLastError() != ERROR_NOT_SUPPORTED) failed(what, "the loaded handle came back");
+                else pass(what);
+            }
+            {
+                const char* what = "a full path to another file of a compat module's name loads that file";
+                const HMODULE o = load_w(other_dll.c_str());
+                if (!o) failed(what, "LoadLibraryW returned NULL");
+                else if (o == h || answer(o) != 43) failed(what, "the compat DLL came back instead");
+                else pass(what);
+                if (o && o != h) FreeLibrary(o);
+            }
+            {
+                const char* what = "a full path to the compat file itself gives the compat module";
+                if (!h || load_w(path_dll.c_str()) != h || module_w(path_dll.c_str()) != h)
+                    failed(what, "another handle came back");
+                else pass(what);
+            }
+            {
+                const char* what = "a compat module whose name is outside ASCII answers LoadLibraryW and GetModuleHandleW";
+                const HMODULE u = load_w(L"TËSTCOMPAT");
+                if (!u) failed(what, "LoadLibraryW returned NULL");
+                else if (u != GetModuleHandleW(wide_dll.c_str()) || answer(u) != 44)
+                    failed(what, "the handle is not the compat DLL's");
+                else if (module_w(L"tëstcompat.dll") != u) failed(what, "GetModuleHandleW did not find it");
+                else pass(what);
+            }
+        }
+        // Windows loads the pair itself; each case below then asks a fresh Loader, which has looked nothing up yet, so
+        // the two ways of recognising the dependency (by its handle's folder, by its name) are checked apart.
+        HMODULE importer = nullptr, live = nullptr;
+        if (GetModuleHandleW(L"testshim.dll")) {
+            failed("a compat DLL Windows loaded as another's dependency", "a testshim.dll from an earlier case is loaded");
+        } else {
+            importer = LoadLibraryExW(dep_importer.c_str(), nullptr,
+                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            const DWORD error = GetLastError();
+            live = GetModuleHandleW(dep_shim.c_str());
+            if (!importer || !live)
+                failed("a compat DLL Windows loaded as another's dependency",
+                       "Windows did not load the pair (error " + std::to_string(error) + ")");
+        }
+        if (live) {
+            SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", dep.c_str());
+            {
+                const char* what = "GetProcAddress on a compat DLL Windows loaded as a dependency gives only its exports";
+                rt::Loader loader(g_dir);
+                if (proc(live, "F")) failed(what, "F, which the DLL lacks, was filled in from the shim");
+                else pass(what);
+            }
+            {
+                const char* what = "GetModuleHandle / LoadLibrary of a compat DLL Windows loaded as a dependency give it";
+                rt::Loader loader(g_dir);
+                if (module_w(L"testshim.dll") != live) failed(what, "GetModuleHandle did not return the live DLL");
+                else if (load_w(L"testshim.dll") != live) failed(what, "LoadLibrary did not return the live DLL");
+                else pass(what);
+            }
+        }
+        if (importer) FreeLibrary(importer);
+    } catch (const std::exception& e) {
+        failed("LEONIDA_COMPAT_DIR at run time (edges)", e.what());
+    }
+    // Loaders keep compat DLLs for the process lifetime; drop the references so the work folder can be removed.
+    for (const auto& p : {path_dll, other_dll, wide_dll, dep_importer, dep_shim})
+        while (HMODULE m = GetModuleHandleW(p.c_str())) FreeLibrary(m);
+}
+
 }  // namespace
 
 int main() {
@@ -1578,6 +1736,7 @@ int main() {
         test_lookup_during_loads();
         test_compat_modules();
         test_compat_runtime_loads();
+        test_compat_runtime_edges();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());

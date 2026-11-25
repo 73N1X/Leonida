@@ -508,12 +508,13 @@ void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_
     return nullptr;
 }
 
-void* compat_module(const std::string& dll_lower, bool load, bool& handled) {
+void* compat_module(const std::wstring& basename, const std::wstring& name, bool load, uint32_t flags,
+                    bool& handled) {
     handled = false;
     for (const auto& entry : snapshot_bundled_loaders()) {
         if (!entry.ops->compat_module) continue;
         bool loader_handled = false;
-        void* h = entry.ops->compat_module(entry.ctx, dll_lower, load, loader_handled);
+        void* h = entry.ops->compat_module(entry.ctx, basename, name, load, flags, loader_handled);
         if (loader_handled) {
             handled = true;
             return h;

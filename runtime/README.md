@@ -114,7 +114,12 @@ folder that Windows refuses to load stops the run with the error code. Unset or 
 loaded for the process lifetime. A run-time `LoadLibrary` of the same name (from a mapped image, through
 `shims/library_loader.cpp`) gets the same DLL and handle, ahead of the shim; `GetModuleHandle` answers it once loaded,
 `GetProcAddress` on it gives only its own exports, and `FreeLibrary` leaves it loaded. A file Windows refuses to load
-there fails that `LoadLibrary` with Windows' error instead of stopping the run.
+there fails that `LoadLibrary` with Windows' error instead of stopping the run. A name with a directory gets the
+compat DLL only when it is that file, any name outside ASCII is looked up as well, and `LoadLibraryEx` with
+`DONT_RESOLVE_DLL_REFERENCES` fails with `ERROR_NOT_SUPPORTED`, as for bundled DLLs. A DLL Windows loaded from the
+folder as another compat DLL's dependency is found by `GetModuleHandle` and `LoadLibrary` of its name, and
+`GetProcAddress` on it gives only its own exports. The folder's file names are listed once, when the loader starts:
+a file added during the run is not seen.
 
 It exists for drop-in implementations of console DLLs that have no shim here, such as the `AcpHal`, `chad`, `xapu`
 and `XCRDAPI` crates of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later).
