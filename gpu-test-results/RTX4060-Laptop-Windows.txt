@@ -11,7 +11,10 @@ run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val
             LEONIDA_W64_EMULATE=1:  243/264 passed, 20 skipped, 1 failed
 Failed:     cs_imgatomic_ext (native and emulated alike): 6 of 64 sint words differ, first word 32: got
             0x0badf00d, expected 0x00000101. This is the failure open pull request #1518 addresses (the
-            fixture's volume T# key against what vk_store_test now expects); it was not rerun with that change.
+            fixture's volume T# key against what vk_store_test now expects). With that pull request's
+            fixture applied at the same commit, `run_gpu_tests.py --filter cs_imgatomic --require-pass`
+            passes 3/3 (cs_imgatomic, cs_imgatomic3d, cs_imgatomic_ext: all 64 words exact), native and with
+            LEONIDA_W64_EMULATE=1, with LEONIDA_VK_DEVICE=4060 set (the filtered output has no device line).
 Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this device"
             (the wave64 compute fixtures, which the emulated run runs), 1 "this device cannot require a 64-wide
             fragment subgroup: subgroup 32..32" (ps_w64x_readlane, skipped in the emulated run too), plus
