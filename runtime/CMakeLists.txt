@@ -16,6 +16,18 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
+# BCPack, the console's DirectStorage texture codec (src/bcpack.h), ported from VIctory's victory-formats. Portable
+# C++ with no game data; the format tables are read at run time (LEONIDA_BCPACK_TABLES, or bcpack-tables.bin next to
+# the executable) and never committed. gta6rt links it; DirectStorage calls leonida_bcpack_decode (src/bcpack_decode.h).
+add_library(gta6rt_bcpack STATIC src/bcpack.cpp)
+target_include_directories(gta6rt_bcpack PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(MSVC)
+  target_compile_definitions(gta6rt_bcpack PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_bcpack PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(gta6rt_bcpack PRIVATE -Wall -Wextra)
+endif()
+
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
@@ -133,8 +145,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
     shims/dstorage_xs.cpp
-    src/bcpack_decode_stub.cpp  # BCPack requests fail until the decoder is ported (src/bcpack_decode.h)
   )
+  # leonida_bcpack_decode comes from gta6rt_bcpack (src/bcpack.cpp), linked below. Never add
+  # src/bcpack_decode_stub.cpp here: an object file wins over the library, so the stub would silently replace the
+  # real decoder. Only dstorage_xs_test links the stub, for a decoder that always refuses.
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -150,7 +164,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # scripts/build_runtime.ps1.
   set(GTA6RT_STACK 8388608)
   target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
-  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
+  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue gta6rt_bcpack psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -566,6 +580,17 @@ if(BUILD_TESTING)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
   add_executable(vk_presenter_capture_colour_test test/vk_presenter_capture_colour_test.cpp)
   add_test(NAME vk_presenter_capture_colour COMMAND vk_presenter_capture_colour_test)
+  # BCPack decoder (src/bcpack.h): SHA-256, table parsing and loading, and streams the test encodes itself against
+  # tables of its own; no game data. bcpack_tables repeats the checks on the real format tables (LEONIDA_BCPACK_TABLES
+  # or bcpack-tables.bin next to the test) and prints SKIP (exit 77) without them.
+  add_executable(bcpack_test test/bcpack_test.cpp)
+  target_link_libraries(bcpack_test PRIVATE gta6rt_bcpack)
+  if(MSVC)
+    target_compile_options(bcpack_test PRIVATE /W4 /permissive-)
+  endif()
+  add_test(NAME bcpack COMMAND bcpack_test)
+  add_test(NAME bcpack_tables COMMAND bcpack_test --tables)
+  set_tests_properties(bcpack_tables PROPERTIES SKIP_RETURN_CODE 77)
   if(TARGET gta6rt)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
       add_executable(cpp_unwind_test test/cpp_unwind_test.cpp)

@@ -22,6 +22,8 @@ carve/
 *.glb
 *.ogg
 *.wav
+# the BCPack format tables: supplied locally, not under this project's license (runtime/src/bcpack.h)
+bcpack-tables.bin
 
 # ---- build output and caches ----
 build/

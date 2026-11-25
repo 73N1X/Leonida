@@ -130,6 +130,18 @@ With `LEONIDA_RNG_SEED=<number>` (decimal, or hexadecimal with `0x`; read once w
 runs with the same seed get the same bytes. The shim prints `[rt] bcrypt: deterministic LEONIDA_RNG_SEED enabled`
 with the seed on stderr; a seed of 0 uses a fixed non-zero state. Unset, the host's generator answers as before.
 
+### BCPack format tables: `LEONIDA_BCPACK_TABLES`
+
+The title streams most textures through DirectStorage packed with BCPack, the console's BCn codec. `src/bcpack.cpp`
+(ported from VIctory's victory-formats, bit-exact with it; `leonida_bcpack_decode` in `src/bcpack_decode.h` is the
+entry point) needs the format's constant tables, which are not part of Leonida's license and are never committed. They
+are read on the first BCPack request from the file `LEONIDA_BCPACK_TABLES` names, else from `bcpack-tables.bin` next
+to `gta6rt.exe`, and refused unless the file is 77,982 bytes with the SHA-256
+`1F1D4760419202BB5672F0C428CE51E456B5D08FBAEC8F371D043FD94E01C36B` (the value `victory/Initialize-FormatTables.ps1`
+pins). `[rt] bcpack: format tables from <path>` or the reason they were refused is printed once; without them every
+BCPack request fails. `bcpack_test` (CTest `bcpack`) needs no tables or game data; `bcpack_tables` repeats its checks on
+the real tables and skips (exit 77) without them.
+
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
