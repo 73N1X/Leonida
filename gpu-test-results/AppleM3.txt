@@ -1,0 +1,30 @@
+GPU:        Apple M3 (Apple GPU, 10 cores), subgroup 32
+Driver:     MoltenVK 1.4.2 (Homebrew bottle), Vulkan 1.4.357
+Subgroup:   32 (no native 64-wide, no mesh, no geometry stage, no PerVertexKHR)
+OS:         macOS 26.5.1 (25F80), arm64
+Commit:     626d1281a (main, 2026-11-25)
+Tools:      llvm-mc 23.1.6 (Homebrew, AMDGPU target), SPIRV-Tools 1.4.363.0 (Homebrew), CMake 4.5.1,
+            Python 3.15.2
+build.py:   on main it stops at cs_dpp_cmp.asm ("dpp variant of this instruction is not supported": no
+            llvm-mc encodes a VOPC compare in DPP form for gfx1013) and writes no SPIR-V, so check.py runs
+            nothing. With #1444 (TEST-BUILD-TEXT-ONLY) applied locally and not committed: 297 shaders, 297
+            translated, 297 pass spirv-val (six mesh fixtures not built: no VK_EXT_mesh_shader).
+check.py:   183 of 231 pass, 43 skipped, 5 failed (with #1444's build.py output)
+run_gpu_tests.py: 192/263 passed, 68 skipped, 3 failed
+            225/263 passed, 35 skipped, 3 failed (LEONIDA_W64_EMULATE=1)
+ctest:      85/85 passed, 2 skipped (shader_library_corpus, vk_sync_validation)
+Failed:     cs_fma_fused: word 7 (f16) reads 0x00000000, want 0x00007351. The known MoltenVK 1.4.2 row
+            of docs/testing.md, and in the macOS job's EXPECTED_FAILURES.
+            ps_ssharp: point bias +1: (0,0) reads (1.0, 0.0, 0.502, 0.502), want (0.502, 0.502, 0.502,
+            0.502). In the macOS job's EXPECTED_FAILURES (the S#'s LOD bias, which a Metal sampler can't
+            take); the Apple M4 result in #564 reads the same pixel.
+            cs_imgatomic_ext: 6 of 64 sint words differ; first word 32 reads 0x0badf00d, want 0x00000101.
+            0x0badf00d is the initial value of the swap row, so 6 sint words still hold it after the
+            image_atomic_swap. The fixture is from 367d91ef (GPU-IMG-ATOMIC-EXT); it is not in
+            EXPECTED_FAILURES or in the Known problems table.
+Repeats:    the three fail the same way every time: 4 full native runs, 1 full LEONIDA_W64_EMULATE=1 run,
+            then 20 runs of each with --filter (20/20 failed, same words). cs_dpp_cmp passed 20/20.
+check.py only: ps_ij_computed and ps_interp_f16_high report "vk_harness failed or returned no pixels":
+            the device has no PerVertexKHR inputs, as on the Apple M5 Pro.
+Skipped:    33 "full 64-wide compute subgroups unavailable" (the wave64 compute tests), 5 mesh fixtures
+            (no VK_EXT_mesh_shader), 16 fixtures the d3d12_* tests run, and 14 others (see the run log).
