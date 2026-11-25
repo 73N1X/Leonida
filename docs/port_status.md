@@ -85,6 +85,15 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   the hidden return pointer in RCX and the proxy reads it as the device
   (`d3d12_xs_device.cpp`, `proxy_slot<26>`). Slot 48 (`CreateCommandQueueX`)
   fails next. Both are with the D3D12 ABI port (`port/d3d12-abi`).
+- Audio merged from `port/audio` (ported from VIctory's apu.rs, dsp.rs, audio.rs
+  and xma.rs): `xapu.dll`, `chad.dll` and a reworked `acphal.dll`. `gta6rt
+  --dry-run` now reports 0 unimplemented imports (11 before). XMA decoding is
+  real (FFmpeg's wmaprodec.c by way of VIctory); Opus frames are checked but
+  decode to silence (VIctory uses the opus-pure crate, not in the repo); DSP
+  reverb is silent, as in VIctory. `SHAPE_CONTEXTS` is now 0x60 bytes with
+  32-bit APU addresses, as VIctory asserts; Leonida's 120-byte struct wrote 24
+  bytes past the title's (both put `xmaContextArray` at +0x38). With both
+  merges the title runs about 11 s before the slot-26 crash.
 - The title asks the device for three interfaces it does not know
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
