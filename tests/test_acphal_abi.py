@@ -38,7 +38,9 @@ class TestAcpHalAbi(unittest.TestCase):
             self.assertIn(f'"{exp}"', content, f"acphal.dll SHIM_TABLE must register export {exp}")
 
     def test_shape_contexts_layout_matches_gdk_and_retail_offset(self):
-        """SHAPE_CONTEXTS layout: 6 dwords, then 6 pointers, with xmaContextArray at +0x38 (retail measurement)."""
+        """SHAPE_CONTEXTS layout: 6 dwords, 6 pointers with xmaContextArray at +0x38 (retail measurement), then 6
+        32-bit device addresses: 0x60 bytes, as VIctory measured it (victory/crates/victory-hle/src/modules/audio.rs,
+        ShapeContexts). Device addresses are 32-bit everywhere the executable uses them (docs/audio_hal_exe_calls.md)."""
         # SHAPE_CONTEXTS:
         # uint32_t numSrcContexts;        // offset 0
         # uint32_t numEqCompContexts;     // offset 4
@@ -52,15 +54,15 @@ class TestAcpHalAbi(unittest.TestCase):
         # void* dmaContextArray;          // offset 48 (0x30)
         # void* xmaContextArray;          // offset 56 (0x38) - 5th pointer, checked at +0x38!
         # void* pcmContextArray;          // offset 64 (0x40)
-        # APU_ADDRESS apuSrcContextArray; // offset 72 (0x48)
-        # APU_ADDRESS apuEqComp...        // offset 80 (0x50)
-        # APU_ADDRESS apuFiltVol...       // offset 88 (0x58)
-        # APU_ADDRESS apuDma...           // offset 96 (0x60)
-        # APU_ADDRESS apuXma...           // offset 104 (0x68)
-        # APU_ADDRESS apuPcm...           // offset 112 (0x70)
-        # Total size: 120 bytes (0x78)
-        layout_format = "<6I6Q6Q"
-        self.assertEqual(struct.calcsize(layout_format), 120)
+        # APU_ADDRESS apuSrcContextArray; // offset 72 (0x48), 32-bit
+        # APU_ADDRESS apuEqComp...        // offset 76 (0x4c)
+        # APU_ADDRESS apuFiltVol...       // offset 80 (0x50)
+        # APU_ADDRESS apuDma...           // offset 84 (0x54)
+        # APU_ADDRESS apuXma...           // offset 88 (0x58)
+        # APU_ADDRESS apuPcm...           // offset 92 (0x5c)
+        # Total size: 96 bytes (0x60)
+        layout_format = "<6I6Q6I"
+        self.assertEqual(struct.calcsize(layout_format), 0x60)
 
         # Offset of 5th pointer (xmaContextArray): 6 * 4 + 4 * 8 = 24 + 32 = 56 = 0x38
         xma_ptr_offset = 6 * 4 + 4 * 8
@@ -70,8 +72,10 @@ class TestAcpHalAbi(unittest.TestCase):
         with open(self.acphal_cpp, "r", encoding="utf-8") as f:
             content = f.read()
 
-        self.assertIn("static_assert(sizeof(SHAPE_CONTEXTS) == 120", content)
+        self.assertIn("static_assert(sizeof(SHAPE_CONTEXTS) == 0x60", content)
         self.assertIn("static_assert(offsetof(SHAPE_CONTEXTS, xmaContextArray) == 0x38", content)
+        self.assertIn("static_assert(offsetof(SHAPE_CONTEXTS, apuSrcContextArray) == 0x48", content)
+        self.assertIn("using APU_ADDRESS = uint32_t;", content)
         self.assertIn("static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64", content)
         self.assertIn("static_assert(sizeof(SHAPE_SRC_CONTEXT) == 32", content)
         self.assertIn("static_assert(sizeof(SHAPE_EQCOMP_CONTEXT) == 352", content)
@@ -101,6 +105,19 @@ class TestAcpHalAbi(unittest.TestCase):
         with open(self.build_ps1, "r", encoding="utf-8") as f:
             ps1 = f.read()
         self.assertIn("shims\\acphal.cpp", ps1)
+
+    def test_audio_shims_and_decoder_are_in_both_builds(self):
+        """acphal.cpp needs the XMA decoder sources, and xapu/chad are shims of their own: gta6rt in CMakeLists.txt and
+        the cl.exe fallback in build_runtime.ps1 must both list them, and CTest must run their tests."""
+        with open(self.cmakelists, "r", encoding="utf-8") as f:
+            cmake = f.read()
+        with open(self.build_ps1, "r", encoding="utf-8") as f:
+            ps1 = f.read()
+        for source in ("shims/xapu.cpp", "shims/chad_dsp.cpp", "src/xma_decode.cpp", "src/xma_context.cpp"):
+            self.assertIn(source, cmake)
+            self.assertIn(source.replace("/", "\\"), ps1)
+        for test in ("acphal", "xapu", "chad_dsp", "xma"):
+            self.assertIn(f"add_test(NAME {test} COMMAND {test}_test)", cmake)
 
 
 if __name__ == "__main__":

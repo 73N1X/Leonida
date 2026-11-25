@@ -114,8 +114,8 @@ folder that Windows refuses to load stops the run with the error code. Unset or 
 loaded for the process lifetime. Only static imports go through this step; a run-time `LoadLibrary` of the same name
 does not yet.
 
-It exists for drop-in implementations of console DLLs that have no shim here, such as the `AcpHal`, `chad`, `xapu`
-and `XCRDAPI` crates of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later).
+It exists for drop-in implementations of console DLLs, such as the `AcpHal`, `chad`, `xapu` and `XCRDAPI` crates of
+[omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later).
 Measured on the 1.0.2.1 executable at `867d922`: without the folder, `--dry-run` leaves 20 imports unimplemented
 (AcpHal 9, chad 5, xapu 5, XCRDAPI 1); with those four DLLs built from `f89e410`, it leaves 0, with the four
 package DLLs still mapped (`module=72`). Those DLLs run static initializers when Windows loads them, and with the
@@ -227,6 +227,21 @@ Current limits, by design:
   depth views, committed resources and copies (uploads, readbacks, BC textures), root signatures, graphics and
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing.
+- The audio hardware, ported from VIctory (`victory/crates/victory-hle/src/modules/audio.rs`, `apu.rs`, `dsp.rs`)
+  with its measured layouts, command ids and result records:
+  - `acphal.dll` (`shims/acphal.cpp`) — the APU heap with 32-bit device addresses, the SHAPE context arrays (a
+    0x60-byte `SHAPE_CONTEXTS`), and the coprocessor (`AcpHalCreate`): every command completes at once and is
+    acknowledged with VIctory's 28-byte messages. Enabled XMA contexts are decoded on a thread of the shim into their
+    output rings (`src/xma_context.h`, XMA2 frames by `src/xma_decode.h`, VIctory's port of FFmpeg's WMA Pro decoder).
+    The other SHAPE units (rate conversion, EQ, filters, flowgraph mixing) are acknowledged, not carried out.
+  - `xapu.dll` (`shims/xapu.cpp`) — the Opus decoder's command and result queues. Placeholder: there is no Opus
+    decoder in the repository, so a packet is parsed (`src/opus_packet.h`, RFC 6716 framing) for its frame count,
+    output length and errors, and its samples are silence.
+  - `chad.dll` (`shims/chad_dsp.cpp`) — DSP streams and their status blocks; as in VIctory the convolutions and
+    transforms are not computed and their outputs are silence.
+  Mixed audio leaves through the host's WASAPI, which the title's middleware opens through COM (`CoCreateInstance`,
+  forwarded by `shims/com_shim.cpp`), as in VIctory. `acphal_test`, `xapu_test`, `chad_dsp_test` and `xma_test` cover
+  them without game data.
 
 - `XCRDAPI.dll` — `DStorageGetFactory`: the console's DirectStorage (`shims/dstorage_xs.cpp`, ported from VIctory's
   `dstorage.rs`; layouts and slots in `shims/dstorage_xs.h`). The factory opens files through the title's
