@@ -43,6 +43,11 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
 
 ## Build notes for this machine
 
+- PowerShell finds devkitPro's MSYS2 `git` first (`c:\devkitPro\msys2\usr\bin`),
+  and MSYS2 programs expand braces in their arguments: `tag^{commit}` reaches git
+  as `tag^commit` and fails (it broke `build_llvm_mc.ps1`'s version check and
+  automatic worktree creation). Put `C:\Program Files\Git\cmd` first on PATH
+  for any PowerShell script that calls git.
 - The `cmake` that PowerShell finds first is devkitPro's MSYS2 build, which has
   no Visual Studio generators. Use the native one:
   `%LOCALAPPDATA%\Programs\CMake\bin\cmake.exe -S runtime -B runtime/build -G "Visual Studio 17 2022" -A x64`.
