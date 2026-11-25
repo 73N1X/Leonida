@@ -1,5 +1,8 @@
 //! Diagnostic stand-in pad commands. Replace the local file with one line
-//! `<sequence> <W|A|S|D|I|J|K|L> <hold_ms>`. Only increasing sequences run.
+//! `<sequence> <key> <hold_ms>`. Only increasing sequences run. A key is any
+//! key of the stand-in pad's table: the sticks `W|A|S|D|I|J|K|L`, the
+//! triggers `Z|C`, the buttons `X|Y|Q|E|F|H`, or `Enter` (A), `Back` (B),
+//! `Esc` (Menu), `Tab` (View), `Up|Down|Left|Right` (D-pad).
 
 use std::io::Read;
 use std::path::Path;
@@ -11,19 +14,52 @@ use super::PadState;
 
 struct Command {
     sequence: u64,
+    /// The stand-in pad's virtual key.
     key: u8,
     hold_ms: u64,
+}
+
+/// The stand-in pad's virtual key for a command word.
+fn virtual_key(word: &str) -> Option<u8> {
+    Some(match word {
+        "Enter" => 0x0D,
+        "Esc" => 0x1B,
+        "Tab" => 0x09,
+        "Back" => 0x08,
+        "Up" => 0x26,
+        "Down" => 0x28,
+        "Left" => 0x25,
+        "Right" => 0x27,
+        _ => match *word.as_bytes() {
+            [
+                key @ (b'W' | b'A' | b'S' | b'D' | b'I' | b'J' | b'K' | b'L' | b'Z' | b'C' | b'X'
+                | b'Y' | b'Q' | b'E' | b'F' | b'H'),
+            ] => key,
+            _ => return None,
+        },
+    })
+}
+
+/// The command word for a virtual key, for the log.
+fn key_name(key: u8) -> String {
+    match key {
+        0x0D => "Enter".into(),
+        0x1B => "Esc".into(),
+        0x09 => "Tab".into(),
+        0x08 => "Back".into(),
+        0x26 => "Up".into(),
+        0x28 => "Down".into(),
+        0x25 => "Left".into(),
+        0x27 => "Right".into(),
+        key => char::from(key).to_string(),
+    }
 }
 
 impl Command {
     fn parse(line: &str) -> Option<Self> {
         let mut words = line.split_ascii_whitespace();
         let sequence = words.next()?.parse().ok()?;
-        let [key @ (b'W' | b'A' | b'S' | b'D' | b'I' | b'J' | b'K' | b'L')] =
-            *words.next()?.as_bytes()
-        else {
-            return None;
-        };
+        let key = virtual_key(words.next()?)?;
         let hold_ms = words.next()?.parse().ok()?;
         (words.next().is_none() && (1..=10_000).contains(&hold_ms)).then_some(Command {
             sequence,
@@ -48,29 +84,43 @@ impl PartialEq for HeldMovement {
 
 impl HeldMovement {
     pub(super) fn apply(&self, mut pad: PadState) -> Option<PadState> {
-        let (axis, value) = match self.command.key {
-            b'W' => (&mut pad.left_y, 1.0),
-            b'S' => (&mut pad.left_y, -1.0),
-            b'A' => (&mut pad.left_x, -1.0),
-            b'D' => (&mut pad.left_x, 1.0),
-            b'I' => (&mut pad.right_y, 1.0),
-            b'K' => (&mut pad.right_y, -1.0),
-            b'J' => (&mut pad.right_x, -1.0),
-            b'L' => (&mut pad.right_x, 1.0),
-            _ => unreachable!("parsed movement key"),
-        };
-        // A physical keyboard direction already driving this axis takes priority.
-        if *axis != 0.0 {
-            return None;
+        let held = super::fallback(&[super::KeyState {
+            virtual_key: self.command.key,
+            ..Default::default()
+        }]);
+        // A physical keyboard key already driving this axis or button takes priority.
+        let axes = [
+            (&mut pad.left_x, held.left_x),
+            (&mut pad.left_y, held.left_y),
+            (&mut pad.right_x, held.right_x),
+            (&mut pad.right_y, held.right_y),
+            (&mut pad.left_trigger, held.left_trigger),
+            (&mut pad.right_trigger, held.right_trigger),
+        ];
+        let mut changed = false;
+        for (axis, value) in axes {
+            if value != 0.0 {
+                if *axis != 0.0 {
+                    return None;
+                }
+                *axis = value;
+                changed = true;
+            }
         }
-        *axis = value;
-        Some(pad)
+        if held.buttons != 0 {
+            if pad.buttons & held.buttons != 0 {
+                return None;
+            }
+            pad.buttons |= held.buttons;
+            changed = true;
+        }
+        changed.then_some(pad)
     }
 
     pub(super) fn confirm_read(&self, state: &PadState) {
         if !self.read.load(Ordering::Relaxed) && !self.read.swap(true, Ordering::Relaxed) {
-            tracing::info!(sequence = self.command.sequence, key = %char::from(self.command.key),
-                left_x = state.left_x, left_y = state.left_y, right_x = state.right_x,
+            tracing::info!(sequence = self.command.sequence, key = %key_name(self.command.key),
+                buttons = state.buttons, left_x = state.left_x, left_y = state.left_y, right_x = state.right_x,
                 right_y = state.right_y, "GetGamepadState returned movement");
         }
     }
@@ -112,7 +162,7 @@ impl MovementFile {
                 self.end();
                 if available {
                     let until = now + Duration::from_millis(command.hold_ms);
-                    tracing::info!(sequence = command.sequence, key = %char::from(command.key),
+                    tracing::info!(sequence = command.sequence, key = %key_name(command.key),
                         hold_ms = command.hold_ms, "stand-in movement started");
                     self.active = Some(Arc::new(HeldMovement {
                         command,
@@ -127,7 +177,7 @@ impl MovementFile {
 
     fn end(&mut self) {
         if let Some(cue) = self.active.take() {
-            tracing::info!(sequence = cue.command.sequence, key = %char::from(cue.command.key),
+            tracing::info!(sequence = cue.command.sequence, key = %key_name(cue.command.key),
                 "stand-in movement ended");
         }
     }
@@ -139,7 +189,7 @@ mod tests {
 
     #[test]
     fn movements_accept_only_one_direction_and_a_bounded_hold() {
-        for key in "WASDIJKL".chars() {
+        for key in "WASDIJKLZCXYQEFH".chars() {
             let command = Command::parse(&format!("0 {key} 10000\r\n")).unwrap();
             let held = HeldMovement {
                 command,
@@ -157,12 +207,44 @@ mod tests {
             "1 W 0",
             "1 W -1",
             "1 W 10001",
-            "1 Q 1",
+            "1 P 1",
+            "1 enter 1",
             "1 WA 1",
             "1 W 1 extra",
             "x W 1",
         ] {
             assert!(Command::parse(input).is_none(), "{input}");
+        }
+    }
+
+    #[test]
+    fn named_keys_press_their_buttons() {
+        for (word, vk) in [
+            ("Enter", 0x0D),
+            ("Esc", 0x1B),
+            ("Tab", 0x09),
+            ("Back", 0x08),
+            ("Up", 0x26),
+            ("Down", 0x28),
+            ("Left", 0x25),
+            ("Right", 0x27),
+        ] {
+            let command = Command::parse(&format!("5 {word} 300")).unwrap();
+            assert_eq!(command.key, vk);
+            let held = HeldMovement {
+                command,
+                until: Instant::now(),
+                read: false.into(),
+            };
+            let expected = super::super::fallback(&[super::super::KeyState {
+                virtual_key: vk,
+                ..Default::default()
+            }]);
+            assert_ne!(expected.buttons, 0, "{word}");
+            assert_eq!(held.apply(PadState::default()), Some(expected));
+            // A button the keyboard already holds is left to it.
+            assert!(held.apply(expected).is_none());
+            assert_eq!(key_name(vk), word);
         }
     }
 
