@@ -178,6 +178,8 @@ they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
 
 The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+`XCRDAPI.dll!DStorageGetFactory` is served too, by the DirectStorage shim ported from VIctory
+(`runtime/shims/dstorage_xs.cpp`, described in [runtime/README.md](../runtime/README.md#shims)).
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and

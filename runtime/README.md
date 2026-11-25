@@ -228,6 +228,19 @@ Current limits, by design:
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing.
 
+- `XCRDAPI.dll` — `DStorageGetFactory`: the console's DirectStorage (`shims/dstorage_xs.cpp`, ported from VIctory's
+  `dstorage.rs`; layouts and slots in `shims/dstorage_xs.h`). The factory opens files through the title's
+  `CreateFileW` shim (so `GAME:` and `G:` paths read the overlay copy or the package), and creates queues and status
+  arrays. Requests of all queues run on one pool of workers (one per logical CPU): started in queue order, queues
+  shared by priority (about 10x per level, counted in bytes), at most the staging buffer's worth of compressed source
+  in flight; a status entry completes once every earlier request of its queue has, with the first failure since the
+  previous entry. Sources are files or memory; zlib goes through `leonida::zlib_inflate`; destinations are addresses
+  or xmem physical pages (their page array is read when the request runs). BCPack goes through
+  `leonida_bcpack_decode` (`src/bcpack_decode.h`), a stub that fails until the decoder is ported, so BCPack requests
+  complete with `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`, logged once per BC format. `LEONIDA_DSTORAGE_TRACE=1` prints
+  a line for every failed request with its file, `2` for every request plus a summary every 5 s (the summaries also go
+  to `--trace`); `LEONIDA_DSTORAGE_RETRIES` (default 12) is how often a write into physical pages is retried before
+  its request fails.
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
   and trigger haptics where SDL opens the pad as a haptic device, and on a DualSense adaptive-trigger effects and the

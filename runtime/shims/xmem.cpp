@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -846,6 +847,88 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
         first = last;
     }
     return true;
+}
+
+namespace {
+
+// Consecutive pages of one allocation: the section, where in it the first page is, and how many pages.
+struct PhysicalRun {
+    std::shared_ptr<Section> section;
+    uint64_t offset;
+    size_t pages;
+};
+
+// The pages under [offset, offset + size) of `pages` as runs, in order. One look at the page table under g_phys_mutex
+// (which the title's own map calls hold too); the caller writes after it is released, holding each run's section.
+bool physical_runs(const uint64_t* pages, size_t count, size_t offset, size_t size, std::vector<PhysicalRun>& runs) {
+    runs.clear();
+    if (size == 0) return true;
+    constexpr size_t kRoom = (std::numeric_limits<size_t>::max)() - (kPhysicalPageSize - 1);
+    if (!pages || size > kRoom || offset > kRoom - size) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const size_t first = offset / kPhysicalPageSize;
+    const size_t end = (offset + size + (kPhysicalPageSize - 1)) / kPhysicalPageSize;
+    if (end > count) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    for (size_t i = first; i < end; ++i) {
+        const auto it = g_pages.find(pages[i]);
+        if (it == g_pages.end() || !it->second.section->scratch) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        if (!runs.empty() && runs.back().section == it->second.section &&
+            it->second.offset == runs.back().offset + runs.back().pages * kPhysicalPageSize) {
+            ++runs.back().pages;
+        } else {
+            runs.push_back(PhysicalRun{it->second.section, it->second.offset, 1});
+        }
+    }
+    return true;
+}
+
+// The run's bytes in the section's own view, committed (the section is SEC_RESERVE: a page has no memory until then).
+uint8_t* commit_run(const PhysicalRun& run) {
+    uint8_t* const backing = static_cast<uint8_t*>(run.section->scratch) + run.offset;
+    return VirtualAlloc(backing, run.pages * kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE) ? backing : nullptr;
+}
+
+}  // namespace
+
+bool physical_span(const uint64_t* pages, size_t count, size_t offset, size_t size, PhysicalSpan& out) {
+    out = PhysicalSpan{};
+    std::vector<PhysicalRun> runs;
+    if (!physical_runs(pages, count, offset, size, runs) || runs.size() != 1) return false;
+    uint8_t* const backing = commit_run(runs.front());
+    if (!backing) return false;
+    out.data = backing + offset % kPhysicalPageSize;
+    out.keep = runs.front().section;
+    return true;
+}
+
+bool write_physical(const uint64_t* pages, size_t count, size_t offset, const void* data, size_t size) {
+    std::vector<PhysicalRun> runs;
+    if (!physical_runs(pages, count, offset, size, runs)) return false;
+    const auto* from = static_cast<const uint8_t*>(data);
+    size_t within = offset % kPhysicalPageSize, done = 0;
+    for (const PhysicalRun& run : runs) {
+        uint8_t* const backing = commit_run(run);
+        if (!backing) return false;
+        const size_t n = (std::min)(run.pages * kPhysicalPageSize - within, size - done);
+        std::memcpy(backing + within, from + done, n);
+        within = 0;
+        done += n;
+    }
+    return true;
+}
+
+bool physical_pages_known(const uint64_t* pages, size_t count, size_t offset, size_t size) {
+    std::vector<PhysicalRun> runs;
+    return physical_runs(pages, count, offset, size, runs);
 }
 
 }
