@@ -5500,6 +5500,18 @@ public:
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
     IUnknown* holder() { return identity(); }
+    // Slot 14's console form (rt::d3d12::create_console_descriptor_heap): as CreateDescriptorHeap, with the title's
+    // address and size, so the heap's CPU handle start is that address. The caller has checked the description.
+    HRESULT create_console_heap(const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t console_address,
+                                std::uint64_t console_size, REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, desc, console_address, console_size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
+    }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -9997,14 +10009,9 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
-
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    // Through the device: its state and identity are its own (a const state() and a private identity() made the
+    // inline version of this fail to compile, so 3630610ca was never built with the Vulkan device).
+    return d->create_console_heap(*desc, console_address, console_size, riid, out);
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
