@@ -61,6 +61,24 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   `C02932BD9A968B22D404536108ADAACAC908C081CD6B0113F5BFEFC523DD0A6A`) installs to
   `C:\VulkanSDK\1.4.363.1`; it needs an elevated (UAC) install.
 
+## Leonida on this machine
+
+- `gta6rt` with the Vulkan device (`runtime\build-vk`, Vulkan SDK 1.4.363.1):
+  builds; `run_tiny_frame` (a stand-in title creating the console device on
+  Vulkan, clear + readback, through `gta6rt --run`) passes on the RTX 4060 Ti.
+- GPU test suite (`scripts\run_gpu_tests.py`, `LEONIDA_W64_EMULATE=1`):
+  226 of 248 passed, 17 skipped (run by other tests, or need 64-wide fragment
+  subgroups), 5 failed:
+  - `cs_imgload_tfe`, `cs_imgload_d16_tfe`: the program exits with an error
+    (texture-fail status of image loads; partially resident textures use it).
+  - `cs_w32_exec_computed` (`8192 8192 8192 7682 512 4100 0 3`) and
+    `cs_w64_exec_computed` (`8224 8192 16384 16384 8192 4132 0 3`): wrong
+    results with a computed EXEC mask.
+  - `ms_wave_info_s3`: (-1,-1,-1,-1) instead of (0.0078,0.0078,0.5,1.0);
+    driver-dependent per docs/testing.md.
+- Real title on `gta6rt --run`: stops at `XCRDAPI.dll!DStorageGetFactory`
+  (DirectStorage port in progress).
+
 ## Reference run of VIctory's runtime on this machine (host D3D12)
 
 - Shader warm-up: 25,745 shaders translated, 13 refused; 2,700 compute
