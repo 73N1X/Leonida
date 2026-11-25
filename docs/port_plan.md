@@ -31,22 +31,25 @@ Path roots: `L\` = `runtime\`, `V\` = `victory\crates\victory-gpu\src\`,
 
 The title creates its device as `ID3D12Device11`, which selects the newer
 console layouts: list slots from 59 and queue slots from 14 are two slots later
-(`V\device.rs:149-168`, `V\list.rs:2134`, `V\queue.rs:985`). Leonida's list map
-is half on the newer layout and its queue and fence proxies use PC order
-(`L\shims\d3d12_xs_device.cpp:623-633, 681`).
+(`V\device.rs:149-168`, `V\list.rs:2134`, `V\queue.rs:985`). The proxies now
+take every slot's meaning from the slot tables in `L\shims\d3d12_xs_slots.h`
+(device, queue, list, fence; each entry cites its source), with that switch: a
+device created as `ID3D12Device11` gets the console layouts, any other keeps the
+PC order Leonida's own PC-interface tests use. `L\test\xs_proxy_mock_test.cpp`
+checks every queue and list slot of the tables through the proxies.
 
 Boot, in order:
 
-| # | Title calls (VIctory reference) | Leonida today |
+| # | Title calls (VIctory reference) | Leonida now |
 |---|---|---|
-| 1 | Queue Signal 16, Wait 17, GetTimestampFrequency 18 (`queue.rs:960-987`) | forwarded as PC 16/17/18 |
-| 2 | Fence slot 12: address of the 64-bit value the title polls (`fence.rs:21-27,136-139`) | refused |
-| 3 | Device 69 (debug filter, no-op), 127 CreateCommittedResource3 for back buffers (`device.rs:442,457`; `resource.rs:2162-2186`) | 69 → PC CreateCommittedResource2; 127 E_NOTIMPL |
-| 4 | Queue 35 ExecuteX, 34 Signal2X, 32 PresentX (`queue.rs:597-610,757-841`) | E_NOTIMPL; `XboxPresentation` exists unrouted (`L\shims\xbox_present.h`) |
-| 5 | Device 78-81 frame clock (`frame.rs:1-130`) | 78-80 return at once |
-| 6 | Lists from device slot 12 get the console layout (`list.rs:566`) | returned unwrapped (`d3d12_xs_device.cpp:1819-1830`) |
-| 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | return 0 (`d3d12_xs_device.cpp:1062-1071`, map `d3d12_xs_device.h:172-182`) |
-| 8 | Queries at slots 28-30 (`list.rs:2114-2117,1330-1345`) | dropped; 56-59 shifted by a guessed +4 (59 is a marker per `docs\d3d12_command_objects.md:565`) |
+| 1 | Queue Signal 16, Wait 17, GetTimestampFrequency 18 (`queue.rs:960-987`) | PC 14/15/16; GetDesc 28 → PC 18, the return buffer first or second |
+| 2 | Fence slot 12: address of the 64-bit value the title polls (`fence.rs:21-27,136-139`) | a word the proxy keeps at the fence's completed value (CPU signals at once, queue signals through one completion event per signal) |
+| 3 | Device 69 (debug filter, no-op), 127 CreateCommittedResource3 for back buffers (`device.rs:442,457`; `resource.rs:2162-2186`) | 69 S_OK; 127 → PC CreateCommittedResource3 (PC description, ALLOW_DISPLAY cleared), else CreateCommittedResource |
+| 4 | Queue 35 ExecuteX, 34 Signal2X, 32 PresentX (`queue.rs:597-610,757-841`) | 35 → PC 10, 34 → PC 14; 32 → `set_present_handler`, else S_OK with nothing shown. `XboxPresentation` is not attached: gta6rt has no window yet, and its FramePacer hands out its own tokens and models only the origin event |
+| 5 | Device 78-81 frame clock (`frame.rs:1-130`) | VIctory's clock per device (S_FALSE time-outs, token on time-out, flips on consecutive ticks) |
+| 6 | Lists from device slot 12 get the console layout (`list.rs:566`) | console list proxies (also as the console's List5/List6 IIDs); device 25/26/108 take the return buffer first; device 48 takes the console queue description |
+| 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | 139 → PC Reset, 80 → Dispatch, 86 → CopyResource; 71-74, 62 and 148 still return 0 (no Vulkan-layer implementation for title addresses) |
+| 8 | Queries at slots 28-30 (`list.rs:2114-2117,1330-1345`) | → PC 52-54; 59 is the console marker (ignored); 27, 31, 56-58 and 60 are named by no source and refused |
 | 9 | ~60,000 PSOs in the first 20 s; device 86 CreatePipelineState with streams (`pipeline.rs:6-11`) | every PSO compiled at creation (`d3d12_vulkan_device.cpp:3948,4061`), slot 86 E_NOTIMPL; the title's 30 s watchdog fires |
 
 Menus and movies: sampler stride 16, views 32 (`descriptor.rs:1-7`; Leonida

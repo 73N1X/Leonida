@@ -106,6 +106,92 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
     return SUCCEEDED(hr) && bytecode;
 }
 
+// Calls slot `slot` of a COM object with the given words, as the title calls by slot.
+template <class Fn, class... Args>
+auto by_slot(void* object, unsigned slot, Args... args) {
+    return reinterpret_cast<Fn>((*reinterpret_cast<void***>(object))[slot])(object, args...);
+}
+
+void release_object(void* object) {
+    if (object) static_cast<IUnknown*>(object)->Release();
+}
+
+// The console layouts on the real runtime: a device made as ID3D12Device11, the title's interface
+// (d3d12_xs_slots.h). Its queue submits at 10, signals at 16 and answers GetDesc at 28 with the return buffer first;
+// its fence's slot 12 is a value word that follows the GPU; its lists from slot 12 are console list proxies that the
+// queue unwraps; GetCustomHeapProperties (26) takes the return buffer first.
+void check_console_layout(XboxCreateDeviceFn create_device, IUnknown* adapter) {
+    std::uint32_t params[24] = {};
+    const IID iid_device11 = __uuidof(ID3D12Device11);
+    void* device = nullptr;
+    HRESULT hr = create_device(adapter, params, &iid_device11, &device);
+    if (FAILED(hr) || !device) {
+        std::printf("device_proxy_test: no ID3D12Device11 behind the proxy (0x%08lX): console layouts not checked "
+                    "on the runtime\n", static_cast<unsigned long>(hr));
+        return;
+    }
+    check(rt::d3d12_xs::device_proxy_console_layout(device),
+          "a device created as ID3D12Device11 has the console layouts");
+
+    using HeapPropertiesFn = D3D12_HEAP_PROPERTIES*(WINAPI*)(void*, void*, UINT, UINT);
+    D3D12_HEAP_PROPERTIES properties{};
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    D3D12_HEAP_PROPERTIES* back = reinterpret_cast<HeapPropertiesFn>(vtable[26])(&properties, device, 0,
+                                                                                 D3D12_HEAP_TYPE_UPLOAD);
+    check(back == &properties && properties.Type == D3D12_HEAP_TYPE_CUSTOM,
+          "slot 26 GetCustomHeapProperties takes the return buffer first (console order)");
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    const IID iid_queue = __uuidof(ID3D12CommandQueue), iid_fence = __uuidof(ID3D12Fence);
+    const IID iid_allocator = __uuidof(ID3D12CommandAllocator), iid_list = __uuidof(ID3D12GraphicsCommandList);
+    void *queue = nullptr, *fence = nullptr, *allocator = nullptr, *list = nullptr;
+    using CreateQueueFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+    using CreateFenceFn = HRESULT(WINAPI*)(void*, UINT64, D3D12_FENCE_FLAGS, const IID*, void**);
+    using CreateAllocatorFn = HRESULT(WINAPI*)(void*, D3D12_COMMAND_LIST_TYPE, const IID*, void**);
+    using CreateListFn = HRESULT(WINAPI*)(void*, UINT, D3D12_COMMAND_LIST_TYPE, void*, void*, const IID*, void**);
+    hr = by_slot<CreateQueueFn>(device, 8, &queue_desc, &iid_queue, &queue);
+    check(SUCCEEDED(hr) && rt::d3d12_xs::command_object_proxy_console_layout(queue), "console queue from slot 8");
+    hr = by_slot<CreateFenceFn>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &iid_fence, &fence);
+    check(SUCCEEDED(hr) && rt::d3d12_xs::command_object_proxy_console_layout(fence), "console fence from slot 36");
+    hr = by_slot<CreateAllocatorFn>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, &iid_allocator, &allocator);
+    check(SUCCEEDED(hr) && rt::d3d12_xs::is_allocator_proxy(allocator),
+          "slot 9 wraps the runtime's allocator in the console layout");
+    if (allocator)
+        hr = by_slot<CreateListFn>(device, 12, 0u, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, &iid_list,
+                                   &list);
+    check(list && rt::d3d12_xs::is_command_list_proxy(list), "slot 12 makes a console list proxy");
+    if (queue && fence && list) {
+        using CloseFn = HRESULT(WINAPI*)(void*);
+        check(SUCCEEDED(by_slot<CloseFn>(list, 9)), "console list Close (9)");
+        using ExecuteFn = void(WINAPI*)(void*, UINT, void* const*);
+        void* lists[] = {list};
+        by_slot<ExecuteFn>(queue, 10, 1u, lists);
+        using SignalFn = HRESULT(WINAPI*)(void*, void*, UINT64);
+        check(SUCCEEDED(by_slot<SignalFn>(queue, 16, fence, UINT64{1})), "console queue Signal (16)");
+        using AddressFn = std::uint64_t(WINAPI*)(void*);
+        const auto* word = reinterpret_cast<const volatile std::uint64_t*>(by_slot<AddressFn>(fence, 12));
+        const ULONGLONG until = GetTickCount64() + 5000;
+        while (word && *word < 1 && GetTickCount64() < until) Sleep(1);
+        check(word && *word >= 1, "the fence's value word (slot 12) follows the GPU's signal");
+        UINT64 frequency = 0;
+        using FrequencyFn = HRESULT(WINAPI*)(void*, UINT64*);
+        check(SUCCEEDED(by_slot<FrequencyFn>(queue, 18, &frequency)) && frequency > 0,
+              "console queue GetTimestampFrequency (18)");
+        D3D12_COMMAND_QUEUE_DESC got{};
+        got.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        using GetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(void*, void*);
+        void* const get_desc = (*reinterpret_cast<void***>(queue))[28];
+        D3D12_COMMAND_QUEUE_DESC* desc_back = reinterpret_cast<GetDescFn>(get_desc)(&got, queue);
+        check(desc_back == &got && got.Type == D3D12_COMMAND_LIST_TYPE_DIRECT,
+              "console queue GetDesc (28) with the return buffer first");
+    }
+    release_object(list);
+    release_object(allocator);
+    release_object(fence);
+    release_object(queue);
+    release_object(device);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -341,13 +427,16 @@ int main(int argc, char** argv) {
         hr = reinterpret_cast<ScheduleFrameEventFn>(proxy_vtbl[79])(device.Get(), 0, 0, nullptr, 0);
         check(hr == S_OK, "slot 79 ScheduleFrameEventX returns S_OK");
 
+        // VIctory's frame clock (frame.rs): a blocking wait ends on the next tick with the next token; a poll that
+        // times out answers S_FALSE and makes a token only with "token on time-out" (flag 2); a null token pointer is
+        // no error.
         std::uint64_t token = 0, token2 = 0;
         hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, INFINITE, nullptr, 0, &token);
-        check(hr == S_OK && token != 0, "slot 80 WaitFrameEventX returns a non-zero token");
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, &token2);
-        check(hr == S_OK && token2 != 0 && token2 != token, "slot 80 returns a fresh token on the next wait");
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, nullptr);
-        check(hr == E_POINTER, "slot 80 refuses a null token with E_POINTER");
+        check(hr == S_OK && token == 1, "slot 80 WaitFrameEventX ends on the next tick with the first token");
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 2, &token2);
+        check(hr == S_FALSE && token2 == token + 1, "slot 80: a timed-out poll with token on time-out begins a frame");
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, INFINITE, nullptr, 0, nullptr);
+        check(hr == S_OK, "slot 80 takes a null token pointer");
         check(rt::d3d12_xs::device_slot_hits(78) == 1 && rt::d3d12_xs::device_slot_hits(79) == 1 &&
                   rt::d3d12_xs::device_slot_hits(80) == 3,
               "slots 78/79/80 hit counters are 1/1/3");
@@ -496,6 +585,8 @@ int main(int argc, char** argv) {
                   "the queue proxy's GetDevice is the device the shim returned");
         }
     }
+
+    check_console_layout(create_device, warp.Get());
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
     if (real) real->AddRef();

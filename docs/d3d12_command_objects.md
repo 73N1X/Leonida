@@ -755,6 +755,13 @@ first calls; a wrong slot would therefore be visible as a misnamed call, not a s
 
 Queues and fences are wrapped the same way.
 
+A device created as `ID3D12Device11`, as the title creates its own, has the console layouts instead: its queues,
+fences, allocators and lists follow the slot tables in `runtime/shims/d3d12_xs_slots.h`, taken from VIctory
+(`victory/crates/victory-gpu/src/{device,queue,list,fence}.rs`, which runs the title) and from the measurements on
+this page, each entry with its source. There the queue methods from slot 14 on are two later than the PC's, the
+fence has a value address at slot 12, and device slot 12 makes console list proxies. What follows describes the PC
+layout, which every other device keeps.
+
 - **What is wrapped.** Device slots 8 (`CreateCommandQueue`), 75 (`CreateCommandQueue1`), 36
   (`CreateFence`) and 32 (`OpenSharedHandle`, when it opens a fence) return queue and fence proxies. Each
   proxy forwards the public chain in PC order: 19 queue slots, and 11 or 12 fence slots, in SDK 10.0.26100.
