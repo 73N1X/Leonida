@@ -77,6 +77,55 @@ argument clamps (`indirect.rs`); GPU memory placement between 4 GiB and 2^40
    `L\src\resource_detile.h`), then indirect (clamps, mesh indirect, counts),
    rectangle lists and frame pacing.
 
+## Shaders: rules to take from VIctory into `tools/rdna2spirv.py`
+
+`VS\` = `victory\crates\victory-shader\src\`. Some VIctory fixes exist only in
+its history (commit `570a941e9` replaced the whole shader crate): `060195536`,
+`2286e038c`, `77053a0c5`.
+
+In order, each with a `tests/semantic` fixture (the suite needs no LLVM, SPIR-V
+tools or GPU):
+
+1. **Loop iteration cap** (stops GPU hangs): 128 pixel, 256 vertex/mesh, 4096
+   compute, then discard/return (`VS\emit\lower.rs:328-335,11124-11173`,
+   `15b0091e8`). Loops over unmirrored data that reads as zeros ran ~4 billion
+   times and lost the card. Leonida has no cap; its loops follow the whole wave,
+   so one counter per wave, and an early-exiting wave must not stall barrier
+   rounds.
+2. **Rectangle lists** (topology 19) through a generated geometry shader
+   (`VS\emit\rect.rs:1-27`, `683ad7a99`); Leonida refuses the topology
+   (`runtime\shims\d3d12_vulkan_device.cpp:3712-3718`). Full-screen passes and
+   tiled lighting use it.
+3. **Literal sampler compare**: the console writes `DEPTH_COMPARE_FUNC =
+   LESS_EQUAL` into every static S#, so whether a sample compares is decided by
+   the instruction (`VS\emit\sampler.rs:13-15`, `2286e038c`). Leonida enables
+   compare from the S# field (`runtime\src\gfx10_descriptors.h:534,609`), so a
+   plain `image_sample` gets a compare sampler: undefined behaviour. Key literal
+   samplers by (words, compare).
+4. **Quad ops and helper lanes**: quad-confined DPP and `ds_swizzle` quad mode
+   as quad operations in pixel and mesh shaders (`lower.rs:4335-4370,
+   4464-4495, 6671-6760`, `921d8d3b4`); a helper lane's `v_readfirstlane`
+   returns its own value (`060195536`: waterfalls with only helpers left spun
+   until DEVICE_HUNG ~200 s into the world); a discarded lane stays a helper
+   (`77053a0c5`).
+5. **VS → PS linking by signature row**, not parameter number
+   (`VS\native.rs:37-48,203-241`, `lower.rs:1090-1251`); run a census of the
+   corpus first.
+6. **Per-program wave64 emulation** for speed on 32-lane GPUs: run Leonida's
+   partition-invariance tiers (`tools\wave64_halves.py`) on compute and mesh
+   too, emulate only tier C, add VIctory's exact idioms (`lower.rs:483-533,
+   996-1017`, `VS\emit\own_bits.rs`).
+7. Compute implicit derivatives (both use LOD 0 today), cube `_d` LOD pin,
+   waterfall collapse (measure first).
+
+Leonida is ahead on BVH node numerics, f16 rounding and named-level gathers.
+
+Runtime shader lookup (`runtime\src\shader_library.h`): key entries on the
+parts the translator reads (ISG1/OSG1/PSG1/PSV0) with an exact match first;
+write the translator commit and flag profile into `index.json` and refuse a
+mismatch; on a miss, log the hashes, dump the container and let `make_game.py`
+translate it.
+
 ## Frame time: where Leonida can beat VIctory
 
 VIctory's world frames cost 240-970 ms, mostly host copies of title memory
