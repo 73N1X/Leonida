@@ -9,10 +9,13 @@ Path roots: `L\` = `runtime\`, `V\` = `victory\crates\victory-gpu\src\`,
 ## Measured so far (`gta6rt` on the 1.0.2.1 package)
 
 - `--dry-run`, `--init`: all five modules map and initialise (TLS callbacks,
-  DLL entry points). 11 imports are unimplemented:
+  DLL entry points). 11 imports were unimplemented:
   `XCRDAPI.dll!DStorageGetFactory`, `xapu.dll!XApu{Connect,DequeueResult,
   Disconnect,EnqueueCommand,GetResultCount}`, `chad.dll!XDsp{Activate,
-  ConnectWithMaximumStreamLimit,Deactivate,Disconnect,SubmitCommand}`.
+  ConnectWithMaximumStreamLimit,Deactivate,Disconnect,SubmitCommand}`. With
+  the audio port (`L\shims\xapu.cpp`, `L\shims\chad_dsp.cpp`, the coprocessor
+  and XMA decoder in `L\shims\acphal.cpp`) the dry run leaves only
+  `DStorageGetFactory`.
 - `--run`: the GDK runtime initialises offline, then the title calls
   `DStorageGetFactory` and stops (about 3 s in).
 
@@ -22,7 +25,7 @@ Path roots: `L\` = `runtime\`, `V\` = `victory\crates\victory-gpu\src\`,
 |---|---|---|
 | DirectStorage (factory, queues, requests, status arrays, zlib, BCPack) | `VH\dstorage.rs` | new `L\shims\dstorage_xs.cpp`; inflate from `L\src\shader_library.h` |
 | BCPack decode (tables supplied locally, SHA-256 checked, never committed) | `victory\crates\victory-formats\src\bcpack*` | new `L\src\bcpack.h/.cpp` |
-| APU (`xapu.dll`) and DSP (`chad.dll`) | `VH\apu.rs`, `VH\dsp.rs`, `VH\audio\` | new shims next to `L\shims\acphal.cpp` |
+| APU (`xapu.dll`) and DSP (`chad.dll`) | `VH\apu.rs`, `VH\dsp.rs`, `VH\audio\` | done: `L\shims\xapu.cpp` (Opus decoded as silence: no decoder in the repo), `L\shims\chad_dsp.cpp`, coprocessor and XMA in `L\shims\acphal.cpp`, `L\src\xma_decode.h` |
 
 ## Step 2: the console D3D12 ABI in front of the Vulkan layer
 

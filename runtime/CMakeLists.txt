@@ -117,6 +117,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
+    shims/xapu.cpp
+    shims/chad_dsp.cpp
+    src/xma_decode.cpp
+    src/xma_context.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -234,16 +238,38 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
 
-  # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
+  # acphal shim ABI test: resolves the registered acphal.dll exports through the registry; the coprocessor's
+  # messages and the XMA decoding thread filling a ring from a hand-built stream.
   add_executable(acphal_test
     test/acphal_test.cpp
     shims/acphal.cpp
     shims/registry.cpp
+    src/xma_decode.cpp
+    src/xma_context.cpp
   )
   target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
+
+  # xapu.dll (the Opus decoder's command and result queues) and chad.dll (the DSP's streams and status blocks), each
+  # through the registry with hand-built commands and packets: no game data.
+  add_executable(xapu_test
+    test/xapu_test.cpp
+    shims/xapu.cpp
+    shims/registry.cpp
+  )
+  add_executable(chad_dsp_test
+    test/chad_dsp_test.cpp
+    shims/chad_dsp.cpp
+    shims/registry.cpp
+  )
+  foreach(_audio_test xapu_test chad_dsp_test)
+    target_include_directories(${_audio_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(${_audio_test} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${_audio_test} PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(${_audio_test} PRIVATE /OPT:NOREF)
+  endforeach()
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -506,6 +532,13 @@ if(BUILD_TESTING)
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
+  # XMA2 frame decoder and SHAPE XMA context machine (src/xma_decode.h, src/xma_context.h): pure stdlib, streams built
+  # in memory, including VIctory's noise tests of damaged packets and frames.
+  add_executable(xma_test test/xma_test.cpp src/xma_decode.cpp src/xma_context.cpp)
+  target_include_directories(xma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(xma_test PRIVATE Threads::Threads)
+  add_test(NAME xma COMMAND xma_test)
+  set_tests_properties(xma PROPERTIES TIMEOUT 120)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
@@ -1124,6 +1157,13 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
+    set_tests_properties(acphal PROPERTIES TIMEOUT 60)
+  endif()
+  if(WIN32 AND TARGET xapu_test)
+    add_test(NAME xapu COMMAND xapu_test)
+  endif()
+  if(WIN32 AND TARGET chad_dsp_test)
+    add_test(NAME chad_dsp COMMAND chad_dsp_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)

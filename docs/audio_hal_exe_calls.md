@@ -52,6 +52,9 @@ turns such an address back into a pointer. That is an inference from the shapes;
 `XApuEnqueueCommand` and `XApuDequeueResult` share one handle global, which `XApuDisconnect` clears: a command queue
 with a result queue, connected once and torn down once. How `chad.dll`'s handle relates to it is not read.
 
+All 19 audio imports are now served by shims ported from VIctory (`runtime/shims/acphal.cpp`, `xapu.cpp`,
+`chad_dsp.cpp`; what they do and what is a placeholder is at the top of each file and in `runtime/README.md`).
+
 ## `xg_xs.dll` and `XCRDAPI.dll`
 
 | Import | Sites | What the sites show |
