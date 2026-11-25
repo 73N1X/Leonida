@@ -14,6 +14,8 @@
 //
 // The frame decoder follows FFmpeg's wmaprodec.c (LGPL-2.1-or-later, used under GPL-3.0-or-later) restricted to what
 // XMA needs: at most two channels, four subframe sizes (512 down to 128), no LFE channel. Pure C++: no OS headers.
+// wmaprodec.c's own notices, kept as the LGPL asks: Copyright (c) 2007 Baptiste Coudurier, Benjamin Larsson, Ulion;
+// Copyright (c) 2008 - 2011 Sascha Sommer, Benjamin Larsson (the same lines are in third_party/xma/NOTICE.md).
 #pragma once
 
 #include <array>
