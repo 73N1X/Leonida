@@ -101,6 +101,18 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   machine `victory\crates\victory-formats\src\bcpack-tables.bin`, git-ignored)
   or a `bcpack-tables.bin` next to `gta6rt.exe`; without them BCPack requests
   fail with `ERROR_INVALID_DATA`.
+- Console D3D12 ABI merged from `port/d3d12-abi` (`runtime\shims\d3d12_xs_slots.h`,
+  VIctory's slot tables; Device11 selects the console layouts; struct returns
+  take the return buffer first). On Vulkan the title now creates its device,
+  queues, descriptor heaps, CBV/SRV/UAV views and its 3840x2160 back buffers
+  (device slot 127, CreateCommittedResource3), then stops about 2.7 s in at
+  its own breakpoint (`0x80000003`, `game_scarlett_master.exe+0x247af2d`) right
+  after device slot 70 (a placed SRV over title memory) returned E_NOTIMPL.
+  Next: the title-memory model and the slots that need it (device 70/71, list
+  62, 71-74, 100, 148).
+- The title renders to 3840x2160 because it is told it is on a 4K console
+  display; reporting a smaller display mode is a large frame-time lever for
+  later (VIctory has `VICTORY_DISPLAY_MODE`).
 - The title asks the device for three interfaces it does not know
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
