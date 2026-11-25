@@ -19,17 +19,24 @@ Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wi
             one, 20 in all.
 ctest:      ctest --test-dir runtime\build -C RelWithDebInfo: 448 registered, 2 disabled (gameinput and
             gameinput_script, no SDL3), 11 skipped (no game directory, no validation layer, and similar),
-            433 passed, 2 failed. The two failures:
+            433 passed, 2 failed. Both failures are in the comparison with the host's native D3D12, which
+            this PC runs on the Intel UHD Graphics iGPU, not on the RTX 4060 (see the notes):
             - d3d12_root_args_validation: line 194, CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE)
-              fails after the layer's constants/root-signature refusals; the same line as open pull
-              request #1165. Not rerun with that change.
-            - d3d12_texture_tiles: "alias tile 0 at (0,0): got 0x1cc0200, expected 0xcc020000"
-              (line 239, compare_pixel on the aliased tile). Not found in the Known problems table of
-              docs/testing.md and not tied to an open pull request here; not examined further.
+              fails in the hardware pass; the same line as open pull request #1165 (an Intel driver that
+              removes its device). The test walks the hardware adapters in DXGI order; which one failed
+              was not printed, and the Intel iGPU is the likely one. Not rerun with that change.
+            - d3d12_texture_tiles: "alias tile 0 at (0,0): got 0x1cc0200, expected 0xcc020000" (line 239),
+              in the 256 x 240, linear offset 1 case. The test printed "Native D3D12: Intel(R) UHD
+              Graphics" before it, and the layer's own replay on the RTX 4060 had already completed that
+              case and the 256 x 256, offset 4 one. It looks like the Intel CopyTiles byte-offset rounding
+              open pull request #964 handles (measured there on an Iris Xe); not rerun with that change.
+              LEONIDA_HOST_ADAPTER=4060 does not change the adapter this test picks.
 Notes:
 - Built with scripts\build_runtime.ps1 (Ninja, RelWithDebInfo, MSVC) at the commit above; the tests ran from
   runtime\build with --build runtime\build. The PC also lists the Intel UHD and Microsoft Dozen devices to
   Vulkan, so LEONIDA_VK_DEVICE=4060 was set for every run; the device line of both runs names the RTX 4060.
+  d3d12_texture_tiles takes its native D3D12 adapter itself and printed the Intel iGPU, so its native side is
+  not the RTX 4060; d3d12_root_args_validation walks the hardware adapters in DXGI order.
 - The commit above is the one built and tested; origin/main had moved 17 commits ahead when this record
   was written, none of them touching the GPU test fixtures or scripts.
 - AI-assisted (Claude Code ran the build and tests and wrote this file from the run output). No game files,
