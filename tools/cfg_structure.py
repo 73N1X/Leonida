@@ -234,6 +234,48 @@ def _sccs(nodes, adj):
     return out
 
 
+def loop_counters(succ):
+    """The counted edges and reset blocks of an iteration cap that bounds every cycle of `succ` (any graph).
+
+    Returns one (counted, resets, blocks) triple of frozensets per loop, a loop being a strongly connected region of the
+    graph left after the counted edges of the loops around it are removed. Its counted edges go from a block of
+    the region to one of its entries (a block with a predecessor outside the region, or block 0); its resets are
+    the blocks outside it with an edge into it. A counter that every counted edge increments and every reset block
+    sets to 0 therefore counts the passes since the loop was entered: every cycle contains a counted edge of the
+    innermost loop it lies in, and no block of that loop resets it. In a reducible graph a loop is a natural loop,
+    its counted edges are the back edges to its header and its resets are the header's other predecessors. Only
+    blocks reachable from block 0 take part. The loops are ordered by their smallest entry (then as found), so the
+    numbering does not depend on set order."""
+    if not succ:
+        return []
+    reach, work = {0}, [0]
+    while work:
+        for w in succ[work.pop()]:
+            if w not in reach:
+                reach.add(w)
+                work.append(w)
+    preds = collections.defaultdict(set)
+    for u in reach:
+        for w in succ[u]:
+            preds[w].add(u)
+    removed, loops, regions = set(), [], [sorted(reach)]
+    while regions:
+        region = regions.pop()
+        inside = set(region)
+        adj = {u: [w for w in succ[u] if w in inside and (u, w) not in removed] for u in region}
+        comps = _sccs(region, adj)
+        in_comp = set().union(*comps) if comps else set()
+        comps += [{u} for u in region if u in adj[u] and u not in in_comp]      # a block that loops to itself
+        for comp in comps:
+            entries = {w for w in comp if w == 0 or preds[w] - comp}
+            counted = frozenset((u, w) for u in comp for w in adj[u] if w in entries)
+            resets = frozenset(p for w in comp for p in preds[w] if p not in comp)
+            removed |= counted
+            loops.append((min(entries), len(loops), counted, resets, frozenset(comp)))
+            regions.append(sorted(comp))
+    return [loop[2:] for loop in sorted(loops, key=lambda x: x[:2])]
+
+
 def split_irreducible(succ, max_factor=2, max_splits=64):
     """Make an irreducible CFG reducible by controlled node splitting (cloning the closed region R reachable from a secondary entry e without passing through primary entry h
     in an irreducible SCC, and redirecting e's external predecessors to clone[e]).

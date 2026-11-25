@@ -102,6 +102,12 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 F16_HALVES = False
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
+# --loop-limit: a loop runs at most this many times per entry into it, by stage (0 = no cap); then a conditional back
+# edge takes its other way out and a jump back leaves the program (a pixel is discarded). The console runs a loop as
+# long as its data says, and data the host has not got yet reads as zeros: VIctory saw such loops run ~4 billion
+# times and lose the GPU (victory/crates/victory-shader/src/emit/lower.rs, LOOP_LIMIT and count_iteration; commit
+# 15b0091e8, the per-stage values from 570a941e9). docs/design.md "Loop iteration cap".
+LOOP_LIMITS = {"ps": 128, "vs": 256, "gs": 256, "ms": 256, "cs": 4096}
 
 
 # The heap base as one %ulong, in the entry block of %main: the push constants don't change during the invocation, and
@@ -373,6 +379,11 @@ class Gen:
         self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
+        self.loop_limit = 0        # --loop-limit of this stage: passes per entry into a loop (0 = no cap)
+        self.loop_edges = {}       # (block, successor) -> its loop's counter (%lc<k>): the counted edges
+        self.loop_resets = {}      # block -> the counters it sets to 0: it is outside their loop, with an edge in
+        self.loop_exits = set()    # blocks whose every way on is a counted edge: at the cap they leave the program
+        self.loop_count = 0        # counters %lc0.. declared
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
@@ -426,6 +437,89 @@ class Gen:
                 self.x_tok[reg] = val
             elif s.endswith("= OpLabel"):
                 self.x_gen += 1
+
+    # ---- loop iteration cap (--loop-limit) ----
+    def loop_next(self, u, taken, fall, cond, pc_of):
+        """The %pc value block u leaves: `taken` where `cond` holds (cond None: always), else `fall` (None: the
+        program ends); pc_of(b) is block b's number, pc_of(None) the end. A counted edge (loop_edges) is taken only
+        while its loop's counter %lc<k> + 1 is below the limit, and taking it counts it, so a loop's first block runs
+        at most loop_limit times per entry (the blocks in loop_resets set the counter to 0). A branch whose way is
+        blocked takes its other way (VIctory's rule: a back edge is taken only below the limit), and a block with no
+        way left leaves the program (loop_abort). Every lane of a wave runs the same blocks (votes and SCC are the
+        wave's), so their counters agree: one per wave. Returns (pc id, the bool that picks `taken`, or None when
+        the block has one way)."""
+        kt = self.loop_edges.get((u, taken)) if taken is not None else None
+        kf = self.loop_edges.get((u, fall)) if fall is not None and cond is not None else None
+        if kt is None and kf is None:              # no counted edge: what the translation always emitted
+            if cond is None:
+                return pc_of(taken), None
+            r = self.tmp()
+            self.emit(f"{r} = OpSelect %uint {cond} {pc_of(taken)} {pc_of(fall)}")
+            return r, cond
+        if cond is None or taken == fall:          # both ways are the same edge
+            fall, kf, cond_used = taken, None, None
+        else:
+            cond_used = cond
+        steps = {}
+        for k in dict.fromkeys(x for x in (kt, kf) if x is not None):
+            c, c1, ok = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{c} = OpLoad %uint %lc{k}")
+            self.emit(f"{c1} = OpIAdd %uint {c} {self.cu(1)}")
+            self.emit(f"{ok} = OpULessThan %bool {c1} {self.cu(self.loop_limit)}")
+            steps[k] = (c, c1, ok)
+        if cond_used is None:                      # one way, counted: on below the limit, else out of the program
+            ok = steps[kt][2]
+            self.emit(f"OpStore %lc{kt} {steps[kt][1]}")
+            r = self.tmp()
+            self.emit(f"{r} = OpSelect %uint {ok} {pc_of(taken)} {pc_of(None)}")
+            self.loop_abort(ok)
+            return r, None
+        sel = self.tmp()
+        if kf is None:                             # taken only below the limit
+            self.emit(f"{sel} = OpLogicalAnd %bool {cond_used} {steps[kt][2]}")
+        elif kt is None:                           # fall only below the limit
+            nf = self.tmp()
+            self.emit(f"{nf} = OpLogicalNot %bool {steps[kf][2]}")
+            self.emit(f"{sel} = OpLogicalOr %bool {cond_used} {nf}")
+        else:                                      # both counted: the way cond picks, else the other one
+            nf = self.tmp()
+            self.emit(f"{nf} = OpLogicalNot %bool {steps[kf][2]}")
+            self.emit(f"{sel} = OpSelect %bool {cond_used} {steps[kt][2]} {nf}")
+        r = self.tmp()
+        self.emit(f"{r} = OpSelect %uint {sel} {pc_of(taken)} {pc_of(fall)}")
+        if kt is not None and kf is not None:
+            live, out = self.tmp(), self.tmp()
+            self.emit(f"{live} = OpLogicalOr %bool {steps[kt][2]} {steps[kf][2]}")
+            self.emit(f"{out} = OpSelect %uint {live} {r} {pc_of(None)}")
+            self.loop_abort(live)
+            r = out
+        if kt is not None and kt == kf:
+            self.emit(f"OpStore %lc{kt} {steps[kt][1]}")
+        else:
+            if kt is not None:
+                v = self.tmp()
+                self.emit(f"{v} = OpSelect %uint {sel} {steps[kt][1]} {steps[kt][0]}")
+                self.emit(f"OpStore %lc{kt} {v}")
+            if kf is not None:
+                v = self.tmp()
+                self.emit(f"{v} = OpSelect %uint {sel} {steps[kf][0]} {steps[kf][1]}")
+                self.emit(f"OpStore %lc{kf} {v}")
+        return r, sel
+
+    def loop_abort(self, live):
+        """The lane leaves the program at the cap unless `live`: %done (the round schedulers stop running it and,
+        since it no longer counts, the other waves' barrier rounds go on without it) and, in a pixel shader,
+        %lc_kill, which discards the pixel at the end (after OpEndInvocationInterlockEXT, as every exit)."""
+        dead, d0, d1 = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{dead} = OpLogicalNot %bool {live}")
+        self.emit(f"{d0} = OpLoad %bool %done")
+        self.emit(f"{d1} = OpLogicalOr %bool {d0} {dead}")
+        self.emit(f"OpStore %done {d1}")
+        if self.stage == "ps":
+            k0, k1 = self.tmp(), self.tmp()
+            self.emit(f"{k0} = OpLoad %bool %lc_kill")
+            self.emit(f"{k1} = OpLogicalOr %bool {k0} {dead}")
+            self.emit(f"OpStore %lc_kill {k1}")
 
     # ---- register access ----
     def reg_ptr(self, kind, r):
@@ -15881,7 +15975,11 @@ def assemble(gen):
           "%scc = OpVariable %_ptr_Function_uint Function %c0",
           *(["%mode_r16 = OpVariable %_ptr_Function_uint Function %c0"] if gen.round_mode else []),
           "%active = OpVariable %_ptr_Function_bool Function %true",
-          *[f"{var} = OpVariable {ptr} Function" for var, ptr in gen.eager_vars]]
+          *[f"{var} = OpVariable {ptr} Function" for var, ptr in gen.eager_vars],
+          # --loop-limit: each loop's passes since it was entered, and (pixel) whether the lane left at the cap.
+          *[f"%lc{k} = OpVariable %_ptr_Function_uint Function %c0" for k in range(gen.loop_count)],
+          *(["%lc_kill = OpVariable %_ptr_Function_bool Function %false"]
+            if gen.stage == "ps" and gen.loop_exits else [])]
     if gen.vm_latch:
         fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
                "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
@@ -16227,13 +16325,14 @@ def assemble(gen):
               "%ms_cend = OpLabel",
               "OpBranch %ms_pend", "%ms_pend = OpLabel"]
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
-    if gen.uses_active and gen.stage == "ps":
+    loop_kill = gen.stage == "ps" and bool(gen.loop_exits)
+    if (gen.uses_active or loop_kill) and gen.stage == "ps":
         # A pixel is written when its lane was on in EXEC at the last `vm` export the path ran (if it ran one) and
         # at the last export to its color target (measured on RDNA2 with one target; docs/design.md, EXEC). With
         # several targets the pixel stays when any of them got an export from the lane: Vulkan can't skip one
         # attachment per pixel, so the others keep what the lane exported before (or the initial value). Without a
         # latch EXEC can't have changed since those exports, so EXEC at the end is the same mask; a path with no
-        # export at all also goes by EXEC at the end.
+        # export at all also goes by EXEC at the end. A lane that left a loop at --loop-limit is discarded.
         keep, latched = "%act_end", ""
         if gen.vm_latch:
             keep = "%vm_keep"
@@ -16251,6 +16350,11 @@ def assemble(gen):
                 any_set, any_on = f"%col_any_set_{t}", f"%col_any_on_{t}"
             latched += (f"         %col_part = OpSelect %bool {any_set} {any_on} %no_col\n"
                         "         %vm_keep = OpLogicalAnd %bool %vm_part %col_part\n")
+        if loop_kill:
+            latched += ("         %lc_killed = OpLoad %bool %lc_kill\n"
+                        "         %lc_alive = OpLogicalNot %bool %lc_killed\n"
+                        f"         %lc_keep = OpLogicalAnd %bool {keep} %lc_alive\n")
+            keep = "%lc_keep"
         tail = end_lock + ("         %act_end = OpLoad %bool %active\n" + latched +
                 "         OpSelectionMerge %live None\n"
                 f"         OpBranchConditional {keep} %live %dead\n"
@@ -17626,14 +17730,32 @@ def translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    g.loop_limit = LOOP_LIMITS.get(stage, 0)
+    if g.loop_limit:
+        # --loop-limit: a counter per loop (cfg_structure.loop_counters bounds every cycle, reducible or not), and the
+        # blocks that leave the program at the cap: every way on from them is counted.
+        for k, (counted, resets, _) in enumerate(cfg_structure.loop_counters(succ)):
+            g.loop_count = k + 1
+            for e in counted:
+                g.loop_edges[e] = k
+            for u in sorted(resets):
+                g.loop_resets.setdefault(u, []).append(k)
+        for u, edges in enumerate(raw_edges):
+            last = next((i for i in blocks[u] if base_op(i["op"]) == "s_endpgm" or base_op(i["op"]) in BRANCHES),
+                        None)
+            to_end = last is not None and base_op(last["op"]) not in ("s_endpgm", "s_branch") and len(edges) < 2
+            if edges and not to_end and all((u, w) in g.loop_edges for w in edges):
+                g.loop_exits.add(u)
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
-            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
+            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes,
+            loops=(g.loop_edges, g.loop_resets, frozenset(g.loop_exits)))
         if STRUCTURED:
             g.emulate_plan = wave64_emulate_opt.plan_structured_emulation(
-                blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes)
+                blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes,
+                exits=g.loop_exits)
     g.fit_shared_memory()
     g.exec_changes = any(g.may_write_exec(ins) for blk in blocks for ins in blk)
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
@@ -17698,16 +17820,21 @@ def translate(path):
                                 uterm = ("br", op)
                                 break
                             g.insn(ins)
+                        # --loop-limit: a loop inside the region counts in the region's numbering (sub_pc); only
+                        # the active lanes run it (find_local_exec_folds keeps counted edges and exits out of it).
+                        for k in g.loop_resets.get(u, ()):
+                            g.emit(f"OpStore %lc{k} {g.cu(0)}")
+                        sub_pc = lambda b: g.cu(idx_of.get(b, sub_end) if b is not None else sub_end)  # noqa: E731
                         uedges = raw_edges[u]
                         if uterm is None or uterm[0] == "end":
-                            nxt = idx_of.get(uedges[0], sub_end) if (uterm is None and uedges) else sub_end
-                            g.emit(f"OpStore %pc {g.cu(nxt)}")
+                            if uterm is None and uedges:
+                                g.emit(f"OpStore %pc {g.loop_next(u, uedges[0], None, None, sub_pc)[0]}")
+                            else:
+                                g.emit(f"OpStore %pc {g.cu(sub_end)}")
                         elif uterm[1] == "s_branch":
-                            g.emit(f"OpStore %pc {g.cu(idx_of.get(uedges[0], sub_end))}")
+                            g.emit(f"OpStore %pc {g.loop_next(u, uedges[0], None, None, sub_pc)[0]}")
                         else:
                             uop = uterm[1]
-                            utgt = g.cu(idx_of.get(uedges[0], sub_end))
-                            ufall = g.cu(idx_of.get(uedges[1], sub_end) if len(uedges) > 1 else sub_end)
                             if uop in ("s_cbranch_execz", "s_cbranch_execnz"):
                                 uact = g.active_b()
                                 if uop == "s_cbranch_execz":
@@ -17717,8 +17844,7 @@ def translate(path):
                                     ucond = uact
                             else:
                                 ucond = branch_condition(g, uop)
-                            ur = g.tmp()
-                            g.emit(f"{ur} = OpSelect %uint {ucond} {utgt} {ufall}")
+                            ur, _ = g.loop_next(u, uedges[0], uedges[1] if len(uedges) > 1 else None, ucond, sub_pc)
                             g.emit(f"OpStore %pc {ur}")
                     elif it[0] == "guard":
                         v, c, do, end = g.tmp(), g.tmp(), g.tmp(), g.tmp()
@@ -17796,6 +17922,8 @@ def translate(path):
                     term, body = ("br", op, index[target(ins)]), blocks[cur][:k]
                     break
             g.insns(body)
+            for k in g.loop_resets.get(cur, ()):
+                g.emit(f"OpStore %lc{k} {g.cu(0)}")         # --loop-limit: on the way into loop k
             if cur in folds:
                 emit_folded_region(folds[cur])
                 if cur in fold_chain:
@@ -17814,13 +17942,17 @@ def translate(path):
                 break
             edges = raw_edges[cur]
             fall = (edges[0] if edges else None) if term is None else (edges[1] if len(edges) > 1 else None)
+            # The number of block b in %pc; past the end (None) = len(blocks), the default -> done.
+            pc_of = lambda b: g.cu(b if b is not None else len(blocks))          # noqa: E731
             # Every block leaves the number of the block to run next in %pc (len(blocks) = none: the program is over),
             # and its possible successors in g.succ for cfg_structure.
             if term is None or term[0] == "end":
                 nxt = fall if term is None else None
-                g.emit(f"OpStore %pc {g.cu(nxt if nxt is not None else len(blocks))}")
                 if nxt is None:
+                    g.emit(f"OpStore %pc {pc_of(None)}")
                     g.emit("OpStore %done %true")
+                else:
+                    g.emit(f"OpStore %pc {g.loop_next(cur, nxt, None, None, pc_of)[0]}")
                 if mini_set is not None and (nxt is None or nxt not in mini_set):
                     g.emit("OpStore %x_ldone %true")
                 g.succ.append(succ[n] if cur != n else ([nxt] if nxt is not None else []))
@@ -17828,16 +17960,15 @@ def translate(path):
                 _, op, _ = term
                 tgt = edges[0]
                 if op == "s_branch":
-                    g.emit(f"OpStore %pc {g.cu(tgt)}")
+                    g.emit(f"OpStore %pc {g.loop_next(cur, tgt, None, None, pc_of)[0]}")
                     if mini_set is not None and tgt not in mini_set:
                         g.emit("OpStore %x_ldone %true")
                     g.succ.append(succ[n] if cur != n else [tgt])
                 else:
                     marks0, body0 = len(g.x_marks), len(g.body)
                     cond = branch_condition(g, op)
-                    alt = g.cu(fall) if fall is not None else g.cu(len(blocks))   # past the end = default -> done
-                    r = g.tmp()
-                    g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
+                    # --loop-limit: `cond` becomes the bool that really picks tgt (a counted way may be blocked).
+                    r, cond = g.loop_next(cur, tgt, fall, cond, pc_of)
                     g.emit(f"OpStore %pc {r}")
                     if g.emulate and not g.emulate_inline and op in (
                             "s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
@@ -18396,6 +18527,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
         m["wave64_exchange"] = "workgroup"
         m["subgroup_size"] = None
+    if g.loop_count:
+        # --loop-limit: the cap this module's loops were translated with (the translation depends on it, like "fma"),
+        # and how many loop counters it has.
+        m["loop_limit"] = g.loop_limit
+        m["capped_loops"] = g.loop_count
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if "SignedZeroInfNanPreserve" in caps:
@@ -18717,6 +18853,20 @@ def _shard_arg(text):
     return si, sn
 
 
+def _loop_limit_arg(text):
+    """--loop-limit PS,VS,CS (pixel; vertex, geometry and mesh; compute) or one N for all: passes per entry into a
+    loop, 0 = no cap for that kind."""
+    parts = text.split(",")
+    try:
+        values = [int(p, 0) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected PS,VS,CS or N (whole numbers), not {text!r}") from None
+    if len(values) not in (1, 3) or any(not 0 <= v <= 0xFFFFFFFF for v in values):
+        raise argparse.ArgumentTypeError(f"expected PS,VS,CS or N, each 0..4294967295, not {text!r}")
+    ps, vs, cs = values * 3 if len(values) == 1 else values
+    return {"ps": ps, "vs": vs, "gs": vs, "ms": vs, "cs": cs}
+
+
 def _depth_arg(text):
     """--max-structured-depth N: 0 (never fall back to the dispatch loop) or a positive nesting depth."""
     try:
@@ -18816,6 +18966,13 @@ def main():
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
+    ap.add_argument("--loop-limit", type=_loop_limit_arg, metavar="PS,VS,CS",
+                    default=dict(LOOP_LIMITS),
+                    help="a loop runs at most this many times per entry, for pixel; vertex, geometry and mesh; "
+                         "compute shaders (or one number for all; 0 = no cap; default %s): then a conditional back "
+                         "edge takes its other way out and a jump back leaves the program, a pixel discarded (data "
+                         "the host has not mirrored reads as zeros and can make a loop run billions of times; "
+                         "metadata: loop_limit)" % ",".join(str(LOOP_LIMITS[s]) for s in ("ps", "vs", "cs")))
     a = ap.parse_args()
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
@@ -18834,6 +18991,8 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
+    LOOP_LIMITS.clear()
+    LOOP_LIMITS.update(a.loop_limit)
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
