@@ -2258,6 +2258,23 @@ class Gen:
                 kind, args = "BITMASK_PERM", []
                 and_m, or_m, xor_m = off & 0x1F, (off >> 5) & 0x1F, (off >> 10) & 0x1F
         self.uses_subgroup = True
+        if self.stage == "ps":
+            # A swizzle that stays in the quad (QUAD_PERM, or masks that keep lane bits 2-4: VIctory's test in
+            # lower.rs) is a quad operation in a pixel shader, so a helper lane across a triangle edge is read as on
+            # hardware (VIctory 921d8d3b4; quad_read). pattern[q] = the source of quad position q.
+            masks = {"SWAP": (0x1F, 0, args[0] if args else 0), "REVERSE": (0x1F, 0, (args[0] - 1) if args else 0),
+                     "BROADCAST": ((~(args[0] - 1) & 0x1F, args[1], 0) if len(args) > 1 else None),
+                     "BITMASK_PERM": (and_m, or_m, xor_m)}.get(kind)
+            pattern = None
+            if kind == "QUAD_PERM":
+                pattern = tuple(args)
+            elif masks and masks[0] & 0x1C == 0x1C and masks[1] & 0x1C == 0 and masks[2] < 4:
+                pattern = tuple((((q & masks[0]) | masks[1]) ^ masks[2]) & 3 for q in range(4))
+            if pattern is not None:
+                value = self.tmp()
+                self.emit(f"{value} = OpSelect %uint {self.active_b()} {self.src_u(a[1])} {self.cu(0)}")
+                self.dst(a[0], self.quad_read(value, pattern))
+                return
         lane = self.tmp()
         self.sub_lane(lane)
         if kind == "BITMASK_PERM":
@@ -5468,6 +5485,26 @@ class Gen:
         self.uses_subgroup = self.uses_ballot = True
         return first
 
+    def helper_own_value(self, ballot, own, first):
+        """v_readfirstlane_b32 in a pixel shader: `first` (the value of the first lane on in EXEC), except in an
+        active lane that its own `ballot` of EXEC leaves out, which takes its own value `own` (VIctory 060195536).
+        Only a helper invocation a driver keeps out of subgroup operations can be such a lane: Vulkan leaves it to
+        the implementation whether helpers join a ballot or a shuffle (only quad and derivative operations must see
+        them). On the console whole-quad mode puts helpers in EXEC, so a waterfall loop (read the first lane's
+        value, run the lanes that hold it, take them out of EXEC) serves them too; a helper left out instead reads
+        an empty or foreign first lane, never matches, and the loop spins: in VIctory such loops ran to the
+        iteration limit in every draw until DEVICE_HUNG ~200 s into the world. With its own value a helper matches
+        in the first pass; what it computes only feeds derivatives and quad reads, and its stores are dropped. A
+        driver that does include helpers sees them in the ballot, so nothing changes there."""
+        self.uses_subgroup = self.uses_ballot = True
+        first = self.eager("%uint", first)            # read in an OpSelect arm below: every lane must run it
+        bit, out, left, r = (self.tmp() for _ in range(4))
+        self.emit(f"{bit} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {self.subgroup_lane()}")
+        self.emit(f"{out} = OpLogicalNot %bool {bit}")
+        self.emit(f"{left} = OpLogicalAnd %bool {out} {self.active_b()}")
+        self.emit(f"{r} = OpSelect %uint {left} {own} {first}")
+        return r
+
     def ballot_lsb_by_words(self, bal):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
@@ -6265,6 +6302,49 @@ class Gen:
         self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {lo_in}")
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
         return lo, hi
+
+    def quad_read(self, v, pattern=None, pos=None):
+        """`v` of another invocation of this one's quad, by quad operations (pixel shaders: quad-confined DPP and
+        ds_swizzle). `pattern` gives the source position for destination positions 0..3 of every quad; else `pos` is
+        a per-lane id 0..3. The invocations of a fragment quad all join a quad operation, helpers too: Vulkan keeps
+        a helper active for quad (and derivative) operations, while a subgroup shuffle or ballot need not see it, so
+        a read of a pixel across a triangle edge can come back undefined or 0 (VIctory 921d8d3b4: on an RX 7900 XTX
+        its wave reads gave 32 wrong pixels at a shared triangle edge, its quad reads none). Quad position = subgroup
+        lane & 3, the 2x2 order RDNA2 uses (lane % 4 = (x & 1) + 2 (y & 1), measured, see "Whole-quad mode"). Each
+        result goes through `eager`, so every invocation runs the operation (SHADER-529)."""
+        self.uses_subgroup = self.uses_quad = True
+        swaps = {(1, 0, 3, 2): 0, (2, 3, 0, 1): 1, (3, 2, 1, 0): 2}      # QuadSwap Direction: horizontal, vertical, diagonal
+        if pattern is not None:
+            pattern = tuple(pattern)
+            if pattern == (0, 1, 2, 3):
+                return v
+            r = self.tmp()
+            if len(set(pattern)) == 1:
+                self.emit(f"{r} = OpGroupNonUniformQuadBroadcast %uint {self.cu(3)} {v} {self.cu(pattern[0])}")
+                return self.eager("%uint", r)
+            if pattern in swaps:
+                self.emit(f"{r} = OpGroupNonUniformQuadSwap %uint {self.cu(3)} {v} {self.cu(swaps[pattern])}")
+                return self.eager("%uint", r)
+            q = self.tmp()
+            self.emit(f"{q} = OpBitwiseAnd %uint {self.subgroup_lane()} {self.cu(3)}")
+            pos = self.cu(pattern[0])
+            for i in (1, 2, 3):
+                e, nxt = self.tmp(), self.tmp()
+                self.emit(f"{e} = OpIEqual %bool {q} {self.cu(i)}")
+                self.emit(f"{nxt} = OpSelect %uint {e} {self.cu(pattern[i])} {pos}")
+                pos = nxt
+        reads = []
+        for n in range(4):
+            r = self.tmp()
+            self.emit(f"{r} = OpGroupNonUniformQuadBroadcast %uint {self.cu(3)} {v} {self.cu(n)}")
+            reads.append(self.eager("%uint", r))
+        out = reads[0]
+        for n in (1, 2, 3):
+            e, nxt = self.tmp(), self.tmp()
+            self.emit(f"{e} = OpIEqual %bool {pos} {self.cu(n)}")
+            self.emit(f"{nxt} = OpSelect %uint {e} {reads[n]} {out}")
+            out = nxt
+        return out
 
     def quad_any(self, v):
         """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
@@ -7356,6 +7436,28 @@ class Gen:
                     self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
                     active = both
                 src_ok = active
+        elif self.stage == "ps" and (quad is not None or
+                                     (dpp8 is not None and all(((s ^ i) & 4) == 0 for i, s in enumerate(dpp8)))):
+            # quad_perm, and a dpp8 whose every lane reads from its own quad, in a pixel shader: quad operations, which
+            # read a helper lane across a triangle edge as the hardware does (VIctory 921d8d3b4; quad_read). Its
+            # active bit, which decides fi / bound_ctrl, comes through the quad too: a ballot need not see a helper.
+            if quad is not None:
+                pattern = tuple(quad)
+            else:
+                lo, hi = tuple(s & 3 for s in dpp8[:4]), tuple(s & 3 for s in dpp8[4:])
+                pattern = lo if lo == hi else None
+            pos = None
+            if pattern is None:
+                pos = self.tmp()
+                self.emit(f"{pos} = OpBitwiseAnd %uint {src_local} {self.cu(3)}")
+            if fi:
+                src_ok = "%true"
+            else:
+                on, bit = self.tmp(), self.tmp()
+                self.emit(f"{on} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"{bit} = OpINotEqual %bool {self.quad_read(on, pattern, pos)} {self.cu(0)}")
+                src_ok = bit
+            shuffled = self.quad_read(src_val, pattern, pos) if src.get("k") == "vgpr" else src_val
         else:
             sgl = self.subgroup_lane()
             sg_group = self.tmp()
@@ -7680,7 +7782,7 @@ class Gen:
                 self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
                 self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave32_first_running_lane()}")
                 self.g_shuffle(r, v, first)
-                self.dst(a[0], r)
+                self.dst(a[0], self.helper_own_value(ballot, v, r))
                 return
             if self.emulate:
                 # The wave's active lanes as two mask words and every lane's value, in one round.
@@ -7708,7 +7810,7 @@ class Gen:
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
-            self.dst(a[0], r)
+            self.dst(a[0], self.helper_own_value(bal, v, r) if self.stage == "ps" else r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
                     "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
