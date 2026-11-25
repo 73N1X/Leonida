@@ -76,8 +76,19 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
     results with a computed EXEC mask.
   - `ms_wave_info_s3`: (-1,-1,-1,-1) instead of (0.0078,0.0078,0.5,1.0);
     driver-dependent per docs/testing.md.
-- Real title on `gta6rt --run`: stops at `XCRDAPI.dll!DStorageGetFactory`
-  (DirectStorage port in progress).
+- Real title on `gta6rt --run`, host D3D12 proxy and `LEONIDA_D3D12=vulkan`
+  alike: DirectStorage (merged from `port/dstorage`, ported from VIctory's
+  `dstorage.rs`) opens the title's 12 archives; the Vulkan device is created on
+  the RTX 4060 Ti (upload heaps in VRAM through resizable BAR, bindless set
+  up); then the title crashes about 3 s in at console device slot 26,
+  `GetCustomHeapProperties`, which returns a struct by value: the caller passes
+  the hidden return pointer in RCX and the proxy reads it as the device
+  (`d3d12_xs_device.cpp`, `proxy_slot<26>`). Slot 48 (`CreateCommandQueueX`)
+  fails next. Both are with the D3D12 ABI port (`port/d3d12-abi`).
+- The title asks the device for three interfaces it does not know
+  (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
+  `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
+  either.
 
 ## Reference run of VIctory's runtime on this machine (host D3D12)
 
