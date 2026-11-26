@@ -492,11 +492,43 @@ std::int32_t read_source(const Request& request, Buffers& buffers, std::span<con
 }
 
 // Inflates a zlib stream into the worker's buffer, at most `limit` bytes. A stream that ends short of the limit
-// passes: the title's chunks fill their destination exactly, and nothing says that is required. A longer, malformed
-// or truncated stream, or a wrong Adler-32, fails with ERROR_INVALID_DATA.
+// passes: the title's chunks fill their destination exactly, and nothing says that is required. A valid stream that is
+// longer gives its first `limit` bytes; a malformed or truncated stream, or a wrong Adler-32, fails with
+// ERROR_INVALID_DATA.
 std::int32_t inflate(std::span<const std::uint8_t> source, std::size_t limit, std::vector<std::uint8_t>& out) {
     if (out.capacity() < limit) out.reserve(limit);
-    return leonida::zlib_inflate(source, out, limit) ? kOk : kInvalidData;
+    if (leonida::zlib_inflate(source, out, limit)) return kOk;
+    // A whole, valid stream that inflates past the destination: the title asks for its first `limit` bytes (a
+    // 1731-byte stream of 16384 bytes into an 8192-byte destination, the request at offset 1413311488 of
+    // core_restofworld after the start screen), and gets them. Inflated whole, up to 64 times the limit, and cut.
+    if (leonida::zlib_inflate(source, out, (std::min)(limit * 64, std::size_t(256) << 20)) && out.size() > limit) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[rt] dstorage: a zlib stream inflates past its destination (%zu of %zu bytes); "
+                                 "its first bytes are given (logged once)\n", limit, out.size());
+        out.resize(limit);
+        return kOk;
+    }
+    // LEONIDA_DSTORAGE_DUMP=<folder> (diagnostic): the first 16 sources that do not inflate are written there, to
+    // tell a stream this inflater misreads from one the title's request misdescribes. They are the title's bytes:
+    // the folder stays on the player's machine.
+    static const std::string folder = [] {
+        char buf[MAX_PATH] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_DSTORAGE_DUMP", buf, sizeof buf);
+        return n && n < sizeof buf ? std::string(buf) : std::string();
+    }();
+    static std::atomic<unsigned> dumped{0};
+    if (!folder.empty()) {
+        const unsigned n = dumped.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            const std::string path = folder + "\\zlib-" + std::to_string(n) + "-limit" + std::to_string(limit) + ".bin";
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(source.data(), 1, source.size(), f);
+                std::fclose(f);
+            }
+        }
+    }
+    return kInvalidData;
 }
 
 // The page numbers of a destination. The title fills the array after it enqueued the request (a copy taken then holds

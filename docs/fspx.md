@@ -261,6 +261,59 @@ it is now refused (`fall-through into undecodable words`): programs 04, 05, 06, 
 26 of 29 translated and passed before the change, **20 of 29** after it; the 20 kept give byte-identical SPIR-V, and
 8 of the 9 refused stop at a fall-through into undecodable words.
 
+## Graphics pipelines
+
+The title deserializes its graphics pipelines through console device slot 57 (vtable offset `0x1c8`), `(desc, riid,
+out)`, called from `title+0x2477578` in a worker job. Everything it draws past the start screen goes through it: in a
+1.0.2.1 boot it was called more than 16,384 times while every call was refused, and the world never drew. It is the
+graphics side of slot 67, with the same program format. Measured over the first 400 descriptions of a boot
+(`LEONIDA_CAPTURE_SLOT57=<folder>` saves a description's parts there; the folder is the player's):
+
+| Offset | Content | Measured |
+|---|---|---|
+| +0x00 | root signature (one the title made through the device) | all 400 |
+| +0x08, +0x10 | kind 0: the pipeline's register state | 0x17c, 0x184 or 0x17c bytes (95, 97 or 99 dwords) |
+| +0x18, +0x20 | kind 1: the VS-PS semantic table (`POSITION`, `COLOR`, `TEXCOORD` as strings) | 0x98 to 0xbc bytes |
+| +0x28, +0x30 | the pixel stage's kind-6 program | null in 4 of 400 (depth-only pipelines) |
+| +0x38, +0x40 | its kind-7 records | with the program |
+| +0x48, +0x50 | the vertex stage's kind-6 program | all 400 |
+| +0x58, +0x60 | its kind-7 records | all 400 |
+| +0x68 on | zero | all 400 |
+
+**The stages.** Both programs start with the 36-byte prologue of kind 6. The vertex program fetches its own vertices
+(`s_load_dwordx4` of a buffer descriptor from `s[8:9]`, then `buffer_load` with `idxen` on `v0`) and exports `pos0`
+and `paramN`; the pixel program reads the parameters with `v_interp` (checked by hand on 3 pipelines). So the
+programs need no input layout, and `exp paramN` meets `attrN` as the translator already numbers them.
+
+**Kind 0** is gfx10 context registers at fixed offsets. Read so far, from a census of each dword over the 400:
+
+| Offset | Register | Reading |
+|---|---|---|
+| +0x38, +0x3c | the vertex stage's `SPI_SHADER_PGM_RSRC1/2` | never zero; `FLOAT_MODE` 0xC0, `DX10_CLAMP`, `MEM_ORDERED` set in all |
+| +0x4c, +0x50 | the pixel stage's `SPI_SHADER_PGM_RSRC1/2_PS` | zero in exactly the 4 pipelines without a pixel stage |
+| +0x84 | `PA_SU_SC_MODE_CNTL` (hypothesis) | 0, 2, 4, 6 and 0x80; its counts match those of +0x5c exactly, so both encode one state |
+| +0xb8 | `DB_DEPTH_CONTROL` | `0x7007f0` (no depth, 352), `0x7007f6` (test and write, function ALWAYS), `0x7007e2` (reverse-Z: GEQUAL, no write), stencil-equal variants |
+| +0xbc | `DB_STENCIL_CONTROL` | `0x00080080`: ADD_WRAP on pass, front and back |
+| +0xc0, +0xc4 | `DB_STENCILREFMASK` and its back-face twin | `0x0100ff00`: test mask 0xff, write mask 0, op value 1 |
+| +0xd0 to +0xec | `CB_BLEND0..7_CONTROL` | all 8 equal in all 400; `0x80000000` off (193), `0xe5010504` SRC_ALPHA / INV_SRC_ALPHA with ONE / INV_SRC_ALPHA for alpha (147), and four more |
+| +0x100 to +0x11c | 8 per-target words that follow the blend words one to one | not read |
+
+No attachment format is in it, nor in kind 1: the hardware takes the formats from the bound targets' registers. The
+proxy (`proxy_create_graphics_pipeline_from_native_code`, `runtime/shims/d3d12_xs_device.cpp`) therefore makes a
+D3D12 graphics description with eight render targets of unknown format and the private flag
+`rt::d3d12::kPipelineFormatsFromTargets`; the Vulkan device builds the pipeline for the formats and sample count each
+draw binds (`leonida::GraphicsPipeline::formats_from_targets`). Each stage goes to the device as one FSPX payload
+(kinds 0, 1, the stage's 6 and 7), found by its kind-6 SHA-256 and the stage. Culling is off unless
+`LEONIDA_CONSOLE_CULL=1`, until the +0x84 reading is confirmed on screen; `LEONIDA_CONSOLE_PIPELINES=0` refuses the
+calls as before.
+
+**Captured stages.** A stage with no translation is saved once as `<kind-6 sha256>-<stage>.fspx` in the capture
+folder. `make_game.py`'s `shaders` stage unpacks those (`tools/fspx_unpack.py --only graphics`, which keeps kind 0
+as words and writes a container with the signatures the translator reads: empty for the vertex stage, the
+`SV_Position` components a pixel program reads for the pixel stage) into `<work>/shaders/console-captured` and
+translates them into `<work>/shaders/spirv/console-captured`, which the shader library loads. A trial on 40 of them
+translated 39, all passing `spirv-val`.
+
 ## Unknown
 
 - Kind 0 words 0 and 1.

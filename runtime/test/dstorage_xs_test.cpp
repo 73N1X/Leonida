@@ -368,6 +368,25 @@ void memory_sources_inflate_too() {
     release(array);
 }
 
+// The title asks for the first bytes of a longer stream (8192 of a 16384-byte chunk after the start screen): the
+// request succeeds with the stream's first destination_size bytes, and nothing past the destination is written.
+void a_longer_stream_gives_its_first_bytes() {
+    const std::vector<std::uint8_t> plain = pattern(16384);
+    const std::vector<std::uint8_t> packed = compress_zlib(plain);
+    void* const queue = new_queue(1);
+    void* const array = status_array(1);
+    std::vector<std::uint8_t> out(8192 + 64, std::uint8_t(0xcd));
+    enqueue(queue, request(ds::kZlib | ds::kMemorySource, out.data(), 8192, packed.data(), 0, packed.size()));
+    enqueue_status(queue, array, 0);
+    submit(queue);
+    check_hr(wait(array, 0), ds::kOk, "a zlib stream longer than its destination completes");
+    check(std::equal(out.begin(), out.begin() + 8192, plain.begin()), "with the stream's first bytes");
+    check(std::all_of(out.begin() + 8192, out.end(), [](std::uint8_t b) { return b == 0xcd; }),
+          "and nothing past its destination");
+    release(queue);
+    release(array);
+}
+
 void statuses_complete_in_order_with_the_first_failure(const std::filesystem::path& package) {
     const std::vector<std::uint8_t> contents = pattern(4096);
     write_file(package / "small.bin", contents);
@@ -705,6 +724,7 @@ int main() {
     }
     raw_and_zlib_reads_from_a_game_file(package);
     memory_sources_inflate_too();
+    a_longer_stream_gives_its_first_bytes();
     statuses_complete_in_order_with_the_first_failure(package);
     half_a_queue_submits_itself(package);
     a_closed_queue_completes_nothing(package);

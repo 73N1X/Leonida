@@ -4913,7 +4913,8 @@ bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC&
 // Known D3D12_PIPELINE_STATE_FLAGS bits: TOOL_DEBUG (0x1, kept for cached-PSO parity), bit 0x2,
 // DYNAMIC_DEPTH_BIAS (0x4), and DYNAMIC_INDEX_BUFFER_STRIP_CUT (0x8). Higher bits fail with E_INVALIDARG
 // on both Windows hardware D3D12 and WARP.
-constexpr UINT kKnownPipelineStateFlags = 0xFu;
+// rt::d3d12::kPipelineFormatsFromTargets is the console proxy's own bit (device slot 57's pipelines).
+constexpr UINT kKnownPipelineStateFlags = 0xFu | rt::d3d12::kPipelineFormatsFromTargets;
 
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
@@ -5324,6 +5325,8 @@ public:
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
+        for (const auto& [targets, built] : format_variants_)
+            if (built) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
@@ -5586,24 +5589,44 @@ public:
                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
-            stage.fssm = leonida::fssm_program(
-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
+            const std::span<const std::uint8_t> bytecode{static_cast<const std::uint8_t*>(stage.code.pShaderBytecode),
+                                                         stage.code.BytecodeLength};
+            stage.fssm = leonida::fssm_program(bytecode);
+            // A stage of a console pipeline (device slot 57, docs/fspx.md "Graphics pipelines"): an FSPX payload of the
+            // pipeline's register state (kind 0), its semantic table (kind 1), the stage's program (kind 6) and its
+            // records (kind 7). The kind-6 bytes are the key and the code base, as for a compute FSPX program.
+            const leonida::FspxParts console =
+                stage.fssm.empty() ? leonida::fspx_parts(bytecode) : leonida::FspxParts{};
+            const bool console_stage = !console.code.empty();
+            if (console_stage) stage.fssm.assign(console.code.begin(), console.code.end());
             if (stage.fssm.empty()) {
-                log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
+                log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
             const std::string hash = leonida::sha256_hex(stage.fssm);
             // Containers with the same program can differ in their input signature or bindings: a VS must have its
-            // inputs fed by this input layout (else the layout check below reports it).
+            // inputs fed by this input layout (else the layout check below reports it). A console stage fetches its
+            // own vertices (no input layout).
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
-            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
-                return !vertex || layout_feeds(e, desc.InputLayout);
-            });
+            stage.entry = pick_entry(console_stage ? library->fspx_candidates(stage.name, hash)
+                                                   : library->candidates(stage.name, hash),
+                                     [&](const leonida::ShaderEntry& e) {
+                                         return console_stage || !vertex || layout_feeds(e, desc.InputLayout);
+                                     });
             if (!stage.entry) {
                 note_refusal((std::string("no translated shader for stage ") + stage.name).c_str(), 0);
-                capture_shader(*library,
-                               {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength},
-                               hash, stage.name);
+                if (console_stage) {
+                    // Saved once as <kind-6 sha256>-<stage>.fspx: the build unpacks the captured folder's payloads and
+                    // translates the ones with a stage suffix as that stage (tools/fspx_unpack.py).
+                    capture_bytes(*library, bytecode, hash + "-" + stage.name + ".fspx", "console pipeline stages");
+                    static std::atomic<unsigned> missing{0};
+                    const unsigned n = missing.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 4 || (n & (n - 1)) == 0)
+                        std::fprintf(stderr, "[rt] d3d12: no translated console %s for kind-6 sha256 %s (%u so far)\n",
+                                     stage.name, hash.c_str(), n);
+                    return E_INVALIDARG;
+                }
+                capture_shader(*library, bytecode, hash, stage.name);
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
@@ -5997,6 +6020,7 @@ public:
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
+        graphics_.formats_from_targets = static_cast<UINT>(desc.Flags) & rt::d3d12::kPipelineFormatsFromTargets;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -6282,6 +6306,8 @@ public:
         graphics_.pipeline = build(0);
         if (!graphics_.pipeline) return false;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        if (graphics_.formats_from_targets)
+            graphics_.format_variant = [this](const leonida::TargetFormats& t) { return format_variant(t); };
         device_.context->add_graphics_pipeline(id(), graphics_);
         registered_ = true;
         return true;
@@ -6511,7 +6537,9 @@ private:
     };
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
-    VkPipeline build(std::uint32_t unbound) const {
+    // `targets`: a formats_from_targets pipeline's attachment formats and sample count at a draw (format_variant);
+    // null: the description's formats, with the `unbound` slots undefined.
+    VkPipeline build(std::uint32_t unbound, const leonida::TargetFormats* targets = nullptr) const {
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913).
@@ -6525,13 +6553,21 @@ private:
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
         const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
+        VkFormat depth_format = graphics_.depth_format;
+        VkImageAspectFlags depth_aspects = graphics_.depth_aspects;
+        if (targets) {
+            for (std::size_t slot = 0; slot < colors.size() && slot < targets->colors.size(); ++slot)
+                colors[slot] = targets->colors[slot];
+            depth_format = targets->depth;
+            depth_aspects = targets->depth_aspects;
+        }
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         rendering.colorAttachmentCount = std::uint32_t(colors.size());
         rendering.pColorAttachmentFormats = colors.data();
-        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-            rendering.depthAttachmentFormat = graphics_.depth_format;
-        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
-            rendering.stencilAttachmentFormat = graphics_.depth_format;
+        if (depth_bound && (depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+            rendering.depthAttachmentFormat = depth_format;
+        if (depth_bound && (depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+            rendering.stencilAttachmentFormat = depth_format;
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
@@ -6559,6 +6595,7 @@ private:
             raster.pNext = &conservative;
         }
         multisample.pSampleMask = &r.sample_mask;
+        if (targets) multisample.rasterizationSamples = VkSampleCountFlagBits(targets->samples);
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
@@ -6609,12 +6646,25 @@ private:
         return pipeline;
     }
 
+    // A formats_from_targets pipeline for the formats and sample count a draw binds: built on first use and kept until
+    // the PSO is released, as variant().
+    VkPipeline format_variant(const leonida::TargetFormats& targets) {
+        std::lock_guard lock(variants_mutex_);
+        if (const auto it = format_variants_.find(targets); it != format_variants_.end()) return it->second;
+        const VkPipeline pipeline = build(0, &targets);
+        if (!pipeline) log_once("a pipeline for the formats its draw binds could not be built; first format",
+                                int(targets.colors.empty() ? 0 : targets.colors[0]));
+        format_variants_.emplace(targets, pipeline);  // a failure is kept too: not built again every draw
+        return pipeline;
+    }
+
     DeviceState& device_;
     leonida::ComputePipeline pipeline_;
     leonida::GraphicsPipeline graphics_;
     Recipe recipe_;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::map<leonida::TargetFormats, VkPipeline> format_variants_;  // with variants_mutex_
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
@@ -7993,6 +8043,7 @@ public:
     ~Device() override {
         Device* self = this;
         g_title_texture_device.compare_exchange_strong(self, nullptr);
+        stop_fill_worker();
         stop_memory_waits();
         if (state_.context) {
             {
@@ -10098,22 +10149,95 @@ public:
     };
 
     // Placed textures whose title bytes changed since their last upload are uploaded again (fill_from_title), up to
-    // kBudget bytes read per call, round robin; one whose bytes stay the same for kSettled checks in a row is settled
-    // and no longer read. Called once a frame (rt::d3d12::refresh_title_textures, from the present path), so what the
-    // title streamed in during a frame shows from the next one.
+    // kBudget bytes read per pass, round robin; one whose bytes stay the same for kSettled checks in a row is settled
+    // and no longer read. The present path asks for one pass a frame (rt::d3d12::refresh_title_textures), which runs
+    // on the fill worker: reading, hashing and detiling tens of MiB a frame on the present thread took the world load
+    // from 30 to 3-6 frames a second. placed_mutex_ is held only to pick and update an entry, never over the read,
+    // so the title's view creation (placed_texture) does not wait on a pass.
     void refresh_placed_textures() {
+        {
+            std::lock_guard lock(placed_mutex_);
+            if (pending_fills_.empty()) return;
+            if (!fill_worker_.joinable())
+                fill_worker_ = std::thread([this] { fill_worker_loop(); });
+            fill_requested_ = true;
+        }
+        fill_cv_.notify_one();
+    }
+
+    void stop_fill_worker() {
+        {
+            std::lock_guard lock(placed_mutex_);
+            fill_stop_ = true;
+        }
+        fill_cv_.notify_one();
+        if (fill_worker_.joinable()) fill_worker_.join();
+    }
+
+    void fill_worker_loop() {
+        for (;;) {
+            {
+                std::unique_lock lock(placed_mutex_);
+                fill_cv_.wait(lock, [this] { return fill_stop_ || fill_requested_; });
+                if (fill_stop_) return;
+                fill_requested_ = false;
+            }
+            refresh_pass();
+        }
+    }
+
+    // A word-wise FNV-1a style hash: eight bytes a step, so watching a texture costs a fraction of reading it.
+    static std::uint64_t hash_bytes(const std::vector<std::byte>& bytes) {
+        std::uint64_t hash = 1469598103934665603ull;
+        const std::size_t words = bytes.size() / 8;
+        const std::byte* p = bytes.data();
+        for (std::size_t i = 0; i < words; ++i) {
+            std::uint64_t w;
+            std::memcpy(&w, p + i * 8, 8);
+            hash = (hash ^ w) * 1099511628211ull;
+            hash ^= hash >> 29;
+        }
+        for (std::size_t i = words * 8; i < bytes.size(); ++i) hash = (hash ^ std::uint64_t(p[i])) * 1099511628211ull;
+        return hash | 1;  // never 0, which means "never read"
+    }
+
+    void refresh_pass() {
         constexpr std::uint64_t kBudget = std::uint64_t(64) << 20;
         constexpr unsigned kSettled = 6;
-        std::lock_guard lock(placed_mutex_);
-        if (pending_fills_.empty()) return;
         std::uint64_t read_bytes = 0;
         std::vector<std::byte> bytes;
-        for (std::size_t visited = 0; visited < pending_fills_.size() && read_bytes < kBudget; ++visited) {
-            if (next_fill_ >= pending_fills_.size()) next_fill_ = 0;
-            PlacedFill& f = pending_fills_[next_fill_];
+        std::size_t count = 0;
+        {
+            std::lock_guard lock(placed_mutex_);
+            count = pending_fills_.size();
+        }
+        for (std::size_t visited = 0; visited < count && read_bytes < kBudget; ++visited) {
+            PlacedFill f;
+            {
+                std::lock_guard lock(placed_mutex_);
+                if (fill_stop_ || pending_fills_.empty()) return;
+                if (next_fill_ >= pending_fills_.size()) next_fill_ = 0;
+                f = pending_fills_[next_fill_];
+            }
+            // Writes an entry's new state back by its texture (the list may have grown or shrunk meanwhile).
+            const auto update = [&](bool settle, std::uint64_t hash, bool changed) {
+                std::lock_guard lock(placed_mutex_);
+                for (std::size_t i = 0; i < pending_fills_.size(); ++i) {
+                    if (pending_fills_[i].texture != f.texture) continue;
+                    if (settle) {
+                        pending_fills_.erase(pending_fills_.begin() + std::ptrdiff_t(i));
+                        if (next_fill_ > i) --next_fill_;
+                    } else {
+                        pending_fills_[i].hash = hash;
+                        pending_fills_[i].unchanged = changed ? 0 : pending_fills_[i].unchanged + 1;
+                        next_fill_ = i + 1;
+                    }
+                    return;
+                }
+            };
             const std::uint64_t size = placed_bytes(f);
             if (!size) {  // a layout this layer does not read: nothing to watch
-                pending_fills_.erase(pending_fills_.begin() + std::ptrdiff_t(next_fill_));
+                update(true, 0, false);
                 continue;
             }
             bytes.resize(std::size_t(size));
@@ -10123,21 +10247,17 @@ public:
                                                  reinterpret_cast<const void*>(static_cast<std::uintptr_t>(f.address)),
                                                  bytes.data(), bytes.size(), &got) && got == bytes.size();
             if (!there) {  // not all committed yet: try again later
-                ++next_fill_;
+                update(false, f.hash, true);
                 continue;
             }
-            std::uint64_t hash = 1469598103934665603ull;
-            for (const std::byte b : bytes) hash = (hash ^ std::uint64_t(b)) * 1099511628211ull;
-            hash |= 1;  // never 0, which means "never read"
+            const std::uint64_t hash = hash_bytes(bytes);
             if (hash != f.hash) {
-                fill_from_title(*f.texture, f.address, f.desc, f.layout);
-                f.hash = hash;
-                f.unchanged = 0;
-                ++next_fill_;
-            } else if (++f.unchanged >= kSettled) {
-                pending_fills_.erase(pending_fills_.begin() + std::ptrdiff_t(next_fill_));
+                fill_from_title(*f.texture, f.address, f.desc, f.layout, &bytes);
+                update(false, hash, true);
+            } else if (f.unchanged + 1 >= kSettled) {
+                update(true, hash, false);
             } else {
-                ++next_fill_;
+                update(false, hash, false);
             }
         }
     }
@@ -10190,8 +10310,9 @@ public:
     // Series S with LEONIDA_DEVICE_TYPE=6). Not read, logged once each, and the texture starts zeroed: other XOR modes,
     // multisampled and depth/stencil textures, formats the console layout does not know, and a texture whose memory is
     // not all there.
+    // `preread`: the tiled bytes when the caller has just read them (refresh_pass), so they are not read twice.
     void fill_from_title(Resource& texture, std::uint64_t address, const D3D12_RESOURCE_DESC& desc,
-                         std::uint32_t xbox_layout) {
+                         std::uint32_t xbox_layout, const std::vector<std::byte>* preread = nullptr) {
         namespace g = leonida::gfx10;
         const D3D12_RESOURCE_DESC& made = texture.desc();  // the mip count resolved
         const bool depth = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -10235,11 +10356,15 @@ public:
             return;
         }
         const g::TextureLayout& layout = console.planes[0].layout;
-        std::vector<std::byte> tiled(std::size_t(layout.size()));
+        std::vector<std::byte> own;
+        const bool have = preread && preread->size() == std::size_t(layout.size());
+        if (!have) own.resize(std::size_t(layout.size()));
+        const std::vector<std::byte>& tiled = have ? *preread : own;
         SIZE_T read = 0;
-        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
-                               tiled.data(), tiled.size(), &read) ||
-            read != tiled.size()) {
+        if (!have && (!ReadProcessMemory(GetCurrentProcess(),
+                                         reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
+                                         own.data(), own.size(), &read) ||
+                      read != own.size())) {
             log_once("a texture the title placed lies in memory that is not all there; it starts zeroed, KiB",
                      int(std::min<std::size_t>(tiled.size() >> 10, INT_MAX)));
             return;
@@ -12254,6 +12379,10 @@ private:
     std::map<PlacedKey, Resource*> placed_textures_;  // one reference each; null: could not be made
     std::vector<PlacedFill> pending_fills_;  // guarded by placed_mutex_
     std::size_t next_fill_ = 0;              // round-robin position in pending_fills_
+    std::thread fill_worker_;                // refresh_placed_textures' passes; started with the first pending fill
+    std::condition_variable fill_cv_;        // with placed_mutex_
+    bool fill_requested_ = false;            // guarded by placed_mutex_
+    bool fill_stop_ = false;                 // guarded by placed_mutex_
     struct UploadBlock {
         std::uint8_t* base;
         std::uint64_t size;

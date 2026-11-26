@@ -2929,15 +2929,265 @@ HRESULT refuse_console_device(unsigned slot, bool open, std::uint64_t a1, std::u
 // Console device slot 57 (V device.rs:349-400): a pipeline creation, (description, riid, out), that nobody has
 // written. Refused with the output nulled, as VIctory does: S_OK without a pipeline would hand the title whatever its
 // stack held as an object, and on a failure the title goes without that pipeline.
+// LEONIDA_CAPTURE_SLOT57=<folder> (diagnostic): the parts of the first 400 slot-57 descriptions, each pair of the
+// description's words 1..32 that names a readable blob, saved as <call>-w<word>.bin, so the graphics pipelines the
+// title deserializes can be read offline. They are the title's bytes: the folder stays on the player's machine.
+void capture_slot57(std::uint64_t desc, unsigned call) {
+    static const std::string folder = [] {
+        char buf[MAX_PATH] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_CAPTURE_SLOT57", buf, sizeof buf);
+        return n && n < sizeof buf ? std::string(buf) : std::string();
+    }();
+    if (folder.empty() || call > 400 || !desc) return;
+    std::uint64_t d[33] = {};
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(desc), d, sizeof d, &got) ||
+        got != sizeof d)
+        return;
+    const auto write = [&](const std::string& name, const void* data, std::size_t size) {
+        if (FILE* f = std::fopen((folder + "\\" + name).c_str(), "wb")) {
+            std::fwrite(data, 1, size, f);
+            std::fclose(f);
+        }
+    };
+    write(std::to_string(call) + "-desc.bin", d, sizeof d);
+    for (unsigned i = 1; i + 1 < 33; i += 2) {
+        if (d[i] < 0x10000 || d[i + 1] == 0 || d[i + 1] > 0x1000000) continue;
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(d[i + 1]));
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(d[i]), bytes.data(), bytes.size(),
+                               &got) || got != bytes.size())
+            continue;
+        write(std::to_string(call) + "-w" + std::to_string(i) + ".bin", bytes.data(), bytes.size());
+    }
+}
+
+// ---- Console device slot 57: a graphics pipeline from native GPU code (the graphics side of slot 67) ------------
+//
+// The title deserializes its graphics pipelines here, (desc, riid, out), from title+0x2477578 in a worker job, and
+// draws everything past the start screen with them. Measured over the first 400 descriptions of a 1.0.2.1 boot
+// (docs/fspx.md, "Graphics pipelines"): +0x00 the root signature, then (pointer, size) pairs: +0x08 kind 0 (the
+// pipeline's register state, 0x17c-0x184 bytes), +0x18 kind 1 (the VS-PS semantic table, 0x98-0xbc bytes), +0x28
+// the pixel stage's program (kind 6, null in a depth-only pipeline: 4 of 400) and +0x38 its records (kind 7), +0x48
+// the vertex stage's program and +0x58 its records. The programs are bare kind-6 code with the FSPX prologue; the
+// vertex stage fetches its own vertices (buffer loads through s[8:9]) and exports pos0 and params, the pixel stage
+// reads them with v_interp.
+//
+// Kind 0 holds gfx10 context registers at fixed offsets (the census in docs/fspx.md): CB_BLEND0..7_CONTROL at
+// +0xd0, DB_DEPTH_CONTROL at +0xb8, DB_STENCIL_CONTROL at +0xbc, DB_STENCILREFMASK(_BF) at +0xc0/+0xc4 and, read as
+// PA_SU_SC_MODE_CNTL, +0x84. No attachment format is in it: the hardware takes those from the bound targets, so the
+// pipeline is made with rt::d3d12::kPipelineFormatsFromTargets and built per format set at draw time.
+namespace console_pso {
+
+// rt::d3d12::kPipelineFormatsFromTargets (d3d12_com.h, which this file includes only with the Vulkan device).
+constexpr UINT kFormatsFromTargets = 0x40000000u;
+#ifdef LEONIDA_VULKAN_DEVICE
+static_assert(kFormatsFromTargets == rt::d3d12::kPipelineFormatsFromTargets);
+#endif
+
+D3D12_BLEND blend_factor(std::uint32_t amd) {
+    static constexpr D3D12_BLEND map[] = {
+        D3D12_BLEND_ZERO,           D3D12_BLEND_ONE,           D3D12_BLEND_SRC_COLOR,      D3D12_BLEND_INV_SRC_COLOR,
+        D3D12_BLEND_SRC_ALPHA,      D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA,     D3D12_BLEND_INV_DEST_ALPHA,
+        D3D12_BLEND_DEST_COLOR,     D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ONE,
+        D3D12_BLEND_ONE,            D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC1_COLOR,
+        D3D12_BLEND_INV_SRC1_COLOR, D3D12_BLEND_SRC1_ALPHA,    D3D12_BLEND_INV_SRC1_ALPHA, D3D12_BLEND_ALPHA_FACTOR,
+        D3D12_BLEND_INV_ALPHA_FACTOR};
+    return amd < std::size(map) ? map[amd] : D3D12_BLEND_ONE;
+}
+
+D3D12_BLEND_OP blend_op(std::uint32_t amd) {
+    switch (amd) {
+    case 1: return D3D12_BLEND_OP_SUBTRACT;      // COMB_SRC_MINUS_DST
+    case 2: return D3D12_BLEND_OP_MIN;
+    case 3: return D3D12_BLEND_OP_MAX;
+    case 4: return D3D12_BLEND_OP_REV_SUBTRACT;  // COMB_DST_MINUS_SRC
+    default: return D3D12_BLEND_OP_ADD;          // COMB_DST_PLUS_SRC
+    }
+}
+
+D3D12_STENCIL_OP stencil_op(std::uint32_t amd) {
+    switch (amd) {
+    case 1: return D3D12_STENCIL_OP_ZERO;
+    case 2: case 3: case 4: return D3D12_STENCIL_OP_REPLACE;  // ONES, REPLACE_TEST, REPLACE_OP
+    case 5: return D3D12_STENCIL_OP_INCR_SAT;                 // ADD_CLAMP
+    case 6: return D3D12_STENCIL_OP_DECR_SAT;                 // SUB_CLAMP
+    case 7: return D3D12_STENCIL_OP_INVERT;
+    case 8: return D3D12_STENCIL_OP_INCR;                     // ADD_WRAP
+    case 9: return D3D12_STENCIL_OP_DECR;                     // SUB_WRAP
+    default: return D3D12_STENCIL_OP_KEEP;
+    }
+}
+
+// AMD's compare functions are D3D12's minus one (NEVER 0 .. ALWAYS 7).
+D3D12_COMPARISON_FUNC compare(std::uint32_t amd) { return D3D12_COMPARISON_FUNC((amd & 7) + 1); }
+
+bool enabled(const char* name, bool fallback) {
+    char text[8] = {};
+    const DWORD n = GetEnvironmentVariableA(name, text, sizeof text);
+    if (!n || n >= sizeof text) return fallback;
+    return text[0] != '0';
+}
+
+}  // namespace console_pso
+
+HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::uint64_t desc_word, const IID* riid,
+                                                        void** out) {
+    note_slot(57);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!riid) return E_POINTER;
+    if (!desc_word) return E_INVALIDARG;
+    static std::atomic<unsigned> calls{0};
+    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    capture_slot57(desc_word, call);
+    // LEONIDA_CONSOLE_PIPELINES=0: refused as before (the title goes without them).
+    static const bool on = console_pso::enabled("LEONIDA_CONSOLE_PIPELINES", true);
+    if (!on) return E_NOTIMPL;
+    struct Pair {
+        const void* data;
+        std::uint64_t size;
+    };
+    struct Desc {
+        ID3D12RootSignature* root_signature;
+        Pair state, semantics, ps, ps_records, vs, vs_records;
+    };
+    const auto* d = reinterpret_cast<const Desc*>(desc_word);
+    const auto fail = [&](const char* why) {
+        static std::atomic<unsigned> failures{0};
+        const unsigned n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 pipeline %u refused: %s (%u so far)\n", call, why, n);
+        return E_INVALIDARG;
+    };
+    if (!d->root_signature) return fail("no root signature");
+    if (!d->vs.data || !d->vs.size) return fail("no vertex stage");
+    if (!d->state.data || d->state.size < 0xf0 || d->state.size > 0x1000) return fail("kind 0 is not the expected size");
+    std::uint32_t w[0x1000 / 4] = {};
+    std::memcpy(w, d->state.data, static_cast<std::size_t>(d->state.size) & ~std::size_t(3));
+    const auto reg = [&](std::uint32_t offset) { return w[offset / 4]; };
+
+    // Each stage goes to the device as one FSPX payload (kinds 0, 1, 6, 7), which its graphics path takes apart:
+    // the kind-6 bytes are the key and the code base (d3d12_vulkan_device.cpp, create_graphics).
+    const auto payload = [&](const Pair& code, const Pair& records) {
+        const leonida::FspxPart parts[] = {{0, d->state.data, d->state.size},
+                                           {1, d->semantics.data, d->semantics.size},
+                                           {6, code.data, code.size},
+                                           {7, records.data, records.size}};
+        return leonida::fspx_payload_from_parts(parts);
+    };
+    const std::vector<std::uint8_t> vs = payload(d->vs, d->vs_records);
+    const std::vector<std::uint8_t> ps = d->ps.data && d->ps.size ? payload(d->ps, d->ps_records)
+                                                                  : std::vector<std::uint8_t>{};
+    if (vs.empty() || (d->ps.data && d->ps.size && ps.empty())) return fail("a stage's parts are inconsistent");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
+    pc.pRootSignature = d->root_signature;
+    pc.VS = {vs.data(), vs.size()};
+    if (!ps.empty()) pc.PS = {ps.data(), ps.size()};
+    pc.BlendState.IndependentBlendEnable = TRUE;
+    for (unsigned i = 0; i < 8; ++i) {
+        const std::uint32_t b = reg(0xd0 + 4 * i);  // CB_BLENDi_CONTROL
+        D3D12_RENDER_TARGET_BLEND_DESC& t = pc.BlendState.RenderTarget[i];
+        t.BlendEnable = (b >> 30) & 1;
+        t.SrcBlend = console_pso::blend_factor(b & 31);
+        t.BlendOp = console_pso::blend_op((b >> 5) & 7);
+        t.DestBlend = console_pso::blend_factor((b >> 8) & 31);
+        const bool separate = (b >> 29) & 1;
+        t.SrcBlendAlpha = separate ? console_pso::blend_factor((b >> 16) & 31) : t.SrcBlend;
+        t.BlendOpAlpha = separate ? console_pso::blend_op((b >> 21) & 7) : t.BlendOp;
+        t.DestBlendAlpha = separate ? console_pso::blend_factor((b >> 24) & 31) : t.DestBlend;
+        t.LogicOp = D3D12_LOGIC_OP_NOOP;
+        t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    pc.SampleMask = UINT_MAX;
+    // PA_SU_SC_MODE_CNTL: CULL_FRONT bit 0, CULL_BACK bit 1, FACE bit 2 (1: clockwise is front). Culling is off unless
+    // LEONIDA_CONSOLE_CULL=1 until the reading is confirmed on screen: a wrong one would hide the world.
+    static const bool cull = console_pso::enabled("LEONIDA_CONSOLE_CULL", false);
+    const std::uint32_t mode = reg(0x84);
+    pc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pc.RasterizerState.CullMode = !cull ? D3D12_CULL_MODE_NONE
+                                  : (mode & 2) ? D3D12_CULL_MODE_BACK
+                                  : (mode & 1) ? D3D12_CULL_MODE_FRONT
+                                               : D3D12_CULL_MODE_NONE;
+    pc.RasterizerState.FrontCounterClockwise = !((mode >> 2) & 1);
+    pc.RasterizerState.DepthClipEnable = TRUE;
+    // DB_DEPTH_CONTROL: STENCIL_ENABLE 0, Z_ENABLE 1, Z_WRITE_ENABLE 2, ZFUNC 6:4, BACKFACE_ENABLE 7, STENCILFUNC
+    // 10:8, STENCILFUNC_BF 22:20. DB_STENCIL_CONTROL: front FAIL/ZPASS/ZFAIL in 4-bit fields from bit 0, the back
+    // face's from bit 12. DB_STENCILREFMASK: test mask 15:8, write mask 23:16.
+    const std::uint32_t depth = reg(0xb8), stencil = reg(0xbc), refmask = reg(0xc0);
+    D3D12_DEPTH_STENCIL_DESC& ds = pc.DepthStencilState;
+    ds.DepthEnable = (depth >> 1) & 1;
+    ds.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    ds.DepthFunc = console_pso::compare(depth >> 4);
+    ds.StencilEnable = depth & 1;
+    ds.StencilReadMask = static_cast<UINT8>(refmask >> 8);
+    ds.StencilWriteMask = static_cast<UINT8>(refmask >> 16);
+    ds.FrontFace = {console_pso::stencil_op(stencil & 15), console_pso::stencil_op((stencil >> 8) & 15),
+                    console_pso::stencil_op((stencil >> 4) & 15), console_pso::compare(depth >> 8)};
+    if ((depth >> 7) & 1)
+        ds.BackFace = {console_pso::stencil_op((stencil >> 12) & 15), console_pso::stencil_op((stencil >> 20) & 15),
+                       console_pso::stencil_op((stencil >> 16) & 15), console_pso::compare(depth >> 20)};
+    else
+        ds.BackFace = ds.FrontFace;
+    pc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pc.NumRenderTargets = 8;  // formats from the targets each draw binds
+    pc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    pc.SampleDesc = {1, 0};
+    pc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(console_pso::kFormatsFromTargets);
+    const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc, *riid, out);
+    if (FAILED(hr)) {
+        if (out) *out = nullptr;
+        static std::atomic<unsigned> failures{0};
+        const unsigned n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 pipeline %u: the device refused it (0x%08lx, %u so far)\n",
+                         call, static_cast<unsigned long>(hr), n);
+    } else {
+        static std::atomic<unsigned> made{0};
+        const unsigned n = made.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %u console graphics pipelines made\n", n);
+    }
+    return hr;
+}
+
 HRESULT refuse_unknown_pipeline(unsigned slot, std::uint64_t desc, std::uint64_t riid, std::uint64_t out_word) {
     if (auto** out = reinterpret_cast<void**>(out_word)) *out = nullptr;
     static std::atomic<unsigned> calls{0};
     const unsigned call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (call <= 4 || (call & (call - 1)) == 0)
+    if (call <= 4 || (call & (call - 1)) == 0) {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: device slot %u (a console pipeline creation, not implemented) call %u refused "
                      "(description 0x%llx, riid 0x%llx); the title goes without that pipeline\n",
                      slot, call, static_cast<unsigned long long>(desc), static_cast<unsigned long long>(riid));
+        // As VIctory logs them (V device.rs:372-392): the description's first 16 words and those its first word
+        // points at, read through the kernel since neither is known to be mapped, so the method can be written.
+        const auto words = [](std::uint64_t at, std::uint64_t* out, std::size_t n) {
+            SIZE_T got = 0;
+            return at && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), out, n * 8,
+                                           &got) && got == n * 8;
+        };
+        std::uint64_t d[40] = {};
+        if (call <= 8 && words(desc, d, 40)) {
+            std::string line;
+            char part[24];
+            for (const std::uint64_t w : d) {
+                std::snprintf(part, sizeof part, " %llx", static_cast<unsigned long long>(w));
+                line += part;
+            }
+            std::fprintf(stderr, "[rt] d3d12_xs: slot %u description:%s\n", slot, line.c_str());
+            // The first 4 words of each blob a (pointer, size) pair of the description names.
+            for (unsigned i = 1; i + 1 < 40; i += 2) {
+                std::uint64_t head[4] = {};
+                if (d[i] < 0x10000 || d[i + 1] == 0 || d[i + 1] > 0x1000000 || !words(d[i], head, 4)) continue;
+                std::fprintf(stderr, "[rt] d3d12_xs: slot %u   word %u blob 0x%llx size 0x%llx: %016llx %016llx %016llx "
+                                     "%016llx\n", slot, i, static_cast<unsigned long long>(d[i]),
+                             static_cast<unsigned long long>(d[i + 1]), static_cast<unsigned long long>(head[0]),
+                             static_cast<unsigned long long>(head[1]), static_cast<unsigned long long>(head[2]),
+                             static_cast<unsigned long long>(head[3]));
+            }
+        }
+    }
     return E_NOTIMPL;
 }
 
@@ -3262,6 +3512,9 @@ __forceinline std::uint64_t device_call(DeviceProxy* self, std::uint64_t a1, std
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));
     } else if constexpr (M == DeviceMethod::unknown_pipeline) {
+        if constexpr (Slot == 57)
+            return hr_to_u64(proxy_create_graphics_pipeline_from_native_code(
+                self, a1, reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
         note_slot(Slot);
         return hr_to_u64(refuse_unknown_pipeline(Slot, a1, a2, a3));
     } else if constexpr (M == DeviceMethod::compute_pso_x) {

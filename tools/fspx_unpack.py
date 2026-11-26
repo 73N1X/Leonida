@@ -160,7 +160,7 @@ def psv_stage(container_parts: dict):
     return psv[4 + 24] if size > 24 and len(psv) > 4 + 24 else None
 
 
-def unpack_payload(payload: bytes):
+def unpack_payload(payload: bytes, graphics: bool = False):
     status, entries = parse_fspx(payload)
     if status:
         return None, status
@@ -170,9 +170,95 @@ def unpack_payload(payload: bytes):
         "version": struct.unpack_from("<I", payload, 4)[0],
         "directory": {str(k): [o, s] for k, (o, s) in sorted(entries.items())},
         "code": {"start": start, "end": end, "prologue": start == PROLOGUE_SIZE},
-        **decode_kind0(blob[0]),
     }
+    if graphics:
+        # A console pipeline's kind 0 is its register state, not a dispatch state: kept as words, and no wave32
+        # field, so the translator takes the wave size from the code (docs/fspx.md, "Graphics pipelines").
+        meta["graphics_state_words"] = list(struct.unpack_from(f"<{len(blob[0]) // 4}I", blob[0]))
+    else:
+        meta.update(decode_kind0(blob[0]))
     return (meta, blob), 0
+
+
+# A payload the runtime saved from a console graphics pipeline (device slot 57) is named <kind-6 sha256>-<stage>.fspx.
+GRAPHICS_STAGES = ("vs", "ps")
+
+
+def graphics_stage(stem: str):
+    """'vs' or 'ps' for a captured console pipeline stage's file stem, else None."""
+    head, _, tail = stem.rpartition("-")
+    return tail if head and tail in GRAPHICS_STAGES else None
+
+
+VGPR_RE = None
+
+
+def ps_position_reads(listing: str) -> int:
+    """How many SV_Position components a console pixel program reads: the highest of v2..v5 it reads before writing
+    them, walking the listing in order (a straight-line approximation of the translator's own check). The hardware
+    puts the enabled components there in order after the v0/v1 barycentrics (docs/design.md, pixel-shader system
+    VGPRs), so reading v3 means x and y are there."""
+    import re
+    global VGPR_RE
+    if VGPR_RE is None:
+        VGPR_RE = re.compile(r"\bv(\d+)\b|\bv\[(\d+):(\d+)\]")
+    written, highest = set(), 1
+    read_only = ("exp", "buffer_store", "global_store", "ds_write", "image_store", "tbuffer_store", "scratch_store",
+                 "flat_store", "s_", "v_cmp", "v_readlane", "v_readfirstlane")
+    for line in listing.splitlines():
+        text = line.split(";", 1)[0].strip()
+        if not text or text.endswith(":"):
+            continue
+        op, _, rest = text.partition(" ")
+        regs = []
+        for m in VGPR_RE.finditer(rest):
+            if m.group(1) is not None:
+                regs.append([int(m.group(1))])
+            else:
+                regs.append(list(range(int(m.group(2)), int(m.group(3)) + 1)))
+        if not regs:
+            continue
+        dest = [] if op.startswith(read_only) else regs[0]
+        sources = regs if not dest else regs[1:]
+        if op.startswith("v_interp"):
+            sources = []  # the barycentric operand is v0/v1, modelled through v_interp
+        for group in sources:
+            for r in group:
+                if 2 <= r <= 5 and r not in written:
+                    highest = max(highest, r)
+        written.update(dest)
+    return highest - 1
+
+
+def signature_part(elements) -> bytes:
+    """An ISG1/OSG1 part payload: (semantic, index, system value, register, mask, rw mask) per element."""
+    head = struct.pack("<II", len(elements), 8)
+    names, table = b"", b""
+    base = 8 + 32 * len(elements)
+    for semantic, index, sysv, reg, mask, rw in elements:
+        table += struct.pack("<IIIIII", 0, base + len(names), index, sysv, 3, reg) + bytes([mask, rw, 0, 0]) + b"\0" * 4
+        names += semantic.encode() + b"\0"
+    return head + table + names
+
+
+def synthetic_container(stage: str, listing: str) -> bytes:
+    """A DXBC container holding only the signatures the translator reads for a console program, which comes without
+    one: a vertex program's are empty (it fetches its own vertices, and pos0 is SV_Position), a pixel program's input
+    declares the SV_Position components it reads (ps_position_reads); without an OSG1, export mrtN is render target
+    N (rdna2spirv)."""
+    inputs = []
+    if stage == "ps":
+        n = ps_position_reads(listing)
+        if n > 0:
+            inputs.append(("SV_Position", 0, 1, 0, 0xF, (1 << n) - 1))
+    parts = [(b"ISG1", signature_part(inputs)), (b"OSG1", signature_part([]))]
+    offset = 32 + 4 * len(parts)
+    offsets, body = [], b""
+    for tag, payload in parts:
+        offsets.append(offset + len(body))
+        body += tag + struct.pack("<I", len(payload)) + payload
+    total = offset + len(body)
+    return DXBC + b"\0" * 16 + struct.pack("<III", 1, total, len(parts)) + struct.pack(f"<{len(parts)}I", *offsets) + body
 
 
 def main(argv=None) -> int:
@@ -180,6 +266,9 @@ def main(argv=None) -> int:
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads, or a folder of .fspx payloads (the runtime's captured programs, docs/fspx.md)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
+    ap.add_argument("--only", choices=("all", "compute", "graphics"), default="all",
+                    help="for a folder: only its compute payloads, or only its console graphics stages "
+                         "(<code>-vs.fspx / <code>-ps.fspx)")
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
@@ -218,8 +307,12 @@ def main(argv=None) -> int:
             # A folder holds payloads the runtime saved (<code sha256>-<state sha256>.fspx); unfinished .part files
             # are left out. Sorted, so the same folder gives the same names on every platform.
             with os.scandir(path) as entries:
-                inputs.extend(sorted(e.path for e in entries
-                                     if e.name.endswith(".fspx") and e.is_file(follow_symlinks=False)))
+                found = sorted(e.path for e in entries if e.name.endswith(".fspx") and e.is_file(follow_symlinks=False))
+            if a.only != "all":
+                want = a.only == "graphics"
+                found = [p for p in found
+                         if (graphics_stage(os.path.splitext(os.path.basename(p))[0]) is not None) == want]
+            inputs.extend(found)
         else:
             inputs.append(path)
     for path in inputs:
@@ -239,9 +332,10 @@ def main(argv=None) -> int:
             print(f"{path}: no FSPX payload found", file=sys.stderr)
             bad += 1
             continue
+        gstage = graphics_stage(stem) if data[:4] == MAGIC else None
         for n, (off, container, payload) in enumerate(items):
             name = f"{stem}_{n:02d}" if len(items) > 1 else stem
-            got, status = unpack_payload(payload)
+            got, status = unpack_payload(payload, graphics=gstage is not None)
             if not got:
                 print(f"{name}: FSPX status {status}", file=sys.stderr)
                 bad += 1
@@ -257,6 +351,8 @@ def main(argv=None) -> int:
             meta["source"] = {"file": os.path.basename(path), "offset": off}
             entry = {"file": name + ".dxbc", "stage": "cs" if stage in (None, STAGE_COMPUTE) else f"psv{stage}",
                      "source_offset": off}
+            if gstage:
+                entry["stage"] = gstage
             if "threads" in meta:
                 entry["threads"] = meta["threads"]
             if "wave32" in meta:
@@ -274,6 +370,9 @@ def main(argv=None) -> int:
                 listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
                 if err.strip():
                     listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
+            if gstage and container is None:
+                # The translator reads a graphics program's signatures from a container beside it.
+                container = synthetic_container(gstage, listing or "")
             if container:
                 with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
                     f.write(container)
