@@ -238,8 +238,11 @@ int wmain(int argc, wchar_t** argv) {
     char title_memory_mode[16] = {};
     const DWORD title_memory_length =
         GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY", title_memory_mode, sizeof(title_memory_mode));
-    const bool sparse_title_memory = title_memory_length && title_memory_length < sizeof(title_memory_mode) &&
-                                     std::strcmp(title_memory_mode, "sparse") == 0;
+    // Sparse is the default (the imports path loses the device on the title, docs/port_status.md); "imports" or "0"
+    // keep xmem reporting visible ranges. A device whose sparse self-test fails takes mapped pages as visible ranges.
+    const bool title_memory_named = title_memory_length && title_memory_length < sizeof(title_memory_mode);
+    const bool sparse_title_memory = !title_memory_named || (std::strcmp(title_memory_mode, "imports") != 0 &&
+                                                             std::strcmp(title_memory_mode, "0") != 0);
     using Mapped = void (*)(std::uintptr_t, std::size_t, const void*);
     using Pool = void (*)(const void*, std::size_t, bool);
     static const Mapped mapped = [](std::uintptr_t start, std::size_t size, const void* backing) {

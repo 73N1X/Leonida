@@ -9898,7 +9898,9 @@ public:
         char mode[16] = {};
         size_t mode_length = 0;
         if (getenv_s(&mode_length, mode, "LEONIDA_TITLE_MEMORY") != 0) mode_length = 0;
-        const bool want_sparse = mode_length > 1 && std::strcmp(mode, "sparse") == 0;
+        // Sparse unless "imports" is asked for: on the title the imports path re-imports ranges as pages are mapped and
+        // the GPU loses the device about 26 s in (docs/port_status.md); sparse runs on.
+        const bool want_sparse = !(mode_length > 1 && std::strcmp(mode, "imports") == 0);
         if (!state_.title_memory) {
             if (want_sparse)
                 std::fprintf(stderr, "[rt] d3d12: title memory: LEONIDA_TITLE_MEMORY=sparse asked for, but the device "
