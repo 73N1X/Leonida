@@ -2001,7 +2001,7 @@ class Gen:
                 self.uses_active = True
             elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
                 self.emit(f"OpStore %vcc {r}")
-            elif dst["k"] == "sgpr":
+            elif dst["k"] == "sgpr" or (dst["k"] == "special" and dst["t"] == "vcc_hi" and not self.wave64):
                 self.mask_dst(dst, r)
             else:
                 raise Unsupported("v_cmp destination")
@@ -2059,7 +2059,7 @@ class Gen:
             self.uses_active = True
         elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {r}")
-        elif dst["k"] == "sgpr":
+        elif dst["k"] == "sgpr" or (dst["k"] == "special" and dst["t"] == "vcc_hi" and not self.wave64):
             self.mask_dst(dst, r)
         else:
             raise Unsupported("v_cmp destination")
@@ -6574,6 +6574,12 @@ class Gen:
             return r
         if a["k"] == "special" and a["t"] == "null":
             return self.cu(0)
+        if a["k"] == "special" and a["t"] == "vcc_hi" and not self.wave64:
+            # wave32: vcc_hi is an ordinary SGPR; a compare that wrote its mask there (mask_dst) left this lane's 0 or
+            # ~0 in %vcc_hi.
+            v = self.tmp()
+            self.emit(f"{v} = OpLoad %uint %vcc_hi")
+            return v
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
@@ -6692,6 +6698,10 @@ class Gen:
                 self.store_reg("sgpr", d["r"] + 1, v)
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {v}")
+        elif d["k"] == "special" and d["t"] == "vcc_hi" and not self.wave64:
+            # wave32: vcc_hi is an ordinary SGPR, read back as data (%vcc_hi); the console compiler puts compare
+            # masks there (5,907 VOP3 compares in the captured compute programs). A wave64 mask needs a pair.
+            self.emit(f"OpStore %vcc_hi {v}")
         else:
             raise Unsupported("mask destination")
 
