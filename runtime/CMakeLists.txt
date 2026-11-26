@@ -1471,6 +1471,20 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  # The rectangle-list geometry stage (src/rect_list_gs.h) as a command: tests/test_rect_list_gs.py assembles vertex
+  # shaders, runs the generator on them and checks on the CPU what the stage emits. No GPU.
+  add_executable(rect_list_gs_tool test/rect_list_gs_tool.cpp src/rect_list_gs.cpp)
+  target_link_libraries(rect_list_gs_tool PRIVATE Vulkan::Headers)
+  if(MSVC)
+    target_compile_options(rect_list_gs_tool PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND)
+    add_test(NAME rect_list_gs COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_rect_list_gs.py")
+    set_tests_properties(rect_list_gs PROPERTIES
+                         ENVIRONMENT "LEONIDA_RECT_LIST_GS_TOOL=$<TARGET_FILE:rect_list_gs_tool>")
+  endif()
   # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -1745,7 +1759,7 @@ if(TARGET Vulkan::Headers)
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
-                shims/dxgi_com.cpp shims/xbox_display.cpp shims/xbox_window.cpp
+                shims/dxgi_com.cpp shims/xbox_display.cpp shims/xbox_window.cpp src/rect_list_gs.cpp
                 ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
@@ -2963,6 +2977,15 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
+      # Rectangle lists (topology type 19): the generated geometry stage (src/rect_list_gs.h) draws whole rectangles.
+      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_rect_list_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_rect_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_rect_list_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_rect_list COMMAND d3d12_rect_list_test)
+      set_tests_properties(d3d12_rect_list PROPERTIES SKIP_RETURN_CODE 77)
       # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
       # (src/depth24_fragment.h).
       set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)

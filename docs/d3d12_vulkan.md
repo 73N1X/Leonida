@@ -929,6 +929,16 @@ The compute path, end to end:
     standalone device enables where the GPU has it and reports in `VulkanDeviceInfo::features`; without it such a
     PSO is `E_NOTIMPL`. The PSO's topology type must be `TRIANGLE`, the GS's input (`E_INVALIDARG` otherwise). The
     push-constant range names the geometry stage only on such a device (`d3d12_geometry_test`).
+  - **Rectangle lists:** a PSO of D3D12.X topology type 19 (lists draw it with topology 17; the title's full-screen
+    passes and tiled lighting) gets a geometry stage of the runtime's own, generated from the VS's SPIR-V output
+    interface and cached per output signature (`src/rect_list_gs.h`, VIctory's rule from
+    `victory/crates/victory-shader/src/emit/rect.rs`), and takes triangle lists: each rectangle's three vertices
+    arrive as one triangle and leave as two, both led by the first vertex, with the fourth corner continued from the
+    other three. Without `geometryShader`, or for a VS the stage cannot be made for (no Position, a Layer or
+    ViewportIndex output, an output that is not a 32-bit scalar or vector), the PSO is `E_NOTIMPL` with a log; a
+    title GS with type 19 is `E_INVALIDARG`, as above. `tests/test_rect_list_gs.py` runs the generator through
+    `rect_list_gs_tool` and checks what the stage emits on the CPU; `d3d12_rect_list_test` draws three corner
+    orders on the GPU (RTX 4060 Ti, 616.64, also under the validation layer).
   - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
