@@ -387,6 +387,8 @@ class Gen:
         self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
+        self.fence_only_barriers = set()   # blocks whose s_barrier is a memory fence only (barriers_off_top)
+        self.cur_block_n = -1      # the block being emitted
         self.loop_limit = 0        # --loop-limit of this stage: passes per entry into a loop (0 = no cap)
         self.loop_edges = {}       # (block, successor) -> its loop's counter (%lc<k>): the counted edges
         self.loop_resets = {}      # block -> the counters it sets to 0: it is outside their loop, with an edge in
@@ -8875,6 +8877,10 @@ class Gen:
                 # The wave waits in the scheduler until every wave not done waits too (assemble).
                 self.emit("OpStore %x_bar %true")
                 self.x_split()
+                return
+            if self.cur_block_n in self.fence_only_barriers:
+                # Not every invocation may get here (barriers_off_top): order memory without waiting for the group.
+                self.emit(f"OpMemoryBarrier {self.cu(2)} {self.cu(0x108)}")
                 return
             self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x108)}")
         elif op == "v_readlane_b32":
@@ -18158,6 +18164,7 @@ def translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    g.fence_only_barriers = barriers_off_top(g, blocks, succ)
     g.loop_limit = LOOP_LIMITS.get(stage, 0)
     if g.loop_limit:
         # --loop-limit: a counter per loop (cfg_structure.loop_counters bounds every cycle, reducible or not), and the
@@ -18331,6 +18338,7 @@ def translate(path):
         in_tail = bool(plan is not None and n in plan["tail_blocks"])
         g.body = []
         g.block_label = f"%blk{n}"
+        g.cur_block_n = n
         g.x_marks = []
         g.x_dirty = set(plan["dirty_in"].get(n, ())) if g.emulate_inline else set()
         g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
@@ -18492,6 +18500,31 @@ def needs_barrier_rounds(g, blocks, succ):
     tree, _ = capped_tree(succ)         # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
+
+def barriers_off_top(g, blocks, succ):
+    """The blocks whose s_barrier not every invocation of the group may reach: outside the top level of the
+    structured tree (under a guard, in a loop, or anywhere in the dispatch loop). Where no barrier rounds or wave64
+    emulation meet them (a mesh shader; needs_barrier_rounds covers compute), such a barrier is a memory fence only,
+    as VIctory lowers it (victory-shader emit/lower.rs `fence_only`; VItoriaBr 911267c, "BAR.SYNC deadlocks in
+    wave32"): an OpControlBarrier some invocations never reach hangs an NVIDIA GPU (device lost, no fault address).
+    The fence keeps the memory ordering the console's s_waitcnt + s_barrier gives the waves that do arrive."""
+    if g.stage not in ("cs", "ms") or g.emulate or g.bar_rounds or g.drop_barriers:
+        return set()
+    with_barrier = set()
+    for n, blk in enumerate(blocks):
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op == "s_endpgm" or op in BRANCHES:
+                break
+            if op == "s_barrier":
+                with_barrier.add(n)
+                break
+    if not with_barrier:
+        return set()
+    tree, _ = capped_tree(succ)
+    top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
+    return with_barrier - top
+
 
 def interp_copy_sources(insns):
     """SHADER-177: the VGPRs a v_interp may name as its I/J barycentric source besides v0/v1, as
