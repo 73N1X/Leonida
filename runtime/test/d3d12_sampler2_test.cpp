@@ -396,6 +396,87 @@ int main() {
         const D3D12_SAMPLER_DESC2 any = desc2(border);
         device->CreateSampler2(&any, D3D12_CPU_DESCRIPTOR_HANDLE{0});
 
+        // Sampler slots are one S# each, 16 bytes, as on the console (VIctory descriptor.rs:1-7); views stay 32. A
+        // sampler written into a slot leaves its neighbours as they were, and a copy moves whole S#s.
+        EXPECT(device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) == 16);
+        EXPECT(device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) == 32);
+        EXPECT(slots.size == 16);
+        {
+            const D3D12_CPU_DESCRIPTOR_HANDLE a = slots.take(), b = slots.take(), c = slots.take();
+            EXPECT(b.ptr == a.ptr + 16 && c.ptr == b.ptr + 16);
+            device->CreateSampler(&regular, b);
+            EXPECT(slots.unwritten(a) && slots.unwritten(c) && words_of(slots.bytes(b)) == regular_words);
+            const D3D12_CPU_DESCRIPTOR_HANDLE d2 = slots.take(), e = slots.take(), f = slots.take();
+            device->CopyDescriptorsSimple(2, d2, a, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            EXPECT(slots.unwritten(d2) && words_of(slots.bytes(e)) == regular_words && slots.unwritten(f));
+        }
+
+        // Xbox device slot 61, CreateSamplerX: the console's 27-word description (VIctory sampler.rs), whose filter
+        // words are the S#'s own fields. Where D3D12 can say the same, the S# is CreateSampler's.
+        {
+            namespace g = leonida::gfx10;
+            const auto bits = [](float v) {
+                std::uint32_t u = 0;
+                std::memcpy(&u, &v, sizeof(u));
+                return u;
+            };
+            bool written = true;
+            const auto via_x = [&](const std::array<std::uint32_t, 27>& words) {
+                const D3D12_CPU_DESCRIPTOR_HANDLE h = slots.take();
+                written = rt::d3d12::create_sampler_x(device.p, words.data(), h.ptr) && written;
+                return slots.bytes(h);
+            };
+            std::array<std::uint32_t, 27> x{};
+            x[1] = 1;  // bilinear magnification
+            x[2] = 1;  // bilinear minification
+            x[3] = 2;  // linear mips
+            x[6] = x[7] = x[8] = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            x[10] = bits(1000.0f);
+            x[16] = D3D12_COMPARISON_FUNC_NEVER;
+            const D3D12_SAMPLER_DESC linear_clamp = sampler(D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                                                            D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+            EXPECT(via_x(x) == via1(linear_clamp));
+            // A real test makes a comparison sampler (LESS_EQUAL: compare 3 in the S#).
+            x[16] = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            auto compared = linear_clamp;
+            compared.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+            compared.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            EXPECT(via_x(x) == via1(compared));
+            EXPECT(g::decode(words_of(via_x(x))).compare == g::CompareFunction::less_equal);
+            // ALWAYS is no test: a plain sampler, with no NEVER mark.
+            x[16] = D3D12_COMPARISON_FUNC_ALWAYS;
+            const g::Sampler always = g::decode(words_of(via_x(x)));
+            EXPECT(always.compare == g::CompareFunction::never && !always.compare_never &&
+                   !g::vulkan_sampler(always).compareEnable);
+            // What D3D12 cannot say: anisotropic point minification under bilinear magnification, no mip filter, a
+            // maximum filter, wrap/mirror/border, a bias and an opaque white border.
+            x[1] = 1;
+            x[2] = 2;
+            x[3] = 0;
+            x[5] = 2;
+            x[6] = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            x[7] = D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+            x[8] = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+            x[9] = bits(1.5f);
+            x[10] = bits(7.0f);
+            x[11] = bits(-2.0f);
+            x[13] = 8;
+            x[16] = 0;
+            for (int i = 17; i < 21; ++i) x[i] = bits(1.0f);
+            const g::Sampler s = g::decode(words_of(via_x(x)));
+            EXPECT(s.mag_filter == g::Filter::bilinear && s.min_filter == g::Filter::aniso_point &&
+                   s.mip_filter == g::MipFilter::none && s.filter_mode == g::FilterMode::maximum);
+            EXPECT(s.max_anisotropy == 8 && s.address_u == g::AddressMode::wrap && s.address_v == g::AddressMode::mirror &&
+                   s.address_w == g::AddressMode::clamp_border && s.border_color == g::BorderColor::opaque_white);
+            EXPECT(s.min_lod == 1.5f && s.max_lod == 7.0f && s.lod_bias == -2.0f && s.compare == g::CompareFunction::never);
+            const VkSamplerCreateInfo vk = g::vulkan_sampler(s);
+            EXPECT(vk.anisotropyEnable && vk.maxAnisotropy == 8.0f && vk.magFilter == VK_FILTER_LINEAR &&
+                   vk.minFilter == VK_FILTER_NEAREST && vk.maxLod == 0.25f);
+            EXPECT(written);
+            // Not a Vulkan device: false, nothing written.
+            EXPECT(!rt::d3d12::create_sampler_x(nullptr, x.data(), slots.take().ptr));
+        }
+
         // D3D12_OPTIONS17: non-normalized samplers, no manual write tracking.
         D3D12_FEATURE_DATA_D3D12_OPTIONS17 ours17{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS17, &ours17, sizeof(ours17))));

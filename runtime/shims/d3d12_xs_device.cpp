@@ -1121,6 +1121,7 @@ private:
 
 std::atomic<const ListTitleHandlers*> g_list_title{nullptr};
 std::atomic<PlacedViewHandler> g_placed_view{nullptr};
+std::atomic<SamplerXHandler> g_sampler_x{nullptr};
 std::atomic<std::uint64_t> g_unmet_waits{0};
 
 // Reads the 32 or 64 bits at `address` without faulting on memory that is not there (false then).
@@ -1262,9 +1263,14 @@ std::uint64_t list_title_method(ListProxy* self, std::uint64_t a1, std::uint64_t
             not_done("the address is not GPU memory");
         return 0;
     } else if constexpr (M == ListMethod::wait32 || M == ListMethod::wait64) {
-        // V list.rs:1891-1934: (address, comparison, reference); the queue looks at them when the list is executed.
+        // V list.rs:1891-1934: (address, comparison, reference). The list holds the rest of its commands at the wait
+        // where the device can (ListTitleHandlers::wait_value: the queue that executes it stands there until the value
+        // is in memory, V's cut); otherwise the queue looks at the wait when the list is executed (wait_for_values).
+        const bool wide = M == ListMethod::wait64;
+        const auto comparison = static_cast<std::uint32_t>(a2);
+        const bool held = a1 && h && h->wait_value && h->wait_value(device, self->real, a1, comparison, a3, wide);
         try {
-            self->waits.push_back(ValueWait{a1, static_cast<std::uint32_t>(a2), a3, M == ListMethod::wait64});
+            self->waits.push_back(ValueWait{a1, comparison, a3, wide, held});
         } catch (const std::bad_alloc&) {
         }
         return 0;
@@ -1501,6 +1507,10 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 // S_OK (logged once).
 HRESULT queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes, std::uint64_t parameters) {
     DeviceProxy* const device = self->device;
+    // What the queues hold for memory values runs first (V queue.rs:113-119, VICTORY_WAIT_FORCE): the present shows
+    // the frame's work, and a wait is not kept across frames.
+    const ListTitleHandlers* const title = g_list_title.load(std::memory_order_acquire);
+    if (device && title && title->force_waits) title->force_waits(device->real);
     const PresentHandler handler = device ? device->present_handler.load(std::memory_order_acquire) : nullptr;
     if (handler)
         return handler(device->present_context.load(std::memory_order_acquire),
@@ -1513,12 +1523,15 @@ HRESULT queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64
     return S_OK;
 }
 
-// The value waits (slots 73/74) of the lists a queue executes. VIctory holds the submission until the memory holds
-// what a list waits for (V queue.rs:529-546, list.rs:1836-1871: the title's compute queue waits for a value the
-// graphics queue's depth pass writes at the bottom of the pipe). Here the submitting thread waits for it, up to
-// LEONIDA_VALUE_WAIT_MS (100 by default): a value earlier work of another queue writes (Write32/64, into title memory
-// the GPU reaches at its address) arrives meanwhile. One that only later work would write never comes, so after the
-// limit the submission goes on, counted (unmet_value_wait_submissions) and logged for the first ones.
+// The value waits (slots 73/74) of the lists a queue executes that the lists do not hold themselves. On the Vulkan
+// device every list holds its waits (ListTitleHandlers::wait_value: its queue runs the parts between them as the
+// values arrive, V queue.rs:94-210 and list.rs:290-450); this is for a device without that. VIctory holds the
+// submission until the memory holds what a list waits for (V queue.rs:529-546, list.rs:1836-1871: the title's compute
+// queue waits for a value the graphics queue's depth pass writes at the bottom of the pipe). Here the submitting thread
+// waits for it, up to LEONIDA_VALUE_WAIT_MS (100 by default): a value earlier work of another queue writes (Write32/64,
+// into title memory the GPU reaches at its address) arrives meanwhile. One that only later work would write never
+// comes, so after the limit the submission goes on, counted (unmet_value_wait_submissions) and logged for the first
+// ones.
 unsigned value_wait_limit_ms() {
     static const unsigned limit = [] {
         char text[16] = {};
@@ -1536,6 +1549,7 @@ void wait_for_values(std::uint64_t lists, std::uint64_t count) {
         void* const object = objects[i];
         if (!object || *reinterpret_cast<void* const*>(object) != reinterpret_cast<void*>(get_list_vtable())) continue;
         for (const ValueWait& wait : static_cast<const ListProxy*>(object)->waits) {
+            if (wait.held) continue;  // the list stands at it itself
             std::uint64_t value = 0;
             const ULONGLONG start = GetTickCount64();
             bool met = !read_value(wait.address, wait.wide, value) || wait.met_by(value);
@@ -2583,6 +2597,17 @@ HRESULT refuse_unknown_pipeline(unsigned slot, std::uint64_t desc, std::uint64_t
     return E_NOTIMPL;
 }
 
+// Console device slot 61, CreateSamplerX(desc, handle) (V device.rs:439, descriptor.rs:828-832): the S# the device's
+// handler writes from the console description (the Vulkan device), or else the D3D12 sampler VIctory gives the host
+// (console_sampler_desc), through the real device's CreateSampler.
+void proxy_create_sampler_x(DeviceProxy* self, std::uint64_t desc, std::uint64_t handle) {
+    if (!desc || !handle) return;
+    const SamplerXHandler handler = g_sampler_x.load(std::memory_order_acquire);
+    if (handler && handler(self->real, reinterpret_cast<const void*>(desc), handle)) return;
+    const D3D12_SAMPLER_DESC host = console_sampler_desc(reinterpret_cast<const std::uint32_t*>(desc));
+    self->real->CreateSampler(&host, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
+}
+
 // Console device slots 74 and 75 (V resource.rs:2187-2223): page pools, 64 KiB pages the title maps into its tiled
 // resources by page index (through queue slot 31, CopyPageMappingsBatchX, which is still open). Kept per device: the
 // first address and the page count; a handle is an index plus one, and a removed pool keeps its index.
@@ -2795,6 +2820,10 @@ __forceinline std::uint64_t device_call(DeviceProxy* self, std::uint64_t a1, std
         if (a1 && a2 && a3) handler(self->real, Slot == 71, reinterpret_cast<const void*>(a1),
                                     reinterpret_cast<const void*>(a2), a3);
         return 0;
+    } else if constexpr (M == DeviceMethod::sampler_x) {
+        note_slot(Slot);
+        proxy_create_sampler_x(self, a1, a2);  // (desc, handle), no result
+        return 0;
     } else if constexpr (M == DeviceMethod::committed_resource3) {
         return hr_to_u64(proxy_create_committed_resource3(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
     } else if constexpr (M == DeviceMethod::placed_resource_x) {
@@ -2999,6 +3028,42 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_sampler_x_handler(SamplerXHandler handler) {
+    g_sampler_x.store(handler, std::memory_order_release);
+}
+
+// Ported from VIctory (GPL-3.0-or-later, Marvisak and contributors, DexNom fork), victory-gpu sampler.rs:28-96:
+// words 1-3 the magnification, minification and mip filters, 5 the filter mode, 6-8 the address modes (D3D12's), 9-11
+// the minimum and maximum LOD and the bias, 13 the anisotropy, 16 the comparison (D3D12's), 17-20 the border colour.
+D3D12_SAMPLER_DESC console_sampler_desc(const std::uint32_t* w) {
+    D3D12_SAMPLER_DESC desc{};
+    if (!w) return desc;
+    const auto real = [&](int i) {
+        float value = 0;
+        std::memcpy(&value, &w[i], sizeof(value));
+        return value;
+    };
+    const std::uint32_t mag = w[1], min = w[2], mip = w[3], mode = w[5], compare = w[16];
+    const auto linear = [](std::uint32_t f) { return std::uint32_t(f == 1 || f == 3); };
+    const bool aniso = mag >= 2 || min >= 2;
+    // The console compares when the instruction says so, with the sampler's function; the host needs a comparison
+    // sampler for that. A real test (LESS .. GREATER_EQUAL) makes one; NEVER, ALWAYS and none are plain samplers.
+    const bool compares = compare >= D3D12_COMPARISON_FUNC_LESS && compare <= D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    const std::uint32_t reduction = mode == 1 ? 2u : mode == 2 ? 3u : compares ? 1u : 0u;
+    const std::uint32_t filter = aniso ? 0x55u : linear(min) << 4 | linear(mag) << 2 | std::uint32_t(mip == 2);
+    desc.Filter = static_cast<D3D12_FILTER>(reduction << 7 | filter);
+    desc.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[6]);
+    desc.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[7]);
+    desc.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[8]);
+    desc.MipLODBias = real(11);
+    desc.MaxAnisotropy = aniso ? std::clamp<std::uint32_t>(w[13], 1, 16) : 1;
+    desc.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(std::max<std::uint32_t>(compare, 1));
+    for (int i = 0; i < 4; ++i) desc.BorderColor[i] = real(17 + i);
+    desc.MinLOD = real(9);
+    desc.MaxLOD = mip == 0 ? desc.MinLOD : real(10);  // without a mip filter the console samples mip 0 only
+    return desc;
 }
 
 void set_placed_view_handler(PlacedViewHandler handler) {

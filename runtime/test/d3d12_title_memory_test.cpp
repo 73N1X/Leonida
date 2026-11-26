@@ -172,6 +172,112 @@ struct Runner {
     }
 };
 
+// Whether `done` comes true within `ms` milliseconds.
+template<class F>
+bool within(unsigned ms, F&& done) {
+    const ULONGLONG until = GetTickCount64() + ms;
+    while (!done()) {
+        if (GetTickCount64() > until) return false;
+        Sleep(1);
+    }
+    return true;
+}
+
+// A console queue, allocator and list of the proxy device; the list is open.
+struct ConsoleQueue {
+    void* queue = nullptr;
+    void* allocator = nullptr;
+    void* list = nullptr;
+    bool make(void* device, D3D12_COMMAND_LIST_TYPE type) {
+        const D3D12_COMMAND_QUEUE_DESC desc{type, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+        const IID queue_iid = __uuidof(ID3D12CommandQueue), allocator_iid = __uuidof(ID3D12CommandAllocator),
+                  list_iid = __uuidof(ID3D12GraphicsCommandList);
+        struct {
+            std::uint32_t type, node_mask;
+            std::uint64_t reserved[2];
+        } list_desc{std::uint32_t(type), 0, {0, 0}};
+        return call(device, 8, word(&desc), word(&queue_iid), word(&queue)) == S_OK &&
+               call(device, 9, type, word(&allocator_iid), word(&allocator)) == S_OK &&
+               call(device, 73, word(&list_desc), word(allocator), 0, word(&list_iid), word(&list)) == S_OK;
+    }
+    // Close, ExecuteX (queue slot 35) and Reset for the next recording.
+    bool execute() {
+        if (hr_from(call(list, 9)) != S_OK) return false;
+        void* lists[] = {list};
+        call(queue, 35, 1, word(lists), 0, 0);
+        return hr_from(call(list, 10, word(allocator), 0)) == S_OK;
+    }
+    ~ConsoleQueue() {
+        for (void* object : {list, allocator, queue})
+            if (object) static_cast<IUnknown*>(object)->Release();
+    }
+};
+
+std::uint64_t completed(void* fence) { return rt::d3d12_xs::fence_proxy_real_fence(fence)->GetCompletedValue(); }
+
+// Waits for memory values on the console queues: 0 when every check holds.
+int waits_hold(void* device, std::uint64_t A) {
+    ConsoleQueue graphics, compute;
+    EXPECT(graphics.make(device, D3D12_COMMAND_LIST_TYPE_DIRECT) && compute.make(device, D3D12_COMMAND_LIST_TYPE_COMPUTE));
+    const IID fence_iid = __uuidof(ID3D12Fence);
+    void* done = nullptr;
+    void* gate = nullptr;
+    EXPECT(call(device, 36, 0, 0, word(&fence_iid), word(&done)) == S_OK &&
+           call(device, 36, 0, 0, word(&fence_iid), word(&gate)) == S_OK);
+    auto* const v = reinterpret_cast<volatile std::uint32_t*>(A + 0x3C0000);  // v[0] the gate value, v[1..] marks
+    for (int i = 0; i < 16; ++i) v[i] = 0;
+
+    // 1. The compute queue's list: a mark, a wait for v[0] == 7, a second mark. The part before the wait runs; the
+    //    part after it waits for the graphics queue's Write32, submitted later.
+    call(compute.list, 71, A + 0x3C0004, 0x11, 0, 0);
+    call(compute.list, 73, A + 0x3C0000, 3, 7);  // WaitValue32: equal
+    call(compute.list, 71, A + 0x3C0008, 0x22, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 1) == S_OK);  // Signal behind the held part
+    EXPECT(within(5000, [&] { return v[1] == 0x11; }));
+    Sleep(50);
+    EXPECT(v[2] == 0 && completed(done) == 0);
+    call(graphics.list, 71, A + 0x3C0000, 7, 0, 0);
+    EXPECT(graphics.execute());
+    EXPECT(within(5000, [&] { return v[2] == 0x22 && completed(done) == 1; }));
+    std::printf("title memory: a WaitValue32 held the rest of its compute list until a later graphics submission's "
+                "Write32 put the value in memory\n");
+
+    // 2. A WaitValue64 on a console fence's value word (fence slot 12): met when another queue's Signal reaches it.
+    const auto gate_word = call(gate, 12);
+    EXPECT(gate_word);
+    call(compute.list, 74, gate_word, 7, 5);  // WaitValue64: greater-equal 5
+    call(compute.list, 71, A + 0x3C000C, 0x33, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 2) == S_OK);
+    Sleep(50);
+    EXPECT(v[3] == 0 && completed(done) == 1);
+    EXPECT(call(graphics.queue, 16, word(gate), 5) == S_OK);  // the graphics queue signals the gate fence
+    EXPECT(within(5000, [&] { return v[3] == 0x33 && completed(done) == 2; }));
+    std::printf("title memory: a WaitValue64 on a fence's value word ran on once another queue signalled the fence\n");
+
+    // 3. A wait nothing meets runs at the next present (PresentX, queue slot 32), as VIctory's queues do.
+    call(compute.list, 73, A + 0x3C0010, 3, 99);
+    call(compute.list, 71, A + 0x3C0014, 0x44, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 3) == S_OK);
+    Sleep(50);
+    EXPECT(v[5] == 0 && completed(done) == 2);
+    EXPECT(hr_from(call(graphics.queue, 32, 0, 0, 0)) == S_OK);
+    EXPECT(within(5000, [&] { return v[5] == 0x44 && completed(done) == 3; }));
+    std::printf("title memory: a wait nothing met ran on at the next PresentX\n");
+
+    // 4. A wait whose value is there already holds nothing; one of a list without waits after it is not cut.
+    call(compute.list, 73, A + 0x3C0004, 3, 0x11);
+    call(compute.list, 71, A + 0x3C0018, 0x55, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 4) == S_OK);
+    EXPECT(within(5000, [&] { return v[6] == 0x55 && completed(done) == 4; }));
+    static_cast<IUnknown*>(gate)->Release();
+    static_cast<IUnknown*>(done)->Release();
+    return 0;
+}
+
 const rt::xmem::GraphicsListener kListener{
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); }};
@@ -432,6 +538,12 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     EXPECT(hr_from(call(console_list, 9)) == S_OK);
     static_cast<IUnknown*>(console_list)->Release();
     static_cast<IUnknown*>(console_allocator)->Release();
+
+    // ---- List slots 73/74 hold the rest of their list until the value is in memory (VIctory's cut): a later
+    // submission's Write32 on another queue, a fence's value word after a Signal, or a present that forces it.
+    {
+        EXPECT(waits_hold(device, A) == 0);
+    }
 
     // ---- Slot 133 on mapped physical pages: bound to their import.
     constexpr std::uint64_t kPages = 4;

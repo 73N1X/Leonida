@@ -58,6 +58,7 @@ enum class DeviceMethod : std::uint8_t {
     committed_resource3,   // 127
     placed_resource_x,     // 133
     placed_view,           // 70, 71: a view of title memory (rt::d3d12_xs::set_placed_view_handler)
+    sampler_x,             // 61: the console's sampler description (rt::d3d12_xs::set_sampler_x_handler)
 };
 
 struct DeviceSlot {
@@ -128,7 +129,8 @@ inline constexpr DeviceEntry kDeviceEntries[] = {
     {50, DeviceMethod::unwrap, DeviceMethod::refuse, "EnqueueMakeResident (pc layout)"},
     {57, DeviceMethod::forward, DeviceMethod::unknown_pipeline,
      "Xbox pipeline creation (V device.rs:438, not written)"},
-    {61, DeviceMethod::forward, DeviceMethod::open, "Xbox CreateSamplerX (V device.rs:439, open)"},
+    // V device.rs:439, descriptor.rs:828-832, sampler.rs: (27-word console sampler description, handle), no result.
+    {61, DeviceMethod::forward, DeviceMethod::sampler_x, "Xbox CreateSamplerX (V device.rs:439)"},
     {62, DeviceMethod::compute_pso_x, DeviceMethod::compute_pso_x, "Xbox CreateComputePipelineState"},
     // V device.rs:441 does not implement 67 (same call shape, an unknown pipeline); L §3.5a measured it in the FSR DLL.
     {67, DeviceMethod::native_compute_pso, DeviceMethod::native_compute_pso, "Xbox DeserializeComputePipelineStateX"},

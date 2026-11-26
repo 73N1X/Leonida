@@ -651,6 +651,37 @@ struct AccelerationStructurePostbuild {
     std::vector<std::uint64_t> sources;
 };
 
+// A wait for a value in memory (the Xbox list's WaitValue32/64, console list slots 73/74): the commands from `at` on
+// run once the 32 or 64 bits at `address` compare with `reference` as `comparison` says. The codes are D3D12's
+// comparison functions, the value against the reference (1 never, 2 less, 3 equal, 4 less-equal, 5 greater,
+// 6 not-equal, 7 greater-equal, 8 always); any other code is met. A 32-bit wait compares the low halves. Ported from
+// VIctory (GPL-3.0-or-later, Marvisak and contributors, DexNom fork), victory-gpu list.rs:1800-1845 (ValueWait) and
+// 1891-1928: the console's queue runs the list up to the wait and stands there until the value is in memory, so the
+// queue that executes the list cuts it at its waits (vulkan_backend.h, VulkanQueue::execute_parts). Not a Command:
+// it is where the list is cut, kept beside its commands.
+struct MemoryWait {
+    std::uint64_t address = 0;
+    std::uint32_t comparison = 0;
+    std::uint64_t reference = 0;
+    bool wide = false;
+    std::size_t at = 0;  // the first command after the wait
+
+    bool met_by(std::uint64_t value) const {
+        const std::uint64_t mask = wide ? ~std::uint64_t(0) : 0xffffffffu;
+        const std::uint64_t v = value & mask, r = reference & mask;
+        switch (comparison) {
+        case 1: return false;
+        case 2: return v < r;
+        case 3: return v == r;
+        case 4: return v <= r;
+        case 5: return v > r;
+        case 6: return v != r;
+        case 7: return v >= r;
+        default: return true;
+        }
+    }
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
@@ -905,12 +936,23 @@ public:
         if (!closed_) return false;
         commands_.clear();
         active_.clear();
+        memory_waits_.clear();
         closed_ = false;
+        return true;
+    }
+
+    // A wait for a memory value before the next command recorded (MemoryWait).
+    bool wait_memory(MemoryWait wait) {
+        if (closed_ || !wait.address) return false;
+        wait.at = commands_.size();
+        memory_waits_.push_back(wait);
         return true;
     }
 
     bool closed() const { return closed_; }
     std::span<const Command> commands() const { return commands_; }
+    // In the order they were recorded, so their `at` never goes down.
+    std::span<const MemoryWait> memory_waits() const { return memory_waits_; }
 
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
@@ -948,6 +990,7 @@ private:
 
     std::vector<Command> commands_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
+    std::vector<MemoryWait> memory_waits_;
     bool closed_ = false;
 };
 

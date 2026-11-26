@@ -55,7 +55,9 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <system_error>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <cwchar>
@@ -70,9 +72,11 @@ namespace {
 
 class TitleMemory;  // the imports of the title's GPU memory (after Resource)
 
-// Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
-// increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
+// Every view, RTV and DSV slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. A sampler slot is
+// kSamplerDescriptorSize, one S# (VIctory descriptor.rs:1-7). The application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = descriptor_size;
+constexpr UINT kSamplerDescriptorSize = sampler_descriptor_size;
+static_assert(sizeof(leonida::gfx10::SamplerWords) == kSamplerDescriptorSize);
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kArenaReserved = 64 * 1024;
@@ -1724,7 +1728,7 @@ public:
                    std::uint64_t console_size = 0)
         : device_(device), desc_(desc), console_address_(console_address), console_size_(console_size),
           console_addressed_(console_address != 0) {
-        const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
+        const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * descriptor_increment(desc_.Type);
         if (console_addressed_) {
             // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
             // now; backing this range with title memory / §3.3 aliasing is tracked separately.
@@ -1752,7 +1756,8 @@ public:
     }
 
     ~DescriptorHeap() override {
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+        if (in_arena_) device_.arena_release(arena_offset_,
+                                            VkDeviceSize(desc_.NumDescriptors) * descriptor_increment(desc_.Type),
                                             DeviceState::arena_descriptor_heap);
     }
 
@@ -5598,6 +5603,7 @@ public:
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         // And slots 70/71 and the console list methods on title addresses, the same way.
         rt::d3d12_xs::set_placed_view_handler(&rt::d3d12::create_placed_view);
+        rt::d3d12_xs::set_sampler_x_handler(&rt::d3d12::create_sampler_x);
         rt::d3d12_xs::set_list_title_handlers(&kListTitleHandlers);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
@@ -5720,6 +5726,7 @@ public:
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         start_title_memory();
+        start_memory_waits();
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -6133,6 +6140,7 @@ public:
     }
 
     ~Device() override {
+        stop_memory_waits();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -6861,8 +6869,8 @@ public:
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
-    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
-        return kDescriptorSize;
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        return descriptor_increment(type);
     }
 
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
@@ -7040,8 +7048,9 @@ public:
     void STDMETHODCALLTYPE CopyDescriptors(UINT destination_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* destinations,
                                            const UINT* destination_sizes, UINT source_ranges,
                                            const D3D12_CPU_DESCRIPTOR_HANDLE* sources, const UINT* source_sizes,
-                                           D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                           D3D12_DESCRIPTOR_HEAP_TYPE type) override {
         if (!destinations || !sources) return;
+        const std::size_t step = descriptor_increment(type);
         UINT d = 0, s = 0, d_at = 0, s_at = 0;  // the range on each side, and the position in it
         while (d < destination_ranges && s < source_ranges) {
             if (d_at >= (destination_sizes ? destination_sizes[d] : 1) || !destinations[d].ptr) {
@@ -7051,19 +7060,18 @@ public:
                 ++s;
                 s_at = 0;
             } else {
-                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * kDescriptorSize,
-                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
-                             kDescriptorSize);
+                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * step,
+                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * step, step);
             }
         }
     }
 
     void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination,
                                                  D3D12_CPU_DESCRIPTOR_HANDLE source,
-                                                 D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE type) override {
         if (!destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
-                     std::size_t(count) * kDescriptorSize);
+                     std::size_t(count) * descriptor_increment(type));
     }
 
     // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
@@ -7420,12 +7428,12 @@ public:
         state_.context->note_shader_image(r->id());
     }
 
-    // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
+    // A sampler is an S#, the whole 16-byte slot; the shader finds the sampler by those four dwords.
     void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc,
                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateSampler");
         if (!destination.ptr) return;
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kSamplerDescriptorSize);
         if (!desc) return;
         const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc, &state_));
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -7445,9 +7453,60 @@ public:
             return;
         }
         const leonida::gfx10::SamplerWords words = sampler2_words(*desc);
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         state_.bind_sampler(words);
+    }
+
+    // Xbox device slot 61, CreateSamplerX(desc, handle): the console's own sampler description, 27 words (ported
+    // from VIctory, GPL-3.0-or-later, Marvisak and contributors, DexNom fork: victory-gpu device.rs:439,
+    // descriptor.rs:828-832 and sampler.rs:1-96). Its filter words are the S#'s own fields (VIctory sampler.rs:11-17:
+    // magnification and minification point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3, as
+    // SQ_TEX_XY_FILTER; mip none 0, point 1, linear 2, as SQ_TEX_MIP_FILTER; plain, minimum and maximum, as
+    // SQ_IMG_FILTER_TYPE), so the S# is written from them directly, which keeps what a D3D12 filter cannot say (an
+    // anisotropic point minification with a bilinear magnification, no mip filter). The address modes and the
+    // comparison are D3D12's values (sampler.rs:19-22), mapped as sampler_descriptor maps them, and the border colour
+    // goes through its table. A sampler compares only for a real test, LESS to GREATER_EQUAL; NEVER, ALWAYS and none
+    // are plain samplers (sampler.rs:34-41). Without a mip filter the S# samples the base level, as the console does
+    // (sampler.rs:66-71 pins MaxLOD to MinLOD for the host). Words 0 (flags), 4 (depth filter), 12 (secondary bias),
+    // 14-15 (anisotropy bias and threshold) and 21-26 (tuning) are not read, as in VIctory.
+    void create_sampler_x(const std::uint32_t* words, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        d3d12_trace::record("Xbox CreateSamplerX (device slot 61)");
+        if (!destination.ptr) return;
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kSamplerDescriptorSize);
+        if (!words) return;
+        const leonida::gfx10::SamplerWords s = sampler_x_words(words);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), s.data(), sizeof(s));
+        state_.bind_sampler(s);
+    }
+
+    leonida::gfx10::SamplerWords sampler_x_words(const std::uint32_t* w) {
+        namespace g = leonida::gfx10;
+        const auto real = [&](int i) {
+            float value = 0;
+            std::memcpy(&value, &w[i], sizeof(value));
+            return value;
+        };
+        D3D12_SAMPLER_DESC base{};
+        base.AddressU = D3D12_TEXTURE_ADDRESS_MODE(w[6]);
+        base.AddressV = D3D12_TEXTURE_ADDRESS_MODE(w[7]);
+        base.AddressW = D3D12_TEXTURE_ADDRESS_MODE(w[8]);
+        for (int i = 0; i < 4; ++i) base.BorderColor[i] = real(17 + i);
+        g::Sampler sampler = sampler_descriptor(base, &state_);  // the address modes and the border colour
+        sampler.mag_filter = g::Filter(w[1] & 3);
+        sampler.min_filter = g::Filter(w[2] & 3);
+        sampler.mip_filter = g::MipFilter(w[3] & 3);
+        sampler.filter_mode = g::FilterMode(w[5] & 3);
+        const bool anisotropic = (w[1] & 3) >= 2 || (w[2] & 3) >= 2;
+        sampler.max_anisotropy = anisotropic ? std::clamp<std::uint32_t>(w[13], 1, 16) : 1;
+        constexpr std::uint32_t kLess = D3D12_COMPARISON_FUNC_LESS, kGreaterEqual = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        sampler.compare = w[16] >= kLess && w[16] <= kGreaterEqual
+                              ? g::CompareFunction(w[16] - D3D12_COMPARISON_FUNC_NEVER)
+                              : g::CompareFunction::never;
+        sampler.compare_never = false;
+        sampler.min_lod = real(9);
+        sampler.max_lod = real(10);
+        sampler.lod_bias = real(11);
+        return g::encode(sampler);
     }
 
     // The S# of a D3D12_SAMPLER_DESC2 that sampler2_refusal accepts.
@@ -7777,6 +7836,119 @@ public:
         auto* heap = new Heap(state_, desc, memory, memory_type, address);
         heap->attach_device(identity());
         return d3d12_trace::result(method, hand_out(heap, riid, out));
+    }
+
+    // ---- Waits for memory values (the Xbox list's WaitValue32/64; VulkanQueue::execute_parts) --------------------
+    //
+    // A queue holds what a list records after a wait whose value is not in memory yet. The value comes from another
+    // queue's GPU work (a Write32/64 at the bottom of its pipe, into title memory imported at its own address) or from
+    // the CPU, and nothing says when: so while any queue holds such a wait, a thread of the device looks at the holds
+    // every 250 microseconds, and a queue whose value has arrived runs on. The values are read in place (title memory
+    // is host memory) without faulting. LEONIDA_VALUE_HOLD_MS (default 1000; 0: no limit) is the longest a wait holds
+    // its queue before the work after it runs all the same, logged; a present runs what is held at once (VIctory
+    // queue.rs:113-119).
+
+    struct MemoryWaitPoller {
+        HANDLE wake = nullptr;   // auto-reset: a queue held its first memory wait, or the device goes
+        HANDLE timer = nullptr;  // high resolution: a millisecond wait of the system timer can take 15.6 ms
+        std::atomic<bool> stop{false};
+        std::thread thread;
+    };
+
+    static bool read_title_value(std::uint64_t address, bool wide, std::uint64_t& value) {
+        value = 0;
+        SIZE_T read = 0;
+        const SIZE_T bytes = wide ? 8 : 4;
+        return address && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &value, bytes,
+                                            &read) &&
+               read == bytes;
+    }
+
+    static std::uint32_t memory_hold_limit_ms() {
+        char text[16] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_VALUE_HOLD_MS", text, sizeof(text));
+        if (!length || length >= sizeof(text)) return 1000;
+        char* end = nullptr;
+        const unsigned long ms = std::strtoul(text, &end, 10);
+        if (end == text || *end) {
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_VALUE_HOLD_MS=%s is not a number of milliseconds; 1000\n", text);
+            return 1000;
+        }
+        return static_cast<std::uint32_t>(std::min<unsigned long>(ms, UINT32_MAX));
+    }
+
+    void start_memory_waits() {
+        if (!state_.context) return;
+        auto& context = *state_.context;
+        context.set_memory_reader(&read_title_value);
+        context.set_memory_wait_limit_ms(memory_hold_limit_ms());
+        auto poller = std::make_unique<MemoryWaitPoller>();
+        poller->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        poller->timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                               TIMER_ALL_ACCESS);
+        if (!poller->timer) poller->timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        if (!poller->wake || !poller->timer) {
+            std::fprintf(stderr, "[rt] d3d12: no poller for memory waits (error %lu); a held wait is released by "
+                                 "signals, submissions and presents only\n", GetLastError());
+            if (poller->wake) CloseHandle(poller->wake);
+            if (poller->timer) CloseHandle(poller->timer);
+            return;
+        }
+        MemoryWaitPoller* const p = poller.get();
+        try {
+            p->thread = std::thread([this, p] { poll_memory_waits(*p); });
+        } catch (const std::system_error&) {
+            CloseHandle(p->wake);
+            CloseHandle(p->timer);
+            return;
+        }
+        context.set_memory_wait_wake([p] { SetEvent(p->wake); });
+        memory_poller_ = std::move(poller);
+    }
+
+    void poll_memory_waits(MemoryWaitPoller& p) {
+        leonida::VulkanContext& context = *state_.context;
+        const HANDLE handles[2] = {p.timer, p.wake};
+        while (!p.stop.load(std::memory_order_acquire)) {
+            if (context.memory_waits_held() <= 0) {
+                WaitForSingleObject(p.wake, INFINITE);
+                continue;
+            }
+            context.holds().pump_ready();
+            LARGE_INTEGER due{};
+            due.QuadPart = -2500;  // 250 us, relative, in 100 ns units
+            if (SetWaitableTimer(p.timer, &due, 0, nullptr, nullptr, FALSE))
+                WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            else
+                Sleep(1);
+        }
+    }
+
+    void stop_memory_waits() {
+        if (!memory_poller_) return;
+        if (state_.context) state_.context->set_memory_wait_wake(nullptr);
+        memory_poller_->stop.store(true, std::memory_order_release);
+        SetEvent(memory_poller_->wake);
+        if (memory_poller_->thread.joinable()) memory_poller_->thread.join();
+        CloseHandle(memory_poller_->wake);
+        CloseHandle(memory_poller_->timer);
+        memory_poller_.reset();
+    }
+
+    // Slots 73/74 (ListTitleHandlers::wait_value): the wait goes into the list, where its queue cuts it.
+    bool wait_value(ID3D12GraphicsCommandList* list, std::uint64_t address, std::uint32_t comparison,
+                    std::uint64_t reference, bool wide) {
+        leonida::MemoryWait wait;
+        wait.address = address;
+        wait.comparison = comparison;
+        wait.reference = reference;
+        wait.wide = wide;
+        return record_memory_wait(list, wait);
+    }
+
+    // Queue slot 32, PresentX (ListTitleHandlers::force_waits).
+    void force_memory_waits() {
+        if (state_.context) state_.context->force_memory_waits();
     }
 
     // ---- Title memory on this device (src/title_memory.h) ----------------------------------------------------------
@@ -9821,6 +9993,7 @@ private:
     std::map<const void*, std::vector<UploadBlock>> upload_owned_;  // by list
     std::vector<UploadBlock> upload_free_;
     std::vector<std::pair<std::uint8_t*, std::uint64_t>> upload_blocks_;  // every block, for the destructor
+    std::unique_ptr<MemoryWaitPoller> memory_poller_;  // start_memory_waits
 };
 
 }  // namespace
@@ -9981,10 +10154,21 @@ void list_release_uploads(ID3D12Device* device, const void* owner) {
     if (Device* d = vulkan_device_of(device)) d->release_uploads(owner);
 }
 
+bool list_wait_value(ID3D12Device* device, ID3D12GraphicsCommandList* list, std::uint64_t address,
+                     std::uint32_t comparison, std::uint64_t reference, bool wide) {
+    Device* d = vulkan_device_of(device);
+    return d && list && d->wait_value(list, address, comparison, reference, wide);
+}
+
+void list_force_waits(ID3D12Device* device) {
+    if (Device* d = vulkan_device_of(device)) d->force_memory_waits();
+}
+
 }  // namespace
 
-const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers{&list_copy_memory, &list_write_value, &list_allocate_upload,
-                                                         &list_release_uploads};
+const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers{&list_copy_memory,     &list_write_value,
+                                                         &list_allocate_upload, &list_release_uploads,
+                                                         &list_wait_value,      &list_force_waits};
 
 void create_placed_view(ID3D12Device* device, bool uav, const void* resource_desc, const void* view_desc,
                         std::uint64_t handle) {
@@ -9992,6 +10176,15 @@ void create_placed_view(ID3D12Device* device, bool uav, const void* resource_des
     if (!d || !resource_desc || !view_desc || !handle) return;
     d->create_placed_view(uav, static_cast<const std::uint32_t*>(resource_desc),
                           static_cast<const std::uint32_t*>(view_desc), handle);
+}
+
+bool create_sampler_x(ID3D12Device* device, const void* desc, std::uint64_t handle) {
+    Device* d = vulkan_device_of(device);
+    if (!d) return false;
+    if (handle)
+        d->create_sampler_x(static_cast<const std::uint32_t*>(desc),
+                            D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
+    return true;
 }
 
 void title_memory_visible(std::uint64_t start, std::uint64_t size) {

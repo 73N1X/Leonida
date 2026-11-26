@@ -111,6 +111,7 @@ struct Mock {
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the last CreateCommandQueue description, as received
     D3D12_RESOURCE_DESC1 resource_desc;   // device: the last resource description of 27/76 (and 25/68's first)
     float floats[2];                      // command list: 47's depth, 62's bounds
+    D3D12_SAMPLER_DESC sampler;           // device: the last CreateSampler (22) description, as received
 };
 
 Mock g_pool[1024];
@@ -280,6 +281,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 26:  // GetCustomHeapProperties(this, buffer, node_mask, heap_type)
                 std::memcpy(reinterpret_cast<void*>(a1), &kMockHeapProperties, sizeof(kMockHeapProperties));
                 return a1;
+            case 22:  // CreateSampler(desc, handle): the description is the caller's, so it is copied
+                if (a1) std::memcpy(&m->sampler, reinterpret_cast<const void*>(a1), sizeof(m->sampler));
+                break;
             case 27:  // CreateCommittedResource(heap, flags, desc, state, clear, riid, out)
                 std::memcpy(&m->resource_desc, reinterpret_cast<const void*>(a3), sizeof(D3D12_RESOURCE_DESC));
                 break;
@@ -1427,7 +1431,7 @@ int check_slot_tables() {
         {48, DeviceMethod::routed, DeviceMethod::routed},
         {50, DeviceMethod::unwrap, DeviceMethod::refuse},
         {57, DeviceMethod::forward, DeviceMethod::unknown_pipeline},
-        {61, DeviceMethod::forward, DeviceMethod::open},
+        {61, DeviceMethod::forward, DeviceMethod::sampler_x},
         {62, DeviceMethod::compute_pso_x, DeviceMethod::compute_pso_x},
         {67, DeviceMethod::native_compute_pso, DeviceMethod::native_compute_pso},
         {69, DeviceMethod::forward, DeviceMethod::ignore},
@@ -1775,6 +1779,85 @@ int check_console_queue() {
     return 0;
 }
 
+// ---- 13a. List slots 73/74: waits the list holds itself, or ExecuteX checks ----
+
+struct WaitSeen {
+    unsigned calls = 0;
+    std::uint64_t address = 0, reference = 0;
+    std::uint32_t comparison = 0;
+    bool wide = false;
+    ID3D12GraphicsCommandList* list = nullptr;
+    unsigned forced = 0;
+    ID3D12Device* forced_device = nullptr;
+};
+WaitSeen g_wait_seen;
+
+int check_value_waits() {
+    Mock* mock = nullptr;
+    void* device = make_console_device(mock);
+    void* queue = make_queue(device);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    const std::uint32_t list_desc[4] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, 0};
+    const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(list_desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
+    Mock* const real_list = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list));
+    const std::uint64_t lists[1] = {word(list)};
+    volatile std::uint64_t value = 0;
+
+    // No device handler: the wait is the list proxy's, and ExecuteX looks at it, up to LEONIDA_VALUE_WAIT_MS (100).
+    raw(list, 73, word(&value), 3, 5);  // WaitValue32: equal 5
+    xs::ValueWait waits[2] = {};
+    EXPECT(xs::command_list_value_waits(list, waits, 2) == 1 && !waits[0].held && waits[0].comparison == 3 &&
+           !waits[0].wide && waits[0].reference == 5);
+    const std::uint64_t unmet = xs::unmet_value_wait_submissions();
+    raw(queue, 35, 1, word(lists), 0, 0);
+    EXPECT(xs::unmet_value_wait_submissions() == unmet + 1);
+
+    // A device handler that holds waits in the list (the Vulkan layer's): it gets the real list and the title's words,
+    // ExecuteX does not stand at them, and PresentX asks the device to run what its queues hold.
+    static const xs::ListTitleHandlers handlers{
+        nullptr, nullptr, nullptr, nullptr,
+        [](ID3D12Device*, ID3D12GraphicsCommandList* real, std::uint64_t address, std::uint32_t comparison,
+           std::uint64_t reference, bool wide) {
+            g_wait_seen.calls++;
+            g_wait_seen.list = real;
+            g_wait_seen.address = address;
+            g_wait_seen.comparison = comparison;
+            g_wait_seen.reference = reference;
+            g_wait_seen.wide = wide;
+            return true;
+        },
+        [](ID3D12Device* real) {
+            g_wait_seen.forced++;
+            g_wait_seen.forced_device = real;
+        }};
+    xs::set_list_title_handlers(&handlers);
+    EXPECT(hr_of(raw(list, 10, word(allocator), 0)) == S_OK && xs::command_list_value_waits(list, waits, 2) == 0);
+    raw(list, 74, word(&value), 7, 0x123456789ull);  // WaitValue64: greater-equal
+    EXPECT(g_wait_seen.calls == 1 && g_wait_seen.list == reinterpret_cast<ID3D12GraphicsCommandList*>(real_list) &&
+           g_wait_seen.address == word(&value) && g_wait_seen.comparison == 7 &&
+           g_wait_seen.reference == 0x123456789ull && g_wait_seen.wide);
+    EXPECT(xs::command_list_value_waits(list, waits, 2) == 1 && waits[0].held && waits[0].wide);
+    const ULONGLONG before = GetTickCount64();
+    raw(queue, 35, 1, word(lists), 0, 0);
+    EXPECT(xs::unmet_value_wait_submissions() == unmet + 1 && GetTickCount64() - before < 90);
+    EXPECT(hr_of(raw(queue, 32, 0, 0, 0)) == S_OK && g_wait_seen.forced == 1 &&
+           g_wait_seen.forced_device == reinterpret_cast<ID3D12Device*>(mock));
+    // A wait at address 0 is not the device's (nothing to wait for).
+    raw(list, 73, 0, 3, 1);
+    EXPECT(g_wait_seen.calls == 1);
+    xs::set_list_title_handlers(nullptr);
+
+    EXPECT(release(list) == 0 && release(allocator) == 0 && release(queue) == 0 && release(device) == 0 &&
+           mock->refs == 0);
+    std::printf("%s: list slots 73/74: a device that holds waits in the list gets them (ExecuteX does not stand at "
+                "them, PresentX forces them); without one ExecuteX checks them\n", g_label);
+    return 0;
+}
+
 // ---- 14. The console fence's value word (slot 12) ----
 
 // The word, read until it shows `value` or 5 s have passed: the proxy's thread-pool wait sets it.
@@ -1954,12 +2037,58 @@ int check_console_device() {
     EXPECT(hr_of(raw(device, 75, pool)) == E_INVALIDARG && hr_of(raw(device, 75, 9)) == E_INVALIDARG);
     EXPECT(xs::device_page_pool(device, pool2, nullptr, nullptr) && mock->calls[75] == 0);
 
+    // 61 CreateSamplerX (V device.rs:439, sampler.rs): with no device handler, the D3D12 sampler VIctory gives the host,
+    // through PC CreateSampler (22). Anisotropic bilinear minification with a LESS_EQUAL test, wrap/clamp/border, and
+    // a mip filter.
+    {
+        std::uint32_t sx[27] = {};
+        const auto f = [](float v) { std::uint32_t u = 0; std::memcpy(&u, &v, 4); return u; };
+        sx[1] = 1;  // bilinear magnification
+        sx[2] = 3;  // anisotropic bilinear minification
+        sx[3] = 2;  // linear mips
+        sx[6] = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sx[7] = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sx[8] = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sx[9] = f(0.5f);
+        sx[10] = f(9.0f);
+        sx[11] = f(-1.25f);
+        sx[13] = 8;
+        sx[16] = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        sx[20] = f(1.0f);  // opaque black border
+        const std::uint64_t handle = 0x123450;
+        EXPECT(raw(device, 61, word(sx), handle) == 0 && mock->calls[22] == 1 && mock->calls[61] == 0);
+        const D3D12_SAMPLER_DESC& got = mock->sampler;
+        EXPECT(mock->args[22][1] == handle && got.Filter == D3D12_FILTER_COMPARISON_ANISOTROPIC &&
+               got.MaxAnisotropy == 8 && got.ComparisonFunc == D3D12_COMPARISON_FUNC_LESS_EQUAL);
+        EXPECT(got.AddressU == D3D12_TEXTURE_ADDRESS_MODE_WRAP && got.AddressV == D3D12_TEXTURE_ADDRESS_MODE_CLAMP &&
+               got.AddressW == D3D12_TEXTURE_ADDRESS_MODE_BORDER && got.MinLOD == 0.5f && got.MaxLOD == 9.0f &&
+               got.MipLODBias == -1.25f && got.BorderColor[3] == 1.0f && got.BorderColor[0] == 0.0f);
+        // Point magnification, bilinear minification, no mip filter, NEVER (plain), minimum filter mode: MaxLOD is the
+        // minimum LOD (the console samples mip 0 only).
+        sx[1] = 0;
+        sx[2] = 1;
+        sx[3] = 0;
+        sx[5] = 1;
+        sx[16] = D3D12_COMPARISON_FUNC_NEVER;
+        EXPECT(raw(device, 61, word(sx), handle) == 0 && mock->calls[22] == 2);
+        EXPECT(got.Filter == D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_MIP_POINT && got.MaxAnisotropy == 1 &&
+               got.ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER && got.MaxLOD == 0.5f);
+        // A plain comparison: ALWAYS is no test, so no comparison sampler.
+        sx[5] = 0;
+        sx[16] = D3D12_COMPARISON_FUNC_ALWAYS;
+        EXPECT(raw(device, 61, word(sx), handle) == 0 && got.Filter == D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT);
+        sx[16] = D3D12_COMPARISON_FUNC_GREATER;
+        EXPECT(raw(device, 61, word(sx), handle) == 0 && got.Filter == D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT);
+        // No description or no handle: nothing.
+        EXPECT(raw(device, 61, 0, handle) == 0 && raw(device, 61, word(sx), 0) == 0 && mock->calls[22] == 4);
+    }
+
     // 57, a console pipeline creation nobody has written: refused with the output nulled (V device.rs:349-400).
     const IID pipeline_iid = __uuidof(ID3D12PipelineState);
     void* pipeline = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 57, 0x1234, word(&pipeline_iid), word(&pipeline))) == E_NOTIMPL && !pipeline &&
            mock->calls[57] == 0);
-    // From 44 on the console slots no source names, and the console methods not written yet (61, 70, 71, 86), are
+    // From 44 on the console slots no source names, and the console methods not written yet (86), are
     // refused: never the PC method at the same number (45/46/50 among them, PC ID3D12Device1/3 methods).
     for (unsigned slot = 44; slot < slots::kDeviceSlots; ++slot) {
         const slots::DeviceSlot entry = slots::device_slot(slot);
@@ -1998,8 +2127,8 @@ int check_console_device() {
     EXPECT(release(queue) == 0);
 
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: console device: struct returns 25/26/108 in either order, 69 ignored, 127 "
-                "CreateCommittedResource3, 74/75 page pools, 57 refused with a null output, every unnamed slot from 44 "
+    std::printf("%s: console device: struct returns 25/26/108 in either order, 61 CreateSamplerX as VIctory's host "
+                "sampler, 69 ignored, 127 CreateCommittedResource3, 74/75 page pools, 57 refused with a null output, every unnamed slot from 44 "
                 "refused, every allocator wrapped\n", g_label);
     return 0;
 }
@@ -2067,7 +2196,8 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
-        check_slot_tables() || check_list_table() || check_console_queue() || check_console_fence() ||
+        check_slot_tables() || check_list_table() || check_console_queue() || check_value_waits() ||
+        check_console_fence() ||
         check_console_device() || check_frame_clock())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
