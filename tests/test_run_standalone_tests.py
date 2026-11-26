@@ -49,6 +49,19 @@ class StandaloneRunnerTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("1 files, 0 files failed", result.stdout)
 
+    def test_redirected_annotations_preserve_utf8_paths(self):
+        # Model redirected Windows stdout even when this test runs on a UTF-8 host.
+        start = ("import runpy, sys; sys.stdout.reconfigure(encoding='cp1252'); "
+                 "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+        name = "test_λ.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / name).write_bytes(b"raise SystemExit(1)\n")
+            result = subprocess.run([sys.executable, "-I", "-c", start, str(RUNNER), "-j", "2"],
+                                    cwd=tmp, input=(name + "\n").encode(), capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"== {name}".encode(), result.stdout.splitlines())
+        self.assertIn(f"::error file={name}::{name} failed".encode(), result.stdout.splitlines())
+
     def test_bounds_concurrency_without_timing_assumptions(self):
         lock = threading.Lock()
         rendezvous = threading.Barrier(2)

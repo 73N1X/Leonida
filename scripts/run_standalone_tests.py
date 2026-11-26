@@ -60,7 +60,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(errors="replace")
+    if sys.stdout.isatty():
+        sys.stdout.reconfigure(errors="replace")
+    else:
+        # GitHub Actions reads annotations as UTF-8, including on Windows.
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     # Git Bash writes its find/printf paths as UTF-8, even on Windows.
     sys.stdin.reconfigure(encoding="utf-8")
     sys.exit(main())
