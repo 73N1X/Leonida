@@ -269,6 +269,23 @@ int main() {
         SetProcessAffinityMask(GetCurrentProcess(), process_mask);
     }
 
+    // The title's debug output is served (and logged as "[title] ..."); TerminateProcess is served by the shim too.
+    {
+        using DebugA = void(WINAPI*)(LPCSTR);
+        using DebugW = void(WINAPI*)(LPCWSTR);
+        const auto debug_a = reinterpret_cast<DebugA>(rt::shims::find("kernelbase.dll", "OutputDebugStringA"));
+        const auto debug_w =
+            reinterpret_cast<DebugW>(rt::shims::find("api-ms-win-core-debug-l1-1-0.dll", "OutputDebugStringW"));
+        if (!debug_a || !debug_w || !rt::shims::find("kernel32.dll", "TerminateProcess")) {
+            std::fprintf(stderr, "FAIL OutputDebugStringA/W and TerminateProcess are not served\n");
+            ++failures;
+        } else {
+            debug_a("process_cmdline: a narrow debug line\n");
+            debug_w(L"process_cmdline: a wide debug line Δ");
+            debug_a(nullptr);
+        }
+    }
+
     if (failures) return 1;
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "
                 "the WinMain line and the kernelbase/API-set names are the game's\n",

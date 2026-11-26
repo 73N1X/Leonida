@@ -20,6 +20,7 @@
 // umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's own DLLs
 // import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
 #include <windows.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cerrno>
@@ -420,6 +421,52 @@ int run_entry(void* entry, size_t stack_bytes) {
 
 namespace {
 using namespace rt::process;
+
+// The title's debug output goes to the log, as VIctory's kernel.rs OutputDebugStringA/W do (GPL-3.0-or-later): no
+// debugger needs to be attached to read what the title says about itself. "[title] <text>", one line per call, the
+// trailing newline dropped; LEONIDA_TITLE_DEBUG_OUTPUT=0 silences it. The host's function still gets the text, so an
+// attached debugger sees it as before.
+bool title_debug_output_on() {
+    static const bool on = [] {
+        char v[8] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_DEBUG_OUTPUT", v, sizeof(v));
+        return !(n > 0 && n < sizeof(v) && v[0] == '0');
+    }();
+    return on;
+}
+void log_title_text(std::string text) {
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+    std::fprintf(stderr, "[title] %s\n", text.c_str());
+}
+void WINAPI game_output_debug_string_a(LPCSTR text) {
+    if (text && title_debug_output_on()) log_title_text(text);
+    OutputDebugStringA(text);
+}
+void WINAPI game_output_debug_string_w(LPCWSTR text) {
+    if (text && title_debug_output_on()) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+        std::string utf8(n > 1 ? static_cast<size_t>(n - 1) : 0, ' ');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8.data(), n, nullptr, nullptr);
+        log_title_text(std::move(utf8));
+    }
+    OutputDebugStringW(text);
+}
+
+// TerminateProcess of the game's own process ends gta6rt without a word otherwise; it is logged with its code and
+// caller first (VIctory kernel.rs TerminateProcess), then done as asked.
+BOOL WINAPI game_terminate_process(HANDLE process, UINT code) {
+    if (process == GetCurrentProcess() || GetProcessId(process) == GetCurrentProcessId()) {
+        std::fprintf(stderr, "[rt] process: the game called TerminateProcess(code %u) from %s\n", code,
+                     rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
+        std::fflush(nullptr);
+    }
+    return TerminateProcess(process, code);
+}
+
+#define DEBUG_OUTPUT(dll) \
+    {dll, "OutputDebugStringA", reinterpret_cast<void*>(&game_output_debug_string_a)}, \
+    {dll, "OutputDebugStringW", reinterpret_cast<void*>(&game_output_debug_string_w)}
+#define TERMINATE_PROCESS(dll) {dll, "TerminateProcess", reinterpret_cast<void*>(&game_terminate_process)}
 #define UCRT(dll) \
     {dll, "exit", reinterpret_cast<void*>(&game_exit)}, {dll, "_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
     {dll, "_Exit", reinterpret_cast<void*>(&game_quick_exit)}, \
@@ -459,5 +506,12 @@ SHIM_TABLE(process,
     EXIT_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
+    DEBUG_OUTPUT("kernel32.dll"),
+    DEBUG_OUTPUT("kernelbase.dll"),
+    DEBUG_OUTPUT("api-ms-win-core-debug-l1-1-0.dll"),
+    DEBUG_OUTPUT("api-ms-win-core-debug-l1-1-1.dll"),
+    TERMINATE_PROCESS("kernel32.dll"),
+    TERMINATE_PROCESS("kernelbase.dll"),
+    TERMINATE_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
 );
