@@ -116,12 +116,12 @@ does not yet.
 
 It exists for drop-in implementations of console DLLs, such as the `AcpHal`, `chad`, `xapu` and `XCRDAPI` crates
 of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later). All four modules now
-have a shim here as well (`shims/acphal.cpp`, `shims/xapu_chad.cpp` for both `xapu.dll` and `chad.dll`, and
-`shims/dstorage.cpp` for `xcrdapi.dll`); a DLL in the folder replaces its module's shim, as above. Measured on the
-1.0.2.1 executable at `867d922`, before those shims: without the folder, `--dry-run` leaves 20 imports unimplemented
-(AcpHal 9, chad 5, xapu 5, XCRDAPI 1); with those four DLLs built from `f89e410`, it leaves 0, with the four
-package DLLs still mapped (`module=72`). Those DLLs run static initializers when Windows loads them, and with the
-defaults one of them hooks the process: the package DLLs mapped after it then fail to map. With
+have a shim here as well (`shims/acphal.cpp`, `shims/xapu_queue.cpp` for `xapu.dll`, `shims/xapu_chad.cpp` for
+`chad.dll`, and `shims/dstorage.cpp` for `xcrdapi.dll`); a DLL in the folder replaces its module's shim, as above.
+Measured on the 1.0.2.1 executable at `867d922`, before those shims: without the folder, `--dry-run` leaves 20
+imports unimplemented (AcpHal 9, chad 5, xapu 5, XCRDAPI 1); with those four DLLs built from `f89e410`, it leaves 0,
+with the four package DLLs still mapped (`module=72`). Those DLLs run static initializers when Windows loads them,
+and with the defaults one of them hooks the process: the package DLLs mapped after it then fail to map. With
 `TOMBOX_GDK_EARLY=0 TOMBOX_GDK_RUNTIME=0 TOMBOX_OSHOST=0 TOMBOX_PAD=0 TOMBOX_TIMER_1MS=0` they map; their network
 guard stays on and denies all traffic. `loader_test` covers the step with a synthetic DLL (no game data).
 
