@@ -10682,7 +10682,8 @@ public:
         const auto& key = order_key_.empty() ? cache_key_ : order_key_;
         log->request(order_hash_, key, variant, order_kind_, order_created_ms_,
                      [&] { return order_ready(variant); },
-                     [&] { return variant == 0 ? order_build_ms_.load() : leonida::pipeline_order::unknown_ms; });
+                     [&] { return variant == 0 ? order_build_ms_.load() : leonida::pipeline_order::unknown_ms; },
+                     order_name_hash_);
     }
     // Its handle existed, and nobody was building it, when it was first asked for.
     bool order_ready(std::uint32_t variant) {
@@ -10693,12 +10694,15 @@ public:
         return pipeline_.built ? pipeline_.built(this) != VK_NULL_HANDLE : pipeline_.pipeline != VK_NULL_HANDLE;
     }
     // Called at the end of create_compute / create_graphics, before the pipeline is registered with the replay.
-    void order_install(void (*&requested)(void*, std::uint32_t), void*& context, char kind) {
+    // A compute pipeline passes the name of its library entry: the log then adds an E line for it.
+    void order_install(void (*&requested)(void*, std::uint32_t), void*& context, char kind,
+                       std::string_view entry_name = {}) {
         if (!device_.order_log) return;
         const auto& key = order_key_.empty() ? cache_key_ : order_key_;
         if (key.empty()) return;
         order_hash_ = leonida::pipeline_order::key_hash(key);
         order_kind_ = kind;
+        if (!entry_name.empty()) order_name_hash_ = leonida::pipeline_order::entry_name_hash(entry_name);
         requested = &order_requested;
         context = this;
     }
@@ -11717,7 +11721,7 @@ public:
             code_bytes_ = code.size();
             pipeline_.code_base = code_base_;
         }
-        if (!pipeline_.skipped) order_install(pipeline_.requested, pipeline_.request_context, 'c');
+        if (!pipeline_.skipped) order_install(pipeline_.requested, pipeline_.request_context, 'c', entry->name);
         device_.context->add_pipeline(id(), pipeline_,
                                       device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
         registered_ = true;
@@ -12343,6 +12347,7 @@ private:
     leonida::cached_pso::Key order_key_;  // see set_order_key; empty: cache_key_
     std::uint64_t order_hash_ = 0;        // 0: this pipeline is not in the order log
     char order_kind_ = 'c';
+    std::uint64_t order_name_hash_ = 0;   // compute: the hash of its library entry's name (E line); 0: none
     std::uint32_t order_created_ms_ = device_.order_log ? DeviceState::order_now_ms() : 0;
     std::atomic<std::uint32_t> order_build_ms_{leonida::pipeline_order::unknown_ms};  // variant 0, once built
 };

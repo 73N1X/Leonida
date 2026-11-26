@@ -17,9 +17,13 @@
 //   S 1 <vendor hex> <device hex>     a run starts here
 //   P <c|g|m> <key> <variant hex> <created ms> <first ms> <build ms or -> <ready 0|1> *<checksum>
 //   B <key> <variant hex> <build ms> *<checksum>   the build of a P line whose time was not known yet
+//   E <key> <variant hex> <name hash hex> *<checksum>   which library entry a compute P line is (right after it)
 //
 // c = compute, g = graphics, m = mesh. The checksum is FNV-1a over the line before " *". No game data is in the file:
-// the key is a SHA-256 of the title's own description of the pipeline (cached_pso.h), the rest are numbers.
+// the key is a SHA-256 of the title's own description of the pipeline (cached_pso.h), the rest are numbers. The name
+// hash of an E line is 16 hex digits of FNV-1a 64 over the name of the library entry the pipeline was made from (the
+// name itself is not written). A reader from before E lines skips them (counted as lines not read);
+// parse() below reads them.
 #pragma once
 
 #include <algorithm>
@@ -40,6 +44,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace leonida::pipeline_order {
@@ -64,6 +69,14 @@ struct Record {
     bool operator==(const Record&) const = default;
 };
 
+// An E line: the library entry (by the hash of its name) behind a pipeline and variant.
+struct EntryName {
+    std::string key;
+    std::uint32_t variant = 0;
+    std::uint64_t name_hash = 0;
+    bool operator==(const EntryName&) const = default;
+};
+
 struct Session {
     std::uint32_t vendor = 0;
     std::uint32_t device = 0;
@@ -72,6 +85,7 @@ struct Session {
 
 struct ReadResult {
     std::vector<Session> sessions;
+    std::vector<EntryName> entries;  // the E lines of the whole file, in file order
     std::size_t bad_lines = 0;  // complete lines that could not be read: skipped
     bool cut_tail = false;      // the last line had no newline: a write that did not finish, skipped
 };
@@ -87,6 +101,9 @@ inline std::uint64_t key_hash(std::string_view key) {
     for (const char c : key) h = (h ^ std::uint8_t(c)) * 0x100000001b3ull;
     return h ? h : 1;
 }
+
+// The hash an E line carries for the name of a library entry.
+inline std::uint64_t entry_name_hash(std::string_view name) { return key_hash(name); }
 
 namespace detail {
 
@@ -119,6 +136,21 @@ inline bool parse_u32(std::string_view s, int base, std::uint32_t& out) {
         if (v > 0xffffffffull) return false;
     }
     out = std::uint32_t(v);
+    return true;
+}
+
+// Exactly 16 lowercase hex digits.
+inline bool parse_hash64(std::string_view s, std::uint64_t& out) {
+    if (s.size() != 16) return false;
+    std::uint64_t v = 0;
+    for (const char c : s) {
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else return false;
+        v = (v << 4) | std::uint64_t(d);
+    }
+    out = v;
     return true;
 }
 
@@ -171,6 +203,17 @@ inline std::string format_build(std::string_view key, std::uint32_t variant, std
     body += key;
     body += numbers;
     body += std::to_string(build_ms);
+    std::string out;
+    detail::append_line(out, std::move(body));
+    return out;
+}
+
+inline std::string format_entry(std::string_view key, std::uint32_t variant, std::uint64_t name_hash) {
+    char numbers[48];
+    std::snprintf(numbers, sizeof(numbers), " %x %016llx", variant, static_cast<unsigned long long>(name_hash));
+    std::string body = "E ";
+    body += key;
+    body += numbers;
     std::string out;
     detail::append_line(out, std::move(body));
     return out;
@@ -234,6 +277,14 @@ inline ReadResult parse(std::string_view text) {
                         it->build_ms = ms;
                         break;
                     }
+            }
+        } else if (f.size() == 4 && f[0] == "E") {
+            EntryName e;
+            ok = !f[1].empty() && f[1].size() <= key_chars && detail::parse_u32(f[2], 16, e.variant) &&
+                 detail::parse_hash64(f[3], e.name_hash);
+            if (ok) {
+                e.key = std::string(f[1]);
+                result.entries.push_back(std::move(e));
             }
         }
         if (!ok) ++result.bad_lines;
@@ -313,11 +364,13 @@ public:
     }
 
     // Fills the claimed record and makes it visible to the writer. `key` is cut at key_chars. `build_ms` is what is
-    // known of the build now, or unknown_ms.
+    // known of the build now, or unknown_ms. `name_hash` is entry_name_hash() of the library entry of a compute
+    // pipeline (an E line follows its P line), 0 when there is none.
     void publish(Claim claim, std::string_view key, char kind, bool ready, std::uint32_t created_ms,
-                 std::uint32_t build_ms) noexcept {
+                 std::uint32_t build_ms, std::uint64_t name_hash = 0) noexcept {
         if (!claim.first) return;
         Slot& s = slots_[claim.index];
+        s.name_hash = name_hash;
         s.key_len = std::uint8_t(std::min(key.size(), key_chars));
         for (std::size_t i = 0; i < s.key_len; ++i) {  // a key is one word of the line: no space, no newline
             const char c = key[i];
@@ -338,11 +391,11 @@ public:
     // Returns true when this call made the record.
     template <class Ready, class Build>
     bool request(std::uint64_t hash, std::string_view key, std::uint32_t variant, char kind, std::uint32_t created_ms,
-                 Ready&& ready, Build&& build_ms) noexcept {
+                 Ready&& ready, Build&& build_ms, std::uint64_t name_hash = 0) noexcept {
         const Claim c = claim(hash, variant);
         if (!c) return false;
         const bool is_ready = ready();
-        publish(c, key, kind, is_ready, created_ms, build_ms());
+        publish(c, key, kind, is_ready, created_ms, build_ms(), name_hash);
         return true;
     }
 
@@ -449,6 +502,7 @@ private:
         std::uint32_t variant = 0;
         std::uint32_t created_ms = 0;
         std::uint32_t first_ms = 0;
+        std::uint64_t name_hash = 0;  // 0: no E line
         std::uint8_t key_len = 0;
         char kind = 'c';
         bool ready = false;
@@ -487,6 +541,10 @@ private:
             r.ready = s.ready;
             out += format_record(r);
             ++lines;
+            if (s.name_hash) {
+                out += format_entry(r.key, r.variant, s.name_hash);
+                ++lines;
+            }
             if (r.build_ms == unknown_ms) waiting_.push_back(cursor_);
             ++cursor_;
         }
