@@ -51,6 +51,10 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Leonida: keeps the reflections of the frames before (packed like the
+    /// diffuse light). Without rays they hold the miss colour - sky - on
+    /// every glossy texel: white glitter on floors, lit windows and eyes.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +66,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -75,6 +81,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where `CS_UpdateHistory` keeps the reflections (R32_UINT of R9G9B9E5):
+/// the place lepotane/VIctory-leonida measured.
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -121,6 +130,18 @@ fn most() -> f32 {
     *SET.get_or_init(|| {
         let set = std::env::var("LEONIDA_AMBIENT_MOST").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
+    })
+}
+
+/// Leonida: the brightest a reflection may be, as a multiple of the light
+/// around (`LEONIDA_REFLECT_MOST=<multiple>`, 3; 0: reflections as the
+/// title left them). Also pulls colours far from grey towards it: the
+/// misses' sky and stale history are what made eyes and posters glow.
+fn reflect_most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("LEONIDA_REFLECT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(3.0)
     })
 }
 
@@ -263,8 +284,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
-RWTexture2D<uint> light : register(u0);
+// R9G9B9E5 kept in 32-bit integers (the light and the reflections).
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
 }
@@ -277,6 +297,29 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+
+#ifdef REFLECT
+RWTexture2D<uint> kept : register(u0);
+// Leonida: a reflection no brighter than `unused` times the room's light,
+// and a colour more than twice as strong in one channel as its grey pulled
+// towards that grey (nothing lit by the scene does that; a miss's sky or a
+// stale history does).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void guard_reflect(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 c = unpack(kept[at.xy]);
+    float y = dot(c, LUMA);
+    float peak = max(c.r, max(c.g, c.b));
+    c = lerp(c, y.xxx, saturate((peak / max(y, 1e-6) - 2.0) * 0.5));
+    float cap = unused * max(dot(cells[CELLS].rgb, LUMA), 0.05);
+    if (y > cap) c *= cap / y;
+    kept[at.xy] = pack(c);
+}
+#endif
+
+#ifdef RAISE
+RWTexture2D<uint> light : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -359,6 +402,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -390,6 +434,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let reflect = pipeline("REFLECT", s!("guard_reflect"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -399,6 +444,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -455,6 +501,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::Reflect && (constant > 0.0 || reflect_most() == 0.0) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -476,6 +525,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = most().to_bits();
     words[10] = air().to_bits();
+    words[11] = reflect_most().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -502,6 +552,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -533,6 +584,7 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"CS_UpdateHistory_1234"), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 

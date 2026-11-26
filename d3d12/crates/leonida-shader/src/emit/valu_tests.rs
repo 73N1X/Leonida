@@ -476,6 +476,29 @@ fn normalized_codes_truncate_back_to_themselves() {
     }
 }
 
+/// Leonida: `v_mad_legacy_f32` reads its sources flushed, as RDNA 2 runs
+/// it, so a subnormal factor is a zero and the product +0 whatever the
+/// other factor is - an infinity or a NaN too. On the PC a subnormal times
+/// infinity was infinity, which the colour scrub turned into a black pixel.
+#[test]
+fn mad_legacy_takes_a_subnormal_factor_as_a_zero() {
+    let shader = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let tiny = f32::from_bits(1);
+    let cases: [([f32; 3], f32); 6] = [
+        ([tiny, f32::INFINITY, 2.0], 2.0),
+        ([-tiny, f32::NAN, 2.0], 2.0),
+        ([f32::INFINITY, tiny, -1.0], -1.0),
+        ([0.0, f32::INFINITY, 0.5], 0.5),
+        ([3.0, 4.0, 1.0], 13.0),
+        ([-1.5, 2.0, 0.25], -2.75),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|([a, b, c], _)| [a.to_bits(), b.to_bits(), c.to_bits(), 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (sources, want) = cases[i];
+        assert_eq!(f32::from_bits(got), want, "{backend}: mad_legacy{sources:?}");
+    });
+}
+
 #[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.

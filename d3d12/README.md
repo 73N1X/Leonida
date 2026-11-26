@@ -9,6 +9,17 @@ It grew from the VIctory runtime: Marvisak/VIctory, through trustno1-coder/VIcto
 its own work on top; everything below this section is trustno1-coder/VIctory-NVIDIA's README as it came, with the
 project name changed where it named the program.
 
+## Leonida's picture fixes
+
+| What it fixes | Setting (default) | Where | Credit |
+| --- | --- | --- | --- |
+| A 540p picture | `scripts/play-d3d12.ps1 -Resolution native`: the title's own 1920x1080 on Series S, neither title patch. A pinned scale of 1 with the own upscaler forced stops the title in its init (twice in two runs, frame 0, "Game Init") | `scripts/play-nvidia.ps1` | lepotane/VIctory-leonida runs 1080p this way |
+| A soft world | `LEONIDA_SHARPEN` (0.4; 0 off): the game plane is sharpened before the interface goes over it, limited to each pixel's neighbourhood so there are no halos | `crates/leonida-gpu/src/compose.rs` | Leonida's own; lepotane's `VICTORY_COMPOSE_SHARPEN` was the hint |
+| Black skin, faces and clothes | `LEONIDA_PAGE_WRITES` (bits 1, 2 and 8): textures picked by index that were uploaded before DirectStorage or a plain read filled them are uploaded again | `crates/leonida-gpu/src/watch.rs` | fxceless/victory-fork `e4245f3` |
+| Skin that turns black later and stays so | `LEONIDA_HEAP_RECHECK_EVERY` (300 frames; 0 off): uploaded textures picked by index are looked at again on a slow beat after the first five looks | `crates/leonida-gpu/src/draw.rs` | fxceless/victory-fork, after RyanCase94 `920423a9` |
+| Black pixels where a NaN or infinity was scrubbed | `v_mac_legacy_f32` / `v_mad_legacy_f32` fused with flushed sources, as RDNA 2 runs them: a subnormal factor is a zero, so subnormal times infinity is no longer infinity (test `mad_legacy_takes_a_subnormal_factor_as_a_zero`) | `crates/leonida-shader/src/emit/lower.rs` | fxceless/victory-fork `f6a09d3` |
+| White glitter on floors, glowing windows and eyes | `LEONIDA_REFLECT_MOST` (3; 0 off): after `CS_UpdateHistory`, reflections are capped at a multiple of the room's light and colours far from grey pulled towards it; without rays they hold the sky of every miss | `crates/leonida-gpu/src/ambient.rs` | Leonida's own pass; the program and its view from lepotane/VIctory-leonida |
+
 ---
 
 ## From trustno1-coder/VIctory-NVIDIA's README: built from many projects

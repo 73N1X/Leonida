@@ -22,24 +22,55 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 /// must not find theirs rewritten.
 const SLOTS: u32 = 16;
 
+// Leonida: the game plane is sharpened before the interface goes over it
+// (`sharpen`, from `LEONIDA_SHARPEN`). The title's temporal upscaler and
+// its history leave the world soft; the interface is drawn at 4K and is
+// left as it is. Detail is the pixel against the mean of its four
+// neighbours, added back by an amount that falls where the neighbourhood
+// already spans a wide range (edges get little, flat textured areas most),
+// and the result never leaves the neighbourhood's own range (no halos).
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=3, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
-cbuffer Size : register(b0) { uint w; uint h; uint premultiplied; };
+#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Size : register(b0) { uint w; uint h; uint premultiplied; float sharpen; };
 Texture2D<float4> game : register(t0);
 Texture2D<float4> ui : register(t1);
 RWTexture2D<float4> outp : register(u0);
 SamplerState linear_clamp : register(s0);
+float3 at(int2 p) { return game.Load(int3(clamp(p, int2(0, 0), int2(w - 1, h - 1)), 0)).rgb; }
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
     float2 uv = (float2(id.xy) + 0.5) / float2(w, h);
-    float4 g = game.Load(int3(id.xy, 0));
+    int2 p = int2(id.xy);
+    float3 g = at(p);
+    if (sharpen > 0.0) {
+        float3 l = at(p + int2(-1, 0)), r = at(p + int2(1, 0));
+        float3 t = at(p + int2(0, -1)), b = at(p + int2(0, 1));
+        float3 lo = min(g, min(min(l, r), min(t, b)));
+        float3 hi = max(g, max(max(l, r), max(t, b)));
+        float3 detail = g - 0.25 * (l + r + t + b);
+        float3 room = saturate(1.0 - (hi - lo) * 2.0);
+        g = clamp(g + detail * (sharpen * 2.0) * room, lo, hi);
+    }
     float4 u = ui.SampleLevel(linear_clamp, uv, 0);
-    float3 c = premultiplied != 0 ? g.rgb * (1.0 - u.a) + u.rgb : lerp(g.rgb, u.rgb, u.a);
+    float3 c = premultiplied != 0 ? g * (1.0 - u.a) + u.rgb : lerp(g, u.rgb, u.a);
     outp[id.xy] = float4(c, 1.0);
 }
 "#;
+
+/// Leonida: how much the game plane is sharpened (`LEONIDA_SHARPEN`, 0 to
+/// 1; default 0.4; 0: off, the pass as before).
+fn sharpen() -> f32 {
+    static SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("LEONIDA_SHARPEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map_or(0.4, |v| v.clamp(0.0, 1.0))
+    })
+}
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -223,7 +254,7 @@ pub(crate) fn record(
         before.push(t(ui, ui_state, read));
         after.push(t(ui, read, ui_state));
     }
-    let constants: [u32; 3] = [w as u32, h, u32::from(premultiplied())];
+    let constants: [u32; 4] = [w as u32, h, u32::from(premultiplied()), sharpen().to_bits()];
     // SAFETY: an open list (the present's); slots of our heap; live
     // resources and objects (the pass's own live as long as the process,
     // the texture is kept by the present's list).
@@ -235,7 +266,7 @@ pub(crate) fn record(
         list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         list.SetComputeRootSignature(&pass.root);
         list.SetPipelineState(&pass.pso);
-        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         list.SetComputeRootDescriptorTable(1, gpu);
         list.Dispatch((w as u32).div_ceil(8), h.div_ceil(8), 1);
         list.ResourceBarrier(&after);

@@ -2102,23 +2102,34 @@ impl Drop for KernelWrite {
 /// 1, the guarded blocks under it are opened and count as written (host
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
-/// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
-/// copies lay under such writes and kept the bytes from before; runs 197
-/// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// 4, both also for reads to plain addresses when they have finished;
+/// 8, for those finished plain reads only bit 2's look at the textures.
+/// Unset: bits 1, 2 and 8. `guards`: bit 1 alone (Leonida's default until
+/// 2026-11-26). `0`: nothing, counted only. `1`: bits 1 and 2. `slots`:
+/// bit 2 alone. `all`: every bit.
+///
+/// Bit 1: every run had 10,000 to 50,000 guarded blocks of host copies
+/// under such writes, holding the bytes from before; opening them cost
+/// nothing seen.
+///
+/// Bits 2 and 8 (Leonida, after fxceless/victory-fork e4245f3, GPL-3.0):
+/// the black skin and faces. A texture picked by index is uploaded when its
+/// slot is first looked at; the title often streams its levels in after
+/// that, through DirectStorage or a plain read, which no guard sees. The
+/// upload kept what was there first - zeros, so black - until the slot was
+/// written again, which for characters' skin and clothes may be never.
+/// Only slots uploaded before the bytes landed are made due again
+/// (`HostHeap::texture_slots_page_written`); one still waiting for its first
+/// upload takes whatever is there by then.
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("LEONIDA_PAGE_WRITES").as_deref().map(str::trim) {
         Ok("0") => 0,
         Ok("1") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
+        Ok("guards") => 1,
+        Ok("all") => 15,
+        _ => 1 | 2 | 8,
     })
 }
 
@@ -2155,7 +2166,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
         if mode & 4 == 0 {
+            // Bit 8 without bit 4: a finished plain read touches only the
+            // placed textures under it; the guards stay as they are.
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }

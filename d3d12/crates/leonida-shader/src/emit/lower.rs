@@ -3992,6 +3992,41 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, z, zero, m)
     }
 
+    /// Leonida: `x` with a subnormal made a zero of the same sign, as the
+    /// console's legacy multiply-add reads its sources. (A subnormal times
+    /// a tiny value is 0 by the zero-factor rule there; on the PC it was a
+    /// subnormal times infinity = infinity, which the colour scrub then
+    /// turned into a black pixel.)
+    fn flush_subnormal(&mut self, x: V) -> V {
+        let c = self.cur;
+        let magnitude = self.unary(6, x);
+        // The smallest normal f32, 2^-126.
+        let smallest = self.s.m.f32(0x0080_0000);
+        let tiny = self.s.m.cmp(c, pred::OLT, magnitude, smallest);
+        let zero = self.s.m.f32(0);
+        // x * 0 is a zero with x's sign for every finite x.
+        let signed = self.s.m.bin(c, Bin::Mul, x, zero);
+        self.s.m.select(c, tiny, signed, x)
+    }
+
+    /// Leonida: `v_mac_legacy_f32` / `v_mad_legacy_f32` as RDNA 2 runs them
+    /// (it decodes both as `v_fma_legacy_f32`): sources flushed, one rounding,
+    /// and a product of +0 where either factor is a zero, whatever the other
+    /// is. The same finding as fxceless/victory-fork f6a09d3 (pull request
+    /// #1026 there, GPL-3.0).
+    fn legacy_mad(&mut self, a: V, b: V, addend: V) -> V {
+        let (a, b, addend) = (self.flush_subnormal(a), self.flush_subnormal(b), self.flush_subnormal(addend));
+        let fused = self.fmad(a, b, addend);
+        let c = self.cur;
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+        let either = self.s.m.bin(c, Bin::Or, az, bz);
+        // +0 + addend: a zero addend's sign comes out as an addition makes it.
+        let plain = self.s.m.bin(c, Bin::Add, zero, addend);
+        self.s.m.select(c, either, plain, fused)
+    }
+
     // ---- lane booleans ----
 
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
@@ -8389,20 +8424,18 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
-                    _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
-                    }
+                    _ => self.legacy_mad(a, bb, acc),
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let r = self.legacy_mad(a, bb, cc);
+                float(self, r)
+            }
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }

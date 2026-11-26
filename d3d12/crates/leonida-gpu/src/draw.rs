@@ -623,6 +623,22 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Leonida: frames between further looks at an uploaded texture picked by
+/// index once [`RECHECK_FRAMES`] is through (`LEONIDA_HEAP_RECHECK_EVERY`,
+/// 300; 0: never again, as before). Characters' skin and clothes are
+/// streamed in and rewritten long after their views are written; a change
+/// after the schedule's last look stayed on the card for the rest of the
+/// run, which is the skin that turns black (or red) and stays so. The same
+/// finding as fxceless/victory-fork (after RyanCase94 920423a9, GPL-3.0),
+/// there off by default; here on, since a look reads only 48 KiB and only
+/// a changed texture goes up again.
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("LEONIDA_HEAP_RECHECK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(300)
+    })
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2300,11 +2316,16 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
+                    match (RECHECK_FRAMES.get(usize::from(looks) + 1), recheck_every()) {
+                        (Some(wait), _) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // Past the schedule: on a slow beat for as long as
+                        // the slot shows this texture (`recheck_every`).
+                        (None, 0) => host.texture_slot_done(index, write, None),
+                        (None, every) => {
+                            host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded)
+                        }
                     }
                     continue;
                 }
@@ -2720,7 +2741,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2753,6 +2774,7 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflect => REFLECTIONS,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
@@ -2770,10 +2792,10 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air => None,
+            Role::Radiance | Role::Air | Role::Reflect => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");

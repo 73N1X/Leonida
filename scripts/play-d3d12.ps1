@@ -11,7 +11,7 @@ param(
     [string]$Data = (Join-Path $env:LOCALAPPDATA "Leonida\d3d12"),
     [switch]$SeriesX,
     [switch]$Quality,
-    [ValidateSet('', '2160', '1440', '1080', '720', '540', '480')][string]$Resolution = '',
+    [ValidateSet('', 'native', '2160', '1440', '1080', '720', '540', '480')][string]$Resolution = '',
     [string]$Adapter = '',
     [hashtable]$More = @{},
     [switch]$Rebuild
