@@ -37,7 +37,7 @@
 //     one that starts inside a block another holds is refused, and from 64 MiB on one must start on a 2 MiB line. The
 //     retail title's 32-bit windows lie side by side on 1 MiB lines, so imports that share a block are merged.
 //
-// Sparse title memory (LEONIDA_TITLE_MEMORY=sparse, opt-in; SparseTitleMemory in shims/d3d12_vulkan_device.cpp,
+// Sparse title memory (the default: the imports path lost the device on the title; LEONIDA_TITLE_MEMORY=imports opts out; SparseTitleMemory in shims/d3d12_vulkan_device.cpp,
 // docs/d3d12_vulkan.md section 3.3): sparse buffers over both windows at heap_base + VA, xmem's physical-page pools
 // imported once each (in 256 MiB pieces) and every mapped page a sparse bind of its VA to its pool's import, every
 // unmapped page bound to nothing (it reads zero), the title's other GPU memory imported once per range and bound at its
