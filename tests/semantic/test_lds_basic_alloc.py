@@ -115,9 +115,9 @@ class TestAllocationSize(unittest.TestCase):
 
 
 class TestRefusals(unittest.TestCase):
-    def test_tg_size_en_refused(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            L.translate([READ], rsrc2(8, extra=1 << 10))
+    def test_tg_size_en_accepted(self):
+        # The thread-group info SGPR is seeded now (its value: test_cs_tg_size.py).
+        self.assertIn("OpShiftLeftLogical", L.translate([READ], rsrc2(8, extra=1 << 10)))
 
     def test_group_over_1024_refused(self):
         for size in ((1025, 1, 1), (32, 33, 1), (16, 16, 5)):

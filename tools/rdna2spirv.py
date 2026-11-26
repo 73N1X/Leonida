@@ -16277,6 +16277,24 @@ def assemble(gen):
             r = gen.cs["user"] + k
             fn += [f"%wg{c} = OpCompositeExtract %uint %wgi {c}",
                    f"%wgp{c} = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", f"OpStore %wgp{c} %wg{c}"]
+        if gen.cs.get("tg_size"):
+            # The thread-group info SGPR after the workgroup ids: (wave index in the group << 20) | wave count, the
+            # wave index being the flat local index over the console wave size.
+            sx, sy, sz = gen.cs["size"]
+            wave = 64 if gen.wave64 else 32
+            waves = -(-(sx * sy * sz) // wave)
+            if gen.relabel:
+                idx = "%rl_t"
+            else:
+                fn += ["%tg_lx = OpCompositeExtract %uint %lci 0", "%tg_ly = OpCompositeExtract %uint %lci 1",
+                       "%tg_lz = OpCompositeExtract %uint %lci 2",
+                       f"%tg_zy = OpIMul %uint %tg_lz {gen.cu(sx * sy)}", f"%tg_y = OpIMul %uint %tg_ly {gen.cu(sx)}",
+                       "%tg_s = OpIAdd %uint %tg_zy %tg_y", "%tg_i = OpIAdd %uint %tg_s %tg_lx"]
+                idx = "%tg_i"
+            r = gen.cs["user"] + len(gen.cs["tgid"])
+            fn += [f"%tg_w = OpUDiv %uint {idx} {gen.cu(wave)}", f"%tg_h = OpShiftLeftLogical %uint %tg_w {gen.cu(20)}",
+                   f"%tg_v = OpBitwiseOr %uint %tg_h {gen.cu(waves)}",
+                   f"%tg_p = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", "OpStore %tg_p %tg_v"]
         for c in range(gen.cs["tid"] + 1):
             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
@@ -17784,13 +17802,18 @@ def translate(path):
         # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
         # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
-        if (rsrc2 >> 10) & 1:
-            raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")
         user = (rsrc2 >> 1) & 31
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
-                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
+                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz), "tg_size": bool((rsrc2 >> 10) & 1)}
+        if g.cs["tg_size"]:
+            # TG_SIZE_EN [10]: one more SGPR after the workgroup ids, the wave's index in its group in bits 24:20 and
+            # the group's wave count in bits 5:0 (Mesa ac_nir_lower_intrinsics_to_args: load_subgroup_id unpacks
+            # tg_size bits 20..24, load_num_subgroups bits 0..5). 91 of the title's captured compute programs read it.
+            wave = 64 if g.wave64 else 32
+            for i in (user + len(g.cs["tgid"]), 20, wave, -(-(lx * ly * lz) // wave), lx, lx * ly):
+                g.cu(i)
         # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
         # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
