@@ -488,6 +488,10 @@ const leonida::pipelines::Job* pipeline_bound(ID3D12PipelineState* pipeline);
 const leonida::pipelines::Job* pipeline_job(ID3D12PipelineState* pipeline);
 std::string pipeline_early_key(ID3D12PipelineState* pipeline);
 bool make_pipeline_now(ID3D12PipelineState* pipeline);
+// For the console's stream slot (86): a graphics PSO whose pipeline is never made, handed out where the layer refused
+// the description, as VIctory hands out a pipeline for every stream; its draws are dropped and counted as refused.
+// E_NOINTERFACE for a device of another implementation.
+HRESULT create_refused_pipeline_state(ID3D12Device* device, REFIID riid, void** out);
 
 // Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.

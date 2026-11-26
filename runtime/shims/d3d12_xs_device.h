@@ -139,6 +139,12 @@ void set_sampler_x_handler(SamplerXHandler handler);
 // V sampler.rs:28-96, Fields::host and console: the D3D12 sampler of a console sampler description (27 words).
 D3D12_SAMPLER_DESC console_sampler_desc(const std::uint32_t* words);
 
+// Console device slot 86: a pipeline object for a stream the device behind the proxy refused, as VIctory hands one out
+// for every stream (rt::d3d12::create_refused_pipeline_state, which the Vulkan layer registers). With none registered
+// the refusal reaches the title.
+using RefusedPipelineHandler = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
+void set_refused_pipeline_handler(RefusedPipelineHandler handler);
+
 // Console list methods that work on title addresses (V list.rs:1294-1314, 1409-1431, 1891-1983), done by the device
 // behind the list's device proxy, which registers them (the Vulkan layer). `real` is the PC list, `device` the PC
 // device. With no handler a slot records nothing and answers 0, as before.

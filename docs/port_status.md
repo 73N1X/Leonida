@@ -288,6 +288,18 @@ saves), made under VIctory, is kept outside the repository:
   every key of the stand-in pad's table, so menus can be driven by a script;
   the user-facing name is Leonida instead of DexNom Runtime.
 
+## Pipelines off the title's thread (`port/pipelines`)
+
+Run on `port/pipelines` merged (uncommitted) with `port/victory-merge` 43f98a6dd, `LEONIDA_D3D12=vulkan`,
+`LEONIDA_SHADERS`, `LEONIDA_DISPLAY_MODE=2560x1440`, its own save and overlay folders, no `pipeline_cache.bin`:
+the first CreateComputePipelineState (slot 62) returns at once and the title goes on (root signatures, query
+heaps, committed resources, views, command signatures), where it stopped ~28 s in that call before. About 12 s in
+the title's own int3 at `+0x19f4f58` (a soft assert) ends the run. With `LEONIDA_SKIP_INT3=1` it goes on through
+its pipeline burst (six slot-86 streams with no shaders, handed never-made PSOs; over 8,192 slot-57 creations,
+refused as VIctory refuses them; the FidelityFX slot-67 programs the shader stage does not translate) and texture
+creation, then writes to `0x20` at `+0x24844a9` about 10 s in. No list had bound a pipeline yet, and the frame
+clock had begun no frame.
+
 ## Open items, in order
 
 1. Build `gta6rt` and run it on the real executable (`--dry-run`, `--init`,

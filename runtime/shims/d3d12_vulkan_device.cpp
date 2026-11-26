@@ -4174,6 +4174,18 @@ public:
             leonida::pipelines::Builder::get().start(job_, leonida::pipelines::kEarly);
     }
 
+    // A graphics PSO whose pipeline is never made, for a console stream the layer refused (device slot 86): VIctory
+    // hands out a pipeline for every stream (pipeline.rs create_stream), and the title uses what it gets (its streams
+    // with no shader at all came back E_INVALIDARG, and it wrote through the null pointer at once). Draws with it are
+    // dropped and counted as refused.
+    void make_refused() {
+        is_graphics_ = true;
+        created_ = true;
+        job_ = std::make_shared<leonida::pipelines::Job>(false, false);
+        job_->set_work([] { return false; });
+        job_->run_now();
+    }
+
     // The bind site (SetPipelineState): notes the pipeline for the next run's early list, starts it, and waits for it
     // while the frame's budget lasts.
     const leonida::pipelines::Job* bind() {
@@ -6021,6 +6033,8 @@ public:
         rt::d3d12_xs::set_placed_view_handler(&rt::d3d12::create_placed_view);
         rt::d3d12_xs::set_sampler_x_handler(&rt::d3d12::create_sampler_x);
         rt::d3d12_xs::set_list_title_handlers(&kListTitleHandlers);
+        // And slot 86's pipeline for a stream this device refuses (create_refused_pipeline_state).
+        rt::d3d12_xs::set_refused_pipeline_handler(&rt::d3d12::create_refused_pipeline_state);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -7340,6 +7354,16 @@ public:
         }
         pipeline->created(stream_pipeline_key(stream));
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
+    }
+
+    // rt::d3d12::create_refused_pipeline_state: a PSO that is never made (PipelineState::make_refused).
+    HRESULT refused_pipeline_state(REFIID riid, void** out) {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        auto* pipeline = new PipelineState(state_);
+        pipeline->attach_device(identity());
+        pipeline->make_refused();
+        return hand_out(pipeline, riid, out);
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE type) override {
@@ -10987,6 +11011,12 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
     if (!real) real = device;
     if (auto* d = Device::from<Device>(real)) return d->info().max_push_constants_size;
     return 0;
+}
+
+HRESULT create_refused_pipeline_state(ID3D12Device* device, REFIID riid, void** out) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (auto* d = device ? Device::from<Device>(real ? real : device) : nullptr) return d->refused_pipeline_state(riid, out);
+    return E_NOINTERFACE;
 }
 
 void prefetch_shader_library(ID3D12Device* device) {

@@ -2111,6 +2111,20 @@ title's own 30 s hang detector fired.
   when the builder runs dry; the next run starts those at creation, depth-only ones first.
 - The builds share the device's `VkPipelineCache` (seeded from `pipeline_cache.bin`). The index is read on a thread
   from the title's device creation on (57 MB, about 3.5 s on the test machine).
+- Console device slot 86 (`CreatePipelineState` from a stream, VIctory `pipeline.rs` `create_stream`) renumbers the
+  console's AS/MS subobjects (23/24) to the PC's (24/25) and goes to the layer's stream PSO. A stream the layer refuses
+  still gets a graphics PSO that is never made (its draws are dropped, counted as refused), as VIctory hands out a
+  pipeline for every stream: the title's first six streams have all five shader slots empty, and a null pipeline
+  was written through at once.
+- Why monolithic pipelines, measured (`runtime/test/vk_pipeline_paths.cpp`; 31 translated pixel shaders sampled
+  evenly over the index's 12,101, each path on its own renamed copy of the module so no cache serves it; RTX 4060 Ti,
+  driver 616.64, one thread, with other builds running on the machine). Mean / median ms: monolithic pipeline
+  4,041 / 632 (the same again in-process, a cache hit: 19.8 / 5.5); `VK_EXT_graphics_pipeline_library` fragment
+  library 4,249 / 642, pre-rasterization library 1.9 / 0.9, link 0.01, optimised link 3.3; `VK_EXT_shader_object`
+  4,222 / 583. Time follows the module's size: 5-90 KiB modules take 4-260 ms, 1.1-2.2 MB ones 9-20 s. The
+  pixel shader's compile is the cost whichever way it is made, so a library or a shader object saves only the
+  compiles of pixel shaders that several PSOs share (VIctory's world run bound 1,089 graphics pipelines with 762
+  pixel shaders), and shader objects would put every draw's state in dynamic state. Neither is used.
 - Open: VIctory's loading allowance (longer waits while a world loads); the attachment-format variants, still made
   where replay meets them.
 

@@ -1129,6 +1129,7 @@ std::atomic<const ListTitleHandlers*> g_list_title{nullptr};
 std::atomic<PlacedViewHandler> g_placed_view{nullptr};
 std::atomic<SamplerXHandler> g_sampler_x{nullptr};
 std::atomic<PageMapper> g_page_mapper{nullptr};
+std::atomic<RefusedPipelineHandler> g_refused_pipeline{nullptr};
 std::atomic<std::uint64_t> g_unmet_waits{0};
 
 // Reads the 32 or 64 bits at `address` without faulting on memory that is not there (false then).
@@ -2902,13 +2903,20 @@ HRESULT proxy_create_pipeline_state_stream(DeviceProxy* self, std::uint64_t desc
     std::vector<std::uint8_t> stream(in, in + desc->SizeInBytes);
     std::size_t at = 0, cut = stream.size();
     unsigned shaders = 0;
-    char types[160] = {};  // the console's subobject types in order, for the log
+    char types[256] = {};  // the console's subobject types in order (shaders with their lengths), for the log
     std::size_t types_used = 0;
     while (at + 8 <= stream.size()) {
         std::uint32_t type = 0;
         std::memcpy(&type, stream.data() + at, sizeof(type));
-        if (types_used + 4 < sizeof(types))
-            types_used += std::snprintf(types + types_used, sizeof(types) - types_used, "%s%u", types_used ? " " : "", type);
+        // A shader subobject's bytecode length after the colon (its bytecode pointer is at +8, its length at +16).
+        std::uint64_t code_bytes = 0;
+        const bool shader = (type >= 1 && type <= 6) || type == 23 || type == 24;
+        if (shader && at + 24 <= stream.size()) std::memcpy(&code_bytes, stream.data() + at + 16, sizeof(code_bytes));
+        if (types_used + 24 < sizeof(types))
+            types_used += shader ? std::snprintf(types + types_used, sizeof(types) - types_used, "%s%u:%llu",
+                                                 types_used ? " " : "", type, static_cast<unsigned long long>(code_bytes))
+                                 : std::snprintf(types + types_used, sizeof(types) - types_used, "%s%u",
+                                                 types_used ? " " : "", type);
         const std::size_t size = console_subobject_size(type);
         if (!size) {
             static std::atomic<bool> logged{false};
@@ -2922,22 +2930,30 @@ HRESULT proxy_create_pipeline_state_stream(DeviceProxy* self, std::uint64_t desc
             const std::uint32_t pc = type + 1;  // D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS / _MS
             std::memcpy(stream.data() + at, &pc, sizeof(pc));
         }
-        if ((type >= 1 && type <= 6) || type == 23 || type == 24) ++shaders;
+        if (shader) ++shaders;
         at += size;
     }
     const D3D12_PIPELINE_STATE_STREAM_DESC pc_desc{cut, stream.data()};
     using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
     const HRESULT hr = reinterpret_cast<Fn>(self->real_vtable[kPcCreatePipelineState])(self->real, &pc_desc, riid, out);
-    // The first four calls, and failures: the first 16, then every power of two.
+    // A stream the layer refuses still gets a pipeline object, one that is never made (its draws are dropped), as
+    // VIctory hands one out for every stream: the title's own streams include some with no shader at all, and it writes
+    // through what it is given (a null pipeline faulted at once).
+    HRESULT answer = hr;
+    if (const RefusedPipelineHandler refused = g_refused_pipeline.load(std::memory_order_acquire);
+        refused && FAILED(hr) && hr != E_OUTOFMEMORY && SUCCEEDED(refused(self->real, *riid, out)))
+        answer = S_OK;
+    // The first four calls, and refusals: the first 16, then every power of two.
     static std::atomic<unsigned> calls{0}, failures{0};
     const unsigned call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
     const unsigned failure = FAILED(hr) ? failures.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     if (call <= 4 || trace_enabled() || (failure && (failure <= 16 || !(failure & (failure - 1)))))
         std::fprintf(stderr, "[rt] d3d12_xs: slot 86 CreatePipelineState call %u: %llu bytes, %u shader subobjects "
-                             "(types %s) -> 0x%08lx, %u failed so far\n",
+                             "(types %s) -> 0x%08lx%s, %u refused so far\n",
                      call, static_cast<unsigned long long>(desc->SizeInBytes), shaders, types,
-                     static_cast<unsigned long>(hr), failures.load(std::memory_order_relaxed));
-    return hr;
+                     static_cast<unsigned long>(hr), answer != hr ? " (handed a pipeline that is never made)" : "",
+                     failures.load(std::memory_order_relaxed));
+    return answer;
 }
 
 // Console device slots 74 and 75 (V resource.rs:2187-2223): page pools, 64 KiB pages the title maps into its tiled
@@ -3409,6 +3425,10 @@ void set_page_mapper(PageMapper mapper) {
 
 void set_placed_view_handler(PlacedViewHandler handler) {
     g_placed_view.store(handler, std::memory_order_release);
+}
+
+void set_refused_pipeline_handler(RefusedPipelineHandler handler) {
+    g_refused_pipeline.store(handler, std::memory_order_release);
 }
 
 void set_list_title_handlers(const ListTitleHandlers* handlers) {

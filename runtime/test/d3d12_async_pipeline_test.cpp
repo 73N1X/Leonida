@@ -454,8 +454,29 @@ int main() {
         EXPECT(rt::d3d12::pipeline_early_key(console_pso) == rt::d3d12::pipeline_early_key(pc.p));
         EXPECT(rt::d3d12::make_pipeline_now(console_pso));
         console_pso->Release();
+        // A console stream with no shader (the title makes such streams): the layer refuses it, the title still gets
+        // a pipeline, and a draw with it is dropped and counted as refused.
+        std::vector<std::uint8_t> empty;
+        append(empty, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, gfx_rs.p);
+        append(empty, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE{});
+        append(empty, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE{});
+        append(empty, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, formats);
+        const D3D12_PIPELINE_STATE_STREAM_DESC empty_desc{empty.size(), empty.data()};
+        Ref<ID3D12PipelineState> refused_pc;
+        EXPECT(device->CreatePipelineState(&empty_desc, IID_PPV_ARGS(&refused_pc.p)) == E_INVALIDARG && !refused_pc.p);
+        void* refused = nullptr;
+        EXPECT(SUCCEEDED(reinterpret_cast<CreateStreamFn>(slot(proxy, 86))(proxy, &empty_desc, &iid, &refused)) &&
+               refused);
+        auto* refused_pso = static_cast<ID3D12PipelineState*>(refused);
+        const pipelines::Job* refused_job = rt::d3d12::pipeline_job(refused_pso);
+        EXPECT(refused_job && refused_job->finished() && !refused_job->ready());
+        const std::uint64_t refused_before = pipelines::Drops::get().counts().refused;
+        EXPECT(draw_with({refused_pso}, colour, recorded) && recorded == 0 && colour == kBlue);
+        EXPECT(pipelines::Drops::get().counts().refused == refused_before + 1);
+        refused_pso->Release();
         static_cast<IUnknown*>(proxy)->Release();
-        std::printf("d3d12_async_pipeline_test: console slot 86 made the stream PSO\n");
+        std::printf("d3d12_async_pipeline_test: console slot 86 made the stream PSO, and handed a pipeline that is never "
+                    "made for a stream without shaders (its draw dropped as refused)\n");
     }
 
     pipelines::set_wait_budget(std::chrono::milliseconds(pipelines::kDefaultWaitMs));
