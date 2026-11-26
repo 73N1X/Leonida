@@ -10047,17 +10047,8 @@ public:
         case D3D12_RESOURCE_DIMENSION_TEXTURE3D: td.dimension = g::Dimension::tex3d; break;
         default: known = false; break;
         }
-        if (xbox_layout == 0)
-            td.swizzle = td.dimension == g::Dimension::tex1d ? g::swizzle::linear
-                         : depth                              ? g::swizzle::sw_64kb_z_x
-                         : target                             ? g::swizzle::sw_64kb_r_x
-                                                              : g::swizzle::sw_4kb_s;
-        else if (xbox_layout == 1)
-            td.swizzle = g::swizzle::linear;
-        else if ((xbox_layout & ~0xffu) == 0x100)
-            td.swizzle = xbox_layout & 0xff;
-        else
-            known = false;
+        // The rule xg_xs.dll's texture computer lays the title's textures out with (runtime/shims/xg_xs.cpp).
+        if (!g::swizzle_from_layout_word(xbox_layout, td.dimension, depth, target, td.swizzle)) known = false;
         td.width = static_cast<std::uint32_t>(std::min<UINT64>(made.Width, UINT32_MAX));
         td.height = made.Height;
         td.depth_or_array = made.DepthOrArraySize;
