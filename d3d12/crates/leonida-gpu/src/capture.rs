@@ -174,7 +174,22 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || recording(n))
+}
+
+/// Leonida: every presented frame is saved while a file named `rec` is in
+/// the capture folder (a script makes it while it holds the movement keys,
+/// and removes it after). Looked for once per frame number, so a frame
+/// asked about twice gets one answer.
+pub(crate) fn recording(n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(folder) = folder() else { return false };
+    if ASKED.swap(n, Relaxed) != n {
+        ON.store(folder.join("rec").exists(), Relaxed);
+    }
+    ON.load(Relaxed)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -363,7 +378,14 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        if recording(frame) {
+            // Leonida: while recording every frame, the bytes are copied out
+            // and encoded on a thread of their own; the present goes on.
+            let (owned, w, h, pitch) = (rows.to_vec(), f.Width, f.Height, f.RowPitch as usize);
+            std::thread::spawn(move || save(frame, w, h, pitch, bgra, &owned));
+        } else {
+            save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        }
         buffer.Unmap(0, None);
     }
 }

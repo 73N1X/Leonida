@@ -8987,7 +8987,8 @@ impl Host {
             list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                // Leonida: what is shown (the planes laid and sharpened), not the game plane alone.
+                .then(|| crate::capture::read_back(&self.device, list, laid.as_ref().unwrap_or(texture)))
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
