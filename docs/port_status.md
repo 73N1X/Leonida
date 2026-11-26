@@ -367,16 +367,28 @@ memory are watched and detiled like placed textures; the label font cache was on
 start screen, navigation experience, finish setup, legal notices, the legal terms screen. Accepting the terms starts
 the game, and its loading screen artwork draws.
 
-**The open blocker: a device loss during the world's background load.** 240-300 s into a boot that goes through setup
-(the title starts streaming the world while the setup screens are up; frames fall from 30 to 2-8 a second from about
-frame 4,100), the device is lost, twice reported as a write at 0x0, and the title crashes on the work that never ran.
-Ruled out so far, one run each: the seven captured compute programs first used before it
-(`LEONIDA_DEBUG_SKIP_PROGRAMS`), console mesh pipelines (`LEONIDA_CONSOLE_MESH=0`), out-of-bounds image writes
-(robustImageAccess, now on), work dropped while pipelines are made (`LEONIDA_PIPELINE_WAIT_MS=600000` delays it to
-407 s but does not prevent it), sparse binding churn (quiet before the loss). Runs that stay on the start screen never
-lose the device. `LEONIDA_DEBUG_FIRST_USE=1` with `LEONIDA_PRESENT_DEBUG=1` logs the pipelines that run first before
-it. Suspected: a pass reading an address another pass should have written, where that pass is untranslated (273
-captured compute programs and 1,754 captured console stages still are) or refused.
+**The crash during the world's background load is the title's own hang watchdog, not a device loss.** The "write at
+0x0" those runs reported is deliberate. A title thread wakes once a second (`game+0x2215a60`, `Sleep(1000)` between
+two `QueryPerformanceCounter` reads). When no hang scope is registered, it checks that the main loop has stamped its
+progress since the last check. The stamp is a QPC time written by `game+0x22159f0`, which the frame update
+(`game+0xc9e350`) and the title's wait loops (`game+0x1c82b30`) call. After 30 checks in a row without a new stamp, it
+calls the title's error hook and writes a constant to address 0. With hang scopes registered, it allows 300 s per
+scope instead. Measured in run 103:
+- `LEONIDA_PIPELINE_WAIT_MS=600000` let a frame wait on pipeline builds without a bound (one compute pipeline took
+  10.3 s);
+- draws stopped at about 180 s;
+- the write to 0 came at 211 s, from `game+0x2215c35` through the hook to `game+0x23cf683`.
+
+So the earlier runs that set that budget to delay "the device loss" were what caused it. The budget is now cut to 10 s
+(`kMaxWaitMs` in `runtime/src/pipeline_queue.h`), and runs use the default 500 ms. GPU-assisted validation (run 102,
+30 minutes) reported nothing but the known sparse-bind message.
+
+Still unexplained in the same load:
+- a zlib stream that inflates to 16,384 bytes into an 8,192-byte destination (the first 8,192 bytes are given);
+- a read at the end of `peds_loose.ttpf`: offset 135,676,160, which is the file's size, with a source size of
+  0xf7ea1eec, failing with ERROR_HANDLE_EOF.
+
+The second may be built from a table the first cut short; the title code shows neither yet.
 
 Navigating setup without a pad: `run_nav.ps1`-style key schedules (Enter through the pages, Down Down Enter on the
 legal list's Next, Up Enter twice and Down Down Enter on the terms screen).
@@ -388,7 +400,7 @@ world itself; a root signature that spills past the 32 user dwords (its dispatch
 
 1. The world past the start screen: translate what each run captures (console stages, compute programs), then look
    at what draws.
-2. GPU device loss: sparse title memory (`port/sparse-title-memory`).
+2. The zlib request cut to its destination and the read past the end of `peds_loose.ttpf` (above).
 3. The 8,192+ slot-86 stream PSOs refused before the depth-bounds fix: recount by reason (`79df04da4`). Not
    tessellation: the corpus has no hull, domain or amplification shaders (tools/feature_scan.py, question 10).
 4. A8_UNORM render targets: done as R8 attachments with the alpha splatted (`src/spirv_output_splat.h`); check them
