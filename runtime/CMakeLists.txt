@@ -2802,6 +2802,19 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Title memory (src/title_memory.h): heap_base fixed by capture replay, xmem's graphics memory imported at
+      # heap_base + its address, device slots 70/71/133 and list slots 62/71-74/148 on title addresses, a shader that
+      # reaches title memory through a slot-70 V#. xmem.cpp and registry.cpp give it the XMem* exports. 77 without
+      # bufferDeviceAddressCaptureReplay or VK_EXT_external_memory_host.
+      add_executable(d3d12_title_memory_test test/d3d12_title_memory_test.cpp shims/xmem.cpp shims/registry.cpp
+                     ${LEONIDA_TEST_CS})
+      target_link_libraries(d3d12_title_memory_test PRIVATE gta6rt_d3d12_com d3d12 dxgi psapi)
+      target_compile_definitions(d3d12_title_memory_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+      target_compile_options(d3d12_title_memory_test PRIVATE /W4 /permissive- /utf-8)
+      target_link_options(d3d12_title_memory_test PRIVATE /OPT:NOREF)
+      add_test(NAME d3d12_title_memory COMMAND d3d12_title_memory_test)
+      set_tests_properties(d3d12_title_memory PROPERTIES SKIP_RETURN_CODE 77)
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
       add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)

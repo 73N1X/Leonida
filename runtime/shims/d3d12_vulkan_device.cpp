@@ -32,6 +32,8 @@
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
+#include "../src/gfx10_tiling.h"
+#include "../src/title_memory.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -39,6 +41,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cctype>
@@ -53,12 +56,19 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <cwchar>
 #include <vector>
 
 namespace rt::d3d12 {
+
+// Xbox list methods on title addresses (rt::d3d12_xs::set_list_title_handlers); defined after the device.
+extern const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers;
+
 namespace {
+
+class TitleMemory;  // the imports of the title's GPU memory (after Resource)
 
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
@@ -641,6 +651,11 @@ struct DeviceState {
     PFN_vkTransitionImageLayoutEXT transition_image_layout = nullptr;
     // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+    // Title memory (src/title_memory.h): the arena's memory got the device address title_memory::kHeapBase, and host
+    // imports ask for heap_base + their address (Resource::create_host_buffer). `titles` holds the imports of the
+    // title's graphics memory; it is the device's.
+    bool title_memory = false;
+    TitleMemory* titles = nullptr;
 
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
     // the device's VkQueue and waited for. Created on first use.
@@ -1713,7 +1728,10 @@ public:
         if (console_addressed_) {
             // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
             // now; backing this range with title memory / §3.3 aliasing is tracked separately.
-            log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
+            // With title memory (src/title_memory.h) the GPU reads the heap where the title put it, at that address.
+            log_once(device.titles ? "descriptor heap at a console address in title memory (the GPU reads it there)"
+                                   : "descriptor heap uses console address/size (not backed by title memory)",
+                     int(desc_.Type));
             cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
             in_arena_ = false;
             return;
@@ -1798,6 +1816,14 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
+        if (title_import_) {
+            // The memory is the import's: the buffer goes once the GPU is done with it, then the reference.
+            device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
+            if (buffer_) device_.context->vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            title_import_->Release();
+            title_import_ = nullptr;
+        }
         if (host_import_) {
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
@@ -1842,6 +1868,21 @@ public:
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
+    // A host import (create_host_buffer): its memory, and where its first byte (va_) lies in it.
+    VkDeviceMemory import_memory() const { return host_import_ ? memory_ : VK_NULL_HANDLE; }
+    const char* refusal() const { return refusal_ ? refusal_ : "unknown"; }
+    VkDeviceSize import_offset() const { return import_offset_; }
+    std::uint64_t va() const { return va_; }
+    // The device address of byte 0 (the buffer's, or 0).
+    std::uint64_t device_address() const { return buffer_va_; }
+    // CPU data into a subresource, as WriteToSubresource, without its line about heaps the CPU cannot see: the device's
+    // own upload of a texture it made from title memory (create_placed_view).
+    HRESULT upload(UINT subresource, const void* data, UINT row_pitch, UINT depth_pitch) {
+        quiet_upload_ = true;
+        const HRESULT hr = cpu_copy(true, subresource, nullptr, const_cast<void*>(data), row_pitch, depth_pitch);
+        quiet_upload_ = false;
+        return hr;
+    }
     const DeviceState& device_state() const { return device_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
@@ -1978,8 +2019,13 @@ public:
     // docs/d3d12_vulkan.md section 3.3, which this does not decide. The pages stay the caller's: nothing is zeroed.
     HRESULT create_host_buffer(void* address) {
         auto& vk = device_.context->vk;
+        // Why an import was refused, for the title-memory log (refusal()).
+        const auto refuse = [this](const char* why, HRESULT hr) {
+            refusal_ = why;
+            return hr;
+        };
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
-        if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
+        if (!device_.get_host_pointer_properties || !alignment) return refuse("no VK_EXT_external_memory_host", E_NOTIMPL);
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
         // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
@@ -1996,7 +2042,7 @@ public:
         if (start < device_.arena.size) {
             log_once("a title-placed buffer's host address overlaps the arena's VA window; not imported, size",
                      int(desc_.Width > INT_MAX ? INT_MAX : desc_.Width));
-            return E_NOTIMPL;
+            return refuse("inside the arena's VA window", E_NOTIMPL);
         }
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
         // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
@@ -2013,7 +2059,7 @@ public:
             const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
             at = region_end - base;
         }
-        if (!importable) return E_NOTIMPL;
+        if (!importable) return refuse("not committed, or write-combined or uncached", E_NOTIMPL);
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -2025,23 +2071,34 @@ public:
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
         if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (device_.title_memory && need_bda) info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
         device_.share(info);
-        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS)
+            return refuse("vkCreateBuffer failed", E_OUTOFMEMORY);
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (device_.get_host_pointer_properties(device_.info.device,
                                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address,
                                                 &host) != VK_SUCCESS)
-            return E_NOTIMPL;
+            return refuse("vkGetMemoryHostPointerPropertiesEXT refused the pages", E_NOTIMPL);
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
         // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size) return E_NOTIMPL;
+        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size)
+            return refuse("no memory type, or the offset is off the buffer's alignment", E_NOTIMPL);
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
-        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
-        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        // Title memory (src/title_memory.h): the import asks for the device address heap_base + its host address,
+        // so the shaders' heap_base + VA reaches it at the title's own address.
+        VkMemoryOpaqueCaptureAddressAllocateInfo replay{VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO,
+                                                        &import};
+        replay.opaqueCaptureAddress = device_.arena.address + base;
+        const bool title = device_.title_memory && need_bda;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                        title ? static_cast<const void*>(&replay) : &import};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT |
+                      (title ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT : 0);
         // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
         // buffer take.
         for (const VkMemoryPropertyFlags want :
@@ -2053,29 +2110,85 @@ public:
                                               need_bda ? static_cast<const void*>(&flags) : &import};
                 allocate.allocationSize = bytes;
                 allocate.memoryTypeIndex = i;
-                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS)
+                allocate_result_ = vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_);
+                if (allocate_result_ == VK_SUCCESS)
                     memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
                 else
                     memory_ = VK_NULL_HANDLE;
             }
             if (memory_) break;
         }
-        if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (!memory_)
+            return refuse(allocate_result_ == VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS
+                              ? "vkAllocateMemory: the device address is taken (VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS)"
+                              : "vkAllocateMemory refused the import", E_OUTOFMEMORY);
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS)
+            return refuse("vkBindBufferMemory failed", E_OUTOFMEMORY);
         mapped_ = address;
         host_import_ = true;
+        import_offset_ = offset;
         va_ = start;
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
             gpu_va_ = buffer_va_;
+            // The driver gave another address than the one asked for: the shaders would not reach the import.
+            if (title && buffer_va_ != device_.arena.address + start)
+                return refuse("the driver gave another device address", E_NOTIMPL);
         }
         device_.log_va("title-placed buffer", va_, desc_.Width);
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
         binding.size = desc_.Width;
         binding.host = static_cast<const std::uint8_t*>(address);
+        binding.host_readable = true;
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    // A buffer at title address `va` on the memory of `import`, a title-memory import that holds
+    // [va, va + Width) (TitleMemory::cover): Xbox device slot 133's buffer, when title memory is on. Its device address
+    // is heap_base + va, as the import's own; the import is held until this buffer is gone.
+    HRESULT create_title_alias(Resource* import, std::uint64_t va) {
+        auto& vk = device_.context->vk;
+        if (!import || !import->host_import_ || va < import->va_ ||
+            desc_.Width > import->desc_.Width - (va - import->va_))
+            return E_INVALIDARG;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        info.flags = VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        info.size = desc_.Width;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        device_.share(info);
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        const VkDeviceSize offset = import->import_offset_ + (va - import->va_);
+        if (offset % requirements.alignment) return E_NOTIMPL;
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, import->memory_, offset) != VK_SUCCESS)
+            return E_OUTOFMEMORY;
+        import->AddRef();
+        title_import_ = import;
+        memory_flags_ = import->memory_flags_;
+        mapped_ = reinterpret_cast<void*>(static_cast<std::uintptr_t>(va));
+        va_ = va;
+        VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        bda.buffer = buffer_;
+        buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+        gpu_va_ = buffer_va_;
+        if (buffer_va_ != device_.arena.address + va) return E_NOTIMPL;
+        device_.log_va("title-placed buffer", va_, desc_.Width);
+        leonida::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(mapped_);
         binding.host_readable = true;
         binding.va = va_;
         device_.context->add_resource(id(), binding);
@@ -2424,7 +2537,7 @@ private:
         if (!r.rows || !r.slices) return S_OK;  // an empty box: nothing to copy
         // The pitches are not checked, as on the host runtime: rows or slices that overlap (a pitch smaller than a
         // row, or 0) are copied in order, row by row and slice by slice, so on a read the last one wins.
-        if (!cpu_visible())
+        if (!cpu_visible() && !quiet_upload_)
             log_once(write ? "WriteToSubresource on a texture outside a CPU-visible heap; heap type"
                            : "ReadFromSubresource on a texture outside a CPU-visible heap; heap type",
                      heap_.Type);
@@ -2616,9 +2729,15 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    VkDeviceSize import_offset_ = 0;  // a host import: where va_ lies in memory_ (the import starts on a host page)
+    // A buffer on title memory another import holds (create_title_alias): its memory, held through a reference.
+    Resource* title_import_ = nullptr;
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
+    bool quiet_upload_ = false;  // upload(): cpu_copy says nothing about the heap
+    const char* refusal_ = nullptr;  // create_host_buffer: why it refused
+    VkResult allocate_result_ = VK_SUCCESS;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
@@ -2628,6 +2747,475 @@ private:
     // first, and the range must not go to another allocation while this buffer lives.
     std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
+
+// ---- Title memory (src/title_memory.h) ------------------------------------------------------------------------------
+// The imports of the title's GPU memory on one device. Each is a buffer Resource on the title's own pages
+// (create_host_buffer) with VA = its CPU address and the device address heap_base + that address, registered with the
+// context like any buffer: a vertex, index, copy or immediate-write VA finds it (VulkanContext::buffer_at), and a
+// shader's heap_base + VA lands in it. VIctory reaches title memory through host copies brought up to date every
+// submission (V shadow.rs:1-16, inplace.rs:1-35 for its in-place heaps); an import needs no copy at all
+// (docs/port_plan.md, Frame time). Imports never overlap. The map holds one reference to each; a slot-133 buffer on an
+// import's memory (create_title_alias) holds another, so the memory stays until both are gone.
+class TitleMemory {
+public:
+    explicit TitleMemory(DeviceState& device) : device_(device) {}
+    TitleMemory(const TitleMemory&) = delete;
+    TitleMemory& operator=(const TitleMemory&) = delete;
+    ~TitleMemory() {
+        for (auto& [start, import] : imports_) import->Release();
+        for (auto& [start, hold] : holds_)
+            device_.context->vk.vkDestroyBuffer(device_.info.device, hold.second, nullptr);
+    }
+
+    // The title window's device addresses, held (see holds_) from the start: before anything is imported.
+    void hold_window() {
+        std::lock_guard lock(mutex_);
+        const VkPhysicalDeviceFeatures& f = device_.info.features;
+        if (!f.sparseBinding || !f.sparseResidencyBuffer) {
+            std::fprintf(stderr, "[rt] d3d12: title memory: no sparse buffers to hold the title window's device "
+                                 "addresses; the driver's own mappings of imports may take them\n");
+            return;
+        }
+        namespace tm = leonida::title_memory;
+        // The 32-bit window must be held: the driver's mappings start right after the arena, below it. The other
+        // window lies above the room they get first; it is held in 16 GiB pieces where the driver allows (one sparse
+        // buffer of all 384 GiB was refused on the RTX 4060 Ti).
+        if (!hold(tm::kLow32Start, tm::kLow32End - tm::kLow32Start))
+            std::fprintf(stderr, "[rt] d3d12: title memory: the 32-bit window's device addresses could not be held; "
+                                 "the driver's own mappings of imports may take them\n");
+        constexpr std::uint64_t kPiece = std::uint64_t(16) << 30;
+        std::uint64_t held = 0;
+        for (std::uint64_t at = tm::kWindowStart; at < tm::kWindowEnd; at += kPiece)
+            held += hold(at, std::min(kPiece, tm::kWindowEnd - at)) ? 1 : 0;
+        if (verbose())
+            std::fprintf(stderr, "[rt] d3d12: title memory: %llu of %llu pieces of the main window held\n",
+                         static_cast<unsigned long long>(held),
+                         static_cast<unsigned long long>((tm::kWindowEnd - tm::kWindowStart) / kPiece));
+    }
+
+    // xmem's ranges (title_memory_visible): imported now, around what is imported already.
+    void visible(std::uint64_t start, std::uint64_t size) {
+        std::lock_guard lock(mutex_);
+        if (verbose() && !maps_) {
+            ++maps_;
+            probe_taken(0);
+        }
+        import_range_locked(start, size);
+    }
+
+    // The title is about to free, decommit, unmap or remap [start, start + size): the imports there leave the GPU
+    // first (a Resource's destructor waits for the work submitted so far), and the parts of them outside the range,
+    // still the title's, are imported again.
+    void gone(std::uint64_t start, std::uint64_t size) {
+        std::lock_guard lock(mutex_);
+        const std::uint64_t end = start + size;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
+        for (auto it = first_overlap(start); it != imports_.end() && it->first < end;) {
+            Resource* import = it->second;
+            const std::uint64_t a = import->va(), b = a + import->desc().Width;
+            if (b <= start) {
+                ++it;
+                continue;
+            }
+            if (a < start) keep.emplace_back(a, start - a);
+            if (b > end) keep.emplace_back(end, b - end);
+            if (verbose())
+                std::fprintf(stderr, "[rt] d3d12: title memory: release 0x%llx + 0x%llx (gone: 0x%llx + 0x%llx)\n",
+                             static_cast<unsigned long long>(a), static_cast<unsigned long long>(b - a),
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size));
+            bytes_ -= b - a;
+            it = imports_.erase(it);
+            const bool was_shared = shared(import);
+            if (was_shared) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true))
+                    std::fprintf(stderr, "[rt] d3d12: title memory at 0x%llx is freed while a title-placed buffer is "
+                                         "still on it; the GPU keeps the old pages until that buffer goes (logged once)\n",
+                                 static_cast<unsigned long long>(a));
+            }
+            import->Release();
+            ++released_;
+            if (!was_shared) hold(a & ~kHoldMask, ((b + kHoldMask) & ~kHoldMask) - (a & ~kHoldMask));
+        }
+        for (const auto& [a, n] : keep) import_range_locked(a, n);
+    }
+
+    // Imports whatever of [va, va + bytes) is committed and not imported yet. False when part of it is not GPU memory
+    // (outside the window, not committed, write-combined) and was not imported.
+    bool ensure(std::uint64_t va, std::uint64_t bytes) {
+        if (!bytes || !leonida::title_memory::addressable(va, bytes)) return false;
+        std::lock_guard lock(mutex_);
+        return ensure_locked(va, bytes);
+    }
+
+    // The one import that holds [va, va + bytes), with a reference for the caller: made, or merged from the imports
+    // that hold parts of it (released first, so the GPU waits), when the whole span is committed and no other buffer
+    // is on those imports. Null otherwise.
+    Resource* cover(std::uint64_t va, std::uint64_t bytes) {
+        if (!bytes || !leonida::title_memory::addressable(va, bytes)) return nullptr;
+        std::lock_guard lock(mutex_);
+        std::uint64_t first = va & ~std::uint64_t(0xfff), last = va + bytes;
+        std::vector<std::map<std::uint64_t, Resource*>::iterator> parts;
+        for (auto it = first_overlap(va); it != imports_.end() && it->first < va + bytes; ++it) {
+            const std::uint64_t a = it->second->va(), b = a + it->second->desc().Width;
+            if (b <= va) continue;
+            if (a <= va && b >= va + bytes) {
+                it->second->AddRef();
+                return it->second;
+            }
+            parts.push_back(it);
+            first = std::min(first, a);
+            last = std::max(last, b);
+        }
+        for (const auto& it : parts)
+            if (shared(it->second)) return nullptr;
+        if (!committed(first, last - first)) return nullptr;
+        for (const auto& it : parts) {
+            bytes_ -= it->second->desc().Width;
+            const std::uint64_t a = it->second->va(), b = a + it->second->desc().Width;
+            it->second->Release();
+            imports_.erase(it);
+            hold(a & ~kHoldMask, ((b + kHoldMask) & ~kHoldMask) - (a & ~kHoldMask));
+            ++merged_;
+        }
+        Resource* import = import_piece_locked(first, (last - first + 0xfff) & ~std::uint64_t(0xfff));
+        if (import && (import->va() > va || import->va() + import->desc().Width < va + bytes)) import = nullptr;
+        if (import) import->AddRef();
+        return import;
+    }
+
+    // The import that holds `va` and where in it, or null.
+    Resource* at(std::uint64_t va) {
+        std::lock_guard lock(mutex_);
+        auto it = imports_.upper_bound(va);
+        if (it == imports_.begin()) return nullptr;
+        --it;
+        return va - it->second->va() < it->second->desc().Width ? it->second : nullptr;
+    }
+
+    TitleMemoryStats stats() {
+        std::lock_guard lock(mutex_);
+        TitleMemoryStats out;
+        out.enabled = true;
+        out.heap_base = device_.arena.address;
+        out.imports = imports_.size();
+        out.bytes = bytes_;
+        out.failed = failed_;
+        return out;
+    }
+
+private:
+    // The first import that can overlap a range starting at `start` (the one before it may run into it).
+    std::map<std::uint64_t, Resource*>::iterator first_overlap(std::uint64_t start) {
+        auto it = imports_.upper_bound(start);
+        if (it != imports_.begin()) {
+            auto before = std::prev(it);
+            if (before->second->va() + before->second->desc().Width > start) it = before;
+        }
+        return it;
+    }
+
+    // Another buffer (a slot-133 one) holds a reference to the import besides the map.
+    static bool shared(Resource* import) {
+        const ULONG refs = import->AddRef();
+        import->Release();
+        return refs > 2;
+    }
+
+    // Every page of [start, start + size) committed and neither write-combined nor uncached (an import of those
+    // succeeded on an RTX 5090 but GPU reads returned wrong bytes: Resource::create_host_buffer).
+    static bool committed(std::uint64_t start, std::uint64_t size) {
+        for (std::uint64_t at = start; at < start + size;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region, sizeof(region)) ||
+                region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)))
+                return false;
+            at = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        }
+        return true;
+    }
+
+    bool ensure_locked(std::uint64_t va, std::uint64_t bytes) {
+        // The committed regions the range touches, each clipped to the 64 MiB lines around the part needed, so an
+        // on-demand import is large but does not take a whole pool with it.
+        constexpr std::uint64_t kLine = std::uint64_t(64) << 20;
+        bool all = true;
+        const std::uint64_t end = va + bytes;
+        for (std::uint64_t at = va & ~std::uint64_t(0xfff); at < end;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region, sizeof(region)))
+                return false;
+            const std::uint64_t region_start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+            const std::uint64_t region_end = region_start + region.RegionSize;
+            if (region.State == MEM_COMMIT && !(region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                const std::uint64_t a = std::max(region_start, at & ~(kLine - 1));
+                const std::uint64_t b = std::min(region_end, (std::min(end, region_end) + kLine - 1) & ~(kLine - 1));
+                import_range_locked(a, b - a);
+            } else {
+                all = false;
+            }
+            at = region_end;
+        }
+        // What is covered now.
+        for (std::uint64_t at = va; at < end;) {
+            auto it = imports_.upper_bound(at);
+            if (it == imports_.begin()) return false;
+            --it;
+            const std::uint64_t b = it->second->va() + it->second->desc().Width;
+            if (b <= at) return false;
+            at = b;
+        }
+        return all;
+    }
+
+    // [start, start + size) imported where no import is yet, in pieces of at most kMaxImport.
+    void import_range_locked(std::uint64_t start, std::uint64_t size) {
+        if (!size) return;
+        if (!leonida::title_memory::addressable(start, size)) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: title memory at 0x%llx (0x%llx bytes) lies outside the GPU address "
+                                     "windows [0x%llx, 0x%llx) and [0x%llx, 0x%llx): not imported (logged once)\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
+                             static_cast<unsigned long long>(leonida::title_memory::kLow32Start),
+                             static_cast<unsigned long long>(leonida::title_memory::kLow32End),
+                             static_cast<unsigned long long>(leonida::title_memory::kWindowStart),
+                             static_cast<unsigned long long>(leonida::title_memory::kWindowEnd));
+            return;
+        }
+        const std::uint64_t end = start + size;
+        std::uint64_t at = start;
+        auto it = first_overlap(start);
+        while (at < end) {
+            // Skip what an import holds.
+            while (it != imports_.end() && it->second->va() + it->second->desc().Width <= at) ++it;
+            if (it != imports_.end() && it->second->va() <= at) {
+                at = it->second->va() + it->second->desc().Width;
+                continue;
+            }
+            const std::uint64_t gap_end = it != imports_.end() ? std::min(end, it->second->va()) : end;
+            // Pieces of at most kMaxImport that end on 2 MiB lines, so two pieces share no 2 MiB block.
+            for (std::uint64_t piece = at; piece < gap_end;) {
+                std::uint64_t piece_end = (piece + leonida::title_memory::kMaxImport) & ~(kBlock - 1);
+                if (piece_end <= piece || piece_end > gap_end) piece_end = gap_end;
+                import_piece_locked(piece, piece_end - piece);
+                piece = piece_end;
+            }
+            at = gap_end;
+            it = first_overlap(at);
+        }
+    }
+
+    // The driver gives imports their device addresses 2 MiB at a time: an import that ends inside a 2 MiB block takes
+    // the rest of it, and another that starts there is refused (measured on the RTX 4060 Ti, 616.64: a 65 MiB import
+    // and one right behind it; the retail title's 32-bit windows lie side by side on 1 MiB lines).
+    static constexpr std::uint64_t kBlock = std::uint64_t(2) << 20;
+
+    // An import of [start, start + size) that shares no 2 MiB block with another: imports in the same blocks are
+    // merged into one, the neighbours released first (their memory goes once the GPU has finished with it), when the
+    // whole span is committed and no other buffer is on them. Otherwise the range alone.
+    Resource* import_piece_locked(std::uint64_t start, std::uint64_t size) {
+        std::uint64_t first = start, last = start + size;
+        for (bool grew = true; grew;) {
+            grew = false;
+            const std::uint64_t lo = first & ~(kBlock - 1), hi = (last + kBlock - 1) & ~(kBlock - 1);
+            for (auto it = first_overlap(lo); it != imports_.end() && it->first < hi; ++it) {
+                const std::uint64_t a = it->second->va(), b = a + it->second->desc().Width;
+                if (b <= lo) continue;
+                if (a < first) first = a, grew = true;
+                if (b > last) last = b, grew = true;
+            }
+        }
+        // A large import must also start on a 2 MiB line (one that does not is refused, measured from 64 MiB on): its
+        // start goes down to the line when the pages before it are committed.
+        if (last - first >= (std::uint64_t(32) << 20) && (first & (kBlock - 1)) &&
+            committed(first & ~(kBlock - 1), first & (kBlock - 1)))
+            first &= ~(kBlock - 1);
+        if (first == start && last == start + size) return import_locked(start, size);
+        std::vector<std::map<std::uint64_t, Resource*>::iterator> parts;
+        for (auto it = first_overlap(first); it != imports_.end() && it->first < last; ++it) {
+            if (it->second->va() + it->second->desc().Width <= first) continue;
+            if (shared(it->second)) return import_locked(start, size);
+            parts.push_back(it);
+        }
+        if (!committed(first, last - first)) return import_locked(start, size);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> released;
+        for (const auto& it : parts) {
+            released.emplace_back(it->second->va(), it->second->desc().Width);
+            bytes_ -= it->second->desc().Width;
+            it->second->Release();
+            imports_.erase(it);
+            ++merged_;
+        }
+        if (Resource* merged = import_locked(first, last - first)) return merged;
+        // The union was refused: what was there before, and the range alone.
+        for (const auto& [a, n] : released) import_locked(a, n);
+        return import_locked(start, size);
+    }
+
+    Resource* import_locked(std::uint64_t start, std::uint64_t size) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        // Not attached to the device: the device owns this map, and a reference back would keep it alive.
+        auto* import = new Resource(device_, desc, heap, D3D12_HEAP_FLAG_NONE);
+        const std::uint64_t held_start = start & ~kHoldMask, held_end = (start + size + kHoldMask) & ~kHoldMask;
+        unhold(held_start, held_end - held_start);
+        const HRESULT hr = import->create_host_buffer(reinterpret_cast<void*>(static_cast<std::uintptr_t>(start)));
+        if (FAILED(hr)) hold(held_start, held_end - held_start);
+        if (verbose())
+            std::fprintf(stderr, "[rt] d3d12: title memory: import 0x%llx + 0x%llx: %s\n",
+                         static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
+                         FAILED(hr) ? import->refusal() : "ok");
+        if (verbose() && (FAILED(hr) ? !probed_ : maps_ < 12)) {
+            probed_ |= FAILED(hr);
+            ++maps_;
+            probe_taken(start);
+        }
+        if (FAILED(hr)) {
+            const std::uint64_t n = ++failed_;
+            if (n <= 4 || (n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[rt] d3d12: title memory at 0x%llx (0x%llx bytes) could not be imported (%s); the GPU "
+                             "does not reach it at its address (%llu so far)\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
+                             import->refusal(), static_cast<unsigned long long>(n));
+            import->Release();
+            return nullptr;
+        }
+        imports_.emplace(start, import);
+        bytes_ += size;
+        const std::uint64_t count = imports_.size();
+        if ((count & (count - 1)) == 0 || count % 512 == 0)
+            std::fprintf(stderr, "[rt] d3d12: title memory: %llu imports, %.1f MiB (the latest at 0x%llx, 0x%llx bytes)\n",
+                         static_cast<unsigned long long>(count), double(bytes_) / double(1 << 20),
+                         static_cast<unsigned long long>(start), static_cast<unsigned long long>(size));
+        return import;
+    }
+
+    // LEONIDA_TITLE_MEMORY_LOG=1, at the first refused import: which device addresses around heap_base + `start` a
+    // 64 KiB capture-replay allocation can still have, and where an ordinary allocation goes.
+    void probe_taken(std::uint64_t start) {
+        auto& vk = device_.context->vk;
+        const auto try_at = [&](VkDeviceAddress address) {
+            VkMemoryOpaqueCaptureAddressAllocateInfo replay{
+                VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO};
+            replay.opaqueCaptureAddress = address;
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &replay};
+            flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+            allocate.allocationSize = 0x10000;
+            allocate.memoryTypeIndex = device_.arena.memory_type;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            const VkResult r = vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory);
+            if (r == VK_SUCCESS) vk.vkFreeMemory(device_.info.device, memory, nullptr);
+            return r == VK_SUCCESS;
+        };
+        const VkDeviceAddress at = device_.arena.address + start;
+        // A map of heap_base .. heap_base + 8 GiB in 32 MiB steps: '#' taken, '.' free.
+        std::string map;
+        for (VkDeviceAddress step = 0; step < (VkDeviceAddress(8) << 30); step += VkDeviceAddress(64) << 20)
+            map += try_at(device_.arena.address + step) ? '.' : '#';
+        std::fprintf(stderr, "[rt] d3d12: title memory probe at 0x%llx: heap base + 0..8 GiB by 64 MiB: %s\n",
+                     static_cast<unsigned long long>(at), map.c_str());
+    }
+    bool probed_ = false;
+    int maps_ = 0;
+
+    // Holds. Every host import gets a second, ordinary device address from the driver besides the one asked for, and
+    // the driver puts it right after the arena, first fit (measured on the RTX 4060 Ti, 616.64: all but the first
+    // import of a device; 4.5 GB of the retail title's pools took [heap_base + 256 MiB, heap_base + 4.7 GiB), so its
+    // 32-bit memory, imported later, found its addresses taken). So the window's device addresses are held from the
+    // start by sparse buffers at them (a sparse buffer takes the capture-replay address asked for and holds it without
+    // memory), and an import first gives up the part of a hold it needs: the driver's mappings go elsewhere.
+    static constexpr std::uint64_t kHoldMask = 0xffff;  // holds are cut on 64 KiB lines
+
+    // A sparse buffer at heap_base + [start, start + size), merged with nothing. False when the driver refuses it.
+    bool hold(std::uint64_t start, std::uint64_t size) {
+        if (!size || !device_.info.features.sparseBinding || !device_.info.features.sparseResidencyBuffer) return false;
+        auto& vk = device_.context->vk;
+        VkBufferOpaqueCaptureAddressCreateInfo opaque{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
+        opaque.opaqueCaptureAddress = device_.arena.address + start;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &opaque};
+        info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                     VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        info.size = size;
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer) != VK_SUCCESS) return false;
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = buffer;
+        if (vk.vkGetBufferDeviceAddress(device_.info.device, &address) != device_.arena.address + start) {
+            vk.vkDestroyBuffer(device_.info.device, buffer, nullptr);
+            return false;
+        }
+        holds_[start] = {size, buffer};
+        return true;
+    }
+
+    // The holds overlapping [start, start + size) give that range up, keeping their other parts.
+    void unhold(std::uint64_t start, std::uint64_t size) {
+        const std::uint64_t end = start + size;
+        auto it = holds_.upper_bound(start);
+        if (it != holds_.begin()) --it;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        auto& vk = device_.context->vk;
+        while (it != holds_.end() && it->first < end) {
+            const std::uint64_t a = it->first, b = a + it->second.first;
+            if (b <= start) {
+                ++it;
+                continue;
+            }
+            vk.vkDestroyBuffer(device_.info.device, it->second.second, nullptr);
+            it = holds_.erase(it);
+            if (a < start) rest.emplace_back(a, start - a);
+            if (b > end) rest.emplace_back(end, b - end);
+        }
+        for (const auto& [a, n] : rest) hold(a, n);
+    }
+
+    std::map<std::uint64_t, std::pair<std::uint64_t, VkBuffer>> holds_;  // by first VA: (bytes, sparse buffer)
+
+    // LEONIDA_TITLE_MEMORY_LOG=1: a line for every import and release.
+    static bool verbose() {
+        static const bool on = [] {
+            char text[4] = {};
+            size_t length = 0;
+            return getenv_s(&length, text, "LEONIDA_TITLE_MEMORY_LOG") == 0 && length > 1 && text[0] != '0';
+        }();
+        return on;
+    }
+
+    DeviceState& device_;
+    std::mutex mutex_;
+    std::map<std::uint64_t, Resource*> imports_;  // by first VA; one reference each
+    std::uint64_t bytes_ = 0;
+    std::uint64_t failed_ = 0;
+    std::uint64_t released_ = 0;
+    std::uint64_t merged_ = 0;
+};
+
+// Every live device's title memory, and what xmem says is visible, so a device made later imports it too
+// (title_memory_visible). The lock is taken before a device's own.
+struct TitleRanges {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::uint64_t> visible;  // start -> size, non-overlapping
+    std::vector<TitleMemory*> devices;
+};
+TitleRanges& title_ranges() {
+    static TitleRanges* ranges = new TitleRanges;  // never destroyed: xmem may call after static destruction began
+    return *ranges;
+}
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
 bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
@@ -5008,6 +5596,9 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // And slots 70/71 and the console list methods on title addresses, the same way.
+        rt::d3d12_xs::set_placed_view_handler(&rt::d3d12::create_placed_view);
+        rt::d3d12_xs::set_list_title_handlers(&kListTitleHandlers);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -5122,8 +5713,13 @@ public:
                     return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
                 });
         }
+        // Before the arena, which looks at it for title memory.
+        if (info.host_pointer_alignment)
+            state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+                get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
+        start_title_memory();
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -5145,9 +5741,6 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        if (info.host_pointer_alignment)
-            state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
-                get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -5373,6 +5966,47 @@ public:
         return true;
     }
 
+    // title_memory::kHeapBase, or LEONIDA_TITLE_HEAP_BASE (hex) to try another one: heap_base + a title address must
+    // stay below title_memory::kDeviceAddressEnd for every address xmem hands out.
+    static VkDeviceAddress title_heap_base() {
+        static const VkDeviceAddress base = [] {
+            char text[32] = {};
+            size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_TITLE_HEAP_BASE") == 0 && length > 1) {
+                const unsigned long long v = std::strtoull(text, nullptr, 16);
+                if (v && v % 0x10000 == 0 && v + leonida::title_memory::kWindowEnd <= leonida::title_memory::kDeviceAddressEnd)
+                    return VkDeviceAddress(v);
+            }
+            return VkDeviceAddress(leonida::title_memory::kHeapBase);
+        }();
+        return base;
+    }
+
+    // Memory for `requirements` with the device address `address` (an opaque capture address,
+    // bufferDeviceAddressCaptureReplay): host-visible and coherent, preferring device-local, as the arena's own. Null
+    // when no type takes it there (VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS, or no room).
+    VkDeviceMemory allocate_at(const VkMemoryRequirements& requirements, VkDeviceAddress address,
+                               std::uint32_t* chosen_type) {
+        VkMemoryOpaqueCaptureAddressAllocateInfo replay{VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO};
+        replay.opaqueCaptureAddress = address;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &replay};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        for (const std::uint32_t i : leonida::memory_type_order(
+                 state_.memory, requirements.memoryTypeBits,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size)) {
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+            allocate.allocationSize = requirements.size;
+            allocate.memoryTypeIndex = i;
+            VkDeviceMemory out = VK_NULL_HANDLE;
+            if (state_.context->vk.vkAllocateMemory(state_.info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+                if (chosen_type) *chosen_type = i;
+                return out;
+            }
+        }
+        return VK_NULL_HANDLE;
+    }
+
     // LEONIDA_ARENA_MB sets its size (default 256, at most 4095, and no more than the device's maxBufferSize and
     // maxMemoryAllocationSize allow: src/arena_size.h): it holds every default-heap buffer, shader-visible
     // descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
@@ -5398,6 +6032,18 @@ public:
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         state_.share(info);
+        // Title memory (src/title_memory.h): with capture replay the arena's memory asks for the device address
+        // title_memory::kHeapBase, so heap_base is that constant and the title's memory can be imported at heap_base +
+        // its CPU address. LEONIDA_TITLE_MEMORY=0 leaves the arena where the driver puts it, as before.
+        bool want_title = state_.info.buffer_device_address_capture_replay && state_.info.host_pointer_alignment &&
+                          state_.get_host_pointer_properties;
+        {
+            char off[4] = {};
+            size_t off_length = 0;
+            if (getenv_s(&off_length, off, "LEONIDA_TITLE_MEMORY") == 0 && off_length > 1 && off[0] == '0')
+                want_title = false;
+        }
+        if (want_title) info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
         VkMemoryRequirements requirements{};
         const auto create_buffer = [&] {
             if (info.size <= kArenaReserved ||
@@ -5427,9 +6073,23 @@ public:
                                  "device's %s\n",
                          static_cast<unsigned long long>(size.bytes >> 20),
                          static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
-        arena.memory = state_.allocate(requirements,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
+        if (want_title) {
+            arena.memory = allocate_at(requirements, title_heap_base(), &arena.memory_type);
+            if (!arena.memory) {
+                // No memory at that address: the arena as before, on a buffer without the replay flag.
+                std::fprintf(stderr, "[rt] d3d12: title memory: the arena's memory cannot have the device address 0x%llx; "
+                                     "title memory is not imported at its addresses\n",
+                             static_cast<unsigned long long>(title_heap_base()));
+                want_title = false;
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                info.flags &= ~VkBufferCreateFlags(VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT);
+                if (!create_buffer()) return false;
+            }
+        }
+        if (!arena.memory)
+            arena.memory = state_.allocate(requirements,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
@@ -5447,6 +6107,21 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        state_.title_memory = want_title && arena.address == title_heap_base();
+        if (want_title || state_.info.buffer_device_address_capture_replay)
+            std::fprintf(stderr,
+                         state_.title_memory
+                             ? "[rt] d3d12: title memory: a GPU address is the title's CPU address (heap base 0x%llx, "
+                               "title memory imported below 0x%llx)\n"
+                             : "[rt] d3d12: title memory is off (heap base 0x%llx; the driver did not place the arena at "
+                               "0x%llx or LEONIDA_TITLE_MEMORY=0)\n",
+                         static_cast<unsigned long long>(arena.address),
+                         static_cast<unsigned long long>(state_.title_memory ? leonida::title_memory::kWindowEnd
+                                                                             : leonida::title_memory::kHeapBase));
+        if (state_.title_memory)
+            std::fprintf(stderr, "[rt] d3d12: title memory: the arena is 0x%llx bytes (memory 0x%llx) at heap base\n",
+                         static_cast<unsigned long long>(arena.size),
+                         static_cast<unsigned long long>(requirements.size));
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
         arena.peak_end = kArenaReserved;
         char log[4] = {};
@@ -5464,6 +6139,7 @@ public:
                 state_.context->vk.vkDeviceWaitIdle(state_.info.device);
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
+            release_title_memory();
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
@@ -6411,6 +7087,75 @@ public:
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
     // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
+    // A shader-resource view of a buffer is a V# (docs section 3.4) whose base is the buffer's console VA plus the first
+    // element: a committed buffer's (CreateShaderResourceView), or title memory's own address (Xbox slot 70).
+    void write_buffer_srv(UINT64 base_va, UINT64 width, const D3D12_SHADER_RESOURCE_VIEW_DESC& desc,
+                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        if (desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+            log_once("shader-resource view dimension not supported for buffer:", desc.ViewDimension);
+            return;
+        }
+        if (!base_va || !desc.Buffer.NumElements || (desc.Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
+        leonida::gfx10::Buffer buffer{};
+        if (desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+            if (desc.Format != DXGI_FORMAT_R32_TYPELESS || desc.Buffer.StructureByteStride != 0) return;
+            if (desc.Buffer.FirstElement > width / 4) return;
+            const UINT64 byte_off = desc.Buffer.FirstElement * 4;
+            const UINT64 byte_size = UINT64(desc.Buffer.NumElements) * 4;
+            if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
+            buffer.address = base_va + byte_off;
+            buffer.stride = 0;
+            buffer.num_records = std::uint32_t(byte_size);
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::raw;
+        } else if (desc.Buffer.StructureByteStride != 0) {
+            if (desc.Format != DXGI_FORMAT_UNKNOWN || desc.Buffer.StructureByteStride > 16383) return;
+            const UINT64 stride = desc.Buffer.StructureByteStride;
+            if (desc.Buffer.FirstElement > width / stride) return;
+            const UINT64 byte_off = desc.Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc.Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return;
+            buffer.address = base_va + byte_off;
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc.Buffer.NumElements;
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        } else {
+            const Format fmt = vulkan_format(desc.Format, false);
+            if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                log_once("buffer SRV format not supported:", int(desc.Format));
+                return;
+            }
+            const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+            const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+            const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                log_once("buffer SRV format not supported:", int(desc.Format));
+                return;
+            }
+            const UINT64 stride = bf.bytes;
+            if (desc.Buffer.FirstElement > width / stride) return;
+            const UINT64 byte_off = desc.Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc.Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return;
+            buffer.address = base_va + byte_off;
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc.Buffer.NumElements;
+            buffer.format = code;
+            const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
+            for (unsigned i = 0; i < 4; ++i) {
+                const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc.Shader4ComponentMapping);
+                buffer.swizzle[i] = from < 4 ? channels[from]
+                                    : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
+                                        ? leonida::gfx10::select_zero
+                                        : leonida::gfx10::select_one;
+            }
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        }
+        const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+    }
+
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
@@ -6432,71 +7177,7 @@ public:
                 log_once("buffer SRV requires a description; width", int(r->desc().Width));
                 return;
             }
-            if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
-                log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
-                return;
-            }
-            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
-            const UINT64 width = r->desc().Width;
-            if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
-            leonida::gfx10::Buffer buffer{};
-            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
-                if (desc->Buffer.FirstElement > width / 4) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
-                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = 0;
-                buffer.num_records = std::uint32_t(byte_size);
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::raw;
-            } else if (desc->Buffer.StructureByteStride != 0) {
-                if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
-                const UINT64 stride = desc->Buffer.StructureByteStride;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            } else {
-                const Format fmt = vulkan_format(desc->Format, false);
-                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
-                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
-                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
-                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const UINT64 stride = bf.bytes;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = code;
-                const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
-                for (unsigned i = 0; i < 4; ++i) {
-                    const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
-                    buffer.swizzle[i] = from < 4 ? channels[from]
-                                        : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
-                                            ? leonida::gfx10::select_zero
-                                            : leonida::gfx10::select_one;
-                }
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            }
-            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
-            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+            write_buffer_srv(const_cast<Resource*>(r)->GetGPUVirtualAddress(), r->desc().Width, *desc, destination);
             return;
         }
         TextureView view{};
@@ -6584,10 +7265,11 @@ public:
     // index is checked against NUM_RECORDS, docs/buffer_bounds.md). A slot left as zeros is a null descriptor.
     // A UAV counter (docs section 3.4, "UAV counters") is a second, raw V# of 4 bytes in the slot's upper 16 bytes: the
     // counter resource's address plus CounterOffsetInBytes. Append and consume are atomics a shader does on it.
-    void write_buffer_uav(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
-                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    // `va_base` and `rd`: the buffer's console VA and description (a committed buffer's, or title memory's own address
+    // and the description Xbox slot 71 passes).
+    void write_buffer_uav(UINT64 va_base, const D3D12_RESOURCE_DESC& rd, ID3D12Resource* counter,
+                          const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
         namespace g = leonida::gfx10;
-        const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
         if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags", int(rd.Flags));
             return;
@@ -6641,9 +7323,17 @@ public:
                 return;
             }
         }
-        const UINT64 va = resource->GetGPUVirtualAddress();
+        const UINT64 va = va_base;
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
+        write_buffer_uav_words(va, view, unit, structured, typed, format_code, channels, counter_va, destination);
+    }
+
+    // The V# words of a buffer UAV (write_buffer_uav), and the counter's in the slot's upper half when there is one.
+    void write_buffer_uav_words(UINT64 va, const D3D12_BUFFER_UAV& view, UINT64 unit, bool structured, bool typed,
+                                std::uint32_t format_code, const leonida::gfx10::Swizzle& channels, UINT64 counter_va,
+                                D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        namespace g = leonida::gfx10;
         g::Buffer buffer{};
         buffer.address = va + view.FirstElement * unit;
         buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
@@ -6654,7 +7344,7 @@ public:
                                   : structured ? g::OobSelect::structured_with_offset : g::OobSelect::raw;
         const g::BufferWords words = g::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        if (counter) {
+        if (counter_va) {
             g::Buffer counter_buffer{};
             counter_buffer.address = counter_va + view.CounterOffsetInBytes;
             counter_buffer.num_records = 4;
@@ -6677,7 +7367,7 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image()) return write_buffer_uav(resource, counter, desc, destination);
+        if (!r->image()) return write_buffer_uav(resource->GetGPUVirtualAddress(), r->desc(), counter, desc, destination);
         if (counter) {
             log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
             return;
@@ -7089,6 +7779,320 @@ public:
         return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
+    // ---- Title memory on this device (src/title_memory.h) ----------------------------------------------------------
+
+    TitleMemory* titles() { return titles_.get(); }
+
+    // From the destructor, with the GPU idle: everything title memory holds, then the device leaves the registry.
+    void release_title_memory() {
+        {
+            std::lock_guard lock(placed_mutex_);
+            for (auto& [key, texture] : placed_textures_)
+                if (texture) texture->Release();
+            placed_textures_.clear();
+        }
+        if (titles_) {
+            auto& ranges = title_ranges();
+            std::lock_guard lock(ranges.mutex);
+            std::erase(ranges.devices, titles_.get());
+        }
+        state_.titles = nullptr;
+        titles_.reset();  // its imports first: the upload blocks' pages go after them
+        for (const auto& [base, bytes] : upload_blocks_) {
+            title_memory_gone(reinterpret_cast<std::uintptr_t>(base), bytes);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        upload_blocks_.clear();
+    }
+
+    // After the arena: the device keeps title memory when the arena got heap_base = kHeapBase, and imports what is
+    // visible already (title_memory_visible).
+    void start_title_memory() {
+        if (!state_.title_memory) return;
+        titles_ = std::make_unique<TitleMemory>(state_);
+        titles_->hold_window();
+        state_.titles = titles_.get();
+        auto& ranges = title_ranges();
+        std::lock_guard lock(ranges.mutex);
+        ranges.devices.push_back(titles_.get());
+        for (const auto& [start, size] : ranges.visible) titles_->visible(start, size);
+    }
+
+    // Xbox device slots 70 and 71 (V device.rs:443-444, descriptor.rs:795-818): a view of memory the title placed
+    // itself. `resource` is the 56-byte resource description (words 1 and 13 its padding), `view` the PC view
+    // description (words 0-9, 40 bytes for both kinds) and the title address of the resource (words 10-11; V
+    // descriptor/host.rs:2432-2442, 3120-3121); words 12-15 are not read, as in VIctory.
+    //   - A buffer view is the V# a committed buffer's view would be, with that address as its base: a GPU address is
+    //     the title's CPU address, and the memory is imported where it is not yet (TitleMemory::ensure).
+    //   - A texture view is a view of a texture this device makes for (address, description), the description's
+    //     padding words zeroed (V resource.rs:2383-2448: two views that differ only in them are one texture). Its
+    //     contents are the title's at the first view, detiled (gfx10_tiling.h) where the layout is one 2D level in
+    //     SW_4KB_S or SW_64KB_D; other layouts start zeroed, logged once each. Later title writes do not reach it.
+    void create_placed_view(bool uav, const std::uint32_t* resource, const std::uint32_t* view, std::uint64_t handle) {
+        constexpr auto method = "Xbox placed view (device slots 70/71)";
+        d3d12_trace::record(method);
+        const D3D12_CPU_DESCRIPTOR_HANDLE destination{static_cast<SIZE_T>(handle)};
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        D3D12_RESOURCE_DESC rd{};
+        std::memcpy(&rd, resource, sizeof(rd));
+        const std::uint64_t address = view[10] | std::uint64_t(view[11]) << 32;
+        if (!address) return;
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (titles_ && !titles_->ensure(address, rd.Width))
+                log_once("a placed buffer view's title memory is not all GPU memory; width", int(std::min<UINT64>(
+                    rd.Width, INT_MAX)));
+            if (uav) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+                std::memcpy(&desc, view, sizeof(desc));
+                if (desc.Buffer.CounterOffsetInBytes)
+                    log_once("a placed buffer UAV with a counter offset (the counter is not known); offset",
+                             int(desc.Buffer.CounterOffsetInBytes));
+                desc.Buffer.CounterOffsetInBytes = 0;
+                rd.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(rd.Flags) & 0x5ff);
+                write_buffer_uav(address, rd, nullptr, &desc, destination);
+            } else {
+                D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+                std::memcpy(&desc, view, sizeof(desc));
+                write_buffer_srv(address, rd.Width, desc, destination);
+            }
+            return;
+        }
+        Resource* texture = placed_texture(address, resource);
+        if (!texture) return;
+        if (uav) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+            std::memcpy(&desc, view, sizeof(desc));
+            CreateUnorderedAccessView(texture, nullptr, &desc, destination);
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+            std::memcpy(&desc, view, sizeof(desc));
+            CreateShaderResourceView(texture, &desc, destination);
+        }
+    }
+
+    // The texture slot 70/71 views of (address, description) show: made on the first view (V resource.rs:2398-2448).
+    Resource* placed_texture(std::uint64_t address, const std::uint32_t* words) {
+        PlacedKey key{address, {}};
+        std::memcpy(key.words.data(), words, sizeof(key.words));
+        key.words[1] = 0;   // V resource.rs:2383-2396: the description's padding, which the title leaves as its stack
+        key.words[13] = 0;  // had it; not part of what a texture is
+        std::lock_guard lock(placed_mutex_);
+        if (const auto it = placed_textures_.find(key); it != placed_textures_.end()) return it->second;
+        D3D12_RESOURCE_DESC desc{};
+        std::memcpy(&desc, key.words.data(), sizeof(desc));
+        const std::uint32_t xbox_layout = static_cast<std::uint32_t>(desc.Layout);
+        desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(desc.Flags) & 0x5ff);  // slot 133's mask
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Alignment = 0;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        ID3D12Resource* made = nullptr;
+        if (FAILED(create_committed(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
+                                    __uuidof(ID3D12Resource), reinterpret_cast<void**>(&made))) ||
+            !made) {
+            log_once("a texture the title placed (device slots 70/71) could not be made; format", int(desc.Format));
+            placed_textures_.emplace(key, nullptr);
+            return nullptr;
+        }
+        auto* texture = Resource::from<Resource>(made);
+        texture->attach_device(nullptr);  // the device holds it: a reference back would keep the device alive
+        fill_from_title(*texture, address, desc, xbox_layout);
+        placed_textures_.emplace(key, texture);  // holds the reference `made` came with
+        return texture;
+    }
+
+    // The texture of (address, description) if a view made one, with a reference (title_placed_texture).
+    ID3D12Resource* find_placed_texture(std::uint64_t address, const std::uint32_t* words) {
+        PlacedKey key{address, {}};
+        std::memcpy(key.words.data(), words, sizeof(key.words));
+        key.words[1] = 0;
+        key.words[13] = 0;
+        std::lock_guard lock(placed_mutex_);
+        const auto it = placed_textures_.find(key);
+        if (it == placed_textures_.end() || !it->second) return nullptr;
+        it->second->AddRef();
+        return it->second;
+    }
+
+    // The title's bytes at `address` into the texture, detiled, where the layout is one this layer can read: one 2D
+    // level of one slice in SW_4KB_S (0x105, or 0: the layout library's pick for a texture that is neither a render
+    // target nor depth, V resource.rs:150-158) or SW_64KB_D (0x10a).
+    void fill_from_title(Resource& texture, std::uint64_t address, const D3D12_RESOURCE_DESC& desc,
+                         std::uint32_t xbox_layout) {
+        using leonida::gfx10::TileMode;
+        const bool target = desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        TileMode mode{};
+        bool known = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.MipLevels == 1 &&
+                     desc.DepthOrArraySize == 1 && desc.SampleDesc.Count <= 1;
+        if (xbox_layout == 0x105 || (xbox_layout == 0 && !target))
+            mode = TileMode::sw_4kb_s;
+        else if (xbox_layout == 0x10a)
+            mode = TileMode::sw_64kb_d;
+        else
+            known = false;
+        const Format format = vulkan_format(desc.Format, false);
+        const leonida::BlockFormat block = footprint_block(format, VK_IMAGE_ASPECT_COLOR_BIT);
+        leonida::gfx10::TiledSurface2D surface;
+        const std::size_t blocks_w = block.block ? (std::size_t(desc.Width) + block.block - 1) / block.block : 0;
+        const std::size_t blocks_h = block.block ? (std::size_t(desc.Height) + block.block - 1) / block.block : 0;
+        if (!known || !block.bytes ||
+            !leonida::gfx10::TiledSurface2D::make(mode, block.bytes, blocks_w, blocks_h, surface)) {
+            static std::mutex mutex;
+            static std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
+            std::lock_guard lock(mutex);
+            if (seen.insert({xbox_layout, (std::uint32_t(desc.Dimension) << 16) | desc.MipLevels}).second)
+                std::fprintf(stderr,
+                             "[rt] d3d12: a texture the title placed has a layout this layer does not read (layout "
+                             "0x%x, dimension %d, %u mips, %u slices, format %d); it starts zeroed\n",
+                             xbox_layout, int(desc.Dimension), unsigned(desc.MipLevels),
+                             unsigned(desc.DepthOrArraySize), int(desc.Format));
+            return;
+        }
+        std::vector<std::byte> tiled(surface.tiled_size());
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
+                               tiled.data(), tiled.size(), &read) ||
+            read != tiled.size()) {
+            log_once("a texture the title placed lies in memory that is not there; it starts zeroed, bytes",
+                     int(std::min<std::size_t>(tiled.size(), INT_MAX)));
+            return;
+        }
+        const std::size_t pitch = blocks_w * block.bytes;
+        std::vector<std::byte> linear(pitch * blocks_h);
+        if (!surface.detile(tiled, linear, pitch) ||
+            FAILED(texture.upload(0, linear.data(), UINT(pitch), UINT(linear.size()))))
+            log_once("a texture the title placed could not be filled; format", int(desc.Format));
+    }
+
+    // Xbox list slot 62, CopyMemoryToMemoryX (V list.rs:1294-1314): `size` bytes from title address `src` to `dst`,
+    // through the buffers that hold them (imports of title memory, or any buffer at those VAs), in pieces where a
+    // range crosses from one buffer into the next.
+    bool copy_memory(ID3D12GraphicsCommandList* list, std::uint64_t dst, std::uint64_t src, std::uint64_t size) {
+        if (titles_) {
+            titles_->ensure(dst, size);
+            titles_->ensure(src, size);
+        }
+        auto& context = *state_.context;
+        while (size) {
+            leonida::ResourceId dst_id = 0, src_id = 0;
+            std::uint64_t dst_offset = 0, src_offset = 0, dst_room = size, src_room = size;
+            if (!context.resource_at(dst, dst_room, dst_id, dst_offset) ||
+                !context.resource_at(src, src_room, src_id, src_offset))
+                return false;
+            const std::uint64_t n = std::min({size, dst_room, src_room});
+            if (!n) return false;
+            list->CopyBufferRegion(reinterpret_cast<ID3D12Resource*>(dst_id), dst_offset,
+                                   reinterpret_cast<ID3D12Resource*>(src_id), src_offset, n);
+            dst += n;
+            src += n;
+            size -= n;
+        }
+        return true;
+    }
+
+    // Xbox list slots 71/72, Write32/Write64 (V list.rs:1964-1983): the value at `address` once the list's earlier work
+    // has finished, as WriteBufferImmediate's MARKER_OUT mode writes it; 64 bits as two words. Flags 1 and 2 (the
+    // 64-bit form) ask for the GPU and the system timestamp: written here as the CPU's clock when the list is recorded,
+    // in the queue's timestamp ticks for 1 (VIctory writes both when the list has run).
+    bool write_value(ID3D12GraphicsCommandList* list, std::uint64_t address, std::uint64_t value, unsigned bytes,
+                     std::uint32_t flags) {
+        if (address % 4) return false;
+        if (titles_) titles_->ensure(address, bytes);
+        std::uint64_t room = bytes;
+        leonida::ResourceId id = 0;
+        std::uint64_t offset = 0;
+        if (!state_.context->resource_at(address, room, id, offset) || room < bytes) return false;
+        if (bytes == 8 && (flags == 1 || flags == 2)) {
+            LARGE_INTEGER now{}, frequency{};
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&frequency);
+            value = static_cast<std::uint64_t>(now.QuadPart);
+            if (flags == 1 && state_.context->timestamp_period() > 0)
+                value = static_cast<std::uint64_t>(double(now.QuadPart) * 1e9 / double(frequency.QuadPart) /
+                                                   state_.context->timestamp_period());
+            log_once("Write64 timestamps are the CPU clock when the list is recorded; flags", int(flags));
+        }
+        ID3D12GraphicsCommandList2* list2 = nullptr;
+        if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list2))) || !list2) return false;
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER words[2] = {
+            {address, static_cast<UINT>(value)}, {address + 4, static_cast<UINT>(value >> 32)}};
+        D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2] = {D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+                                                    D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
+        list2->WriteBufferImmediate(bytes == 8 ? 2 : 1, words, modes);
+        list2->Release();
+        return true;
+    }
+
+    // Xbox list slot 148, AllocateUploadMemory (V list.rs:1409-1431): `size` bytes aligned to `alignment` (at least
+    // 16, a power of two) that the list owns until it is reset, at an address the CPU writes and the GPU reads alike.
+    // The memory is the device's own title memory: 4 MiB blocks (or one as large as the request) in the GPU address
+    // window, imported like the title's, handed out in order and taken back when the list is reset, for reuse once the
+    // GPU has finished the work submitted by then.
+    void* allocate_upload(const void* owner, std::uint64_t size, std::uint64_t alignment) {
+        const std::uint64_t align = std::max<std::uint64_t>(alignment, 16);
+        if (!size || (align & (align - 1)) || size > (std::uint64_t(1) << 32)) return nullptr;
+        std::lock_guard lock(upload_mutex_);
+        auto& blocks = upload_owned_[owner];
+        for (UploadBlock& block : blocks) {
+            const std::uint64_t at = (block.used + align - 1) & ~(align - 1);
+            if (at <= block.size && size <= block.size - at) {
+                block.used = at + size;
+                return block.base + at;
+            }
+        }
+        const std::uint64_t completed = state_.context->completed_retire_ticket();
+        for (auto it = upload_free_.begin(); it != upload_free_.end(); ++it) {
+            if (it->ticket > completed || size > it->size) continue;
+            UploadBlock block = *it;
+            upload_free_.erase(it);
+            block.used = size;
+            blocks.push_back(block);
+            return block.base;
+        }
+        constexpr std::uint64_t kBlock = std::uint64_t(4) << 20;
+        const std::uint64_t bytes = std::max(kBlock, (size + 0xffff) & ~std::uint64_t(0xffff));
+        void* const base = allocate_title_window(bytes);
+        if (!base) {
+            log_once("AllocateUploadMemory: no memory in the GPU address window; KiB", int(bytes >> 10));
+            return nullptr;
+        }
+        // Visible to every device, as the title's own graphics memory is.
+        title_memory_visible(reinterpret_cast<std::uintptr_t>(base), bytes);
+        if (titles_ && !titles_->at(reinterpret_cast<std::uintptr_t>(base)))
+            log_once("AllocateUploadMemory: its block could not be imported; KiB", int(bytes >> 10));
+        upload_blocks_.emplace_back(static_cast<std::uint8_t*>(base), bytes);
+        blocks.push_back(UploadBlock{static_cast<std::uint8_t*>(base), bytes, size, 0});
+        return base;
+    }
+
+    void release_uploads(const void* owner) {
+        std::lock_guard lock(upload_mutex_);
+        const auto it = upload_owned_.find(owner);
+        if (it == upload_owned_.end()) return;
+        const std::uint64_t ticket = state_.context->submitted_retire_ticket();
+        for (UploadBlock block : it->second) {
+            block.used = 0;
+            block.ticket = ticket;
+            upload_free_.push_back(block);
+        }
+        upload_owned_.erase(it);
+    }
+
+    // Committed read-write memory in the GPU address window (title_memory.h's placement for graphics memory).
+    static void* allocate_title_window(std::uint64_t bytes) {
+        using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+        static const auto va2 = reinterpret_cast<VirtualAlloc2Fn>(
+            GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+        if (!va2) return nullptr;
+        const leonida::title_memory::Range range = leonida::title_memory::placement(3);
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.LowestStartingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(range.first));
+        requirements.HighestEndingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(range.last));
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        return va2(GetCurrentProcess(), nullptr, SIZE_T(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &parameter, 1);
+    }
+
     // The size of the VirtualAlloc allocation `address` starts, and its protection, when the whole of it is committed
     // PAGE_READWRITE, or PAGE_READWRITE | PAGE_WRITECOMBINE: what the host runtime accepts (a write-combined range
     // opens as a WRITE_COMBINE heap). False for an address inside an allocation, a reserved or free page, another
@@ -7154,6 +8158,23 @@ public:
         heap.Type = D3D12_HEAP_TYPE_CUSTOM;
         heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
         heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        // With title memory the pages are imported already (or now, merged into one import that holds the buffer):
+        // the buffer is bound to that import's memory, so it has the device address heap_base + `address` too.
+        if (state_.titles) {
+            const auto va = reinterpret_cast<std::uintptr_t>(address);
+            if (Resource* import = state_.titles->cover(va, desc.Width)) {
+                auto* alias = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
+                alias->attach_device(identity());
+                const HRESULT made = alias->create_title_alias(import, va);
+                import->Release();
+                if (SUCCEEDED(made)) return d3d12_trace::result(method, hand_out(alias, riid, out));
+                alias->Release();
+                log_once("a title-placed buffer could not be bound to its title memory's import; HRESULT", int(made));
+            } else {
+                log_once("a title-placed buffer's pages are not one import of title memory; width in KiB",
+                         int(std::min<UINT64>(desc.Width >> 10, INT_MAX)));
+            }
+        }
         auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
         resource->attach_device(identity());
         const HRESULT hr = resource->create_host_buffer(address);
@@ -8779,6 +9800,27 @@ private:
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
+    // Title memory (src/title_memory.h): the imports, the textures of slots 70/71 (detached from the device, so they
+    // do not keep it alive), and slot 148's upload blocks. All released in the destructor's body, while the context
+    // is alive.
+    std::unique_ptr<TitleMemory> titles_;
+    struct PlacedKey {
+        std::uint64_t address;
+        std::array<std::uint32_t, 14> words;
+        bool operator<(const PlacedKey& o) const { return std::tie(address, words) < std::tie(o.address, o.words); }
+    };
+    std::mutex placed_mutex_;
+    std::map<PlacedKey, Resource*> placed_textures_;  // one reference each; null: could not be made
+    struct UploadBlock {
+        std::uint8_t* base;
+        std::uint64_t size;
+        std::uint64_t used;
+        std::uint64_t ticket;  // free blocks: reused once the GPU has finished this retire ticket
+    };
+    std::mutex upload_mutex_;
+    std::map<const void*, std::vector<UploadBlock>> upload_owned_;  // by list
+    std::vector<UploadBlock> upload_free_;
+    std::vector<std::pair<std::uint8_t*, std::uint64_t>> upload_blocks_;  // every block, for the destructor
 };
 
 }  // namespace
@@ -8891,6 +9933,101 @@ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_NOTIMPL;
     return d->create_at_host_address(address, desc, layout, riid, out);
+}
+
+namespace {
+
+Device* vulkan_device_of(ID3D12Device* device) {
+    if (!device) return nullptr;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    return Device::from<Device>(real ? real : device);
+}
+
+// [start, start + size) out of `ranges` (start -> size, non-overlapping), keeping what lies outside it.
+void cut_range(std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t start, std::uint64_t size) {
+    const std::uint64_t end = start + size;
+    auto it = ranges.upper_bound(start);
+    if (it != ranges.begin()) --it;
+    while (it != ranges.end() && it->first < end) {
+        const std::uint64_t a = it->first, b = it->first + it->second;
+        if (b <= start) {
+            ++it;
+            continue;
+        }
+        it = ranges.erase(it);
+        if (a < start) ranges.emplace(a, start - a);
+        if (b > end) ranges.emplace(end, b - end);
+    }
+}
+
+bool list_copy_memory(ID3D12Device* device, ID3D12GraphicsCommandList* list, std::uint64_t dst, std::uint64_t src,
+                      std::uint64_t size) {
+    Device* d = vulkan_device_of(device);
+    return d && list && d->copy_memory(list, dst, src, size);
+}
+
+bool list_write_value(ID3D12Device* device, ID3D12GraphicsCommandList* list, std::uint64_t address,
+                      std::uint64_t value, unsigned bytes, std::uint32_t flags) {
+    Device* d = vulkan_device_of(device);
+    return d && list && d->write_value(list, address, value, bytes, flags);
+}
+
+void* list_allocate_upload(ID3D12Device* device, const void* owner, std::uint64_t size, std::uint64_t alignment) {
+    Device* d = vulkan_device_of(device);
+    return d ? d->allocate_upload(owner, size, alignment) : nullptr;
+}
+
+void list_release_uploads(ID3D12Device* device, const void* owner) {
+    if (Device* d = vulkan_device_of(device)) d->release_uploads(owner);
+}
+
+}  // namespace
+
+const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers{&list_copy_memory, &list_write_value, &list_allocate_upload,
+                                                         &list_release_uploads};
+
+void create_placed_view(ID3D12Device* device, bool uav, const void* resource_desc, const void* view_desc,
+                        std::uint64_t handle) {
+    Device* d = vulkan_device_of(device);
+    if (!d || !resource_desc || !view_desc || !handle) return;
+    d->create_placed_view(uav, static_cast<const std::uint32_t*>(resource_desc),
+                          static_cast<const std::uint32_t*>(view_desc), handle);
+}
+
+void title_memory_visible(std::uint64_t start, std::uint64_t size) {
+    if (!size) return;
+    auto& ranges = title_ranges();
+    std::lock_guard lock(ranges.mutex);
+    cut_range(ranges.visible, start, size);
+    ranges.visible.emplace(start, size);
+    for (TitleMemory* titles : ranges.devices) titles->visible(start, size);
+}
+
+void title_memory_gone(std::uint64_t start, std::uint64_t size) {
+    if (!size) return;
+    auto& ranges = title_ranges();
+    std::lock_guard lock(ranges.mutex);
+    cut_range(ranges.visible, start, size);
+    for (TitleMemory* titles : ranges.devices) titles->gone(start, size);
+}
+
+ID3D12Resource* title_placed_texture(ID3D12Device* device, std::uint64_t address, const void* resource_desc) {
+    Device* d = vulkan_device_of(device);
+    return d && resource_desc ? d->find_placed_texture(address, static_cast<const std::uint32_t*>(resource_desc))
+                              : nullptr;
+}
+
+TitleMemoryStats title_memory_stats(ID3D12Device* device) {
+    Device* d = vulkan_device_of(device);
+    if (!d || !d->titles()) return {};
+    return d->titles()->stats();
+}
+
+std::uint64_t title_memory_device_address(ID3D12Device* device, std::uint64_t va) {
+    Device* d = vulkan_device_of(device);
+    if (!d || !d->titles()) return 0;
+    Resource* import = d->titles()->at(va);
+    return import ? import->device_address() + (va - import->va()) : 0;
 }
 
 bool device_supports_ray_tracing(ID3D12Device* device) {
@@ -9567,6 +10704,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
     enable12.bufferDeviceAddress = VK_TRUE;
     info.buffer_device_address = true;
+    // Title memory (src/title_memory.h): device addresses chosen by the layer, where the driver offers them.
+    info.buffer_device_address_capture_replay = chosen12.bufferDeviceAddressCaptureReplay == VK_TRUE;
+    enable12.bufferDeviceAddressCaptureReplay = info.buffer_device_address_capture_replay ? VK_TRUE : VK_FALSE;
     std::uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, nullptr);
     std::vector<VkQueueFamilyProperties> families(family_count);

@@ -193,6 +193,11 @@ struct VulkanDeviceInfo {
     // minImportedHostPointerAlignment): OpenExistingHeapFromAddress backs a heap with the caller's own committed
     // memory. Zero: existing heaps stay unsupported.
     VkDeviceSize host_pointer_alignment = 0;
+    // Vulkan 1.2 bufferDeviceAddressCaptureReplay is enabled. With host_pointer_alignment too, the device keeps title
+    // memory (src/title_memory.h): the arena's memory at heap_base = title_memory::kHeapBase, the title's graphics
+    // memory imported at heap_base + its CPU address, so a GPU address is the title's CPU address. Without it (or
+    // when the driver refuses those addresses) title memory is not imported at its addresses, logged once.
+    bool buffer_device_address_capture_replay = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -246,6 +251,36 @@ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const
                                       std::uint32_t layout, REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
+
+// ---- Title memory (src/title_memory.h) ----------------------------------------------------------------------------
+// The title's GPU-visible memory as xmem reports it (rt::xmem::set_graphics_listener; gta6rt connects the two): a range
+// becomes visible when committed or mapped, and is gone before the title frees, decommits, unmaps or remaps it. The
+// ranges are kept, so a device created later imports what is visible by then; every live device with title memory
+// imports each range at heap_base + its address, and on `gone` releases its imports there once the GPU has finished
+// with them (the parts of an import outside the range are imported again).
+void title_memory_visible(std::uint64_t start, std::uint64_t size);
+void title_memory_gone(std::uint64_t start, std::uint64_t size);
+// What a device does with title memory. For tests and logs: whether it keeps it (heap_base is
+// title_memory::kHeapBase), its imports and their bytes, and the device address the import holding `va` gives it (0
+// when no import holds it).
+struct TitleMemoryStats {
+    bool enabled = false;
+    std::uint64_t heap_base = 0;
+    std::uint64_t imports = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t failed = 0;  // imports the driver refused since the device was made
+};
+TitleMemoryStats title_memory_stats(ID3D12Device* device);
+std::uint64_t title_memory_device_address(ID3D12Device* device, std::uint64_t va);
+
+// Xbox device slots 70 and 71 (rt::d3d12_xs::set_placed_view_handler): a shader-resource (uav false) or unordered-access
+// view of memory the title placed itself, written at `handle`. `resource_desc` is the 56-byte resource description,
+// `view_desc` 16 words: the PC view description (words 0-9) and the title address of the resource (words 10-11).
+void create_placed_view(ID3D12Device* device, bool uav, const void* resource_desc, const void* view_desc,
+                        std::uint64_t handle);
+// The texture those slots made for (address, resource description), with a reference added; null when there is none.
+// For tests.
+ID3D12Resource* title_placed_texture(ID3D12Device* device, std::uint64_t address, const void* resource_desc);
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);

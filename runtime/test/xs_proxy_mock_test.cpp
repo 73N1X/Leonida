@@ -1431,8 +1431,8 @@ int check_slot_tables() {
         {62, DeviceMethod::compute_pso_x, DeviceMethod::compute_pso_x},
         {67, DeviceMethod::native_compute_pso, DeviceMethod::native_compute_pso},
         {69, DeviceMethod::forward, DeviceMethod::ignore},
-        {70, DeviceMethod::forward, DeviceMethod::open},
-        {71, DeviceMethod::forward, DeviceMethod::open},
+        {70, DeviceMethod::forward, DeviceMethod::placed_view},
+        {71, DeviceMethod::forward, DeviceMethod::placed_view},
         {73, DeviceMethod::routed, DeviceMethod::routed},
         {74, DeviceMethod::forward, DeviceMethod::register_page_pool},
         {75, DeviceMethod::create_queue1, DeviceMethod::unregister_page_pool},
@@ -1504,14 +1504,17 @@ int check_slot_tables() {
     list_want[51] = {ListMethod::typed, 47};  // ClearDepthStencilView (a float)
     list_want[59] = {ListMethod::ignore, 0};  // the console GPU-event marker
     list_want[61] = {ListMethod::forward, 59};  // ExecuteIndirect
-    list_want[62] = {ListMethod::open, 0};      // CopyMemoryToMemoryX
+    list_want[62] = {ListMethod::copy_memory, 0};  // CopyMemoryToMemoryX
     list_want[70] = {ListMethod::typed, 62};    // OMSetDepthBounds (two floats)
-    for (unsigned s = 71; s <= 74; ++s) list_want[s] = {ListMethod::open, 0};  // Write32/64, WaitValue32/64
+    list_want[71] = {ListMethod::write32, 0};
+    list_want[72] = {ListMethod::write64, 0};
+    list_want[73] = {ListMethod::wait32, 0};
+    list_want[74] = {ListMethod::wait64, 0};
     list_want[75] = {ListMethod::ignore, 0};
     list_want[80] = {ListMethod::forward, 14};  // DispatchX
     list_want[85] = {ListMethod::forward, 16};  // CopyTextureRegionX
     list_want[86] = {ListMethod::forward, 17};  // CopyResourceX
-    list_want[100] = {ListMethod::open, 0};     // DispatchMeshX
+    list_want[100] = {ListMethod::dispatch_mesh_x, 79};  // DispatchMeshX -> DispatchMesh
     list_want[101] = {ListMethod::ignore, 0};   // DriverHintX
     list_want[126] = {ListMethod::ignore, 0};
     list_want[129] = {ListMethod::forward, 79};  // DispatchMesh
@@ -1520,7 +1523,7 @@ int check_slot_tables() {
     list_want[141] = {ListMethod::open, 0};
     list_want[142] = {ListMethod::ignore, 0};
     list_want[146] = {ListMethod::forward, 80};  // Barrier
-    list_want[148] = {ListMethod::open, 0};      // AllocateUploadMemory
+    list_want[148] = {ListMethod::allocate_upload, 0};  // AllocateUploadMemory
     for (unsigned slot = 3; slot < slots::kListSlots; ++slot) {
         if (slot == 7) continue;  // GetDevice, the proxy's own
         const slots::ListSlot s = slots::console_list_slot(slot);

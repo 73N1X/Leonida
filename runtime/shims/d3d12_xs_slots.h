@@ -57,6 +57,7 @@ enum class DeviceMethod : std::uint8_t {
     unregister_page_pool,  // 75 in the console layout
     committed_resource3,   // 127
     placed_resource_x,     // 133
+    placed_view,           // 70, 71: a view of title memory (rt::d3d12_xs::set_placed_view_handler)
 };
 
 struct DeviceSlot {
@@ -132,8 +133,9 @@ inline constexpr DeviceEntry kDeviceEntries[] = {
     // V device.rs:441 does not implement 67 (same call shape, an unknown pipeline); L §3.5a measured it in the FSR DLL.
     {67, DeviceMethod::native_compute_pso, DeviceMethod::native_compute_pso, "Xbox DeserializeComputePipelineStateX"},
     {69, DeviceMethod::forward, DeviceMethod::ignore, "Xbox debug error filter (V device.rs:442, ignored)"},
-    {70, DeviceMethod::forward, DeviceMethod::open, "Xbox placed SRV over title memory (V device.rs:443, open)"},
-    {71, DeviceMethod::forward, DeviceMethod::open, "Xbox placed UAV over title memory (V device.rs:444, open)"},
+    // V device.rs:443-444, descriptor.rs:795-818: (resource desc, view desc, handle), no result.
+    {70, DeviceMethod::forward, DeviceMethod::placed_view, "Xbox placed SRV over title memory (V device.rs:443)"},
+    {71, DeviceMethod::forward, DeviceMethod::placed_view, "Xbox placed UAV over title memory (V device.rs:444)"},
     {73, DeviceMethod::routed, DeviceMethod::routed, "Xbox CreateCommandListX -> console list proxy"},
     {74, DeviceMethod::forward, DeviceMethod::register_page_pool, "Xbox RegisterPagePoolX (V resource.rs:2196-2212)"},
     {75, DeviceMethod::create_queue1, DeviceMethod::unregister_page_pool,
@@ -228,6 +230,14 @@ enum class ListMethod : std::uint8_t {
     heaps,    // the PC SetDescriptorHeaps at `pc` with heap proxies unwrapped
     typed,    // the PC method at `pc` through a thunk with the real prototype: the method takes floats in XMM
               // registers, which a forwarding thunk declared with integer words does not keep
+    // Methods on title addresses (rt::d3d12_xs::set_list_title_handlers), and the ones the proxy does itself.
+    copy_memory,      // CopyMemoryToMemoryX(dst, src, size, flags)
+    write32,          // Write32(address, value, flush, flags)
+    write64,          // Write64(address, value, flush, flags)
+    wait32,           // WaitValue32(address, comparison, reference): recorded for the queue
+    wait64,           // WaitValue64
+    dispatch_mesh_x,  // DispatchMeshX(x, flags, indirect, payload): the PC DispatchMesh at `pc` when not indirect
+    allocate_upload,  // AllocateUploadMemory(size, alignment) -> pointer
 };
 
 struct ListSlot {
@@ -310,17 +320,17 @@ inline constexpr ListEntry kListEntries[] = {
     {59, false, ListMethod::ignore, 0, "GPU event marker (console)"},
     // V list.rs:2100-2111, older layout.
     {59, true, ListMethod::forward, 59, "ExecuteIndirect"},
-    {60, true, ListMethod::open, 0, "CopyMemoryToMemoryX"},  // V list.rs:1294-1314: needs title memory on the GPU
+    {60, true, ListMethod::copy_memory, 0, "CopyMemoryToMemoryX"},  // V list.rs:1294-1314
     {68, true, ListMethod::typed, 62, "OMSetDepthBounds"},    // two floats (XMM1, XMM2)
-    {69, true, ListMethod::open, 0, "Write32 (bottom-of-pipe value)"},  // V list.rs:1964-1983; L §3.3a slot 71
-    {70, true, ListMethod::open, 0, "Write64 (bottom-of-pipe value or timestamp)"},
-    {71, true, ListMethod::open, 0, "WaitValue32 (wait for a memory value)"},  // V list.rs:1891-1934; L §3.3a slot 73
-    {72, true, ListMethod::open, 0, "WaitValue64"},
+    {69, true, ListMethod::write32, 0, "Write32 (bottom-of-pipe value)"},  // V list.rs:1964-1983; L §3.3a slot 71
+    {70, true, ListMethod::write64, 0, "Write64 (bottom-of-pipe value or timestamp)"},
+    {71, true, ListMethod::wait32, 0, "WaitValue32 (wait for a memory value)"},  // V list.rs:1891-1934; L §3.3a slot 73
+    {72, true, ListMethod::wait64, 0, "WaitValue64"},
     {73, true, ListMethod::ignore, 0, "pixel shader depth order hint"},
     {78, true, ListMethod::forward, 14, "DispatchX"},  // V list.rs:1321-1328: (x, y, z, flags); L §3.3a slot 80
     {83, true, ListMethod::forward, 16, "CopyTextureRegionX"},  // V list.rs:1113-1124: a trailing flags word
     {84, true, ListMethod::forward, 17, "CopyResourceX"},       // V list.rs:887-889: a trailing flags word
-    {98, true, ListMethod::open, 0, "DispatchMeshX"},           // V list.rs:1596-1613: indirect form unknown
+    {98, true, ListMethod::dispatch_mesh_x, 79, "DispatchMeshX"},  // V list.rs:1596-1613: indirect ones dropped
     {99, true, ListMethod::ignore, 0, "DriverHintX"},           // V list.rs:1316-1319: returns 0
     {124, true, ListMethod::ignore, 0, "shading rate hint"},
     {127, true, ListMethod::forward, 79, "DispatchMesh"},
@@ -331,7 +341,7 @@ inline constexpr ListEntry kListEntries[] = {
     {141, false, ListMethod::open, 0, "compute scratch binding (FSR DLL)"},
     {142, false, ListMethod::ignore, 0, "state flush word"},
     {146, false, ListMethod::forward, 80, "Barrier"},
-    {148, false, ListMethod::open, 0, "AllocateUploadMemory"},  // V list.rs:1409-1431: CPU and GPU address alike
+    {148, false, ListMethod::allocate_upload, 0, "AllocateUploadMemory"},  // V list.rs:1409-1431
 };
 
 constexpr ListSlot console_list_slot(unsigned slot) {

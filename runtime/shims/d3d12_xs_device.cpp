@@ -1059,6 +1059,7 @@ struct ListProxy {
     alignas(8) std::uint8_t console_fields[0x600];
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
+    std::vector<ValueWait> waits;       // slots 73/74 since the last reset, for the queue's ExecuteX
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -1118,6 +1119,25 @@ private:
     std::uint64_t* data_ = nullptr;
 };
 
+std::atomic<const ListTitleHandlers*> g_list_title{nullptr};
+std::atomic<PlacedViewHandler> g_placed_view{nullptr};
+std::atomic<std::uint64_t> g_unmet_waits{0};
+
+// Reads the 32 or 64 bits at `address` without faulting on memory that is not there (false then).
+bool read_value(std::uint64_t address, bool wide, std::uint64_t& value) {
+    value = 0;
+    SIZE_T read = 0;
+    return address && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &value,
+                                        wide ? 8 : 4, &read) &&
+           read == (wide ? 8u : 4u);
+}
+
+// The list's upload memory (slot 148) goes back to the device, once the GPU has finished with it.
+void release_list_uploads(const void* list, DeviceProxy* device) {
+    const ListTitleHandlers* h = g_list_title.load(std::memory_order_acquire);
+    if (h && h->release_uploads && device) h->release_uploads(device->real, list);
+}
+
 struct ListStats {
     static inline std::atomic<std::uint64_t> hits[kListSlots];
     static inline std::atomic<bool> first[kListSlots];
@@ -1164,6 +1184,7 @@ inline unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add
 inline void destroy_list(ListProxy* self) {
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
+    release_list_uploads(self, device);
     delete self;
     if (real) real->Release();
     if (device) proxy_release(device);
@@ -1210,6 +1231,61 @@ inline unsigned detect_list_slot_count(IUnknown* real) {
     return 9;
 }
 
+// A console list method that works on title addresses (d3d12_xs_slots.h). Copies, writes and upload memory are the
+// device's (set_list_title_handlers); waits are kept on the proxy for the queue; DispatchMeshX is the PC DispatchMesh.
+template <slots::ListMethod M, unsigned Slot>
+std::uint64_t list_title_method(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                std::uint64_t a4) {
+    using slots::ListMethod;
+    const ListTitleHandlers* h = g_list_title.load(std::memory_order_acquire);
+    ID3D12Device* const device = self->device ? self->device->real : nullptr;
+    const auto not_done = [](const char* what) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: list slot %u (%s): %s; nothing is recorded (logged once)\n", Slot,
+                         list_slot_name(Slot), what);
+        return std::uint64_t{0};
+    };
+    if constexpr (M == ListMethod::copy_memory) {
+        // V list.rs:1294-1314: (destination, source, size, flags), title GPU addresses.
+        if (!a1 || !a2 || !a3) return 0;
+        if (!h || !h->copy_memory) return not_done("no device handler");
+        if (!h->copy_memory(device, self->real, a1, a2, a3)) not_done("an address is not GPU memory");
+        return 0;
+    } else if constexpr (M == ListMethod::write32 || M == ListMethod::write64) {
+        // V list.rs:1964-1983: (address, value, flush, flags), done when the list has run.
+        if (!a1) return 0;
+        if (!h || !h->write_value) return not_done("no device handler");
+        const std::uint64_t value = M == ListMethod::write32 ? (a2 & 0xffffffffu) : a2;
+        const auto flags = M == ListMethod::write64 ? static_cast<std::uint32_t>(a4) : 0u;
+        if (!h->write_value(device, self->real, a1, value, M == ListMethod::write32 ? 4 : 8, flags))
+            not_done("the address is not GPU memory");
+        return 0;
+    } else if constexpr (M == ListMethod::wait32 || M == ListMethod::wait64) {
+        // V list.rs:1891-1934: (address, comparison, reference); the queue looks at them when the list is executed.
+        try {
+            self->waits.push_back(ValueWait{a1, static_cast<std::uint32_t>(a2), a3, M == ListMethod::wait64});
+        } catch (const std::bad_alloc&) {
+        }
+        return 0;
+    } else if constexpr (M == ListMethod::dispatch_mesh_x) {
+        // V list.rs:1596-1613: (x groups, flags, indirect arguments, payload). Dispatches whose group count is in GPU
+        // memory are dropped, as VIctory drops them; the others are the PC DispatchMesh(x, 1, 1).
+        if (a3) return not_done("an indirect mesh dispatch (its group count in GPU memory) is dropped");
+        constexpr unsigned pc = slots::console_list_slot(Slot).pc;
+        if (pc >= self->pc_slot_count) return not_done("the real list has no DispatchMesh");
+        using Fn = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+        reinterpret_cast<Fn>((*reinterpret_cast<void***>(self->real))[pc])(self->real, static_cast<UINT>(a1), 1, 1);
+        return 0;
+    } else {
+        static_assert(M == ListMethod::allocate_upload);
+        // V list.rs:1409-1431: (size, alignment) -> memory the list owns until it is reset; null for an alignment that
+        // is not a power of two.
+        if (!h || !h->allocate_upload) return not_done("no device handler");
+        return reinterpret_cast<std::uint64_t>(h->allocate_upload(device, self, a1, a2));
+    }
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1241,6 +1317,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         note_list_slot(Slot, a1, a2, a3, a4);
         if constexpr (entry.method == ListMethod::ignore) {
             return 0;
+        } else if constexpr (entry.method == ListMethod::copy_memory || entry.method == ListMethod::write32 ||
+                             entry.method == ListMethod::write64 || entry.method == ListMethod::wait32 ||
+                             entry.method == ListMethod::wait64 || entry.method == ListMethod::dispatch_mesh_x ||
+                             entry.method == ListMethod::allocate_upload) {
+            return list_title_method<entry.method, Slot>(self, a1, a2, a3, a4);
         } else if constexpr (entry.method == ListMethod::open || entry.method == ListMethod::unknown) {
             // Today's answer for every slot the proxy does not route: nothing recorded, 0 (no memory from slot 148,
             // which the BVH builder reports as a failed allocation, docs/d3d12_command_objects.md §3.3a).
@@ -1277,6 +1358,8 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if constexpr (entry.method == ListMethod::reset) {  // Reset, ResetX (allocator, pipeline[, flags])
                 a1 = unwrap_object(a1);
                 self->pin_cursor_at_limit();
+                self->waits.clear();
+                release_list_uploads(self, self->device);
             } else if constexpr (entry.method == ListMethod::heaps) {  // SetDescriptorHeaps(count, heaps)
                 if (!heaps.fill(a2, a1)) return 0;
                 if (heaps.data()) a2 = heaps.data();
@@ -1430,6 +1513,50 @@ HRESULT queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64
     return S_OK;
 }
 
+// The value waits (slots 73/74) of the lists a queue executes. VIctory holds the submission until the memory holds
+// what a list waits for (V queue.rs:529-546, list.rs:1836-1871: the title's compute queue waits for a value the
+// graphics queue's depth pass writes at the bottom of the pipe). Here the submitting thread waits for it, up to
+// LEONIDA_VALUE_WAIT_MS (100 by default): a value earlier work of another queue writes (Write32/64, into title memory
+// the GPU reaches at its address) arrives meanwhile. One that only later work would write never comes, so after the
+// limit the submission goes on, counted (unmet_value_wait_submissions) and logged for the first ones.
+unsigned value_wait_limit_ms() {
+    static const unsigned limit = [] {
+        char text[16] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_VALUE_WAIT_MS", text, sizeof(text));
+        if (!length || length >= sizeof(text)) return 100u;
+        return static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    }();
+    return limit;
+}
+
+void wait_for_values(std::uint64_t lists, std::uint64_t count) {
+    if (!lists) return;
+    const auto* objects = reinterpret_cast<void* const*>(lists);
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(count); ++i) {
+        void* const object = objects[i];
+        if (!object || *reinterpret_cast<void* const*>(object) != reinterpret_cast<void*>(get_list_vtable())) continue;
+        for (const ValueWait& wait : static_cast<const ListProxy*>(object)->waits) {
+            std::uint64_t value = 0;
+            const ULONGLONG start = GetTickCount64();
+            bool met = !read_value(wait.address, wait.wide, value) || wait.met_by(value);
+            while (!met && GetTickCount64() - start < value_wait_limit_ms()) {
+                Sleep(0);
+                met = !read_value(wait.address, wait.wide, value) || wait.met_by(value);
+            }
+            if (met) continue;
+            const std::uint64_t n = g_unmet_waits.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 4 || (n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: a list waits for the value at 0x%llx (comparison %u, reference 0x%llx, %s) "
+                             "and it is 0x%llx after %u ms: submitted all the same (%llu so far)\n",
+                             static_cast<unsigned long long>(wait.address), wait.comparison,
+                             static_cast<unsigned long long>(wait.reference), wait.wide ? "64-bit" : "32-bit",
+                             static_cast<unsigned long long>(value), value_wait_limit_ms(),
+                             static_cast<unsigned long long>(n));
+        }
+    }
+}
+
 // GetDesc into `out`: the PC method (this, hidden return pointer), which returns the pointer.
 std::uint64_t queue_get_desc(ChildProxy* self, std::uint64_t out) {
     using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t);
@@ -1471,6 +1598,7 @@ std::uint64_t console_queue_call(ChildProxy* self, std::uint64_t a1, std::uint64
             // flags are not used (V queue.rs:595-599).
             UnwrappedArray lists;
             if (!lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
+            wait_for_values(a2, a1);
             using Fn = void(WINAPI*)(void*, UINT, std::uint64_t);
             reinterpret_cast<Fn>(self->real_vtable[entry.pc])(self->real, static_cast<UINT>(a1),
                                                               lists.data() ? lists.data() : a2);
@@ -2406,6 +2534,21 @@ std::uint64_t device_struct_return(DeviceProxy* first, std::uint64_t a1, std::ui
             return out;
         }
         fn(self->real, out, a2, a3, descs.data() ? descs.data() : a4, a5);
+        // What the title is told, for the first calls: it sizes its own pools by these answers (a run stops at a
+        // pool check right after the back buffers, game+0x247af2d: docs/port_status.md).
+        static std::atomic<unsigned> logged{0};
+        const auto* info = reinterpret_cast<const D3D12_RESOURCE_ALLOCATION_INFO*>(out);
+        const auto* first = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
+        if (info && first && a3 && (logged.fetch_add(1, std::memory_order_relaxed) < 8 || trace_enabled()))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: device slot %u: %u description(s), the first dimension %d %llux%u, %u mips, "
+                         "format %d, layout word 0x%x, flags 0x%x -> %llu bytes, alignment %llu\n",
+                         Slot, static_cast<unsigned>(a3), static_cast<int>(first->Dimension),
+                         static_cast<unsigned long long>(first->Width), first->Height,
+                         static_cast<unsigned>(first->MipLevels), static_cast<int>(first->Format),
+                         static_cast<unsigned>(first->Layout), static_cast<unsigned>(first->Flags),
+                         static_cast<unsigned long long>(info->SizeInBytes),
+                         static_cast<unsigned long long>(info->Alignment));
     }
     return out;
 }
@@ -2631,6 +2774,27 @@ __forceinline std::uint64_t device_call(DeviceProxy* self, std::uint64_t a1, std
     } else if constexpr (M == DeviceMethod::unregister_page_pool) {
         note_slot(Slot);
         return hr_to_u64(unregister_page_pool(self, a1));  // (handle)
+    } else if constexpr (M == DeviceMethod::placed_view) {
+        // V device.rs:443-444, descriptor.rs:795-818: (resource desc, view desc, handle); the view is the device's.
+        note_slot(Slot);
+        const PlacedViewHandler handler = g_placed_view.load(std::memory_order_acquire);
+        if (!handler) return hr_to_u64(refuse_console_device(Slot, true, a1, a2, a3, a4));
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || trace_enabled()) {
+            const auto* r = reinterpret_cast<const std::uint32_t*>(a1);
+            const auto* v = reinterpret_cast<const std::uint32_t*>(a2);
+            if (r && v)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot %u %s view: dimension %u %ux%u, depth/mips 0x%x, format %u, "
+                             "layout 0x%x, flags 0x%x; view format %u dimension %u at 0x%llx -> handle 0x%llx\n",
+                             Slot, Slot == 70 ? "shader-resource" : "unordered-access", r[0], r[4], r[6], r[7], r[8],
+                             r[11], r[12], v[0], v[1],
+                             static_cast<unsigned long long>(v[10] | std::uint64_t(v[11]) << 32),
+                             static_cast<unsigned long long>(a3));
+        }
+        if (a1 && a2 && a3) handler(self->real, Slot == 71, reinterpret_cast<const void*>(a1),
+                                    reinterpret_cast<const void*>(a2), a3);
+        return 0;
     } else if constexpr (M == DeviceMethod::committed_resource3) {
         return hr_to_u64(proxy_create_committed_resource3(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
     } else if constexpr (M == DeviceMethod::placed_resource_x) {
@@ -2836,6 +3000,38 @@ unsigned device_proxy_slot_count(const void* device) {
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
+
+void set_placed_view_handler(PlacedViewHandler handler) {
+    g_placed_view.store(handler, std::memory_order_release);
+}
+
+void set_list_title_handlers(const ListTitleHandlers* handlers) {
+    g_list_title.store(handlers, std::memory_order_release);
+}
+
+bool ValueWait::met_by(std::uint64_t value) const {
+    const std::uint64_t v = wide ? value : (value & 0xffffffffu);
+    const std::uint64_t r = wide ? reference : (reference & 0xffffffffu);
+    switch (comparison) {
+        case 1: return false;
+        case 2: return v < r;
+        case 3: return v == r;
+        case 4: return v <= r;
+        case 5: return v > r;
+        case 6: return v != r;
+        case 7: return v >= r;
+        default: return true;
+    }
+}
+
+std::size_t command_list_value_waits(const void* list, ValueWait* out, std::size_t capacity) {
+    if (!is_command_list_proxy(list)) return 0;
+    const auto& waits = static_cast<const ListProxy*>(list)->waits;
+    for (std::size_t i = 0; i < waits.size() && i < capacity; ++i) out[i] = waits[i];
+    return waits.size();
+}
+
+std::uint64_t unmet_value_wait_submissions() { return g_unmet_waits.load(std::memory_order_relaxed); }
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);

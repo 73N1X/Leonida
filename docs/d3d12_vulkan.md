@@ -1574,6 +1574,17 @@ fit on smaller PC GPUs. This is a product requirement, not something the layer c
 compatible single-mip RGBA8 2D textures (section 4.2). Other descriptions have fully allocated backing. Wider
 texture coverage and the game's use of tile streaming remain open.
 
+**Title memory.** On the console a GPU address is the title's CPU address, and the title builds its own descriptor
+heaps, constant buffers and views in its own memory. On a device with `bufferDeviceAddressCaptureReplay` and
+`VK_EXT_external_memory_host` the layer keeps that rule (`runtime/src/title_memory.h` has the design and the RTX 4060
+Ti measurements): heap_base is fixed at 512 GiB, the arena's memory asks for that device address, and every range of
+the title's graphics memory xmem reports (`rt::xmem::set_graphics_listener`) is imported at heap_base + its CPU
+address and registered as a buffer at VA = that address, so `heap_base + VA` and `buffer_at` both reach the title's
+own bytes with no copy. xmem places 32-bit graphics memory in [1 GiB, 4 GiB) (the truncated descriptor-table
+pointers above) and the rest in [64 GiB, 448 GiB); imports are released before the title frees or remaps their
+pages. Device slots 70/71 (views of title memory) and the list methods on title addresses (62, 71-74, 148) work on
+these imports. Without capture replay the title's memory is not imported at its addresses (logged).
+
 ### 3.4 Descriptor heaps and the bindless model
 
 The game can use D3D12 descriptors in three ways, and the layer must handle all of them:
