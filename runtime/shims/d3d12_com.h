@@ -493,6 +493,8 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// Diagnostics (LEONIDA_DEBUG_PSO_NAMES / LEONIDA_PRESENT_DEBUG): the stage names of a graphics pipeline id, or "?".
+std::string graphics_pipeline_debug_name(std::uintptr_t id);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 // Makes the pipeline first if it is not made yet.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);

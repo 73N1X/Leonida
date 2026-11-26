@@ -143,6 +143,115 @@ void note_draw_targets(const leonida::Draw& draw) {
             std::fprintf(stderr, "[rt] draw: user data s0-s15:%s\n", words.c_str());
         }
     }
+    // LEONIDA_DEBUG_DRAW_LOG_AT=<s> (with LEONIDA_PRESENT_DEBUG): the 96 draws recorded from <s> seconds after the
+    // first draw on, each with its pipeline's stage names, target and topology.
+    bool logged = false;
+    if (present_debug()) {
+        static const long long at_ms = [] {
+            const char* v = std::getenv("LEONIDA_DEBUG_DRAW_LOG_AT");
+            return v ? std::atoll(v) * 1000 : -1;
+        }();
+        static const auto start = std::chrono::steady_clock::now();
+        static std::atomic<unsigned> logged_count{0};
+        if (at_ms >= 0 && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                                  .count() >= at_ms) {
+            const unsigned n = logged_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 96) {
+                logged = true;
+                std::fprintf(stderr, "[rt] draw log %u: %s; topology %u, %u x%u, indexed %d; target %llx; viewport %.0f,%.0f %.0fx%.0f\n",
+                             n, graphics_pipeline_debug_name(draw.pipeline).c_str(), draw.topology, draw.count,
+                             draw.instances, int(draw.indexed),
+                             static_cast<unsigned long long>(draw.views ? draw.views->render_targets[0].resource : 0),
+                             draw.viewport.x, draw.viewport.y, draw.viewport.width, draw.viewport.height);
+                // An indexed draw: its first indices and the vertices they name, as dwords.
+                if (draw.indexed && draw.index.va && draw.views) {
+                    const bool wide = draw.index.format == DXGI_FORMAT_R32_UINT;
+                    std::string text;
+                    std::vector<std::uint32_t> indices;
+                    const std::uint32_t shown_indices = draw.count <= 96 ? draw.count : 12u;
+                    // The V# at user data s8 (a 32-bit address) and the first rows of the buffer it names.
+                    {
+                        std::uint32_t v[4] = {};
+                        SIZE_T got = 0;
+                        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(std::uintptr_t(draw.user_data[8])),
+                                          v, sizeof(v), &got);
+                        const std::uint64_t base = v[0] | (std::uint64_t(v[1] & 0xffffu) << 32);
+                        const std::uint32_t stride = (v[1] >> 16) & 0x3fffu;
+                        std::fprintf(stderr, "[rt] draw log %u: s8 V# %08x %08x %08x %08x (base %llx stride %u)\n", n, v[0],
+                                     v[1], v[2], v[3], static_cast<unsigned long long>(base), stride);
+                        for (std::uint32_t row = 0; base && row < 10; ++row) {
+                            float r[4] = {};
+                            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(base + row * 16ull), r,
+                                              sizeof(r), &got);
+                            std::fprintf(stderr, "[rt] draw log %u: row %u: %.9g %.9g %.9g %.9g\n", n, row, r[0], r[1], r[2],
+                                         r[3]);
+                        }
+                    }
+                    for (std::uint32_t i = 0; i < shown_indices; ++i) {
+                        std::uint32_t index = 0;
+                        SIZE_T got = 0;
+                        ReadProcessMemory(GetCurrentProcess(),
+                                          reinterpret_cast<const void*>(draw.index.va + std::uint64_t(draw.first + i) * (wide ? 4 : 2)),
+                                          &index, wide ? 4 : 2, &got);
+                        indices.push_back(index);
+                        text += " " + std::to_string(index);
+                    }
+                    std::fprintf(stderr, "[rt] draw log %u: index format %d first %u base %d:%s\n", n,
+                                 int(draw.index.format), draw.first, draw.base_vertex, text.c_str());
+                    const leonida::VertexBufferView& vb = draw.views->vertex_buffers[0];
+                    std::set<std::uint32_t> unique(indices.begin(), indices.end());
+                    if (draw.count > 96) unique = std::set<std::uint32_t>(indices.begin(), indices.begin() + 6);
+                    for (const std::uint32_t index : unique) {
+                        const std::size_t i = std::size_t(std::find(indices.begin(), indices.end(), index) - indices.begin());
+                        if (!vb.va || !vb.stride) break;
+                        std::uint32_t words[8] = {};
+                        SIZE_T got = 0;
+                        ReadProcessMemory(GetCurrentProcess(),
+                                          reinterpret_cast<const void*>(vb.va + (std::int64_t(indices[i]) + draw.base_vertex) * vb.stride),
+                                          words, std::min<std::size_t>(sizeof(words), vb.stride), &got);
+                        std::string line;
+                        for (std::size_t w = 0; w < got / 4; ++w) {
+                            char b[48];
+                            float f;
+                            std::memcpy(&f, &words[w], 4);
+                            std::snprintf(b, sizeof(b), " %08x(%g)", words[w], f);
+                            line += b;
+                        }
+                        std::fprintf(stderr, "[rt] draw log %u: vertex %u stride %u:%s\n", n, indices[i], vb.stride,
+                                     line.c_str());
+                    }
+                }
+            }
+        }
+    }
+    // LEONIDA_PRESENT_DEBUG: the first rectangle-list draws' vertices as the CPU sees them in their vertex buffers
+    // (words as floats), to see the corners the generated geometry stage completes.
+    if (present_debug() && draw.views && draw.topology == 17 && !draw.indexed) {
+        static std::atomic<unsigned> shown{0};
+        if (logged || shown.fetch_add(1, std::memory_order_relaxed) < 24) {
+            for (std::uint32_t slot = 0; slot < 4; ++slot) {
+                const leonida::VertexBufferView& vb = draw.views->vertex_buffers[slot];
+                if (!vb.va || !vb.stride) continue;
+                std::string line;
+                for (std::uint32_t v = 0; v < std::min(draw.count, 6u); ++v) {
+                    float words[8] = {};
+                    SIZE_T got = 0;
+                    const std::uint64_t at = vb.va + std::uint64_t(draw.first + v) * vb.stride;
+                    ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), words,
+                                      std::min<std::size_t>(sizeof(words), vb.stride), &got);
+                    line += " [";
+                    for (std::size_t i = 0; i < got / 4; ++i) {
+                        char w[32];
+                        std::snprintf(w, sizeof(w), "%s%.9g", i ? " " : "", words[i]);
+                        line += w;
+                    }
+                    line += "]";
+                }
+                std::fprintf(stderr, "[rt] rect draw: slot %u stride %u first %u:%s\n", slot, vb.stride, draw.first,
+                             line.c_str());
+            }
+        }
+    }
     if (!present_debug() || !draw.views) return;
     TargetCounts& t = target_counts();
     std::lock_guard lock(t.mutex);

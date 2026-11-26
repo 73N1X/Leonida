@@ -75,6 +75,25 @@ extern const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers;
 
 namespace {
 
+// Diagnostics: graphics pipeline ids and their stage names (graphics_pipeline_debug_name), kept while
+// LEONIDA_PRESENT_DEBUG or LEONIDA_DEBUG_PSO_NAMES is set. Never destroyed: pipelines are made on workers until exit.
+struct DebugPipelineNames {
+    std::mutex mutex;
+    std::unordered_map<std::uintptr_t, std::string> names;
+    std::set<std::string> seen;  // LEONIDA_DEBUG_PSO_NAMES: lines logged
+};
+DebugPipelineNames& debug_pipeline_names() {
+    static DebugPipelineNames* names = new DebugPipelineNames();
+    return *names;
+}
+bool pso_debug_names() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_PRESENT_DEBUG");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+
 class TitleMemory;  // the imports of the title's GPU memory (after Resource)
 class Device;
 // The device with the title's memory, whose placed textures the present path keeps up to date (refresh_title_textures).
@@ -5636,6 +5655,45 @@ public:
             if (!module_present(*library, *stage.entry)) return E_FAIL;
         }
         for (std::size_t i = 0; i < std::size(stages); ++i) planned_[i] = {stages[i].name, stages[i].bit, stages[i].entry, {}};
+        // LEONIDA_DEBUG_PSO_NAMES=1 (diagnostic): every graphics pipeline's stage names and topology type, once each.
+        // LEONIDA_DEBUG_HIDE_SHADERS=a,b (diagnostic): a pipeline with a stage whose name contains one of the
+        // comma-separated parts writes no colour, to tell which pipeline draws what.
+        const bool hidden = [&] {
+            static const bool names = [] {
+                const char* v = std::getenv("LEONIDA_DEBUG_PSO_NAMES");
+                return v && v[0] == '1';
+            }();
+            static const std::vector<std::string> hide = [] {
+                std::vector<std::string> parts;
+                const char* v = std::getenv("LEONIDA_DEBUG_HIDE_SHADERS");
+                for (std::string rest = v ? v : ""; !rest.empty();) {
+                    const std::size_t comma = rest.find(',');
+                    if (comma) parts.push_back(rest.substr(0, comma));
+                    rest = comma == std::string::npos ? std::string() : rest.substr(comma + 1);
+                }
+                return parts;
+            }();
+            const auto name = [&](std::size_t i) { return stages[i].entry ? stages[i].entry->name : std::string("-"); };
+            if (names || pso_debug_names()) {
+                std::string line = name(0) + " " + name(1) + " " + name(2) + " topology type " +
+                                   std::to_string(int(desc.PrimitiveTopologyType));
+                for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+                    const D3D12_INPUT_ELEMENT_DESC& e = desc.InputLayout.pInputElementDescs[i];
+                    line += " [" + std::string(e.SemanticName ? e.SemanticName : "?") +
+                            std::to_string(e.SemanticIndex) + " fmt " + std::to_string(int(e.Format)) + " slot " +
+                            std::to_string(e.InputSlot) + " off " + std::to_string(int(e.AlignedByteOffset)) + "]";
+                }
+                DebugPipelineNames& registry = debug_pipeline_names();
+                std::lock_guard lock(registry.mutex);
+                registry.names[id()] = line;
+                if (names && registry.seen.insert(line).second)
+                    std::fprintf(stderr, "[rt] pso names: %s\n", line.c_str());
+            }
+            for (const std::string& part : hide)
+                for (std::size_t i = 0; i < std::size(stages); ++i)
+                    if (name(i).find(part) != std::string::npos) return true;
+            return false;
+        }();
         uses_bindless_ = uses_bindless;
         depth24_fragment_ = depth24_fragment;
         depth24_bias_ = depth24_bias;
@@ -5865,6 +5923,7 @@ public:
                     (b.RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_ALPHA) ? VK_COLOR_COMPONENT_R_BIT : 0;
                 a8_targets_ |= 1u << i;
             }
+            if (hidden) blends[i].colorWriteMask = 0;  // LEONIDA_DEBUG_HIDE_SHADERS
         }
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         blend.attachmentCount = std::uint32_t(blends.size());
@@ -6180,7 +6239,24 @@ public:
                 const char* v = std::getenv("LEONIDA_DEBUG_SOLID_PS");
                 return v && v[0] == '1';
             }();
-            if (solid_ps && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT)
+            // LEONIDA_DEBUG_MAGENTA_SHADERS=a,b (diagnostic): as LEONIDA_DEBUG_SOLID_PS for the pipelines with a stage
+            // whose name contains one of the comma-separated parts, with their own blending and depth.
+            static const std::vector<std::string> magenta_parts = [] {
+                std::vector<std::string> parts;
+                const char* v = std::getenv("LEONIDA_DEBUG_MAGENTA_SHADERS");
+                for (std::string rest = v ? v : ""; !rest.empty();) {
+                    const std::size_t comma = rest.find(',');
+                    if (comma) parts.push_back(rest.substr(0, comma));
+                    rest = comma == std::string::npos ? std::string() : rest.substr(comma + 1);
+                }
+                return parts;
+            }();
+            const bool magenta = std::any_of(std::begin(planned_), std::end(planned_), [&](const PlannedStage& s) {
+                return s.entry && std::any_of(magenta_parts.begin(), magenta_parts.end(), [&](const std::string& p) {
+                           return s.entry->name.find(p) != std::string::npos;
+                       });
+            });
+            if ((solid_ps || magenta) && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT)
                 stage.words.assign(std::begin(leonida::kMagentaFragment), std::end(leonida::kMagentaFragment));
             // LEONIDA_DEBUG_SOLID_VS=1 (diagnostic, with LEONIDA_DEBUG_SOLID_PS=1): a triangle-list pipeline's vertex
             // shader draws one full-screen triangle, to test the translated vertex shaders' positions.
@@ -12325,6 +12401,12 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->compute() ? p->id() : 0;
+}
+
+std::string graphics_pipeline_debug_name(std::uintptr_t id) {
+    std::lock_guard lock(debug_pipeline_names().mutex);
+    const auto found = debug_pipeline_names().names.find(id);
+    return found == debug_pipeline_names().names.end() ? std::string("?") : found->second;
 }
 
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
