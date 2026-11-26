@@ -1526,8 +1526,54 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
+#ifdef VK_EXT_device_fault
+    // VK_EXT_device_fault, when the device enabled it: the first device loss reports what the GPU says faulted (the
+    // addresses a shader or a fixed-function unit could not reach, and the vendor's own records).
+    void configure_device_fault(PFN_vkGetDeviceProcAddr get) noexcept {
+        fault_info_ = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(get(device_, "vkGetDeviceFaultInfoEXT"));
+    }
+#endif
+
+    void report_device_fault() noexcept {
+#ifdef VK_EXT_device_fault
+        if (!fault_info_) {
+            std::fprintf(stderr, "[rt] vulkan: device lost (no VK_EXT_device_fault to say where)\n");
+            return;
+        }
+        try {
+            VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+            if (fault_info_(device_, &counts, nullptr) != VK_SUCCESS) return;
+            std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+            std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+            counts.vendorBinarySize = 0;  // the vendor's binary dump is not read
+            VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+            info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+            info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+            const VkResult r = fault_info_(device_, &counts, &info);
+            std::fprintf(stderr, "[rt] vulkan: device lost: %s (%u address(es), %u vendor record(s), result %d)\n",
+                         info.description, counts.addressInfoCount, counts.vendorInfoCount, int(r));
+            static const char* const kinds[] = {"none", "read invalid", "write invalid", "execute invalid",
+                                                "instruction pointer unknown", "instruction pointer invalid",
+                                                "instruction pointer fault"};
+            for (const auto& a : addresses) {
+                const unsigned kind = unsigned(a.addressType);
+                const VkDeviceSize mask = a.addressPrecision ? ~(a.addressPrecision - 1) : ~VkDeviceSize(0);
+                std::fprintf(stderr, "[rt] vulkan:   %s at 0x%llx (precision 0x%llx)\n",
+                             kind < std::size(kinds) ? kinds[kind] : "?",
+                             static_cast<unsigned long long>(a.reportedAddress & mask),
+                             static_cast<unsigned long long>(a.addressPrecision));
+            }
+            for (const auto& v : vendor)
+                std::fprintf(stderr, "[rt] vulkan:   vendor: %s (code 0x%llx, data 0x%llx)\n", v.description,
+                             static_cast<unsigned long long>(v.vendorFaultCode),
+                             static_cast<unsigned long long>(v.vendorFaultData));
+        } catch (...) {
+        }
+#endif
+    }
+
     void mark_device_lost() noexcept {
-        device_lost_.store(true, std::memory_order_release);
+        if (!device_lost_.exchange(true, std::memory_order_acq_rel)) report_device_fault();
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();
@@ -1725,6 +1771,9 @@ private:
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+#ifdef VK_EXT_device_fault
+    PFN_vkGetDeviceFaultInfoEXT fault_info_ = nullptr;
+#endif
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;

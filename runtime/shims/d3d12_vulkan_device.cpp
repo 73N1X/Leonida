@@ -6127,6 +6127,9 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+#ifdef VK_EXT_device_fault
+        if (info.device_fault) state_.context->configure_device_fault(get_device);
+#endif
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -11790,6 +11793,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         }
     }
 #endif
+#ifdef VK_EXT_device_fault
+    // VK_EXT_device_fault: a device loss reports the GPU addresses that faulted (VulkanContext::report_device_fault).
+    VkPhysicalDeviceFaultFeaturesEXT device_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (has_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &device_fault};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.device_fault = device_fault.deviceFault == VK_TRUE;
+        if (info.device_fault) {
+            device_fault.deviceFaultVendorBinary = VK_FALSE;
+            device_fault.pNext = *v13.next();
+            *v13.next() = &device_fault;
+        }
+    }
+#endif
     VkPhysicalDeviceShaderClockFeaturesKHR shader_clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
     if (has_device_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_clock};
@@ -11928,6 +11945,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 #endif
     if (info.shader_subgroup_clock || info.shader_device_clock)
         device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+#ifdef VK_EXT_device_fault
+    if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#endif
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);

@@ -135,6 +135,7 @@ struct VulkanDeviceInfo {
     // default `--fma glsl` shaders can.
     bool shader_fma = false;
     bool shader_subgroup_clock = false;
+    bool device_fault = false;  // VK_EXT_device_fault: device losses report the faulting addresses
     bool shader_device_clock = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
