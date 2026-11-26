@@ -103,6 +103,16 @@ void report_called_unimplemented();
 
 }  // namespace rt::shims
 
+// The title's suspend routines (app_state.cpp, from VIctory lifecycle.rs).
+namespace rt::shims::app_state {
+size_t registered_routines();
+// Runs every registered routine with Quiesced = TRUE on a thread of its own; true when they returned within the time.
+bool run_suspend_routines(unsigned deadline_ms);
+// Suspends the title, as the console does when it ends it, then ends the process (after the routines or a second,
+// whichever is first). Returns at once; later calls do nothing.
+void end_title(const char* why);
+}  // namespace rt::shims::app_state
+
 #define SHIM_TABLE(id, ...)                                                       \
     static const ::rt::shims::Entry id##_entries[] = {__VA_ARGS__};               \
     static ::rt::shims::Table id##_table(id##_entries, sizeof(id##_entries) / sizeof(id##_entries[0]))

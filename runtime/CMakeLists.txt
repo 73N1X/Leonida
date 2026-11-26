@@ -134,6 +134,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/winsock_offline.cpp
+    shims/app_state.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -347,6 +348,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
+  # The title's suspend routines (shims/app_state.cpp). No game files.
+  add_executable(app_state_test test/app_state_test.cpp shims/app_state.cpp shims/registry.cpp)
+  target_include_directories(app_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(app_state_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(app_state_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(app_state_test PRIVATE /OPT:NOREF)
+
   # Winsock reaches loopback only (shims/winsock_offline.cpp). Opens loopback sockets only; nothing leaves the machine.
   add_executable(winsock_offline_test
     test/winsock_offline_test.cpp
@@ -1284,6 +1292,7 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
     add_test(NAME winsock_offline COMMAND winsock_offline_test)
+    add_test(NAME app_state COMMAND app_state_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)

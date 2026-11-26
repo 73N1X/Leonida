@@ -9,8 +9,8 @@
 //   - a size that does not fit the primary monitor's work area is shrunk to it, keeping its shape, and centred (what the
 //     window shows is scaled to it: the swapchain follows the client area);
 //   - a window procedure goes in front of the title's: Close (the close button, Alt+F4, the window menu) ends the run,
-//     since a console title is never told it is closing (VIctory first runs the title's suspend routines; Leonida keeps
-//     none, so the process just ends), and Alt or F10 do not put the window into menu mode: the system would run its
+//     since a console title is never told it is closing: as in VIctory, the title's suspend routines run first
+//     (app_state.cpp) and the process ends when they return or after a second, and Alt or F10 do not put the window into menu mode: the system would run its
 //     modal menu loop on the title's thread, which then stops until a key ends the loop.
 // The window is then the one PresentX shows the frames in (xbox_window.h, note_title_window).
 #include <windows.h>
@@ -49,9 +49,8 @@ void fit(HWND parent, DWORD style, int& x, int& y, int& width, int& height, cons
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     if (message == WM_SYSCOMMAND && (w & 0xFFF0) == SC_CLOSE) {
-        std::fprintf(stderr, "[rt] window: the title's window was closed; the run ends\n");
-        std::fflush(nullptr);
-        TerminateProcess(GetCurrentProcess(), 0);
+        // As the console ends a title: its suspend routines first, then the process (app_state.cpp).
+        rt::shims::app_state::end_title("the title's window was closed");
         return 0;
     }
     if (message == WM_SYSCOMMAND && (w & 0xFFF0) == SC_KEYMENU) return 0;
