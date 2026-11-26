@@ -17709,6 +17709,12 @@ def translate(path):
         # A library program can use s_bfm_b64 as scalar data. Use the matching source's
         # wave32 flags only when this program's own EXEC instructions corroborate them.
         g.wave64 = False
+    elif stage in ("vs", "ps") and code_w32 and not (w64_marks - {"s_bfm_b64"}) and os.path.isfile(fspx_path):
+        # A console pipeline's stage (device slot 57, docs/fspx.md "Graphics pipelines"): no header gives its wave
+        # size, and its wave32 code moves vcc as an SGPR pair with _b64 ops (the loose code_w64 test), but its
+        # *_saveexec_b32 / *_wrexec_b32 exist only in wave32 code and it has none of the strict wave64 markers.
+        # Taken as wave64, its compare masks in vcc_hi were refused (402 compares, 437 mask writes).
+        g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if g.wave64:
