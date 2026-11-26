@@ -207,6 +207,8 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+    // Queue slot 31, CopyPageMappingsBatchX, maps xmem's physical pages (VIctory d3d12x.rs: use_page_mapper).
+    rt::d3d12_xs::set_page_mapper(&rt::xmem::map_alias);
 #ifdef LEONIDA_VULKAN_DEVICE
     // The title's GPU memory, as xmem sees it, goes to the Vulkan layer's title memory (src/title_memory.h).
     static const rt::xmem::GraphicsListener title_memory{

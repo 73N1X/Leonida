@@ -8,9 +8,15 @@
 //     reads the title's bytes through it and writes them into title memory through a root UAV at a title address,
 //     which the CPU reads back with no copy;
 //   - device slot 70 makes a texture from title memory, detiled from SW_64KB_D, whose image reads back as the
-//     linear texels;
+//     linear texels; and whole textures in the console's layout (a SW_4KB_S 2D array with a mip tail, a SW_64KB_D
+//     BC1 chain, a thick 3D chain), every subresource;
 //   - console list slots 62 (CopyMemoryToMemoryX), 71/72 (Write32/Write64), 73 (WaitValue32, recorded) and 148
 //     (AllocateUploadMemory) on title addresses;
+//   - list slots 73/74 hold the rest of their list until the value is in memory: a later submission's Write32 on
+//     another queue, a fence's value word after a Signal, or PresentX forcing it; Write64's GPU timestamp (written
+//     when the GPU gets there) and system timestamp (when the submission has run);
+//   - queue slot 31 (CopyPageMappingsBatchX) maps page-pool pages into another window, where the CPU and the GPU
+//     read them;
 //   - device slot 133 on mapped xmem physical pages: the buffer is bound to their import, at heap_base + its address;
 //   - the title's VirtualFree takes the imports off the GPU first;
 //   - with the title's allocator (its __XMemAllocationHooks__ through xmem, rt::d3d12::set_title_allocator), a slot-127
@@ -218,6 +224,143 @@ void __stdcall title_pool_free(void* p, std::uint64_t attributes) {
 
 void* g_title_hooks[2] = {reinterpret_cast<void*>(&title_pool_alloc), reinterpret_cast<void*>(&title_pool_free)};
 
+// Whether `done` comes true within `ms` milliseconds.
+template<class F>
+bool within(unsigned ms, F&& done) {
+    const ULONGLONG until = GetTickCount64() + ms;
+    while (!done()) {
+        if (GetTickCount64() > until) return false;
+        Sleep(1);
+    }
+    return true;
+}
+
+// A console queue, allocator and list of the proxy device; the list is open.
+struct ConsoleQueue {
+    void* queue = nullptr;
+    void* allocator = nullptr;
+    void* list = nullptr;
+    bool make(void* device, D3D12_COMMAND_LIST_TYPE type) {
+        const D3D12_COMMAND_QUEUE_DESC desc{type, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+        const IID queue_iid = __uuidof(ID3D12CommandQueue), allocator_iid = __uuidof(ID3D12CommandAllocator),
+                  list_iid = __uuidof(ID3D12GraphicsCommandList);
+        struct {
+            std::uint32_t type, node_mask;
+            std::uint64_t reserved[2];
+        } list_desc{std::uint32_t(type), 0, {0, 0}};
+        return call(device, 8, word(&desc), word(&queue_iid), word(&queue)) == S_OK &&
+               call(device, 9, type, word(&allocator_iid), word(&allocator)) == S_OK &&
+               call(device, 73, word(&list_desc), word(allocator), 0, word(&list_iid), word(&list)) == S_OK;
+    }
+    // Close, ExecuteX (queue slot 35) and Reset for the next recording.
+    bool execute() {
+        if (hr_from(call(list, 9)) != S_OK) return false;
+        void* lists[] = {list};
+        call(queue, 35, 1, word(lists), 0, 0);
+        return hr_from(call(list, 10, word(allocator), 0)) == S_OK;
+    }
+    ~ConsoleQueue() {
+        for (void* object : {list, allocator, queue})
+            if (object) static_cast<IUnknown*>(object)->Release();
+    }
+};
+
+std::uint64_t completed(void* fence) { return rt::d3d12_xs::fence_proxy_real_fence(fence)->GetCompletedValue(); }
+
+// Waits for memory values on the console queues: 0 when every check holds.
+int waits_hold(void* device, std::uint64_t A) {
+    ConsoleQueue graphics, compute;
+    EXPECT(graphics.make(device, D3D12_COMMAND_LIST_TYPE_DIRECT) && compute.make(device, D3D12_COMMAND_LIST_TYPE_COMPUTE));
+    const IID fence_iid = __uuidof(ID3D12Fence);
+    void* done = nullptr;
+    void* gate = nullptr;
+    EXPECT(call(device, 36, 0, 0, word(&fence_iid), word(&done)) == S_OK &&
+           call(device, 36, 0, 0, word(&fence_iid), word(&gate)) == S_OK);
+    auto* const v = reinterpret_cast<volatile std::uint32_t*>(A + 0x3C0000);  // v[0] the gate value, v[1..] marks
+    for (int i = 0; i < 16; ++i) v[i] = 0;
+
+    // 1. The compute queue's list: a mark, a wait for v[0] == 7, a second mark. The part before the wait runs; the
+    //    part after it waits for the graphics queue's Write32, submitted later.
+    call(compute.list, 71, A + 0x3C0004, 0x11, 0, 0);
+    call(compute.list, 73, A + 0x3C0000, 3, 7);  // WaitValue32: equal
+    call(compute.list, 71, A + 0x3C0008, 0x22, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 1) == S_OK);  // Signal behind the held part
+    EXPECT(within(5000, [&] { return v[1] == 0x11; }));
+    Sleep(50);
+    EXPECT(v[2] == 0 && completed(done) == 0);
+    call(graphics.list, 71, A + 0x3C0000, 7, 0, 0);
+    EXPECT(graphics.execute());
+    EXPECT(within(5000, [&] { return v[2] == 0x22 && completed(done) == 1; }));
+    std::printf("title memory: a WaitValue32 held the rest of its compute list until a later graphics submission's "
+                "Write32 put the value in memory\n");
+
+    // 2. A WaitValue64 on a console fence's value word (fence slot 12): met when another queue's Signal reaches it.
+    const auto gate_word = call(gate, 12);
+    EXPECT(gate_word);
+    call(compute.list, 74, gate_word, 7, 5);  // WaitValue64: greater-equal 5
+    call(compute.list, 71, A + 0x3C000C, 0x33, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 2) == S_OK);
+    Sleep(50);
+    EXPECT(v[3] == 0 && completed(done) == 1);
+    EXPECT(call(graphics.queue, 16, word(gate), 5) == S_OK);  // the graphics queue signals the gate fence
+    EXPECT(within(5000, [&] { return v[3] == 0x33 && completed(done) == 2; }));
+    std::printf("title memory: a WaitValue64 on a fence's value word ran on once another queue signalled the fence\n");
+
+    // 3. A wait nothing meets runs at the next present (PresentX, queue slot 32), as VIctory's queues do.
+    call(compute.list, 73, A + 0x3C0010, 3, 99);
+    call(compute.list, 71, A + 0x3C0014, 0x44, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 3) == S_OK);
+    Sleep(50);
+    EXPECT(v[5] == 0 && completed(done) == 2);
+    EXPECT(hr_from(call(graphics.queue, 32, 0, 0, 0)) == S_OK);
+    EXPECT(within(5000, [&] { return v[5] == 0x44 && completed(done) == 3; }));
+    std::printf("title memory: a wait nothing met ran on at the next PresentX\n");
+
+    // 5. Write64 timestamps: flag 1 the GPU's clock when the GPU gets there (a timestamp query resolved into the
+    //    address), flag 2 QueryPerformanceCounter once the submission has run. Both are later than a calibration
+    //    taken after the list was recorded and before it was executed.
+    {
+        auto* const stamps = reinterpret_cast<volatile std::uint64_t*>(A + 0x3C0040);
+        stamps[0] = stamps[1] = 0;
+        call(graphics.list, 72, A + 0x3C0040, 0, 0, 1);  // GPU timestamp
+        call(graphics.list, 72, A + 0x3C0048, 0, 0, 2);  // system timestamp
+        call(graphics.list, 72, A + 0x3C0050, 0x1122334455667788ull, 0, 0);  // a plain value beside them
+        EXPECT(hr_from(call(graphics.list, 9)) == S_OK);
+        Sleep(30);
+        ID3D12CommandQueue* const real = rt::d3d12_xs::queue_proxy_real_queue(graphics.queue);
+        UINT64 gpu0 = 0, cpu0 = 0, gpu1 = 0, cpu1 = 0;
+        EXPECT(SUCCEEDED(real->GetClockCalibration(&gpu0, &cpu0)));
+        void* lists[] = {graphics.list};
+        call(graphics.queue, 35, 1, word(lists), 0, 0);
+        EXPECT(hr_from(call(graphics.list, 10, word(graphics.allocator), 0)) == S_OK);
+        EXPECT(call(graphics.queue, 16, word(done), 5) == S_OK);
+        EXPECT(within(5000, [&] { return completed(done) == 5 && stamps[1] != 0; }));
+        EXPECT(SUCCEEDED(real->GetClockCalibration(&gpu1, &cpu1)));
+        std::printf("title memory: GPU timestamp %llu in [%llu, %llu], system timestamp %llu in [%llu, %llu]\n",
+                    static_cast<unsigned long long>(stamps[0]), static_cast<unsigned long long>(gpu0),
+                    static_cast<unsigned long long>(gpu1), static_cast<unsigned long long>(stamps[1]),
+                    static_cast<unsigned long long>(cpu0), static_cast<unsigned long long>(cpu1));
+        EXPECT(stamps[0] >= gpu0 && stamps[0] <= gpu1);
+        EXPECT(stamps[1] >= cpu0 && stamps[1] <= cpu1);
+        EXPECT(stamps[2] == 0x1122334455667788ull);
+        std::printf("title memory: Write64 timestamps are written when the GPU gets there (flag 1) and when the "
+                    "submission has run (flag 2)\n");
+    }
+
+    // 4. A wait whose value is there already holds nothing; one of a list without waits after it is not cut.
+    call(compute.list, 73, A + 0x3C0004, 3, 0x11);
+    call(compute.list, 71, A + 0x3C0018, 0x55, 0, 0);
+    EXPECT(compute.execute());
+    EXPECT(call(compute.queue, 16, word(done), 6) == S_OK);
+    EXPECT(within(5000, [&] { return v[6] == 0x55 && completed(done) == 6; }));
+    static_cast<IUnknown*>(gate)->Release();
+    static_cast<IUnknown*>(done)->Release();
+    return 0;
+}
+
 const rt::xmem::GraphicsListener kListener{
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); }};
@@ -395,6 +538,128 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     std::printf("title memory: a slot-70 texture view of a 64x64 SW_64KB_D texture in title memory reads back as "
                 "its linear texels\n");
 
+    // ---- Slot 70, whole textures in the console's layout (gfx10::ConsoleTexture, VIctory texture.rs): a 2D array
+    // with a mip chain and tail in SW_4KB_S, a BC1 chain in SW_64KB_D and a 3D chain in thick SW_4KB_S, every
+    // subresource read back as its linear texels.
+    {
+        namespace g = leonida::gfx10;
+        struct Case {
+            D3D12_RESOURCE_DIMENSION dimension;
+            UINT width, height, depth_or_array, mips;
+            DXGI_FORMAT format;
+            std::uint32_t layout_word;
+            std::uint64_t at;
+        } const cases[] = {
+            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 32, 3, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 0x105, A + 0x110000},
+            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 1, 9, DXGI_FORMAT_BC1_UNORM, 0x10a, A + 0x140000},
+            {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 32, 16, 8, 3, DXGI_FORMAT_R8G8B8A8_UNORM, 0, A + 0x180000},
+        };
+        for (const Case& c : cases) {
+            g::ConsoleTextureDesc cd;
+            cd.dimension = c.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? g::Dimension::tex3d : g::Dimension::tex2d;
+            cd.width = c.width;
+            cd.height = c.height;
+            cd.depth_or_array = c.depth_or_array;
+            cd.mips = c.mips;
+            cd.format = c.format;
+            cd.swizzle = c.layout_word ? (c.layout_word & 0xff) : g::swizzle::sw_4kb_s;
+            g::ConsoleTexture console;
+            EXPECT(g::ConsoleTexture::make(cd, false, console) && console.planes.size() == 1);
+            const g::TextureLayout& layout = console.planes[0].layout;
+            EXPECT(layout.addressable() && c.at + layout.size() <= A + (2 << 20));
+            const bool three_d = cd.dimension == g::Dimension::tex3d;
+            const UINT slices = three_d ? 1 : c.depth_or_array;
+            const std::size_t n = layout.desc().element_bytes;
+            auto* const tiled = reinterpret_cast<std::byte*>(c.at);
+            std::memset(tiled, 0, std::size_t(layout.size()));
+            std::vector<std::vector<std::byte>> expected;  // per subresource, rows packed
+            for (UINT slice = 0; slice < slices; ++slice)
+                for (UINT mip = 0; mip < c.mips; ++mip) {
+                    const g::MipLayout& m = layout.mips()[mip];
+                    const std::size_t row = m.width * n, plane = row * m.height;
+                    std::vector<std::byte> rows(plane * m.depth);
+                    for (std::size_t i = 0; i < rows.size(); ++i)
+                        rows[i] = std::byte(i * 29 + (i >> 7) + mip * 61 + slice * 17 + 1);
+                    EXPECT(layout.tile(std::span<std::byte>(tiled, std::size_t(layout.size())), mip, slice, rows,
+                                       row, plane));
+                    expected.push_back(std::move(rows));
+                }
+            std::uint32_t words14[14] = {};
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = c.dimension;
+            td.Width = c.width;
+            td.Height = c.height;
+            td.DepthOrArraySize = UINT16(c.depth_or_array);
+            td.MipLevels = UINT16(c.mips);
+            td.Format = c.format;
+            td.SampleDesc.Count = 1;
+            std::memcpy(words14, &td, sizeof(td));
+            words14[11] = c.layout_word;
+            std::uint32_t view16[16] = {};
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = c.format;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (three_d) {
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+                srv.Texture3D.MipLevels = c.mips;
+            } else {
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                srv.Texture2DArray.MipLevels = c.mips;
+                srv.Texture2DArray.ArraySize = c.depth_or_array;
+            }
+            std::memcpy(view16, &srv, sizeof(srv));
+            view16[10] = static_cast<std::uint32_t>(c.at);
+            view16[11] = static_cast<std::uint32_t>(c.at >> 32);
+            EXPECT(call(device, 70, word(words14), word(view16), T + 128) == 0);
+            Ref<ID3D12Resource> made;
+            made.p = rt::d3d12::title_placed_texture(inner, c.at, words14);
+            EXPECT(made.p);
+            const UINT subresources = slices * c.mips;
+            std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresources);
+            std::vector<UINT> row_counts(subresources);
+            std::vector<UINT64> row_bytes(subresources);
+            UINT64 total = 0;
+            const D3D12_RESOURCE_DESC made_desc = made->GetDesc();
+            inner->GetCopyableFootprints(&made_desc, 0, subresources, 0, footprints.data(), row_counts.data(),
+                                         row_bytes.data(), &total);
+            const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+            const auto readback_desc = buffer_desc(total);
+            Ref<ID3D12Resource> readback;
+            EXPECT(SUCCEEDED(inner->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&readback.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            for (UINT s = 0; s < subresources; ++s) {
+                D3D12_TEXTURE_COPY_LOCATION src{made.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                src.SubresourceIndex = s;
+                D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                dst.PlacedFootprint = footprints[s];
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(SUCCEEDED(list->Close()));
+            EXPECT(runner.run(list.p));
+            void* mapped = nullptr;
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+            bool same = true;
+            for (UINT s = 0; s < subresources && same; ++s) {
+                const g::MipLayout& m = layout.mips()[s % c.mips];
+                const std::size_t row = m.width * n;
+                const auto& f = footprints[s];
+                for (UINT z = 0; z < m.depth && same; ++z)
+                    for (UINT y = 0; y < m.height && same; ++y)
+                        same = std::memcmp(static_cast<const std::byte*>(mapped) + f.Offset +
+                                               (std::size_t(z) * row_counts[s] + y) * f.Footprint.RowPitch,
+                                           expected[s].data() + (std::size_t(z) * m.height + y) * row, row) == 0;
+                if (!same) std::fprintf(stderr, "subresource %u of a %ux%u layout-0x%x texture differs\n", s, c.width,
+                                        c.height, c.layout_word);
+            }
+            readback->Unmap(0, nullptr);
+            EXPECT(same);
+        }
+    }
+    std::printf("title memory: slot-70 textures in the console's layout (a SW_4KB_S 2D array with a mip tail, a "
+                "SW_64KB_D BC1 chain, a thick 3D chain) read back as their linear texels, every subresource\n");
+
     // ---- Slot 71: a structured buffer UAV (a V# at the title address plus the first element) and a texture UAV.
     {
         std::uint32_t uav_resource[14] = {};
@@ -479,6 +744,12 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     static_cast<IUnknown*>(console_list)->Release();
     static_cast<IUnknown*>(console_allocator)->Release();
 
+    // ---- List slots 73/74 hold the rest of their list until the value is in memory (VIctory's cut): a later
+    // submission's Write32 on another queue, a fence's value word after a Signal, or a present that forces it.
+    {
+        EXPECT(waits_hold(device, A) == 0);
+    }
+
     // ---- Slot 133 on mapped physical pages: bound to their import.
     constexpr std::uint64_t kPages = 4;
     auto* window = static_cast<std::uint8_t*>(virtual_alloc(nullptr, kPages << 16, MEM_RESERVE | kXmem64kPages, 0x23,
@@ -502,6 +773,70 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     EXPECT(map_pages(window, kPages, nullptr) == window);
     EXPECT(rt::d3d12::title_memory_device_address(inner, W) == 0);
     EXPECT(free_pages(count, pages));
+
+    // ---- Queue slot 31, CopyPageMappingsBatchX: a page pool's pages mapped again into another window (VIctory's page
+    // mapper, rt::xmem::map_alias). The CPU and the GPU see the pool's bytes there, and a kind-2 range unmaps it.
+    {
+        rt::d3d12_xs::set_page_mapper(&rt::xmem::map_alias);
+        constexpr std::uint64_t kPoolPages = 4, P = 0x10000;
+        auto* pool_window = static_cast<std::uint8_t*>(
+            virtual_alloc(nullptr, kPoolPages * P, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+        auto* tiled = static_cast<std::uint8_t*>(
+            virtual_alloc(nullptr, 4 * P, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+        EXPECT(pool_window && tiled);
+        std::uint64_t pool_pages[kPoolPages]{};
+        std::uint64_t pool_count = kPoolPages;
+        EXPECT(allocate_pages(0x280, &pool_count, pool_pages) && pool_count == kPoolPages);
+        EXPECT(map_pages(pool_window, kPoolPages, pool_pages) == pool_window);
+        for (std::uint64_t p = 0; p < kPoolPages; ++p)
+            for (std::uint64_t i = 0; i < P; ++i) pool_window[p * P + i] = std::uint8_t(0x40 * p + i % 61);
+        const auto PW = reinterpret_cast<std::uint64_t>(pool_window), D = reinterpret_cast<std::uint64_t>(tiled);
+        std::uint64_t pool_handle = 0;
+        EXPECT(call(device, 74, PW, kPoolPages, word(&pool_handle)) == S_OK && pool_handle);
+        struct Range {
+            std::uint32_t kind, start, count;
+        };
+        struct Batch {
+            std::uint64_t destination;
+            std::uint32_t count;
+            const Range* ranges;
+        };
+        // Pool pages 2 and 3 at D and D + 64 KiB; pool page 0 at D + 128 KiB and D + 192 KiB.
+        const Range ranges[] = {{0, 2, 2}, {1, 0, 2}};
+        const Batch batch{D, 2, ranges};
+        ConsoleQueue gq;
+        EXPECT(gq.make(device, D3D12_COMMAND_LIST_TYPE_DIRECT));
+        EXPECT(call(gq.queue, 31, 1, word(&batch), PW, kPoolPages, 0) == S_OK);
+        EXPECT(std::memcmp(tiled, pool_window + 2 * P, 2 * P) == 0);
+        EXPECT(std::memcmp(tiled + 2 * P, pool_window, P) == 0 && std::memcmp(tiled + 3 * P, pool_window, P) == 0);
+        tiled[3 * P + 5] = 0x77;  // the same physical page as pool page 0
+        EXPECT(pool_window[5] == 0x77 && tiled[2 * P + 5] == 0x77);
+        EXPECT(rt::d3d12::title_memory_device_address(inner, D + P) == tm::kHeapBase + D + P);
+        // The GPU reads the alias: CopyMemoryToMemoryX from D + 64 KiB (pool page 3) into the graphics memory at A.
+        const IID fence_iid = __uuidof(ID3D12Fence);
+        void* copied = nullptr;
+        EXPECT(call(device, 36, 0, 0, word(&fence_iid), word(&copied)) == S_OK);
+        std::memset(pool + (3 << 20), 0, P);
+        call(gq.list, 62, A + (3 << 20), D + P, P, 0);
+        EXPECT(gq.execute() && call(gq.queue, 16, word(copied), 1) == S_OK);
+        EXPECT(within(5000, [&] { return completed(copied) == 1; }));
+        EXPECT(std::memcmp(pool + (3 << 20), pool_window + 3 * P, P) == 0);
+        static_cast<IUnknown*>(copied)->Release();
+        // Kind 2 unmaps the window's pages: its title memory leaves the GPU, and the pool keeps its pages.
+        const Range unmap{2, 0, 4};
+        const Batch unmap_batch{D, 1, &unmap};
+        EXPECT(call(gq.queue, 31, 1, word(&unmap_batch), PW, kPoolPages, 0) == S_OK);
+        EXPECT(rt::d3d12::title_memory_device_address(inner, D) == 0 &&
+               rt::d3d12::title_memory_device_address(inner, D + 3 * P) == 0);
+        MEMORY_BASIC_INFORMATION region{};
+        EXPECT(VirtualQuery(tiled, &region, sizeof(region)) && region.State == MEM_RESERVE);
+        EXPECT(pool_window[5] == 0x77 && rt::d3d12::title_memory_device_address(inner, PW) == tm::kHeapBase + PW);
+        EXPECT(call(device, 75, pool_handle) == S_OK);
+        EXPECT(map_pages(pool_window, kPoolPages, nullptr) == pool_window && free_pages(pool_count, pool_pages));
+        rt::d3d12_xs::set_page_mapper(nullptr);
+        std::printf("title memory: queue slot 31 mapped page-pool pages into another window (in order and one page "
+                    "twice); the CPU and a GPU copy read them there, and an unmap range took them off the GPU\n");
+    }
 
     // ---- The title's VirtualFree takes the pool's imports off the GPU first.
     const std::uint64_t before = rt::d3d12::title_memory_stats(inner).imports;

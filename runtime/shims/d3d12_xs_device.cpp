@@ -712,6 +712,9 @@ struct ChildProxy {
     ChildProxy* word_prev;
     ChildProxy* word_next;
     bool word_listed;
+    // A console queue's own fence for Write64's system timestamps (queue_system_stamps), made on first use.
+    std::atomic<ID3D12Fence*> stamp_fence;
+    std::atomic<std::uint64_t> stamp_value;
 };
 
 template <ChildKind K>
@@ -916,6 +919,7 @@ void unlist_fence_word(ChildProxy* fence) {
 // Frees a proxy whose last reference is gone, with the real object and the device reference it held.
 void destroy_child(ChildProxy* self) {
     unlist_fence_word(self);
+    if (ID3D12Fence* stamps = self->stamp_fence.exchange(nullptr)) stamps->Release();
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     delete self;
@@ -1060,6 +1064,7 @@ struct ListProxy {
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
     std::vector<ValueWait> waits;       // slots 73/74 since the last reset, for the queue's ExecuteX
+    std::vector<std::uint64_t> system_stamps;  // slot 72 with flag 2 since the last reset: written after ExecuteX
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -1121,6 +1126,8 @@ private:
 
 std::atomic<const ListTitleHandlers*> g_list_title{nullptr};
 std::atomic<PlacedViewHandler> g_placed_view{nullptr};
+std::atomic<SamplerXHandler> g_sampler_x{nullptr};
+std::atomic<PageMapper> g_page_mapper{nullptr};
 std::atomic<std::uint64_t> g_unmet_waits{0};
 
 // Reads the 32 or 64 bits at `address` without faulting on memory that is not there (false then).
@@ -1255,16 +1262,32 @@ std::uint64_t list_title_method(ListProxy* self, std::uint64_t a1, std::uint64_t
     } else if constexpr (M == ListMethod::write32 || M == ListMethod::write64) {
         // V list.rs:1964-1983: (address, value, flush, flags), done when the list has run.
         if (!a1) return 0;
+        const auto flags = M == ListMethod::write64 ? static_cast<std::uint32_t>(a4) : 0u;
+        if constexpr (M == ListMethod::write64) {
+            if (flags == 2) {
+                // V queue.rs:697-731 (Written::SystemTimestamp): the CPU's performance counter when the list has run;
+                // the queue writes it after the submission (queue_system_stamps).
+                try {
+                    self->system_stamps.push_back(a1);
+                } catch (const std::bad_alloc&) {
+                }
+                return 0;
+            }
+        }
         if (!h || !h->write_value) return not_done("no device handler");
         const std::uint64_t value = M == ListMethod::write32 ? (a2 & 0xffffffffu) : a2;
-        const auto flags = M == ListMethod::write64 ? static_cast<std::uint32_t>(a4) : 0u;
         if (!h->write_value(device, self->real, a1, value, M == ListMethod::write32 ? 4 : 8, flags))
             not_done("the address is not GPU memory");
         return 0;
     } else if constexpr (M == ListMethod::wait32 || M == ListMethod::wait64) {
-        // V list.rs:1891-1934: (address, comparison, reference); the queue looks at them when the list is executed.
+        // V list.rs:1891-1934: (address, comparison, reference). The list holds the rest of its commands at the wait
+        // where the device can (ListTitleHandlers::wait_value: the queue that executes it stands there until the value
+        // is in memory, V's cut); otherwise the queue looks at the wait when the list is executed (wait_for_values).
+        const bool wide = M == ListMethod::wait64;
+        const auto comparison = static_cast<std::uint32_t>(a2);
+        const bool held = a1 && h && h->wait_value && h->wait_value(device, self->real, a1, comparison, a3, wide);
         try {
-            self->waits.push_back(ValueWait{a1, static_cast<std::uint32_t>(a2), a3, M == ListMethod::wait64});
+            self->waits.push_back(ValueWait{a1, comparison, a3, wide, held});
         } catch (const std::bad_alloc&) {
         }
         return 0;
@@ -1359,6 +1382,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 a1 = unwrap_object(a1);
                 self->pin_cursor_at_limit();
                 self->waits.clear();
+                self->system_stamps.clear();
                 release_list_uploads(self, self->device);
             } else if constexpr (entry.method == ListMethod::heaps) {  // SetDescriptorHeaps(count, heaps)
                 if (!heaps.fill(a2, a1)) return 0;
@@ -1501,6 +1525,10 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 // S_OK (logged once).
 HRESULT queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes, std::uint64_t parameters) {
     DeviceProxy* const device = self->device;
+    // What the queues hold for memory values runs first (V queue.rs:113-119, VICTORY_WAIT_FORCE): the present shows
+    // the frame's work, and a wait is not kept across frames.
+    const ListTitleHandlers* const title = g_list_title.load(std::memory_order_acquire);
+    if (device && title && title->force_waits) title->force_waits(device->real);
     const PresentHandler handler = device ? device->present_handler.load(std::memory_order_acquire) : nullptr;
     if (handler)
         return handler(device->present_context.load(std::memory_order_acquire),
@@ -1513,12 +1541,15 @@ HRESULT queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64
     return S_OK;
 }
 
-// The value waits (slots 73/74) of the lists a queue executes. VIctory holds the submission until the memory holds
-// what a list waits for (V queue.rs:529-546, list.rs:1836-1871: the title's compute queue waits for a value the
-// graphics queue's depth pass writes at the bottom of the pipe). Here the submitting thread waits for it, up to
-// LEONIDA_VALUE_WAIT_MS (100 by default): a value earlier work of another queue writes (Write32/64, into title memory
-// the GPU reaches at its address) arrives meanwhile. One that only later work would write never comes, so after the
-// limit the submission goes on, counted (unmet_value_wait_submissions) and logged for the first ones.
+// The value waits (slots 73/74) of the lists a queue executes that the lists do not hold themselves. On the Vulkan
+// device every list holds its waits (ListTitleHandlers::wait_value: its queue runs the parts between them as the
+// values arrive, V queue.rs:94-210 and list.rs:290-450); this is for a device without that. VIctory holds the
+// submission until the memory holds what a list waits for (V queue.rs:529-546, list.rs:1836-1871: the title's compute
+// queue waits for a value the graphics queue's depth pass writes at the bottom of the pipe). Here the submitting thread
+// waits for it, up to LEONIDA_VALUE_WAIT_MS (100 by default): a value earlier work of another queue writes (Write32/64,
+// into title memory the GPU reaches at its address) arrives meanwhile. One that only later work would write never
+// comes, so after the limit the submission goes on, counted (unmet_value_wait_submissions) and logged for the first
+// ones.
 unsigned value_wait_limit_ms() {
     static const unsigned limit = [] {
         char text[16] = {};
@@ -1536,6 +1567,7 @@ void wait_for_values(std::uint64_t lists, std::uint64_t count) {
         void* const object = objects[i];
         if (!object || *reinterpret_cast<void* const*>(object) != reinterpret_cast<void*>(get_list_vtable())) continue;
         for (const ValueWait& wait : static_cast<const ListProxy*>(object)->waits) {
+            if (wait.held) continue;  // the list stands at it itself
             std::uint64_t value = 0;
             const ULONGLONG start = GetTickCount64();
             bool met = !read_value(wait.address, wait.wide, value) || wait.met_by(value);
@@ -1555,6 +1587,174 @@ void wait_for_values(std::uint64_t lists, std::uint64_t count) {
                              static_cast<unsigned long long>(n));
         }
     }
+}
+
+// Console queue slot 31, CopyPageMappingsBatchX(count, batches, pool, pool pages, flags), ported from VIctory
+// (GPL-3.0-or-later, Marvisak and contributors, DexNom fork), victory-gpu queue.rs:897-962: maps pages of a pool (64 KiB
+// pages the title mapped physical pages into, device slot 74) at the batches' addresses, through the page mapper
+// (set_page_mapper: xmem's). The title streams textures into pool pages and maps them into its tiled heap this way
+// (V: ranges of one constant page or of unmapped pages). A range is a kind, a first pool page and a page count: 0 maps
+// that many pool pages in order, 1 maps the one pool page at each page, 2 unmaps, 3 leaves the pages as they are. Done
+// at once on the CPU, as V does: work already submitted keeps the pages it had (title memory leaves the GPU before it
+// is remapped, src/title_memory.h), and work submitted later sees the new ones. A range that reaches past the pool, or
+// a page the mapper refuses, is logged once; the call still answers S_OK, as V's does.
+// shortcut: work the queue holds (behind a value or fence wait) runs after the remap, not before it.
+struct PageRange {
+    std::uint32_t kind, start, count;
+};
+struct PageBatch {
+    std::uint64_t destination;
+    std::uint32_t count;
+    const PageRange* ranges;
+};
+static_assert(sizeof(PageRange) == 12 && sizeof(PageBatch) == 24 && offsetof(PageBatch, ranges) == 16);
+constexpr std::uint64_t kMappedPage = 64 * 1024;
+
+HRESULT queue_copy_page_mappings(std::uint64_t count_word, std::uint64_t batches_word, std::uint64_t pool,
+                                 std::uint64_t pool_pages_word) {
+    const PageMapper map = g_page_mapper.load(std::memory_order_acquire);
+    if (!map) return E_INVALIDARG;
+    const auto count = static_cast<std::uint32_t>(count_word);
+    const auto pool_pages = static_cast<std::uint32_t>(pool_pages_word);
+    const auto* const batches = reinterpret_cast<const PageBatch*>(batches_word);
+    if (!batches && count) return E_INVALIDARG;
+    bool ok = true;
+    std::uint64_t mapped = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const PageBatch& batch = batches[i];
+        if (!batch.ranges) continue;
+        std::uint64_t at = batch.destination;
+        for (std::uint32_t j = 0; j < batch.count; ++j) {
+            const PageRange& r = batch.ranges[j];
+            const std::uint64_t len = std::uint64_t(r.count) * kMappedPage;
+            const auto inside = [&](std::uint32_t pages) { return std::uint64_t(r.start) + pages <= pool_pages; };
+            const std::uint64_t source = pool + std::uint64_t(r.start) * kMappedPage;
+            switch (r.kind) {
+                case 0:
+                    ok = inside(r.count) && map(at, source, len) && ok;
+                    break;
+                case 1: {
+                    bool all = inside(1);
+                    for (std::uint32_t k = 0; all && k < r.count; ++k) all = map(at + k * kMappedPage, source, kMappedPage);
+                    ok = all && ok;
+                    break;
+                }
+                case 2:
+                    ok = map(at, 0, len) && ok;
+                    break;
+                case 3:
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+            if (r.kind <= 2) mapped += r.count;
+            at += len;
+        }
+    }
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: queue slot 31 CopyPageMappingsBatchX: %u batches, %llu pages from pool 0x%llx "
+                     "(%u pages)%s\n",
+                     count, static_cast<unsigned long long>(mapped), static_cast<unsigned long long>(pool),
+                     pool_pages, ok ? "" : "; a mapping failed");
+    if (!ok) {
+        static std::atomic<bool> failed{false};
+        if (!failed.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a page mapping from pool 0x%llx failed (logged once)\n",
+                         static_cast<unsigned long long>(pool));
+    }
+    return S_OK;
+}
+
+// Write64 with flag 2, the system timestamp (V queue.rs:697-731, Written::SystemTimestamp: QueryPerformanceCounter,
+// stored when the list has run). After an ExecuteX whose lists asked for some, the queue signals a fence of its own
+// behind the submission, and when the real fence gets there a thread-pool wait stores the counter at each address
+// (in place: title memory is host memory; an address that is not writable is skipped). Like VIctory's, the time is when
+// the whole submission has run, not when the GPU reached the write.
+struct StampJob {
+    std::vector<std::uint64_t> addresses;
+    HANDLE event = nullptr;
+    ID3D12Fence* fence = nullptr;
+};
+
+VOID CALLBACK system_stamps_due(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT wait, TP_WAIT_RESULT) {
+    std::unique_ptr<StampJob> job(static_cast<StampJob*>(context));
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    for (const std::uint64_t address : job->addresses)
+        WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), &now.QuadPart, sizeof(now.QuadPart),
+                           nullptr);
+    CloseHandle(job->event);
+    job->fence->Release();
+    CloseThreadpoolWait(wait);
+}
+
+void queue_system_stamps(ChildProxy* self, std::uint64_t lists, std::uint64_t count) {
+    if (!lists || !self->device) return;
+    std::vector<std::uint64_t> addresses;
+    const auto* objects = reinterpret_cast<void* const*>(lists);
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(count); ++i) {
+        void* const object = objects[i];
+        if (!object || *reinterpret_cast<void* const*>(object) != reinterpret_cast<void*>(get_list_vtable())) continue;
+        const auto& stamps = static_cast<const ListProxy*>(object)->system_stamps;
+        try {
+            addresses.insert(addresses.end(), stamps.begin(), stamps.end());
+        } catch (const std::bad_alloc&) {
+            return;
+        }
+    }
+    if (addresses.empty()) return;
+    const auto refuse = [](const char* why) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: Write64 system timestamps: %s; they are written now (logged once)\n",
+                         why);
+    };
+    const auto write_now = [&] {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        for (const std::uint64_t address : addresses)
+            WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), &now.QuadPart,
+                               sizeof(now.QuadPart), nullptr);
+    };
+    ID3D12Fence* fence = self->stamp_fence.load(std::memory_order_acquire);
+    if (!fence) {
+        ID3D12Fence* made = nullptr;
+        if (FAILED(self->device->real->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&made))) || !made) {
+            refuse("no fence for the queue");
+            return write_now();
+        }
+        ID3D12Fence* expected = nullptr;
+        if (self->stamp_fence.compare_exchange_strong(expected, made, std::memory_order_acq_rel)) {
+            fence = made;
+        } else {
+            made->Release();
+            fence = expected;
+        }
+    }
+    const std::uint64_t value = self->stamp_value.fetch_add(1, std::memory_order_relaxed) + 1;
+    using SignalFn = HRESULT(WINAPI*)(void*, ID3D12Fence*, UINT64);
+    std::unique_ptr<StampJob> job(new (std::nothrow) StampJob);  // nothing may throw out of a thunk
+    if (!job) {
+        refuse("out of memory");
+        return write_now();
+    }
+    job->addresses = std::move(addresses);
+    job->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    PTP_WAIT wait = job->event ? CreateThreadpoolWait(&system_stamps_due, job.get(), nullptr) : nullptr;
+    if (!wait || FAILED(reinterpret_cast<SignalFn>(self->real_vtable[kQueueSignal])(self->real, fence, value)) ||
+        FAILED(fence->SetEventOnCompletion(value, job->event))) {
+        if (wait) CloseThreadpoolWait(wait);
+        if (job->event) CloseHandle(job->event);
+        refuse("the queue's fence could not be signalled or waited for");
+        addresses = std::move(job->addresses);
+        return write_now();
+    }
+    fence->AddRef();
+    job->fence = fence;
+    SetThreadpoolWait(wait, job.release()->event, nullptr);
 }
 
 // GetDesc into `out`: the PC method (this, hidden return pointer), which returns the pointer.
@@ -1602,6 +1802,7 @@ std::uint64_t console_queue_call(ChildProxy* self, std::uint64_t a1, std::uint64
             using Fn = void(WINAPI*)(void*, UINT, std::uint64_t);
             reinterpret_cast<Fn>(self->real_vtable[entry.pc])(self->real, static_cast<UINT>(a1),
                                                               lists.data() ? lists.data() : a2);
+            queue_system_stamps(self, a2, a1);
             return 0;
         } else if constexpr (entry.method == QueueMethod::signal) {
             // Signal(fence, value) and Signal2X(fence, value, bottom, top): the sync settings are not used
@@ -1615,6 +1816,14 @@ std::uint64_t console_queue_call(ChildProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[entry.pc])(self->real, unwrap_object(a1), a2));
         } else if constexpr (entry.method == QueueMethod::get_desc) {
             return queue_get_desc(self, a1);
+        } else if constexpr (entry.method == QueueMethod::page_mappings) {
+            return hr_to_u64(queue_copy_page_mappings(a1, a2, a3, a4));
+        } else if constexpr (entry.method == QueueMethod::accept) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u (%s) accepted: nothing suspends a title here\n",
+                             Slot, entry.name);
+            return hr_to_u64(S_OK);
         } else {
             static_assert(entry.method == QueueMethod::present);
             return hr_to_u64(queue_present_x(self, a1, a2, a3));
@@ -1791,6 +2000,8 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     proxy->value_word.store(0, std::memory_order_relaxed);
     proxy->word_prev = proxy->word_next = nullptr;
     proxy->word_listed = false;
+    proxy->stamp_fence.store(nullptr, std::memory_order_relaxed);
+    proxy->stamp_value.store(0, std::memory_order_relaxed);
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
 
     const HRESULT hr = child_query_interface<K>(proxy, riid, out);
@@ -2583,9 +2794,20 @@ HRESULT refuse_unknown_pipeline(unsigned slot, std::uint64_t desc, std::uint64_t
     return E_NOTIMPL;
 }
 
+// Console device slot 61, CreateSamplerX(desc, handle) (V device.rs:439, descriptor.rs:828-832): the S# the device's
+// handler writes from the console description (the Vulkan device), or else the D3D12 sampler VIctory gives the host
+// (console_sampler_desc), through the real device's CreateSampler.
+void proxy_create_sampler_x(DeviceProxy* self, std::uint64_t desc, std::uint64_t handle) {
+    if (!desc || !handle) return;
+    const SamplerXHandler handler = g_sampler_x.load(std::memory_order_acquire);
+    if (handler && handler(self->real, reinterpret_cast<const void*>(desc), handle)) return;
+    const D3D12_SAMPLER_DESC host = console_sampler_desc(reinterpret_cast<const std::uint32_t*>(desc));
+    self->real->CreateSampler(&host, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
+}
+
 // Console device slots 74 and 75 (V resource.rs:2187-2223): page pools, 64 KiB pages the title maps into its tiled
-// resources by page index (through queue slot 31, CopyPageMappingsBatchX, which is still open). Kept per device: the
-// first address and the page count; a handle is an index plus one, and a removed pool keeps its index.
+// resources by page index (through queue slot 31, CopyPageMappingsBatchX, which takes the pool by address). Kept per
+// device: the first address and the page count; a handle is an index plus one, and a removed pool keeps its index.
 HRESULT register_page_pool(DeviceProxy* self, std::uint64_t address, std::uint64_t pages_word, std::uint64_t out_word) {
     const auto pages = static_cast<std::uint32_t>(pages_word);
     auto* const out = reinterpret_cast<std::uint64_t*>(out_word);  // a usize in V
@@ -2797,6 +3019,10 @@ __forceinline std::uint64_t device_call(DeviceProxy* self, std::uint64_t a1, std
         if (a1 && a2 && a3) handler(self->real, Slot == 71, reinterpret_cast<const void*>(a1),
                                     reinterpret_cast<const void*>(a2), a3);
         return 0;
+    } else if constexpr (M == DeviceMethod::sampler_x) {
+        note_slot(Slot);
+        proxy_create_sampler_x(self, a1, a2);  // (desc, handle), no result
+        return 0;
     } else if constexpr (M == DeviceMethod::committed_resource3) {
         return hr_to_u64(proxy_create_committed_resource3(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
     } else if constexpr (M == DeviceMethod::placed_resource_x) {
@@ -3001,6 +3227,46 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_sampler_x_handler(SamplerXHandler handler) {
+    g_sampler_x.store(handler, std::memory_order_release);
+}
+
+// Ported from VIctory (GPL-3.0-or-later, Marvisak and contributors, DexNom fork), victory-gpu sampler.rs:28-96:
+// words 1-3 the magnification, minification and mip filters, 5 the filter mode, 6-8 the address modes (D3D12's), 9-11
+// the minimum and maximum LOD and the bias, 13 the anisotropy, 16 the comparison (D3D12's), 17-20 the border colour.
+D3D12_SAMPLER_DESC console_sampler_desc(const std::uint32_t* w) {
+    D3D12_SAMPLER_DESC desc{};
+    if (!w) return desc;
+    const auto real = [&](int i) {
+        float value = 0;
+        std::memcpy(&value, &w[i], sizeof(value));
+        return value;
+    };
+    const std::uint32_t mag = w[1], min = w[2], mip = w[3], mode = w[5], compare = w[16];
+    const auto linear = [](std::uint32_t f) { return std::uint32_t(f == 1 || f == 3); };
+    const bool aniso = mag >= 2 || min >= 2;
+    // The console compares when the instruction says so, with the sampler's function; the host needs a comparison
+    // sampler for that. A real test (LESS .. GREATER_EQUAL) makes one; NEVER, ALWAYS and none are plain samplers.
+    const bool compares = compare >= D3D12_COMPARISON_FUNC_LESS && compare <= D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    const std::uint32_t reduction = mode == 1 ? 2u : mode == 2 ? 3u : compares ? 1u : 0u;
+    const std::uint32_t filter = aniso ? 0x55u : linear(min) << 4 | linear(mag) << 2 | std::uint32_t(mip == 2);
+    desc.Filter = static_cast<D3D12_FILTER>(reduction << 7 | filter);
+    desc.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[6]);
+    desc.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[7]);
+    desc.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[8]);
+    desc.MipLODBias = real(11);
+    desc.MaxAnisotropy = aniso ? std::clamp<std::uint32_t>(w[13], 1, 16) : 1;
+    desc.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(std::max<std::uint32_t>(compare, 1));
+    for (int i = 0; i < 4; ++i) desc.BorderColor[i] = real(17 + i);
+    desc.MinLOD = real(9);
+    desc.MaxLOD = mip == 0 ? desc.MinLOD : real(10);  // without a mip filter the console samples mip 0 only
+    return desc;
+}
+
+void set_page_mapper(PageMapper mapper) {
+    g_page_mapper.store(mapper, std::memory_order_release);
 }
 
 void set_placed_view_handler(PlacedViewHandler handler) {

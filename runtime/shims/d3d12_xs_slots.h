@@ -58,6 +58,7 @@ enum class DeviceMethod : std::uint8_t {
     committed_resource3,   // 127
     placed_resource_x,     // 133
     placed_view,           // 70, 71: a view of title memory (rt::d3d12_xs::set_placed_view_handler)
+    sampler_x,             // 61: the console's sampler description (rt::d3d12_xs::set_sampler_x_handler)
 };
 
 struct DeviceSlot {
@@ -128,7 +129,8 @@ inline constexpr DeviceEntry kDeviceEntries[] = {
     {50, DeviceMethod::unwrap, DeviceMethod::refuse, "EnqueueMakeResident (pc layout)"},
     {57, DeviceMethod::forward, DeviceMethod::unknown_pipeline,
      "Xbox pipeline creation (V device.rs:438, not written)"},
-    {61, DeviceMethod::forward, DeviceMethod::open, "Xbox CreateSamplerX (V device.rs:439, open)"},
+    // V device.rs:439, descriptor.rs:828-832, sampler.rs: (27-word console sampler description, handle), no result.
+    {61, DeviceMethod::forward, DeviceMethod::sampler_x, "Xbox CreateSamplerX (V device.rs:439)"},
     {62, DeviceMethod::compute_pso_x, DeviceMethod::compute_pso_x, "Xbox CreateComputePipelineState"},
     // V device.rs:441 does not implement 67 (same call shape, an unknown pipeline); L §3.5a measured it in the FSR DLL.
     {67, DeviceMethod::native_compute_pso, DeviceMethod::native_compute_pso, "Xbox DeserializeComputePipelineStateX"},
@@ -170,6 +172,8 @@ enum class QueueMethod : std::uint8_t {
     wait,      // the PC Wait with the fence unwrapped
     get_desc,  // the PC GetDesc; the return buffer may come first (resolved per call)
     present,   // PresentX: the device's present handler, or accepted (V queue.rs:757-841 always answers S_OK)
+    page_mappings,  // CopyPageMappingsBatchX: the page mapper (rt::d3d12_xs::set_page_mapper)
+    accept,    // S_OK, nothing done
 };
 
 struct QueueSlot {
@@ -201,10 +205,12 @@ inline constexpr QueueEntry kQueueEntries[] = {
     {14, QueueMethod::signal, 14, "Signal"},
     {15, QueueMethod::wait, 15, "Wait"},
     {16, QueueMethod::forward, 16, "GetTimestampFrequency"},
-    {21, QueueMethod::open, 0, "SuspendX"},  // V queue.rs:983: suspend and resume at 0xb8/0xc0 in the newer layout
-    {22, QueueMethod::open, 0, "ResumeX"},
+    // V queue.rs:998: suspend and resume at 0xb8/0xc0 in the newer layout (V leaves them E_NOTIMPL). Nothing here
+    // suspends a title, so there is no queue state to stop or bring back: accepted.
+    {21, QueueMethod::accept, 0, "SuspendX"},
+    {22, QueueMethod::accept, 0, "ResumeX"},
     {26, QueueMethod::get_desc, 18, "GetDesc"},
-    {29, QueueMethod::open, 0, "CopyPageMappingsBatchX"},  // V queue.rs:897-948: needs the page mapper (open)
+    {29, QueueMethod::page_mappings, 0, "CopyPageMappingsBatchX"},  // V queue.rs:897-962
     {30, QueueMethod::present, 0, "PresentX"},
     {32, QueueMethod::signal, 14, "Signal2X"},   // V queue.rs:600-610: signals at once, the sync settings unused
     {33, QueueMethod::execute, 10, "ExecuteX"},  // V queue.rs:595-599: the frame token and flags unused

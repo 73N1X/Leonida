@@ -198,6 +198,10 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    // The Xbox list's WaitValue32/64 (rt::d3d12::record_memory_wait): where the queue cuts the list. Not in a bundle.
+    bool wait_memory(const leonida::MemoryWait& wait) {
+        return type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE && list_.wait_memory(wait);
+    }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -2082,6 +2086,11 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
     return true;
+}
+
+bool record_memory_wait(ID3D12GraphicsCommandList* list, const leonida::MemoryWait& wait) {
+    GraphicsCommandList* l = GraphicsCommandList::from(list);
+    return l && l->wait_memory(wait);
 }
 
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands) {

@@ -1087,6 +1087,56 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
     return TRUE;
 }
 
+// The physical pages mapped at [from, from + len) mapped again at `to`, page by page, or with `from` 0 the pages at
+// [to, to + len) unmapped (rt::xmem::map_alias). Ported from VIctory (GPL-3.0-or-later, Marvisak and contributors,
+// DexNom fork), victory-hle xmem.rs:754-791 (map_alias): a nonempty alias maps its last page in full. The sources are
+// read before anything changes, so the two ranges may overlap. A page of `from` with no physical page mapped there
+// fails the call; the pages before it stay mapped. The memory at `to` leaves the GPU first and comes back page run by
+// page run (make_gone, PageRuns), as XMemMapPhysicalPages does it.
+bool map_alias_pages(uintptr_t to, uintptr_t from, uint64_t len) {
+    if (len == 0) return true;
+    const uint64_t pages = (len + kPhysicalPageSize - 1) / kPhysicalPageSize;
+    if (!aligned_page_address(to) || (from && !aligned_page_address(from)) ||
+        pages > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
+        to > (std::numeric_limits<uintptr_t>::max)() - pages * kPhysicalPageSize ||
+        (from && from > (std::numeric_limits<uintptr_t>::max)() - pages * kPhysicalPageSize)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (!placeholder_api().available()) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    std::vector<uint64_t> sources;
+    if (from) {
+        sources.reserve(static_cast<size_t>(pages));
+        for (uint64_t k = 0; k < pages; ++k) {
+            const auto it = g_mapped.find(from + k * kPhysicalPageSize);
+            if (it == g_mapped.end()) {
+                SetLastError(ERROR_INVALID_ADDRESS);
+                return false;
+            }
+            sources.push_back(it->second.page);
+        }
+    }
+    make_gone(to, static_cast<size_t>(pages * kPhysicalPageSize));
+    if (!from) {
+        for (uint64_t k = 0; k < pages; ++k)
+            if (!unmap_page(to + k * kPhysicalPageSize)) return false;
+        return true;
+    }
+    const Window* const window = find_window(to, pages * kPhysicalPageSize);
+    const DWORD protect = window ? view_protect(*window) : PAGE_READWRITE;
+    PageRuns runs;
+    for (uint64_t k = 0; k < pages; ++k) {
+        const uintptr_t at = to + k * kPhysicalPageSize;
+        if (!map_page(at, sources[static_cast<size_t>(k)], protect)) return false;
+        runs.add(at);
+    }
+    return true;
+}
+
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
                               ULONG* granularity) {
     return GetWriteWatch(flags, base_address, region_size, addresses, count, granularity);
@@ -1228,6 +1278,10 @@ bool has_allocation_hooks() {
 void* title_alloc(std::size_t size, std::uint64_t attributes) { return call_alloc(size, attributes); }
 
 void title_free(void* address, std::uint64_t attributes) { call_free(address, attributes); }
+
+bool map_alias(std::uint64_t to, std::uint64_t from, std::uint64_t len) {
+    return map_alias_pages(static_cast<uintptr_t>(to), static_cast<uintptr_t>(from), len);
+}
 
 void set_graphics_listener(const GraphicsListener* listener) {
     const std::lock_guard lock(g_graphics_mutex);

@@ -129,6 +129,16 @@ using PlacedViewHandler = void (*)(ID3D12Device* real, bool uav, const void* res
                                    std::uint64_t handle);
 void set_placed_view_handler(PlacedViewHandler handler);
 
+// Console device slot 61, CreateSamplerX(desc, handle) (V device.rs:439, descriptor.rs:828-832): the console's 27-word
+// sampler description, the S# written at `handle`. The Vulkan device sets a handler that writes the S# from the
+// description's hardware fields; it returns false for a device that is not its own. Without a handler, or when it
+// returns false, the proxy makes the D3D12 sampler VIctory makes for the host (V sampler.rs) with the real device's
+// CreateSampler (console_sampler_desc).
+using SamplerXHandler = bool (*)(ID3D12Device* real, const void* desc, std::uint64_t handle);
+void set_sampler_x_handler(SamplerXHandler handler);
+// V sampler.rs:28-96, Fields::host and console: the D3D12 sampler of a console sampler description (27 words).
+D3D12_SAMPLER_DESC console_sampler_desc(const std::uint32_t* words);
+
 // Console list methods that work on title addresses (V list.rs:1294-1314, 1409-1431, 1891-1983), done by the device
 // behind the list's device proxy, which registers them (the Vulkan layer). `real` is the PC list, `device` the PC
 // device. With no handler a slot records nothing and answers 0, as before.
@@ -145,6 +155,14 @@ struct ListTitleHandlers {
     void* (*allocate_upload)(ID3D12Device* device, const void* owner, std::uint64_t size, std::uint64_t alignment);
     // The list `owner` was reset or released: its upload memory goes back once the GPU has finished with it.
     void (*release_uploads)(ID3D12Device* device, const void* owner);
+    // Slots 73/74, WaitValue32/WaitValue64(address, comparison, reference): the list holds the rest of its commands
+    // until the value is in memory (VIctory's cut, V list.rs:290-345 and 1891-1928): the queue that executes it runs
+    // what comes before and stands at the wait. False: the list cannot hold it, and ExecuteX checks it instead.
+    bool (*wait_value)(ID3D12Device* device, ID3D12GraphicsCommandList* real, std::uint64_t address,
+                       std::uint32_t comparison, std::uint64_t reference, bool wide);
+    // Queue slot 32, PresentX: what the device's queues hold for memory values runs before the present, met or not,
+    // as VIctory's queues do at a present (V queue.rs:113-119: a wait is not kept across frames).
+    void (*force_waits)(ID3D12Device* device);
 };
 void set_list_title_handlers(const ListTitleHandlers* handlers);
 
@@ -155,13 +173,15 @@ struct ValueWait {
     std::uint32_t comparison;
     std::uint64_t reference;
     bool wide;
+    bool held;  // the list holds it itself (ListTitleHandlers::wait_value): ExecuteX does not check it
     // Whether `value` (the 32 or 64 bits at the address) meets the wait: the comparison codes are the D3D12 comparison
     // functions' (1 never .. 8 always, the value against the reference), as V list.rs:1844-1857 takes them; a code
     // not known counts as met.
     bool met_by(std::uint64_t value) const;
 };
 std::size_t command_list_value_waits(const void* list, ValueWait* out, std::size_t capacity);
-// Submissions that went to the GPU with a value wait not met yet (they are not held: queue slot ExecuteX runs them).
+// Submissions that went to the GPU with a value wait no list held and that was not met yet (ExecuteX checks those for
+// up to LEONIDA_VALUE_WAIT_MS and then runs them).
 std::uint64_t unmet_value_wait_submissions();
 
 // True for slots the proxy handles itself rather than forwarding verbatim in the PC layout: IUnknown (0-2), 8 and 75
@@ -190,8 +210,14 @@ using PresentHandler = HRESULT (*)(void* context, ID3D12CommandQueue* queue, std
 // `device` is the proxy or its DXGI pointer; false (nothing set) for anything else. A null handler detaches.
 bool set_present_handler(void* device, PresentHandler handler, void* context);
 
+// Console queue slot 31, CopyPageMappingsBatchX (V queue.rs:897-962): the physical pages behind one range of title
+// memory mapped again at another, (to, from, len), `from` 0 unmapping (V resource.rs:935-948, use_page_mapper). gta6rt
+// sets xmem's (rt::xmem::map_alias). Without one the slot answers E_INVALIDARG, as V's does.
+using PageMapper = bool (*)(std::uint64_t to, std::uint64_t from, std::uint64_t len);
+void set_page_mapper(PageMapper mapper);
+
 // A page pool the device's console slot 74 registered and slot 75 has not removed: its first address and page count
-// (64 KiB pages). For console queue slot 31 (CopyPageMappingsBatchX, still open) and the tests.
+// (64 KiB pages). For the tests: queue slot 31 takes the pool's address and page count from the title.
 bool device_page_pool(const void* device, std::uint64_t handle, std::uint64_t* address, std::uint32_t* pages);
 
 // The frame tokens the device's WaitFrameEventX (slot 80) handed out so far, and the last tick a wait for event

@@ -296,6 +296,10 @@ void create_placed_view(ID3D12Device* device, bool uav, const void* resource_des
 // For tests.
 ID3D12Resource* title_placed_texture(ID3D12Device* device, std::uint64_t address, const void* resource_desc);
 
+// Xbox device slot 61 (rt::d3d12_xs::set_sampler_x_handler): the S# of the console's 27-word sampler description,
+// written at `handle` (a 16-byte sampler slot). False when `device` is not a Vulkan device (nothing written).
+bool create_sampler_x(ID3D12Device* device, const void* desc, std::uint64_t handle);
+
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
 
@@ -474,8 +478,17 @@ IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP
 bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
                                  D3D12_GPU_VIRTUAL_ADDRESS& sampler);
 
-// The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
+// The size of a view, render-target and depth-stencil descriptor slot (GetDescriptorHandleIncrementSize), for handle
+// ranges.
 inline constexpr UINT descriptor_size = 32;
+// A sampler heap's slots are 16 bytes, one S#: the console's RDNA 2 sampler descriptor, as VIctory measured it
+// (victory/crates/victory-gpu/src/descriptor.rs:1-7 and 180-183: views 32 bytes, samplers 16). The title's shaders
+// load sampler n of a table at 16 * n, so a sampler heap with any other stride puts them where the shaders do not
+// look.
+inline constexpr UINT sampler_descriptor_size = 16;
+inline constexpr UINT descriptor_increment(D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    return type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler_descriptor_size : descriptor_size;
+}
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
@@ -494,6 +507,11 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
+
+// A wait for a memory value (leonida::MemoryWait: the Xbox list's WaitValue32/64) before the next command `list`
+// records: the queue that executes it cuts it there and holds the rest until the value is in memory
+// (VulkanQueue::execute_parts). False when `list` is not one of this module's open direct, compute or copy lists.
+bool record_memory_wait(ID3D12GraphicsCommandList* list, const leonida::MemoryWait& wait);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);

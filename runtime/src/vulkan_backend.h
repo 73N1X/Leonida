@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -1553,6 +1554,53 @@ public:
     // hold batches until one is (queue_holds.h).
     QueueHolds<VkSemaphore>& holds() { return holds_; }
 
+    // ---- Waits for memory values (MemoryWait: the Xbox WaitValue32/64) ----
+    // A queue holds the part of a submission after a wait whose value is not in memory yet (VulkanQueue::execute_parts).
+    // Nothing tells the layer when such a value arrives (another queue's GPU write, or the CPU), so the device polls
+    // while any wait is held: `wake` (set_memory_wait_wake) is called when the first one is, and memory_waits_held()
+    // says when to stop. The reader reads title memory, which is host memory, without faulting (false: the value is not
+    // there to read, and the wait counts as met). Without a reader every wait is met.
+    using MemoryReader = bool (*)(std::uint64_t address, bool wide, std::uint64_t& value);
+    void set_memory_reader(MemoryReader reader) { memory_reader_.store(reader, std::memory_order_release); }
+    bool memory_wait_met(const MemoryWait& wait) const {
+        const MemoryReader reader = memory_reader_.load(std::memory_order_acquire);
+        std::uint64_t value = 0;
+        return !reader || !reader(wait.address, wait.wide, value) || wait.met_by(value);
+    }
+    // Called with no lock held by the caller's own code (a queue may hold its state lock): keep it to an event set.
+    void set_memory_wait_wake(std::function<void()> wake) {
+        std::lock_guard lock(memory_wake_mutex_);
+        memory_wake_ = std::move(wake);
+    }
+    std::int64_t memory_waits_held() const { return memory_waits_held_.load(std::memory_order_acquire); }
+    // Every memory wait held now runs when its queue next looks, met or not, as VIctory's queues run what they hold at
+    // a present (queue.rs:113-119, VICTORY_WAIT_FORCE): a wait is not kept across frames.
+    void force_memory_waits() {
+        memory_force_seq_.store(holds_.current_seq(), std::memory_order_release);
+        holds_.pump_ready();
+    }
+    // The longest a memory wait holds its queue before the work after it runs all the same (0: no limit).
+    void set_memory_wait_limit_ms(std::uint32_t ms) { memory_wait_limit_ms_.store(ms, std::memory_order_relaxed); }
+    std::uint32_t memory_wait_limit_ms() const { return memory_wait_limit_ms_.load(std::memory_order_relaxed); }
+    // Memory waits that ran before their value was there (forced at a present, or past the limit), for the logs.
+    std::uint64_t memory_waits_unmet() const { return memory_waits_unmet_.load(std::memory_order_relaxed); }
+
+private:
+    void memory_wait_held_changed(std::int64_t delta) {
+        if (memory_waits_held_.fetch_add(delta, std::memory_order_acq_rel) == 0 && delta > 0) {
+            std::lock_guard lock(memory_wake_mutex_);
+            if (memory_wake_) memory_wake_();
+        }
+    }
+
+    std::atomic<MemoryReader> memory_reader_{nullptr};
+    std::mutex memory_wake_mutex_;  // a leaf lock
+    std::function<void()> memory_wake_;
+    std::atomic<std::int64_t> memory_waits_held_{0};
+    std::atomic<std::uint64_t> memory_force_seq_{0};
+    std::atomic<std::uint32_t> memory_wait_limit_ms_{0};
+    std::atomic<std::uint64_t> memory_waits_unmet_{0};
+
 private:
     friend class VulkanQueue;
     friend class VulkanPresenter;
@@ -1993,6 +2041,8 @@ public:
     using PinFn = std::function<std::shared_ptr<void>()>;
 
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
+        for (const CommandList* list : lists)
+            if (!list->memory_waits().empty()) return execute_parts(lists, pin);
         ReplayResult result = ReplayResult::success;
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
@@ -2015,6 +2065,93 @@ public:
         }
         retired.clear();
         if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
+        return result;
+    }
+
+    // A submission whose lists wait for memory values (MemoryWait: the Xbox WaitValue32/64), ported from VIctory
+    // (GPL-3.0-or-later, Marvisak and contributors, DexNom fork: victory-gpu queue.rs:94-210 `cuts`/submit_cut and
+    // list.rs:290-450 `cut`/detach_parts). The console's queue runs a list up to a wait and stands there until the value
+    // is in memory, with what came before it run and its bottom-of-pipe writes done; the title's lists are chains of
+    // jobs, each behind a wait for a value another queue's list writes in the middle of its own chain. So the lists
+    // are cut at their waits, and the parts go to the queue in order: each wait is an operation of its own
+    // (Deferred::Kind::memory_wait), ahead of the part after it. What comes before the first wait whose value is not
+    // there yet runs now when the queue holds nothing; the rest is held and released, in order, by whichever thread
+    // finds the value there: the device's poller (VulkanContext::set_memory_wait_wake), a Signal's or an
+    // ExecuteCommandLists' pump, or a present that forces them (VulkanContext::force_memory_waits). A wait already met
+    // when the queue reaches it holds nothing. A held part is a copy of its commands (the application may Reset its
+    // lists after the call), and SetPredication carries over into the part after a cut, as within the list.
+    // shortcut: a query begun before a wait and ended after it is cut in two (no title is known to do it).
+    ReplayResult execute_parts(std::span<const CommandList* const> lists, const PinFn& pin) {
+        struct Part {
+            std::vector<MemoryWait> waits;  // stand before the lists
+            std::vector<CommandList> lists;
+        };
+        for (const CommandList* list : lists) {  // what prepare() refuses for the whole list, refused before it is cut
+            if (!list->closed()) return ReplayResult::list_open;
+            if (list->queries_open()) return ReplayResult::invalid_query;
+        }
+        std::vector<Part> parts(1);
+        for (const CommandList* list : lists) {
+            const auto commands = list->commands();
+            std::size_t from = 0;
+            const Predication* predication = nullptr;  // the predicate set at `from`, which a new part sets again
+            const auto piece = [&](std::size_t to) {
+                to = std::min(to, commands.size());
+                if (to <= from) return;
+                CommandList cut;
+                if (from && predication && predication->buffer) cut.set_predication(*predication);
+                cut.execute_bundle(*list, from, to);
+                cut.close();
+                parts.back().lists.push_back(std::move(cut));
+                for (std::size_t i = from; i < to; ++i)
+                    if (const auto* p = std::get_if<Predication>(&commands[i])) predication = p;
+                from = to;
+            };
+            for (const MemoryWait& wait : list->memory_waits()) {
+                piece(wait.at);
+                if (!parts.back().lists.empty()) parts.emplace_back();
+                parts.back().waits.push_back(wait);
+            }
+            piece(commands.size());
+        }
+        ReplayResult result = ReplayResult::success;
+        bool held = false;
+        std::vector<std::shared_ptr<void>> retired;
+        {
+            std::lock_guard state(state_mutex_);
+            std::shared_ptr<void> pins;
+            for (Part& part : parts) {
+                for (const MemoryWait& wait : part.waits) {
+                    if (!must_hold() && context_.memory_wait_met(wait)) continue;  // there already: nothing stands
+                    Deferred op;
+                    op.kind = Deferred::Kind::memory_wait;
+                    op.memory = wait;
+                    op.since = std::chrono::steady_clock::now();
+                    hold(std::move(op));
+                    held = true;
+                }
+                if (part.lists.empty()) continue;
+                if (!must_hold()) {
+                    std::vector<const CommandList*> now;
+                    for (const CommandList& list : part.lists) now.push_back(&list);
+                    const ReplayResult part_result = execute_now(now);
+                    if (result == ReplayResult::success) result = part_result;
+                } else if (context_.is_device_lost()) {
+                    if (result == ReplayResult::success) result = ReplayResult::unsupported;
+                } else {
+                    Deferred op;
+                    op.kind = Deferred::Kind::batch;
+                    op.lists = std::move(part.lists);
+                    if (pin && !pins) pins = pin();
+                    if (pins) op.pins.push_back(pins);
+                    hold(std::move(op));
+                    held = true;
+                }
+            }
+            drain_pins(retired);
+        }
+        retired.clear();
+        if (held) context_.holds().pump_ready();
         return result;
     }
 
@@ -2717,7 +2854,7 @@ private:
 
     // One held operation, with the waits that were pending when it was asked for.
     struct Deferred {
-        enum class Kind : std::uint8_t { batch, signal, marker };
+        enum class Kind : std::uint8_t { batch, signal, marker, memory_wait };
         Kind kind = Kind::batch;
         std::uint64_t seq = 0;  // QueueHolds::next_seq(): the order operations were held in, across queues
         std::vector<VkSemaphore> waits;
@@ -2727,6 +2864,8 @@ private:
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
+        MemoryWait memory{};                             // memory_wait: what the queue stands for
+        std::chrono::steady_clock::time_point since{};  // memory_wait: when it was held
         // Alive until the operation has run: the fences it waits on and signals, the pipeline states and root
         // signatures of the lists (the application may release them right after the call).
         std::vector<std::shared_ptr<void>> pins;
@@ -2773,10 +2912,11 @@ private:
         }
     }
 
-    // Appends `op`, which takes the pending waits with it (a marker has none). Called with state_mutex_ held.
+    // Appends `op`, which takes the pending waits with it (a marker and a memory wait have none: they stay pending for
+    // the batch or Signal after them). Called with state_mutex_ held.
     void hold(Deferred&& op) {
         op.seq = context_.holds().next_seq();
-        if (op.kind != Deferred::Kind::marker) {
+        if (op.kind != Deferred::Kind::marker && op.kind != Deferred::Kind::memory_wait) {
             op.waits = std::move(waits_);
             op.wait_values = std::move(wait_values_);
             op.wait_pins = std::move(wait_pins_);
@@ -2784,8 +2924,16 @@ private:
             wait_values_.clear();
             wait_pins_.clear();
         }
+        const bool memory = op.kind == Deferred::Kind::memory_wait;
         held_.push_back(std::move(op));
         context_.holds().held_changed(1);
+        if (memory) context_.memory_wait_held_changed(1);
+    }
+
+    // An operation leaves held_ (run, dropped or discarded).
+    void unheld(const Deferred& op) {
+        context_.holds().held_changed(-1);
+        if (op.kind == Deferred::Kind::memory_wait) context_.memory_wait_held_changed(-1);
     }
 
     // Runs one held operation as the call would have, with its own waits and none of the ones queued since.
@@ -2821,6 +2969,26 @@ private:
         case Deferred::Kind::marker:
             marker_now(op.marker_kind, op.label.c_str());
             break;
+        case Deferred::Kind::memory_wait:
+            // What follows runs now. It may do so before its value is there: forced at a present, or past the limit.
+            if (!context_.memory_wait_met(op.memory)) {
+                const std::uint64_t n = context_.memory_waits_unmet_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 4 || (n & (n - 1)) == 0)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: a queue held for the value at 0x%llx (comparison %u, reference 0x%llx, "
+                                 "%s) for %lld ms and runs on without it (%s; %llu so far)\n",
+                                 static_cast<unsigned long long>(op.memory.address), op.memory.comparison,
+                                 static_cast<unsigned long long>(op.memory.reference),
+                                 op.memory.wide ? "64-bit" : "32-bit",
+                                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                            std::chrono::steady_clock::now() - op.since)
+                                                            .count()),
+                                 op.seq <= context_.memory_force_seq_.load(std::memory_order_acquire)
+                                     ? "a present forced it"
+                                     : "past LEONIDA_VALUE_HOLD_MS",
+                                 static_cast<unsigned long long>(n));
+            }
+            break;
         }
         retire_pins(op.pins, submitted_);  // the fence it signals, the pipeline states: until its submission is done
         waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
@@ -2828,7 +2996,14 @@ private:
         for (auto& pin : later_pins) wait_pins_.push_back(std::move(pin));
     }
 
-    bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
+    bool ready(const Deferred& op) const {
+        if (waits_pending(op.waits, op.wait_values)) return false;
+        if (op.kind != Deferred::Kind::memory_wait) return true;
+        if (context_.memory_wait_met(op.memory)) return true;
+        if (op.seq <= context_.memory_force_seq_.load(std::memory_order_acquire)) return true;
+        const std::uint32_t limit = context_.memory_wait_limit_ms();
+        return limit && std::chrono::steady_clock::now() - op.since >= std::chrono::milliseconds(limit);
+    }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
     bool release_ready() override {
@@ -2839,7 +3014,7 @@ private:
             while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
-                context_.holds().held_changed(-1);
+                unheld(op);
                 if (!context_.is_device_lost()) run(op);
                 released = true;
             }
@@ -2861,9 +3036,9 @@ private:
                 }
                 std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work that names it; "
                                      "that work is dropped\n");
+                unheld(*it);
                 dropped.push_back(std::move(*it));
                 it = held_.erase(it);
-                context_.holds().held_changed(-1);
             }
         }
     }
@@ -2895,7 +3070,7 @@ private:
                          signals ? "; CPU waits on the fences of its held Signals are completed" : "");
             for (const Deferred& op : held_)
                 if (op.kind == Deferred::Kind::signal) context_.cancel_fence_waits(op.fence);
-            context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
+            for (const Deferred& op : held_) unheld(op);
             dropped.swap(held_);
         }
         // The pins (fences, pipeline states) are released here, outside the lock.
