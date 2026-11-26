@@ -244,7 +244,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
-  # xg_xs shim: the two exports and the texture computer's slots against the measured call shapes.
+  # xg_xs shim: the two exports and the texture computer (layout, copies, tiling, element offsets; VIctory xg.rs's
+  # tests), layouts of known sizes, and a cross-check against resource_detile.h's SW_64KB_D detiler.
   add_executable(xg_xs_test
     test/xg_xs_test.cpp
     shims/xg_xs.cpp

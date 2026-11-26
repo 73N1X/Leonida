@@ -9,6 +9,14 @@
 //
 // Independent X and Y coordinate bit mappings permit O(1) intra-tile offset resolution via compile-time
 // lookup tables (lut_x[x % tile_w] | lut_y[y % tile_h]). No Windows or Vulkan dependency.
+//
+// Scope, against the console's whole layout (gfx10::ConsoleTexture, VIctory texture.rs, which xg_xs.dll's texture
+// computer and the layer's fill_from_title use): one SW_64KB_D level read from the start of its memory. For that,
+// both agree byte for byte (xg_xs_test detiler_agrees, every element size and BC). They disagree on two things:
+//   - with mips the console puts the mip tail first and mip 0 last (256x256 BC7: mip 0 at 64 KiB), so this reads mip
+//     0 only from that mip's offset in the layout;
+//   - VIctory reads the layout word as 0x100 | the swizzle mode, so 0x101 is SW_256B_S, not SW_64KB_D as assumed
+//     here (docs/d3d12_vulkan.md section 4.2). Nothing on the layer's path calls this file's functions.
 
 #include "resource_tiling.h"
 
