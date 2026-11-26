@@ -10213,7 +10213,9 @@ public:
         td.format = static_cast<std::uint32_t>(desc.Format);
         td.samples = std::max<UINT>(made.SampleDesc.Count, 1);
         g::ConsoleTexture console;
-        const Format format = vulkan_format(made.Format, false);
+        // The image's own format (A8_UNORM is an R8 image: vulkan_format has no A8, so the block size came out 0
+        // and the title's A8 font atlases were never read, every glyph blank).
+        const Format format = texture_storage_format(made.Format, false);
         const leonida::BlockFormat block = footprint_block(format, VK_IMAGE_ASPECT_COLOR_BIT);
         known = known && !depth && td.samples == 1 && g::ConsoleTexture::make(td, series_s_tiling(), console) &&
                 console.planes.size() == 1 && console.planes[0].layout.addressable() &&
