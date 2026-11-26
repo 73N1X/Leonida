@@ -208,6 +208,16 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
   either.
 
+- After the allocator-hooks merge (`a61274951`), with `LEONIDA_SHADERS` set and
+  `LEONIDA_DISPLAY_MODE=2560x1440`: the title passes its pool check, makes its
+  2560x1440 back buffers from its own allocator, sets its frame interval
+  (device slots 78/79), then calls its first CreateComputePipelineState
+  (device slot 62); the runtime loads the 26,573-shader index and compiles
+  that pipeline on the title's thread, nothing else happens for ~28 s, and
+  the title's 30 s hang detector (a thread that counts to 30 and writes to
+  address 0 at `+0x2215c35`) ends the run about 36 s in, before the first
+  present. Fix: pipelines built off the title's thread (`port/pipelines`).
+
 ## Saves for testing
 
 The user's own save (first-time setup and legal screens done, two story
