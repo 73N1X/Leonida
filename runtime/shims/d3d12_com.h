@@ -483,6 +483,9 @@ struct RootArgumentLayout {
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
+    // Graphics in the console layout (a title's signature): parameters from s8, a descriptor table ONE dword, as
+    // the title's console-compiled VS and PS read them (they load s8/s9 for root parameter 0).
+    bool graphics_console = false;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
@@ -552,6 +555,13 @@ bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Com
 // records: the queue that executes it cuts it there and holds the rest until the value is in memory
 // (VulkanQueue::execute_parts). False when `list` is not one of this module's open direct, compute or copy lists.
 bool record_memory_wait(ID3D12GraphicsCommandList* list, const leonida::MemoryWait& wait);
+
+// LEONIDA_PRESENT_DEBUG=1: logs, every 2 s, the image a present shows and the render targets draws went into.
+void note_presented(leonida::ResourceId shown);
+// Once a frame: the title's placed textures whose title bytes changed are uploaded again (d3d12_vulkan_device.cpp).
+void refresh_title_textures();
+// LEONIDA_PRESENT_DEBUG=2: the render target most draws went into lately, or 0 (presented instead of the title's image).
+leonida::ResourceId busiest_target();
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);

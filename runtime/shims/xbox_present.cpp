@@ -274,6 +274,8 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             const FramePacer::PresentTiming timing = pacer_.present_timing(token);
             tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
         }
+        note_presented(composed.plane[0].source);
+        refresh_title_textures();
         const HRESULT result = presenter_->present_planes(composed, sync_interval, tear);
         if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
         if (device_clock)
@@ -308,6 +310,19 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         timing = pacer_.present_timing(token);
         tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
     }
+    note_presented(resource_id(resource));
+    refresh_title_textures();
+    // LEONIDA_PRESENT_DEBUG=2 (diagnostic): show the render target most draws go into instead of the title's image,
+    // to tell a black final pass from a black scene. The target must be a 2D texture to be presented.
+    static const bool show_busiest = [] {
+        const char* v = std::getenv("LEONIDA_PRESENT_DEBUG");
+        return v && v[0] == '2';
+    }();
+    if (show_busiest)
+        if (const leonida::ResourceId busiest = busiest_target())
+            if (auto* other = reinterpret_cast<ID3D12Resource*>(busiest);
+                other->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+                resource = other, rect = nullptr;
     const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
     if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
     if (device_clock)

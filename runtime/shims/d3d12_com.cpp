@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <map>
+#include <chrono>
+#include <cstdlib>
 #include <bit>
 #include <condition_variable>
 #include <functional>
@@ -72,6 +75,80 @@ void stub(const char* method) {
 }
 
 namespace {
+
+// Draws and dispatches recorded, logged every 2 s as rates (LEONIDA_FRAME_STATS=0 turns the line off): how much a
+// title actually renders, beside the frame rate the present path reports.
+void count_recorded(bool dispatch) {
+    static std::atomic<std::uint64_t> draws{0}, dispatches{0};
+    static std::atomic<std::int64_t> last_ms{0};
+    static const bool off = [] {
+        const char* v = std::getenv("LEONIDA_FRAME_STATS");
+        return v && v[0] == '0';
+    }();
+    if (off) return;
+    (dispatch ? dispatches : draws).fetch_add(1, std::memory_order_relaxed);
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::int64_t last = last_ms.load(std::memory_order_relaxed);
+    if (last == 0) {
+        last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 2000 || !last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const std::uint64_t d = draws.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t c = dispatches.exchange(0, std::memory_order_relaxed);
+    const double seconds = double(now - last) / 1000.0;
+    std::fprintf(stderr, "[rt] d3d12: recorded %.0f draws/s and %.0f dispatches/s\n", double(d) / seconds,
+                 double(c) / seconds);
+}
+
+// LEONIDA_PRESENT_DEBUG=1: the render targets draws were recorded into, counted, so a present can say whether the
+// image it shows was drawn to (note_presented).
+struct TargetCounts {
+    std::mutex mutex;
+    std::map<leonida::ResourceId, std::uint64_t> draws;
+};
+TargetCounts& target_counts() {
+    static TargetCounts* counts = new TargetCounts();  // never destroyed: written from title threads until exit
+    return *counts;
+}
+bool present_debug() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_PRESENT_DEBUG");
+        return v && (v[0] == '1' || v[0] == '2');
+    }();
+    return on;
+}
+void note_draw_targets(const leonida::Draw& draw) {
+    // LEONIDA_PRESENT_DEBUG: the first draws' rasterizer state, to see draws that cover nothing (a zero scissor or
+    // viewport).
+    if (present_debug()) {
+        static std::atomic<unsigned> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 24)
+            std::fprintf(stderr,
+                         "[rt] draw: viewport %.0f,%.0f %.0fx%.0f depth %.2f-%.2f; scissor %d,%d-%d,%d; topology %u; "
+                         "%u vertices x%u, indexed %d; target %llx\n",
+                         draw.viewport.x, draw.viewport.y, draw.viewport.width, draw.viewport.height,
+                         draw.viewport.min_depth, draw.viewport.max_depth, draw.scissor.left, draw.scissor.top,
+                         draw.scissor.right, draw.scissor.bottom, draw.topology, draw.count, draw.instances,
+                         int(draw.indexed),
+                         static_cast<unsigned long long>(draw.views ? draw.views->render_targets[0].resource : 0));
+        if (shown.load(std::memory_order_relaxed) <= 24) {
+            std::string words;
+            for (std::size_t i = 0; i < 16; ++i) {
+                char w[12];
+                std::snprintf(w, sizeof(w), " %08x", draw.user_data[i]);
+                words += w;
+            }
+            std::fprintf(stderr, "[rt] draw: user data s0-s15:%s\n", words.c_str());
+        }
+    }
+    if (!present_debug() || !draw.views) return;
+    TargetCounts& t = target_counts();
+    std::lock_guard lock(t.mutex);
+    for (std::uint32_t i = 0; i < draw.views->render_target_count && i < draw.views->render_targets.size(); ++i)
+        if (const leonida::ResourceId id = draw.views->render_targets[i].resource) ++t.draws[id];
+}
 
 // Reports a deliberate simplification once (unlike stub, which reports a method not implemented).
 void note_once(const char* what) {
@@ -364,6 +441,20 @@ public:
         address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
     }
     void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        // LEONIDA_PRESENT_DEBUG: the first root SRV addresses and the words the CPU sees there (the title's vertex
+        // fetch reads a packed format/stride/offset word at the address its VS gets in s[8:9]).
+        if (present_debug()) {
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::uint32_t words[4] = {};
+                SIZE_T got = 0;
+                const BOOL ok = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va), words,
+                                                  sizeof(words), &got);
+                std::fprintf(stderr, "[rt] root srv: index %u va 0x%llx; CPU reads %s %08x %08x %08x %08x\n", index,
+                             static_cast<unsigned long long>(va), ok ? "ok" : "FAILED", words[0], words[1], words[2],
+                             words[3]);
+            }
+        }
         address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
     }
     void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
@@ -516,6 +607,8 @@ public:
         draw.mesh = true;
         draw.depth_bounds_min = depth_bounds_min_;
         draw.depth_bounds_max = depth_bounds_max_;
+        count_recorded(false);
+        note_draw_targets(draw);
         check(list_.draw(std::move(draw)));
     }
 
@@ -724,8 +817,18 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        // LEONIDA_DEBUG_CLEAR=1 (diagnostic): every render-target clear is magenta, to tell lists that never reach the
+        // screen (still black) from draws that rasterize nothing (magenta).
+        static const char clear_mode = [] {
+            const char* v = std::getenv("LEONIDA_DEBUG_CLEAR");
+            return v ? v[0] : '0';
+        }();
+        if (clear_mode == '2') return;  // LEONIDA_DEBUG_CLEAR=2: render-target clears are skipped
+        const bool magenta = clear_mode == '1';
+        const FLOAT debug[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+        const FLOAT* c = magenta ? debug : color;
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
-                                        {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
+                                        {c[0], c[1], c[2], c[3]}, to_rects(count, rects)));
     }
 
     void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
@@ -1284,7 +1387,9 @@ private:
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        const bool one_dword_table = type == rt::rootsig::ParamType::Table &&
+                                     (is_compute(state) || (state.layout && state.layout->graphics_console));
+        if (!one_dword_table) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1451,6 +1556,7 @@ private:
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         if (!pipeline_made(true)) return;
         note_direct_heap_indexing(compute_.layout);
+        count_recorded(true);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
@@ -1480,6 +1586,8 @@ private:
                            first, base_vertex, first_instance};
         draw.depth_bounds_min = depth_bounds_min_;
         draw.depth_bounds_max = depth_bounds_max_;
+        count_recorded(false);
+        note_draw_targets(draw);
         check(list_.draw(std::move(draw)));
     }
 };
@@ -1997,6 +2105,42 @@ private:
 };
 
 }  // namespace
+
+// The render target the most draws went into over the last report (LEONIDA_PRESENT_DEBUG=2 presents it).
+std::atomic<leonida::ResourceId>& busiest_target_ref() {
+    static std::atomic<leonida::ResourceId> id{0};
+    return id;
+}
+
+// LEONIDA_PRESENT_DEBUG=1: every 2 s, the resource a present shows and the render targets draws went into since the last
+// line, with their draw counts: a black screen whose presented image no draw reached is a present-side problem.
+void note_presented(leonida::ResourceId shown) {
+    if (!present_debug()) return;
+    static std::atomic<std::int64_t> last_ms{0};
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::int64_t last = last_ms.load(std::memory_order_relaxed);
+    if (now - last < 2000 || !last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    TargetCounts& t = target_counts();
+    std::lock_guard lock(t.mutex);
+    std::string line;
+    for (const auto& [id, n] : t.draws) {
+        char part[64];
+        std::snprintf(part, sizeof(part), " %llx:%llu%s", static_cast<unsigned long long>(id),
+                      static_cast<unsigned long long>(n), id == shown ? "(shown)" : "");
+        line += part;
+    }
+    std::fprintf(stderr, "[rt] present: shows %llx; draws by render target since the last line:%s\n",
+                 static_cast<unsigned long long>(shown), line.empty() ? " none" : line.c_str());
+    leonida::ResourceId busiest = 0;
+    std::uint64_t most = 0;
+    for (const auto& [id, n] : t.draws)
+        if (n > most) most = n, busiest = id;
+    busiest_target_ref().store(busiest, std::memory_order_relaxed);
+    t.draws.clear();
+}
+
+leonida::ResourceId busiest_target() { return busiest_target_ref().load(std::memory_order_relaxed); }
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,

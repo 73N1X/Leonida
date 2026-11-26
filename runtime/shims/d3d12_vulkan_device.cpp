@@ -29,6 +29,7 @@
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/debug_magenta_spv.h"
 #include "../src/spirv_output_splat.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
@@ -75,6 +76,9 @@ extern const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers;
 namespace {
 
 class TitleMemory;  // the imports of the title's GPU memory (after Resource)
+class Device;
+// The device with the title's memory, whose placed textures the present path keeps up to date (refresh_title_textures).
+std::atomic<Device*> g_title_texture_device{nullptr};
 
 // Every view, RTV and DSV slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. A sampler slot is
 // kSamplerDescriptorSize, one S# (VIctory descriptor.rs:1-7). The application reads them from the device, as it must.
@@ -5783,6 +5787,38 @@ public:
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
+        // LEONIDA_PRESENT_DEBUG / LEONIDA_DEBUG_SOLID_PS: the first graphics pipelines' output state, to see a
+        // description that writes nothing (a zero write mask, blending, a depth test that always fails).
+        static const bool pso_debug = [] {
+            const char* a = std::getenv("LEONIDA_PRESENT_DEBUG");
+            const char* b = std::getenv("LEONIDA_DEBUG_SOLID_PS");
+            return (a && a[0] != '0') || (b && b[0] == '1');
+        }();
+        if (pso_debug) {
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 24) {
+                const D3D12_RENDER_TARGET_BLEND_DESC& b0 = desc.BlendState.RenderTarget[0];
+                std::fprintf(stderr,
+                             "[rt] pso: %u targets, format %d, blend %d (%d %d %d / %d %d %d), write mask 0x%x; depth %d "
+                             "func %d write %d, stencil %d, DSV %d; cull %d fill %d; topology type %d; samples %u mask 0x%x\n",
+                             desc.NumRenderTargets, int(desc.RTVFormats[0]), int(b0.BlendEnable), int(b0.SrcBlend),
+                             int(b0.DestBlend), int(b0.BlendOp), int(b0.SrcBlendAlpha), int(b0.DestBlendAlpha),
+                             int(b0.BlendOpAlpha), unsigned(b0.RenderTargetWriteMask), int(ds.DepthEnable),
+                             int(ds.DepthFunc), int(ds.DepthWriteMask), int(ds.StencilEnable), int(desc.DSVFormat),
+                             int(desc.RasterizerState.CullMode), int(desc.RasterizerState.FillMode),
+                             int(desc.PrimitiveTopologyType), unsigned(desc.SampleDesc.Count), unsigned(desc.SampleMask));
+            }
+        }
+        static const bool force_output = [] {
+            const char* v = std::getenv("LEONIDA_DEBUG_SOLID_PS");
+            return v && v[0] == '1';
+        }();
+        if (force_output) {
+            depth.depthTestEnable = VK_FALSE;
+            depth.depthWriteEnable = VK_FALSE;
+            depth.stencilTestEnable = VK_FALSE;
+            depth.depthBoundsTestEnable = VK_FALSE;
+        }
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             const D3D12_RENDER_TARGET_BLEND_DESC& b =
@@ -5795,6 +5831,10 @@ public:
             blends[i].dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
             blends[i].alphaBlendOp = blend_op(b.BlendOpAlpha);
             blends[i].colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+            if (force_output) {  // LEONIDA_DEBUG_SOLID_PS: every target written whole, no blending
+                blends[i].blendEnable = VK_FALSE;
+                blends[i].colorWriteMask = 0xf;
+            }
             // B8G8R8X8 has no alpha, so blending reads destination alpha as 1 there (WARP and AMD's D3D12 driver),
             // where its BGRA8 Vulkan image would read the X byte. For colour SRC_ALPHA_SAT is min(As, 1 - Ad), so 0;
             // for alpha it is 1 in both APIs already.
@@ -6135,6 +6175,22 @@ public:
         std::vector<std::uint32_t> rect_vs;  // the VS's words for the rectangle-list stage (rects_)
         for (PlannedStage& stage : planned_) {
             if (!stage.entry) continue;
+            // LEONIDA_DEBUG_SOLID_PS=1 (diagnostic): every pixel shader writes solid magenta (src/debug_magenta_spv.h).
+            static const bool solid_ps = [] {
+                const char* v = std::getenv("LEONIDA_DEBUG_SOLID_PS");
+                return v && v[0] == '1';
+            }();
+            if (solid_ps && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT)
+                stage.words.assign(std::begin(leonida::kMagentaFragment), std::end(leonida::kMagentaFragment));
+            // LEONIDA_DEBUG_SOLID_VS=1 (diagnostic, with LEONIDA_DEBUG_SOLID_PS=1): a triangle-list pipeline's vertex
+            // shader draws one full-screen triangle, to test the translated vertex shaders' positions.
+            static const bool solid_vs = [] {
+                const char* v = std::getenv("LEONIDA_DEBUG_SOLID_VS");
+                return v && v[0] == '1';
+            }();
+            if (solid_vs && !planned_[1].entry && stage.bit == VK_SHADER_STAGE_VERTEX_BIT)
+                stage.words.assign(std::begin(leonida::kFullscreenVertex), std::end(leonida::kFullscreenVertex));
+            // The rectangle-list stage is made from the VS as it is built (after any debug substitution).
             if (rects_ && stage.bit == VK_SHADER_STAGE_VERTEX_BIT) rect_vs = stage.words;
             // A8_UNORM targets are R8 attachments: their output's alpha is stored in every component, so the one
             // channel holds it (src/spirv_output_splat.h). A module without that output keeps its words.
@@ -7935,6 +7991,8 @@ public:
     }
 
     ~Device() override {
+        Device* self = this;
+        g_title_texture_device.compare_exchange_strong(self, nullptr);
         stop_memory_waits();
         if (state_.context) {
             {
@@ -8565,6 +8623,16 @@ public:
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        // A title's graphics signatures take the console layout its VS and PS were compiled against: parameters
+        // from s8, one dword per descriptor table (pack_stage(Vertex); docs/d3d12_vulkan.md section 3.5). With
+        // pack() (from s0, two dwords a table) every title shader read zeros where its root arguments belong (its
+        // vertex fetch reads root parameter 0 at s8/s9), so every draw came out empty.
+        const rt::rootsig::StagePackResult vertex = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
+        const bool console_graphics = leonida::pipelines::title_running().load(std::memory_order_relaxed) && vertex.ok;
+        if (console_graphics) {
+            layout.graphics_console = true;
+            layout.graphics_ok = true;
+        }
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -8572,6 +8640,7 @@ public:
                     first = d;
                     break;
                 }
+            if (console_graphics) first = vertex.first_sgpr[i];
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
         }
@@ -9921,6 +9990,7 @@ public:
                          mode_length > 1 ? "LEONIDA_TITLE_MEMORY set" : "the default");
         titles_->hold_window();
         state_.titles = titles_.get();
+        g_title_texture_device.store(this);
         auto& ranges = title_ranges();
         std::lock_guard lock(ranges.mutex);
         ranges.devices.push_back(titles_.get());
@@ -10010,7 +10080,92 @@ public:
         texture->attach_device(nullptr);  // the device holds it: a reference back would keep the device alive
         fill_from_title(*texture, address, desc, xbox_layout);
         placed_textures_.emplace(key, texture);  // holds the reference `made` came with
+        // The title streams a texture's bytes in after it makes the first view (the start screen's draws sampled
+        // textures still zero, so every frame was black): its bytes are checked again until they stop changing
+        // (refresh_placed_textures), as VIctory keeps its copies of the title's textures up to date.
+        pending_fills_.push_back({texture, address, desc, xbox_layout, 0, 0});
         return texture;
+    }
+
+    // Placed textures whose title bytes may still change (refresh_placed_textures), with what was last uploaded.
+    struct PlacedFill {
+        Resource* texture = nullptr;  // held by placed_textures_
+        std::uint64_t address = 0;
+        D3D12_RESOURCE_DESC desc{};
+        std::uint32_t layout = 0;
+        std::uint64_t hash = 0;  // FNV-1a of the tiled bytes last uploaded; 0: never read
+        unsigned unchanged = 0;  // checks in a row that found the same bytes
+    };
+
+    // Placed textures whose title bytes changed since their last upload are uploaded again (fill_from_title), up to
+    // kBudget bytes read per call, round robin; one whose bytes stay the same for kSettled checks in a row is settled
+    // and no longer read. Called once a frame (rt::d3d12::refresh_title_textures, from the present path), so what the
+    // title streamed in during a frame shows from the next one.
+    void refresh_placed_textures() {
+        constexpr std::uint64_t kBudget = std::uint64_t(64) << 20;
+        constexpr unsigned kSettled = 6;
+        std::lock_guard lock(placed_mutex_);
+        if (pending_fills_.empty()) return;
+        std::uint64_t read_bytes = 0;
+        std::vector<std::byte> bytes;
+        for (std::size_t visited = 0; visited < pending_fills_.size() && read_bytes < kBudget; ++visited) {
+            if (next_fill_ >= pending_fills_.size()) next_fill_ = 0;
+            PlacedFill& f = pending_fills_[next_fill_];
+            const std::uint64_t size = placed_bytes(f);
+            if (!size) {  // a layout this layer does not read: nothing to watch
+                pending_fills_.erase(pending_fills_.begin() + std::ptrdiff_t(next_fill_));
+                continue;
+            }
+            bytes.resize(std::size_t(size));
+            SIZE_T got = 0;
+            read_bytes += size;
+            const bool there = ReadProcessMemory(GetCurrentProcess(),
+                                                 reinterpret_cast<const void*>(static_cast<std::uintptr_t>(f.address)),
+                                                 bytes.data(), bytes.size(), &got) && got == bytes.size();
+            if (!there) {  // not all committed yet: try again later
+                ++next_fill_;
+                continue;
+            }
+            std::uint64_t hash = 1469598103934665603ull;
+            for (const std::byte b : bytes) hash = (hash ^ std::uint64_t(b)) * 1099511628211ull;
+            hash |= 1;  // never 0, which means "never read"
+            if (hash != f.hash) {
+                fill_from_title(*f.texture, f.address, f.desc, f.layout);
+                f.hash = hash;
+                f.unchanged = 0;
+                ++next_fill_;
+            } else if (++f.unchanged >= kSettled) {
+                pending_fills_.erase(pending_fills_.begin() + std::ptrdiff_t(next_fill_));
+            } else {
+                ++next_fill_;
+            }
+        }
+    }
+
+    // The tiled size of a placed texture's title bytes, or 0 when fill_from_title does not read its layout.
+    std::uint64_t placed_bytes(const PlacedFill& f) const {
+        namespace g = leonida::gfx10;
+        const D3D12_RESOURCE_DESC& made = f.texture->desc();
+        const bool depth = f.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        const bool target = f.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        g::ConsoleTextureDesc td;
+        switch (f.desc.Dimension) {
+        case D3D12_RESOURCE_DIMENSION_TEXTURE1D: td.dimension = g::Dimension::tex1d; break;
+        case D3D12_RESOURCE_DIMENSION_TEXTURE2D: td.dimension = g::Dimension::tex2d; break;
+        case D3D12_RESOURCE_DIMENSION_TEXTURE3D: td.dimension = g::Dimension::tex3d; break;
+        default: return 0;
+        }
+        if (depth || !g::swizzle_from_layout_word(f.layout, td.dimension, depth, target, td.swizzle)) return 0;
+        td.width = static_cast<std::uint32_t>(std::min<UINT64>(made.Width, UINT32_MAX));
+        td.height = made.Height;
+        td.depth_or_array = made.DepthOrArraySize;
+        td.mips = made.MipLevels;
+        td.format = static_cast<std::uint32_t>(f.desc.Format);
+        td.samples = std::max<UINT>(made.SampleDesc.Count, 1);
+        g::ConsoleTexture console;
+        if (td.samples != 1 || !g::ConsoleTexture::make(td, series_s_tiling(), console) || console.planes.size() != 1)
+            return 0;
+        return console.planes[0].layout.size();
     }
 
     // The texture of (address, description) if a view made one, with a reference (title_placed_texture).
@@ -12095,6 +12250,8 @@ private:
     };
     std::mutex placed_mutex_;
     std::map<PlacedKey, Resource*> placed_textures_;  // one reference each; null: could not be made
+    std::vector<PlacedFill> pending_fills_;  // guarded by placed_mutex_
+    std::size_t next_fill_ = 0;              // round-robin position in pending_fills_
     struct UploadBlock {
         std::uint8_t* base;
         std::uint64_t size;
@@ -12264,6 +12421,11 @@ Device* vulkan_device_of(ID3D12Device* device) {
 }
 
 }  // namespace
+
+// Once a frame (the present path): the title's placed textures whose bytes changed are uploaded again.
+void refresh_title_textures() {
+    if (Device* device = g_title_texture_device.load()) device->refresh_placed_textures();
+}
 
 bool accepts_depth_unordered(ID3D12Device* device) {
     static const bool off = [] {
