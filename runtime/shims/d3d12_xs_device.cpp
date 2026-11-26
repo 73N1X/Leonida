@@ -2619,9 +2619,13 @@ HRESULT proxy_create_pipeline_state_stream(DeviceProxy* self, std::uint64_t desc
     std::vector<std::uint8_t> stream(in, in + desc->SizeInBytes);
     std::size_t at = 0, cut = stream.size();
     unsigned shaders = 0;
+    char types[160] = {};  // the console's subobject types in order, for the log
+    std::size_t types_used = 0;
     while (at + 8 <= stream.size()) {
         std::uint32_t type = 0;
         std::memcpy(&type, stream.data() + at, sizeof(type));
+        if (types_used + 4 < sizeof(types))
+            types_used += std::snprintf(types + types_used, sizeof(types) - types_used, "%s%u", types_used ? " " : "", type);
         const std::size_t size = console_subobject_size(type);
         if (!size) {
             static std::atomic<bool> logged{false};
@@ -2641,10 +2645,15 @@ HRESULT proxy_create_pipeline_state_stream(DeviceProxy* self, std::uint64_t desc
     const D3D12_PIPELINE_STATE_STREAM_DESC pc_desc{cut, stream.data()};
     using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
     const HRESULT hr = reinterpret_cast<Fn>(self->real_vtable[kPcCreatePipelineState])(self->real, &pc_desc, riid, out);
-    static std::atomic<unsigned> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || trace_enabled() || FAILED(hr))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 86 CreatePipelineState: %llu bytes, %u shader subobjects -> 0x%08lx\n",
-                     static_cast<unsigned long long>(desc->SizeInBytes), shaders, static_cast<unsigned long>(hr));
+    // The first four calls, and failures: the first 16, then every power of two.
+    static std::atomic<unsigned> calls{0}, failures{0};
+    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const unsigned failure = FAILED(hr) ? failures.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    if (call <= 4 || trace_enabled() || (failure && (failure <= 16 || !(failure & (failure - 1)))))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 86 CreatePipelineState call %u: %llu bytes, %u shader subobjects "
+                             "(types %s) -> 0x%08lx, %u failed so far\n",
+                     call, static_cast<unsigned long long>(desc->SizeInBytes), shaders, types,
+                     static_cast<unsigned long>(hr), failures.load(std::memory_order_relaxed));
     return hr;
 }
 

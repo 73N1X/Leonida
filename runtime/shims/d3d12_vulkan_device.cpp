@@ -3707,8 +3707,19 @@ struct PipelineStream {
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
 
+// E_INVALIDARG for a PSO description, with the check that refused it logged once: the title's own descriptions come
+// through device slots 62 and 86, and a refusal that says nothing cannot be told apart from another.
+HRESULT invalid_description(const char* why) {
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(why).second) std::fprintf(stderr, "[rt] d3d12: a PSO description is refused (E_INVALIDARG): %s\n", why);
+    return E_INVALIDARG;
+}
+
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
-    if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
+    if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes)
+        return invalid_description("!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
     for (auto& target : g.BlendState.RenderTarget) {
         target.SrcBlend = target.SrcBlendAlpha = D3D12_BLEND_ONE;
@@ -3737,7 +3748,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     std::size_t at = 0;
     while (at < size) {
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
-        if (size - at < sizeof(type)) return E_INVALIDARG;
+        if (size - at < sizeof(type)) return invalid_description("size - at < sizeof(type)");
         std::memcpy(&type, base + at, sizeof(type));
         // The versioned depth-stencil and rasterizer subobjects describe the same state as their base type, so the
         // stream contract counts any two of one family as duplicates; the payload below still follows `type`.
@@ -3748,7 +3759,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1 ||
                  type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2)
             family = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
-        if (unsigned(type) >= 64 || (seen >> unsigned(family) & 1)) return E_INVALIDARG;
+        if (unsigned(type) >= 64 || (seen >> unsigned(family) & 1))
+            return invalid_description("unsigned(type) >= 64 || (seen >> unsigned(family) & 1)");
         seen |= std::uint64_t(1) << unsigned(family);
         bool ok = true;
         const auto take = [&](auto& value) {
@@ -3792,7 +3804,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
             D3D12_RT_FORMAT_ARRAY formats{};
             take(formats);
-            if (formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
+            if (formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+                return invalid_description("formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT");
             g.NumRenderTargets = formats.NumRenderTargets;
             std::copy(std::begin(formats.RTFormats), std::end(formats.RTFormats), std::begin(g.RTVFormats));
             break;
@@ -3880,10 +3893,11 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             log_once("unknown pipeline state stream subobject type:", int(type));
             return E_INVALIDARG;
         }
-        if (!ok) return E_INVALIDARG;
+        if (!ok) return invalid_description("a subobject runs past the end of the stream");
     }
-    if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
-    if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
+    if (out.has_cs && out.has_graphics_stage)
+        return invalid_description("out.has_cs && out.has_graphics_stage");  // a compute stage with graphics stages
+    if (!out.has_cs && !out.has_graphics_stage) return invalid_description("!out.has_cs && !out.has_graphics_stage");
     return S_OK;
 }
 
@@ -4057,14 +4071,16 @@ public:
         }
         if (mesh && (desc.VS.BytecodeLength || desc.HS.BytecodeLength || desc.DS.BytecodeLength ||
                      desc.GS.BytecodeLength || desc.StreamOutput.NumEntries))
-            return E_INVALIDARG;  // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
-        if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)) return E_INVALIDARG;
+            return invalid_description("a mesh PSO with a VS, HS, DS, GS or stream output");  // as D3D12
+        if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength))
+            return invalid_description("!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)");
         if (mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT)) {
             log_once("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
             return E_NOTIMPL;
         }
-        if (desc.NodeMask & ~1u) return E_INVALIDARG;
-        if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
+        if (desc.NodeMask & ~1u) return invalid_description("desc.NodeMask & ~1u");
+        if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags)
+            return invalid_description("static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags");
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
@@ -4074,9 +4090,11 @@ public:
             log_once("graphics pipelines need Vulkan 1.3 dynamic rendering and extended dynamic state; stage", 1);
             return E_NOTIMPL;
         }
-        if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
+        if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+            return invalid_description("desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT");
         for (UINT i = desc.NumRenderTargets; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-            if (desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN) return E_INVALIDARG;
+            if (desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
+                return invalid_description("desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN");
         if (desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
             const Format dsv_fmt = vulkan_format(desc.DSVFormat, true);
             if (dsv_fmt.format == VK_FORMAT_UNDEFINED || dsv_fmt.typeless ||
@@ -4085,12 +4103,15 @@ public:
                 return E_INVALIDARG;
             }
         }
-        if (desc.InputLayout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return E_INVALIDARG;
-        if (desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs) return E_INVALIDARG;
+        if (desc.InputLayout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)
+            return invalid_description("desc.InputLayout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT");
+        if (desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs)
+            return invalid_description("desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs");
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
-            if (!element.SemanticName) return E_INVALIDARG;
-            if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
+            if (!element.SemanticName) return invalid_description("!element.SemanticName");
+            if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
+                return invalid_description("element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT");
             if (element.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA &&
                 element.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA)
                 return E_INVALIDARG;
@@ -4100,11 +4121,13 @@ public:
         }
         if (desc.BlendState.IndependentBlendEnable) {
             for (const D3D12_RENDER_TARGET_BLEND_DESC& rt : desc.BlendState.RenderTarget)
-                if (rt.LogicOpEnable) return E_INVALIDARG;
+                if (rt.LogicOpEnable) return invalid_description("rt.LogicOpEnable");
         } else {
             const D3D12_RENDER_TARGET_BLEND_DESC& rt0 = desc.BlendState.RenderTarget[0];
-            if (rt0.BlendEnable && rt0.LogicOpEnable) return E_INVALIDARG;
-            if (rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
+            if (rt0.BlendEnable && rt0.LogicOpEnable)
+                return invalid_description("rt0.BlendEnable && rt0.LogicOpEnable");
+            if (rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED)
+                return invalid_description("rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED");
         }
         if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
             log_once("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
