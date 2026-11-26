@@ -21,7 +21,7 @@ if [ "${1:-}" = "--series-x" ]; then console=series-x; fi
 [ -f "$game_exe" ] || { echo "No $game_exe" >&2; exit 1; }
 
 here=$(cd "$(dirname "$0")" && pwd)
-victory=${LEONIDA_VICTORY:-$here/victory.exe}
+victory=${LEONIDA_VICTORY:-$here/leonida.exe}
 vkd3d=${LEONIDA_VKD3D:-$here/vkd3d-proton}
 [ -f "$victory" ] || { echo "No $victory (the Windows build of victory/)" >&2; exit 1; }
 for dll in d3d12.dll d3d12core.dll; do

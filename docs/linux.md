@@ -14,7 +14,7 @@ to Vulkan. VKD3D-Proton ships inside the Linux package, so players download noth
 
 | Path | What |
 | --- | --- |
-| `victory.exe` | The Windows build of `victory/` (`cargo build --profile diag -p victory --features diagnostics`) |
+| `leonida.exe` | The Windows build of `victory/` (Leonida's D3D12 runtime) (`cargo build --profile diag -p victory --features diagnostics`) |
 | `play-linux.sh` | `scripts/play-linux.sh`: the launcher |
 | `vkd3d-proton/d3d12.dll`, `d3d12core.dll` | VKD3D-Proton 3.1, 64-bit, unmodified |
 | `vkd3d-proton/LICENSE`, `COPYING`, `SOURCE.txt` | Its LGPL-2.1 text, notice, and where its source is |
@@ -42,10 +42,10 @@ It needs Python 3.14 or newer, for `compression.zstd`. `dist/` is not committed.
   `~/.local/share/leonida/{cache,data}`.
 - **Settings:** it uses the measured NVIDIA settings of `scripts/play-nvidia.ps1` as defaults; any `VICTORY_*` you set
   wins.
-- **Start:** it runs `wine victory.exe run <exe> --execute --console series-s`, or `series-x` with `--series-x`.
+- **Start:** it runs `wine leonida.exe run <exe> --execute --console series-s`, or `series-x` with `--series-x`.
 
 On Windows nothing changes: the DLLs live only in the Linux package's `vkd3d-proton/` folder and never sit next to a
-Windows `victory.exe`.
+Windows `leonida.exe`.
 
 ## Licences
 

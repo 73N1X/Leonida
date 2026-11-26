@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Leonida's D3D12 runtime: the program is leonida.exe (the package keeps VIctory's name for upstream merges).
+[[bin]]
+name = "leonida"
+path = "src/main.rs"
+
 [dependencies]
 victory-core.workspace = true
 victory-pe.workspace = true

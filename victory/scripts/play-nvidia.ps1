@@ -1,6 +1,6 @@
 # Starts the title on an NVIDIA card with the Series S settings measured on an RTX 5070 (about 18-22 fps, no device loss).
 #   scripts\play-nvidia.ps1 -Exe <path of your own copy's executable>
-# -NoSmoothMotion  run target\<build>\victory.exe itself. By default a copy named victory_sm.exe is started instead,
+# -NoSmoothMotion  run target\<build>\leonida.exe itself. By default a copy named leonida_sm.exe is started instead,
 #                  so a Smooth Motion profile set for that exe in the NVIDIA App applies every time.
 # -SeriesX         the Series X profile instead (slower: about 7 fps at half scale)
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
@@ -100,12 +100,12 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
 Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+$victory = Join-Path $PSScriptRoot "..\target\$Build\leonida.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 if (-not $NoSmoothMotion) {
     # A copy under the name the NVIDIA App's Smooth Motion profile is set for, refreshed when the build changes.
-    $sm = Join-Path (Split-Path $victory) 'victory_sm.exe'
+    $sm = Join-Path (Split-Path $victory) 'leonida_sm.exe'
     if (-not (Test-Path $sm) -or (Get-Item $sm).LastWriteTime -lt (Get-Item $victory).LastWriteTime) {
         Copy-Item $victory $sm -Force
     }

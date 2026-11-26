@@ -20,7 +20,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 $victory = Join-Path $repo "victory"
-$exe = Join-Path $victory "target\diag\victory.exe"
+$exe = Join-Path $victory "target\diag\leonida.exe"
 $title = Join-Path $Game "game_scarlett_master.exe"
 if (-not (Test-Path $title)) { throw "missing: $title" }
 if ($Rebuild -or -not (Test-Path $exe)) {
