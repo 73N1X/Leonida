@@ -2724,7 +2724,11 @@ void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &k
 
 }  // namespace rt::gameinput
 
+// "#1": titles import GameInputCreate by ordinal only (VIctory, crates/victory-hle/src/modules/gameinput.rs, which
+// registers nothing else for the DLL; GPL-3.0-or-later). The loader looks an ordinal import up as "#<n>", so without
+// this entry the import bound to the host's GameInput.dll (whose ordinal 1 is GameInputCreate) and skipped the shim.
 SHIM_TABLE(gameinput,
     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+    {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},
     {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
 );

@@ -2,7 +2,8 @@
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed (or native Windows cmake + ninja on PATH),
 # otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
-# with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
+# with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it; without it
+# both paths build the XInput shim (shims\gameinput_xinput.cpp: XInput pads, a wired DualSense, keyboard and keyboard pad).
 param(
     [switch]$Debug,
     [switch]$FetchSdl3,
@@ -77,11 +78,11 @@ $build || exit /b 1
 "@
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
-    # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
-    Write-Warning "CMake and Ninja weren't found (neither VS C++ CMake tools nor native PATH tools): building with cl.exe directly, without the GameInput shim (SDL3). Install CMake + Ninja or VS's CMake tools component to get it."
+    # the GameInput shim (SDL3), so controllers go through the XInput shim (gameinput_xinput.cpp) as without SDL3.
+    Write-Warning "CMake and Ninja weren't found (neither VS C++ CMake tools nor native PATH tools): building with cl.exe directly, without the GameInput SDL3 shim (XInput pads and the keyboard still work). Install CMake + Ninja or VS's CMake tools component to get it."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
-    $files = "src\main.cpp", "src\host_cpu.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\xg_xs.cpp", "shims\acphal.cpp", "shims\xapu.cpp", "shims\chad_dsp.cpp", "src\xma_decode.cpp", "src\xma_context.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp", "shims\com_shim.cpp", "shims\registry_oem.cpp", "shims\bcrypt_rng.cpp", "shims\dstorage_xs.cpp", "src\bcpack.cpp" | ForEach-Object { "`"$src\$_`"" }
+    $files = "src\main.cpp", "src\host_cpu.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\xg_xs.cpp", "shims\acphal.cpp", "shims\xapu.cpp", "shims\chad_dsp.cpp", "src\xma_decode.cpp", "src\xma_context.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp", "shims\com_shim.cpp", "shims\registry_oem.cpp", "shims\bcrypt_rng.cpp", "shims\dstorage_xs.cpp", "shims\gameinput_xinput.cpp", "shims\media_foundation.cpp", "src\bcpack.cpp" | ForEach-Object { "`"$src\$_`"" }
     $includes = "/I `"$src\src`" /I `"$src\shims`" /I `"$src\shims\xtaskqueue`" /I `"$xtaskqueueDir\Include`" /I `"$xtaskqueueDir\Source\Task`" /I `"$xtaskqueueDir\Source\Common`""
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"

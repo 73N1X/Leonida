@@ -29,10 +29,20 @@ SDL3 is available in one of these ways:
 - **A local copy of that tarball**: extract it and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=<path to SDL3-3.4.20>`; it is
   built the same way, without a download.
 
-Without any of these, or with `-DLEONIDA_SDL3=OFF`, configure prints a message and `gta6rt` is built without the shim:
-it has no `GameInputCreate`, as before, so the loader binds it to the host's `GameInput.dll` or the unimplemented
-thunk. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
-than failing.
+Without any of these, or with `-DLEONIDA_SDL3=OFF`, configure prints a message and `gta6rt` is built without the SDL3
+shim. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
+than failing. `GameInputCreate` is then served by the XInput shim, `runtime/shims/gameinput_xinput.cpp`, ported from
+VIctory's GameInput module (GPL-3.0-or-later): XInput pads in slots 0-3, a wired DualSense read over HID when no
+XInput pad is there, the keyboard as a device of its own (key readings with scan codes and virtual keys), and a
+keyboard pad that stands in while no other pad is connected (Esc Menu, Tab View, Enter A, Backspace B, X, Y, arrows
+the d-pad, Q/E the shoulders, F/H the stick clicks, W/A/S/D the left stick, I/J/K/L the right stick, Z/C the
+triggers; `LEONIDA_KEYBOARD_PAD=off` leaves it out). Keys count only while a window of this process has focus.
+`LEONIDA_GAMEINPUT=host` binds the host's `GameInput.dll` instead, as builds without any shim did. `gameinput_xinput_test`
+(CTest `gameinput_xinput`) runs it over a fake host and is built with or without SDL3.
+
+Both shims register `GameInputCreate` by name and as ordinal `#1`: VIctory found that titles import `gameinput.dll` by
+ordinal only, and the loader looks an ordinal import up as `#1`. Before, the SDL3 shim was registered by name only, so an
+ordinal import skipped it and bound to the host's `GameInput.dll`, whose ordinal 1 is `GameInputCreate`.
 
 `scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
 C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns

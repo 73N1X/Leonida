@@ -682,6 +682,13 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+bool read_path(const std::wstring& path, std::filesystem::path& out) {
+    const Target t = read_target(path);
+    if (t.error) return false;
+    out = t.path;
+    return true;
+}
+
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
 // path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
 // file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
