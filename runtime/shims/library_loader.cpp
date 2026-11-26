@@ -13,6 +13,7 @@
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -200,8 +201,12 @@ HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
 }
 
 // GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
-// bundled package module already mapped by the native loader.
+// bundled package module already mapped by the native loader. NULL names the title's main image once main.cpp has
+// set it (VIctory victory-hle src/modules/kernel.rs, GPL-3.0-or-later: "GetModuleHandleW(NULL) must return the
+// title's image, not our exe"), as the console's loader would answer: the title's process is its own.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
+    if (!name)
+        if (void* main = main_image()) return static_cast<HMODULE>(main);
     if (name) {
         if (HMODULE h = owned_handle(name)) return h;
         const std::string dll = module_name(name);
@@ -212,6 +217,8 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
+    if (!name)
+        if (void* main = main_image()) return static_cast<HMODULE>(main);
     if (name) {
         if (ascii_basename(name)) {
             const std::string path = narrow(name);
@@ -276,6 +283,49 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     return GetProcAddress(module, name);
 }
 
+// GetModuleFileName of a mapped image (NULL: the main image, once set) is the file it was mapped from, the title's
+// own path, not gta6rt.exe's; Windows cannot answer for an image it did not map (ERROR_MOD_NOT_FOUND). Ported from
+// VIctory kernel.rs: the title relaunches itself and finds its folder through this path. The copy follows
+// Windows' rules: a buffer too small gets the truncated, terminated path, the return value `size` and
+// ERROR_INSUFFICIENT_BUFFER; otherwise the length without the terminator.
+bool mapped_module_path(HMODULE module, std::wstring& path) {
+    void* const base = module ? static_cast<void*>(module) : main_image();
+    return base && bundled_module_path(base, path);
+}
+
+template <class Char> DWORD copy_module_path(const std::basic_string<Char>& path, Char* out, DWORD size) {
+    if (!out || size == 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if (path.size() >= size) {
+        std::copy_n(path.data(), size - 1, out);
+        out[size - 1] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return size;
+    }
+    std::copy_n(path.data(), path.size(), out);
+    out[path.size()] = 0;
+    SetLastError(ERROR_SUCCESS);
+    return static_cast<DWORD>(path.size());
+}
+
+DWORD WINAPI get_module_file_name_w(HMODULE module, LPWSTR out, DWORD size) {
+    std::wstring path;
+    if (!mapped_module_path(module, path)) return GetModuleFileNameW(module, out, size);
+    return copy_module_path(path, out, size);
+}
+
+DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR out, DWORD size) {
+    std::wstring path;
+    if (!mapped_module_path(module, path)) return GetModuleFileNameA(module, out, size);
+    // In the ANSI code page, as GetModuleFileNameA gives it.
+    const int n = WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string narrow(n > 0 ? static_cast<size_t>(n - 1) : 0, ' ');
+    if (n > 1) WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, narrow.data(), n, nullptr, nullptr);
+    return copy_module_path(narrow, out, size);
+}
+
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
@@ -302,7 +352,7 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
     {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
-    {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
+    {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)},         {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},              {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)}
 
 }  // namespace
 }  // namespace rt::shims::library_loader

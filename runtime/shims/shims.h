@@ -69,6 +69,8 @@ struct BundledModuleOps {
     // (library_loader's W entries use them when a name has a character outside ASCII). Either may be null.
     void* (*find_loaded_w)(void* ctx, const std::wstring& basename);
     void* (*load_bundled_w)(void* ctx, const std::wstring& basename, uint32_t flags, bool& handled);
+    // The file a mapped module was mapped from, for GetModuleFileName on its handle (null: not answered).
+    bool (*module_path)(void* ctx, void* module, std::wstring& path);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -79,6 +81,13 @@ void* find_loaded_bundled_module_w(const std::wstring& basename);
 void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
+// The file a live Loader mapped `module` from (its original path in the game folder); false for any other handle.
+bool bundled_module_path(void* module, std::wstring& path);
+
+// The title's main image, which GetModuleHandle(NULL) and GetModuleFileName(NULL) answer with in mapped code, as the
+// console's loader would (VIctory victory-hle src/modules/kernel.rs). Null until set: those calls then reach the host.
+void set_main_image(void* base);
+void* main_image();
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

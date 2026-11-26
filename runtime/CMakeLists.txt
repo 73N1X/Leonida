@@ -418,6 +418,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
 
+  # GetModuleHandle(NULL) / GetModuleFileName in mapped code name the title's image (library_loader.cpp). No game files.
+  add_executable(module_identity_test
+    test/module_identity_test.cpp
+    shims/library_loader.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(module_identity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(module_identity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(module_identity_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(module_identity_test PRIVATE /OPT:NOREF)
+
   # XUserImpl (offline local user) through QueryApiImpl, slot by slot as xgameruntime.lib's thunks call it.
   add_executable(xgameruntime_user_test
     test/xgameruntime_user_test.cpp
@@ -1311,6 +1322,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+    add_test(NAME module_identity COMMAND module_identity_test)
     add_test(NAME xgameruntime_user COMMAND xgameruntime_user_test)
     add_test(NAME xgameruntime_gamesave COMMAND xgameruntime_gamesave_test)
     add_test(NAME xgameruntime_store COMMAND xgameruntime_store_test)

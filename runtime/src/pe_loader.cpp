@@ -1046,6 +1046,10 @@ void* bundled_load_w(void* ctx, const std::wstring& basename, uint32_t flags, bo
     return static_cast<Loader*>(ctx)->load_runtime_module_w(basename, flags, handled);
 }
 
+bool bundled_module_path(void* ctx, void* module, std::wstring& path) {
+    return static_cast<Loader*>(ctx)->module_path(module, path);
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
@@ -1053,6 +1057,7 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_owns_handle,
     &bundled_find_loaded_w,
     &bundled_load_w,
+    &bundled_module_path,
 };
 
 // Marks what a run-time load maps as a dynamic load for as long as it is in scope (the caller holds the mutex).
@@ -1296,6 +1301,19 @@ bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) 
             return true;
         }
     }
+    return false;
+}
+
+bool Loader::module_path(void* module_handle, std::wstring& path) const {
+    if (!module_handle) return false;
+    std::lock_guard lock(mutex_);
+    for (const Module* m : order_)
+        if (m->base == module_handle) {
+            std::error_code ec;
+            const std::filesystem::path absolute = std::filesystem::absolute(m->path, ec);
+            path = (ec ? m->path : absolute).wstring();
+            return true;
+        }
     return false;
 }
 

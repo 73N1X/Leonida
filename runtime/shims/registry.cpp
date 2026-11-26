@@ -480,6 +480,19 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
+bool bundled_module_path(void* module, std::wstring& path) {
+    if (!module) return false;
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->module_path && entry.ops->module_path(entry.ctx, module, path)) return true;
+    return false;
+}
+
+namespace {
+std::atomic<void*> g_main_image{nullptr};
+}
+void set_main_image(void* base) { g_main_image.store(base); }
+void* main_image() { return g_main_image.load(); }
+
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }

@@ -263,6 +263,8 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // GetModuleHandle(NULL) and GetModuleFileName(NULL) in mapped code name the title, not gta6rt.exe.
+        rt::shims::set_main_image(main_module.base);
         if (init || run) {
             apply_display_profile(main_module);
             apply_frame_step(main_module);
