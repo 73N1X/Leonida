@@ -693,6 +693,17 @@ which has one array layer. `d3d12_descriptor_test` checks samples at four W coor
 volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_view_min_lod`, at or below
 `MostDetailedMip`, and above the last mip).
 
+A constant-buffer view is a V# of 16-byte records (`gfx10::constant_buffer_descriptor`): STRIDE 16, NUM_RECORDS the
+size in rows, format 32_32_32_32_FLOAT, OOB_SELECT 1 (index only). The title's console-compiled shaders index a
+constant buffer's float4 rows with `buffer_load_dwordx4 ... idxen` and the row number (a Scaleform batch vertex shader
+reads rows 4 b to 4 b + 3 for batch b: colour transform and position matrix), and MUBUF addressing is base + index x
+STRIDE (design.md, "Buffer bounds checking" and "Swizzled buffer addressing"); the raw V# written before (STRIDE 0)
+gave every row the first one, so every batched shape and glyph of the start screen collapsed onto clip-space y = x, a
+white line from the bottom left to the top right, and no batched text was drawn. Scalar loads keep their bound
+(s_buffer_load: NUM_RECORDS x STRIDE bytes) and offset loads (offen, index 0) reach the whole buffer.
+`gfx10_descriptors_test` checks the fields, `d3d12_compute_test` reads a view through them. Whether the console's own
+driver fills NUM_RECORDS and OOB_SELECT this way is not measured; the 16-byte stride is what the title's code needs.
+
 Known gaps in the descriptor path: buffer shader-resource views and constant-buffer views (the V# a shader would
 load for them; the structure is in `gfx10_descriptors.h`, the views are not written; buffer UAVs of every kind are,
 section 3.4 "Buffer UAVs", `d3d12_m4_compute_test` and `d3d12_buffer_uav_test`);

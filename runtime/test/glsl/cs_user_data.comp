@@ -40,10 +40,12 @@ void main() {
     Words table = at(uvec2(pc.s[8], 0u));
     Words result = at(uvec2(pc.s[6], pc.s[7]));
     if (pc.s[5] == 0u) {
-        // CBV V# mode: table holds a 16-byte GFX10 raw buffer descriptor written by CreateConstantBufferView.
-        const uint num_records = table.w[2];
+        // CBV V# mode: table holds the 16-byte GFX10 V# written by CreateConstantBufferView, read as s_buffer_load
+        // reads it: bounded at NUM_RECORDS * STRIDE bytes (NUM_RECORDS bytes when the stride is 0).
+        const uint stride = (table.w[1] >> 16u) & 0x3FFFu;
+        const uint limit = stride != 0u ? table.w[2] * stride : table.w[2];
         const uint byte_off = pc.s[4] + i * 4u;
-        if (byte_off + 4u <= num_records) {
+        if (byte_off + 4u <= limit) {
             Words cbv = at(uvec2(table.w[0], table.w[1] & 0xFFFFu));
             result.w[i] = cbv.w[byte_off >> 2u];
         } else {
