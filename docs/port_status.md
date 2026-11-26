@@ -324,6 +324,27 @@ Also this session: depth-bounds PSOs are built (`166c49386`); the title's 2,680 
 no build translated, are captured at run time and translated by the shaders stage (`349be3469`, docs/fspx.md);
 `port/pipelines`, `port/wave64-tiers` and `port/rect-lists` are merged.
 
+## First visible frames, 2026-11-26
+
+The title now runs on `LEONIDA_D3D12=vulkan` past its boot and shows its first UI screen at 30 fps (2560x1440, RTX 4060
+Ti): a dark background, the selector arrows, a panel with the A-button glyph and a loading icon. Text and a
+1-pixel diagonal seam are open (`port/ui-text`). What it took, in order:
+
+- Title memory is sparse by default (`0d09c5d92`): sparse buffers over the title's GPU windows bound to imported page
+  pools; the import path lost the device at ~26 s. `LEONIDA_TITLE_MEMORY=imports` opts out.
+- XG texture computer (`xg_xs.cpp`, from VIctory's layout library) and the gap ports from VIctory (GPU, system, media
+  and input slices: `docs/victory_gap_*.md`), including GameInput registered by ordinal (the title imports it as `#1`;
+  without that no key press ever reached it) and SDL3 fetched for the keyboard pad.
+- Textures answer with the title's address (slot 133), title-memory spans map whatever their heap, 3D UAVs,
+  B4G4R4A4 as RGBA8, depth twins on slot 133, larger bindless image arrays.
+- The cause of every black frame: the title's console-compiled VS/PS read their root arguments from user SGPR s8 on
+  (its vertex fetch loads root parameter 0 at s8/s9), and the layer packed graphics root arguments from s0. A title's
+  graphics root signatures now take the console layout (`3fdc4636b`).
+- Placed textures are refreshed from the title's bytes until they settle; A8 font atlases are read (`e7e78fcec`).
+- Diagnostics for black frames: `LEONIDA_PRESENT_DEBUG=1/2`, `LEONIDA_DEBUG_SOLID_PS/VS`, `LEONIDA_DEBUG_CLEAR=1/2`,
+  `LEONIDA_FRAME_STATS` (d3d12_com.cpp, d3d12_vulkan_device.cpp).
+- Soft asserts are stepped over with `LEONIDA_SKIP_INT3=1` (game+0x4ffd879 after the first press).
+
 ## Open items, in order
 
 1. GPU device loss: sparse title memory (`port/sparse-title-memory`).
