@@ -10233,6 +10233,8 @@ public:
         std::uint32_t layout = 0;
         std::uint64_t hash = 0;  // FNV-1a of the tiled bytes last uploaded; 0: never read
         unsigned unchanged = 0;  // checks in a row that found the same bytes
+        unsigned interval = 1;   // settled: passes between checks (refresh_pass)
+        unsigned wait = 0;       // passes left before the next check
     };
 
     // Placed textures whose title bytes changed since their last upload are uploaded again (fill_from_title), up to
@@ -10288,9 +10290,15 @@ public:
         return hash | 1;  // never 0, which means "never read"
     }
 
+    // A texture whose bytes stayed the same kSettled checks in a row is checked less and less often (every 2, 4, ...
+    // up to kMaxInterval passes) instead of never again: the title writes glyphs into its font caches as text needs
+    // them, long after the first ones (FText labels sampled alpha 0 when the cache was dropped from the watch). One
+    // larger than kWatchedBytes is dropped as before: world textures, streamed in once.
     void refresh_pass() {
-        constexpr std::uint64_t kBudget = std::uint64_t(64) << 20;
+        constexpr std::uint64_t kBudget = std::uint64_t(32) << 20;
+        constexpr std::uint64_t kWatchedBytes = std::uint64_t(8) << 20;
         constexpr unsigned kSettled = 6;
+        constexpr unsigned kMaxInterval = 256;
         std::uint64_t read_bytes = 0;
         std::vector<std::byte> bytes;
         std::size_t count = 0;
@@ -10306,25 +10314,29 @@ public:
                 if (next_fill_ >= pending_fills_.size()) next_fill_ = 0;
                 f = pending_fills_[next_fill_];
             }
-            // Writes an entry's new state back by its texture (the list may have grown or shrunk meanwhile).
-            const auto update = [&](bool settle, std::uint64_t hash, bool changed) {
+            // Writes an entry's new state back by its texture (the list may have grown or shrunk meanwhile); a null
+            // `change` drops the entry.
+            const auto update = [&](auto&& change) {
                 std::lock_guard lock(placed_mutex_);
                 for (std::size_t i = 0; i < pending_fills_.size(); ++i) {
                     if (pending_fills_[i].texture != f.texture) continue;
-                    if (settle) {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(change)>, std::nullptr_t>) {
                         pending_fills_.erase(pending_fills_.begin() + std::ptrdiff_t(i));
                         if (next_fill_ > i) --next_fill_;
                     } else {
-                        pending_fills_[i].hash = hash;
-                        pending_fills_[i].unchanged = changed ? 0 : pending_fills_[i].unchanged + 1;
+                        change(pending_fills_[i]);
                         next_fill_ = i + 1;
                     }
                     return;
                 }
             };
+            if (f.wait) {  // settled: not read this pass
+                update([](PlacedFill& e) { --e.wait; });
+                continue;
+            }
             const std::uint64_t size = placed_bytes(f);
             if (!size) {  // a layout this layer does not read: nothing to watch
-                update(true, 0, false);
+                update(nullptr);
                 continue;
             }
             bytes.resize(std::size_t(size));
@@ -10334,17 +10346,26 @@ public:
                                                  reinterpret_cast<const void*>(static_cast<std::uintptr_t>(f.address)),
                                                  bytes.data(), bytes.size(), &got) && got == bytes.size();
             if (!there) {  // not all committed yet: try again later
-                update(false, f.hash, true);
+                update([](PlacedFill& e) { e.unchanged = 0; });
                 continue;
             }
             const std::uint64_t hash = hash_bytes(bytes);
             if (hash != f.hash) {
                 fill_from_title(*f.texture, f.address, f.desc, f.layout, &bytes);
-                update(false, hash, true);
+                update([hash](PlacedFill& e) {
+                    e.hash = hash;
+                    e.unchanged = 0;
+                    e.interval = 1;
+                });
+            } else if (f.unchanged + 1 >= kSettled && size > kWatchedBytes) {
+                update(nullptr);
             } else if (f.unchanged + 1 >= kSettled) {
-                update(true, hash, false);
+                update([](PlacedFill& e) {
+                    e.interval = std::min(e.interval * 2, kMaxInterval);
+                    e.wait = e.interval;
+                });
             } else {
-                update(false, hash, false);
+                update([](PlacedFill& e) { ++e.unchanged; });
             }
         }
     }
