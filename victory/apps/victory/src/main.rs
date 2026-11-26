@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod leonida;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -168,6 +169,8 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Leonida's settings names (LEONIDA_X for VICTORY_X), before any thread starts.
+    leonida::apply_settings_names();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
