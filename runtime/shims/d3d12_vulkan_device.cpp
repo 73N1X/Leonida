@@ -2429,7 +2429,10 @@ public:
         title_span_ = true;
         void* const pages = reinterpret_cast<void*>(static_cast<std::uintptr_t>(va));
         memory_flags_ = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        mapped_ = cpu_visible() ? pages : nullptr;
+        // Title memory is the title's to read and write whatever heap type the buffer names (the console has one
+        // memory): Map gives its address, as the import path's create_host_buffer does. A default-heap buffer that
+        // Map refused left the title clearing w*h*4 bytes at 0x20 (game+0x5ebea33, a null base plus its header).
+        mapped_ = pages;
         va_ = va;
         buffer_va_ = gpu_va_ = device_.arena.address + va;
         device_.log_va(title_memory_ ? "committed buffer on title memory" : "title-placed buffer", va_, desc_.Width);
@@ -2875,6 +2878,14 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        // A texture on memory from the title's allocator: the console maps it to that memory, its data address (as
+        // GetGPUVirtualAddress reports; VIctory resource.rs gpu_address). The title makes a R32_FLOAT texture this
+        // way (game+0x2913410) and clears it through the pointer; refused, it cleared w*h*4 bytes at null
+        // (game+0x5ebea33). The Vulkan image is not that memory, so what the CPU writes there stays the CPU's.
+        if (image_ && title_memory_ && data && subresource == 0) {
+            *data = title_memory_;
+            return S_OK;
+        }
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
@@ -9278,6 +9289,16 @@ public:
                 view.layer_count = desc->Texture2DArray.ArraySize;
                 view.plane = desc->Texture2DArray.PlaneSlice;
                 break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D:
+                // A volume's mip, all of its depth: a 3D storage view (the title writes volume textures from compute
+                // shaders). A W-slice range other than the whole mip is not modelled; the view covers every slice.
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.first_mip = desc->Texture3D.MipSlice;
+                view.layer_count = 1;
+                if (desc->Texture3D.FirstWSlice != 0)
+                    log_once("3D unordered-access view from a W slice other than 0 covers the whole mip; first slice",
+                             int(desc->Texture3D.FirstWSlice));
+                break;
             default:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
                 return;
@@ -10311,6 +10332,13 @@ public:
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
                 hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc,
                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out);
+            // The texture still answers with the title's address, as on the console: GetGPUVirtualAddress and Map
+            // give `address` (adopt_title_memory, with no routine to free it: the pages stay the title's). The title
+            // takes a texture's GPU address as its CPU pointer (game+0x4fd2940); a 0 there had it clear w*h*4 bytes
+            // at null (game+0x5ebea33).
+            if (SUCCEEDED(hr) && out && *out)
+                if (Resource* r = Resource::from<Resource>(static_cast<ID3D12Resource*>(*out)))
+                    r->adopt_title_memory(address, 0, nullptr);
             return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};
