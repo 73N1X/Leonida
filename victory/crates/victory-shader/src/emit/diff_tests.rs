@@ -718,9 +718,12 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -874,9 +877,12 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -991,9 +997,12 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1080,9 +1089,12 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1225,7 +1237,24 @@ fn translated_compute_matches_pc() {
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        // A buffer of halves the translated program moves as unsigned
+        // integers is shown to it as its unsigned twin, as the host does
+        // (`HostShader::half_views`); the PC program keeps the float view.
+        let twins: Vec<View> = views
+            .iter()
+            .map(|&v| match v {
+                View::HalfUav(n) if !cs_c.half_views.is_empty() => View::HalfUintUav(n),
+                v => v,
+            })
+            .collect();
+        let ours = host.dispatch(
+            &root_t,
+            &pso_t,
+            &Dispatch {
+                views: &twins,
+                ..dispatch(roots)
+            },
+        );
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),
@@ -1284,91 +1313,4 @@ fn translated_compute_matches_pc() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
-}
-
-#[test]
-#[ignore = "requires VICTORY_SHALLOW_WATER_SHADER and a hardware D3D12 device"]
-fn shallow_water_reduces_four_independent_tiles_on_the_gpu() {
-    use super::host::{Dispatch, Root, Stride, View};
-    let path = std::env::var_os("VICTORY_SHALLOW_WATER_SHADER").expect("original shader path");
-    let data = std::fs::read(path).unwrap();
-    assert_eq!(data.len(), 1260);
-    assert_eq!(
-        &data[4..20],
-        &[
-            0xad, 0x35, 0x83, 0xf9, 0x5b, 0x9b, 0x1c, 0xf, 0x97, 0x3b, 0xaa, 0xaa, 0xd5, 0xb1,
-            0x21, 0xdf
-        ]
-    );
-    let mut shader = translate(&data).unwrap();
-    let mut validator =
-        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
-            .unwrap();
-    validator.validate(&mut shader.dxil).unwrap();
-    let host = Host::new(false).unwrap();
-    let adapter = unsafe { host.device.GetAdapterLuid() };
-    eprintln!(
-        "dispatch on adapter {:08x}:{:08x}",
-        adapter.HighPart as u32, adapter.LowPart
-    );
-    let (root, pso) = host.compute_pipeline(&shader).unwrap();
-    let mut constants = vec![0; shader.user_data_dwords() as usize];
-    for u in &shader.user_data {
-        if u.root == RootType::Table {
-            constants[u.index as usize] = 32; // table begins at heap slot 1
-        }
-    }
-    let records = shader
-        .user_data
-        .iter()
-        .find(|u| u.root == RootType::Other(super::USER_VIEW_RECORDS))
-        .unwrap();
-    assert_eq!((records.slot, records.dword), (0, 0));
-    let mut input = vec![[800.0f32, -1000.0, -2000.0, -3000.0]; 64 * 64];
-    let minima = [1.0f32, 0.5, 0.25, 0.125];
-    // Exercise different invocation and wave positions within the four groups.
-    for ((x, y), value) in [(31, 31), (32, 0), (1, 62), (52, 43)]
-        .into_iter()
-        .zip(minima)
-    {
-        input[y * 64 + x][0] = value;
-    }
-    // Keep the backing resource identical, including on a zero-length title
-    // view. The early exit must follow the guest subview count independently.
-    let buffer = [0u32; 16];
-    for (count, expected) in [(4, minima), (1, minima), (0, [0.0; 4])] {
-        constants[records.index as usize] = count;
-        let views = [
-            View::Texture(1, 1, &[[0.0; 4]]),
-            View::Buffer {
-                data: &buffer,
-                stride: Stride::Structured(16),
-            },
-            View::Texture(64, 64, &input),
-            View::TextureUav(2, 2),
-        ];
-        let results = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(constants.clone()))],
-                    views: &views,
-                    samplers: &[],
-                    groups: [2, 2, 1],
-                },
-            )
-            .unwrap();
-        assert_eq!(results[0].len(), 16);
-        for (pixel, want) in results[0].chunks_exact(4).zip(expected) {
-            assert_eq!(pixel, &[want.to_bits(); 4], "title record count {count}");
-        }
-        eprintln!(
-            "title record count {count}: {:?}",
-            results[0]
-                .chunks_exact(4)
-                .map(|p| f32::from_bits(p[0]))
-                .collect::<Vec<_>>()
-        );
-    }
 }

@@ -22,10 +22,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
-    /// Folder containing an optional host FidelityFX upscaler DLL.
-    pub fidelityfx_dir: Option<PathBuf>,
-    /// Explicit ray-tracing preference from the environment or config file.
-    pub ray_tracing: Option<bool>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -35,14 +31,6 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
-    #[serde(default)]
-    graphics: Graphics,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Graphics {
-    ray_tracing: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -51,7 +39,6 @@ struct FilePaths {
     game_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
-    fidelityfx_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
 }
@@ -59,7 +46,7 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -83,13 +70,7 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
-        cfg.ray_tracing = match std::env::var("VICTORY_RAY_TRACING").as_deref() {
-            Ok("0") => Some(false),
-            Ok("1") => Some(true),
-            _ => parsed.graphics.ray_tracing,
-        };
-        Ok(cfg)
+        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
@@ -114,9 +95,7 @@ impl Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
-            ray_tracing: None,
             test_titles,
-            fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             source,
         })
     }
@@ -138,6 +117,14 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The config file explicitly named by the environment, if any. An empty
+/// `VICTORY_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -210,11 +197,14 @@ mod tests {
     }
 
     #[test]
-    fn graphics_preferences_are_optional_and_accept_explicit_off() {
-        for (text, expected) in [("", None), ("[graphics]\nray_tracing = false", Some(false)),
-            ("[graphics]\nray_tracing = true", Some(true))] {
-            assert_eq!(toml::from_str::<FileConfig>(text).unwrap().graphics.ray_tracing, expected);
-        }
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
+        );
     }
 
     #[test]

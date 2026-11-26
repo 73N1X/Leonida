@@ -62,23 +62,6 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-/// Whether `device` is on the software adapter: the basic render driver's flag, or its vendor and device.
-fn software(device: &ID3D12Device) -> bool {
-    // SAFETY: a plain factory and adapter query for a live device.
-    unsafe {
-        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
-            return false;
-        };
-        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()) else {
-            return false;
-        };
-        let Ok(desc) = adapter.GetDesc1() else {
-            return false;
-        };
-        desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
-    }
-}
-
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -108,10 +91,15 @@ impl Host {
                 // whose first adapter is a display stub that cannot make a
                 // device): that is no hardware device, and the tests that
                 // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device
-                    && software(made)
-                {
-                    return Err("the default device is the software adapter".to_owned());
+                if let Some(made) = &device {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                    {
+                        return Err("the default device is the software adapter".to_owned());
+                    }
                 }
             }
             let device = device.ok_or("no device")?;
@@ -133,11 +121,6 @@ impl Host {
             }
             Ok(Host { device })
         }
-    }
-
-    /// Whether the device is on the software adapter: asked of the device itself, the one a test runs on.
-    pub fn is_software(&self) -> bool {
-        software(&self.device)
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -202,12 +185,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -616,9 +611,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
-        written_root_uavs: Vec::new(),
-        writes_guest_memory: false,
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     }
 }
 
@@ -637,8 +631,6 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
-    /// Root UAV over the numbered output of a compute dispatch.
-    Uav(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -876,7 +868,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1000,6 +992,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -1007,14 +1000,15 @@ pub enum View<'a> {
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
-    /// A raw buffer UAV initialized with these dwords before dispatch.
-    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
+    /// program that moves halves is shown ([`super::HostShader::half_views`]).
+    HalfUintUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1251,7 +1245,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1260,11 +1254,13 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
+                            View::HalfUintUav(e) => (
+                                2 * e,
+                                DXGI_FORMAT_R16G16B16A16_UINT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
                             View::RawUav(n) => {
-                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
-                            }
-                            View::RawUavData(data) => {
-                                let n = u32::try_from(data.len()).map_err(|_| "raw UAV too large")?;
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
                             _ => unreachable!(),
@@ -1287,16 +1283,6 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
-                        if let View::RawUavData(data) = v {
-                            let source = upload(data)?;
-                            list.CopyBufferRegion(&b, 0, &source, 0, bytes);
-                            list.ResourceBarrier(&[transition(
-                                &b,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                            )]);
-                            keep.push(source);
-                        }
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1430,10 +1416,6 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
-                    }
-                    Root::Uav(output) => {
-                        let (buffer, ..) = uavs.get(*output).ok_or("missing root UAV output")?;
-                        list.SetComputeRootUnorderedAccessView(*param, buffer.GetGPUVirtualAddress());
                     }
                 }
             }
