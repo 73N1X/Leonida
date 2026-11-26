@@ -362,8 +362,27 @@ fps, and no diagonal line. What it took (docs/fspx.md, "Graphics pipelines"):
 - The placed-texture refresh moved off the present thread; a zlib stream longer than its DirectStorage destination
   gives its first bytes.
 
-Still open from this: `FText` labels sample a glyph alpha of 0 (the batched text draws); culling is off for console
-pipelines until `LEONIDA_CONSOLE_CULL=1` is checked on screen; the world past the start screen.
+Later the same day the whole setup flow draws, labels and descriptions included (`6d2476122`: textures on the title's
+memory are watched and detiled like placed textures; the label font cache was one), with its artwork, at 30 fps:
+start screen, navigation experience, finish setup, legal notices, the legal terms screen. Accepting the terms starts
+the game, and its loading screen artwork draws.
+
+**The open blocker: a device loss during the world's background load.** 240-300 s into a boot that goes through setup
+(the title starts streaming the world while the setup screens are up; frames fall from 30 to 2-8 a second from about
+frame 4,100), the device is lost, twice reported as a write at 0x0, and the title crashes on the work that never ran.
+Ruled out so far, one run each: the seven captured compute programs first used before it
+(`LEONIDA_DEBUG_SKIP_PROGRAMS`), console mesh pipelines (`LEONIDA_CONSOLE_MESH=0`), out-of-bounds image writes
+(robustImageAccess, now on), work dropped while pipelines are made (`LEONIDA_PIPELINE_WAIT_MS=600000` delays it to
+407 s but does not prevent it), sparse binding churn (quiet before the loss). Runs that stay on the start screen never
+lose the device. `LEONIDA_DEBUG_FIRST_USE=1` with `LEONIDA_PRESENT_DEBUG=1` logs the pipelines that run first before
+it. Suspected: a pass reading an address another pass should have written, where that pass is untranslated (273
+captured compute programs and 1,754 captured console stages still are) or refused.
+
+Navigating setup without a pad: `run_nav.ps1`-style key schedules (Enter through the pages, Down Down Enter on the
+legal list's Next, Up Enter twice and Down Down Enter on the terms screen).
+
+Still open from this: culling is off for console pipelines until `LEONIDA_CONSOLE_CULL=1` is checked on screen; the
+world itself; a root signature that spills past the 32 user dwords (its dispatches are dropped).
 
 ## Open items, in order
 
