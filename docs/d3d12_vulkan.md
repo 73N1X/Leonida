@@ -2111,6 +2111,11 @@ title's own 30 s hang detector fired.
   when the builder runs dry; the next run starts those at creation, depth-only ones first.
 - The builds share the device's `VkPipelineCache` (seeded from `pipeline_cache.bin`). The index is read on a thread
   from the title's device creation on (57 MB, about 3.5 s on the test machine).
+- Console device slot 86 (`CreatePipelineState` from a stream, VIctory `pipeline.rs` `create_stream`) renumbers the
+  console's AS/MS subobjects (23/24) to the PC's (24/25) and goes to the layer's stream PSO. A stream the layer refuses
+  still gets a graphics PSO that is never made (its draws are dropped, counted as refused), as VIctory hands out a
+  pipeline for every stream: the title's first six streams have all five shader slots empty, and a null pipeline
+  was written through at once.
 - Open: VIctory's loading allowance (longer waits while a world loads); the attachment-format variants, still made
   where replay meets them.
 
