@@ -6521,7 +6521,30 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
+        // LEONIDA_DEBUG_SKIP_PROGRAMS=a,b (diagnostic): a compute program whose name contains one of the parts is
+        // refused, to tell which program a device loss comes from.
+        static const std::vector<std::string> skip_parts = [] {
+            std::vector<std::string> parts;
+            const char* v = std::getenv("LEONIDA_DEBUG_SKIP_PROGRAMS");
+            for (std::string rest = v ? v : ""; !rest.empty();) {
+                const std::size_t comma = rest.find(',');
+                if (comma) parts.push_back(rest.substr(0, comma));
+                rest = comma == std::string::npos ? std::string() : rest.substr(comma + 1);
+            }
+            return parts;
+        }();
+        for (const std::string& part : skip_parts)
+            if (entry->name.find(part) != std::string::npos) {
+                std::fprintf(stderr, "[rt] d3d12: compute program %s skipped (LEONIDA_DEBUG_SKIP_PROGRAMS)\n",
+                             entry->name.c_str());
+                return E_INVALIDARG;
+            }
         if (entry->binding_count) register_literal_samplers(device_, *entry);
+        if (pso_debug_names()) {  // its name for the diagnostics (graphics_pipeline_debug_name takes any id)
+            DebugPipelineNames& registry = debug_pipeline_names();
+            std::lock_guard lock(registry.mutex);
+            registry.names[id()] = "compute " + entry->name;
+        }
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
         if (entry->lds_bytes) {

@@ -3084,6 +3084,9 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::
     // MSG_GS_ALLOC_REQ, exp prim, group index v5 >> 7 as the game's own mesh shaders). Its kind 0 is the same
     // register block 0x54 bytes further on (measured over 300 mesh descriptions, docs/fspx.md).
     const bool mesh = !(d->vs.data && d->vs.size) && d->ms.data && d->ms.size;
+    // LEONIDA_CONSOLE_MESH=0 (diagnostic): mesh pipelines are refused, to tell what they do from the rest.
+    static const bool mesh_on = console_pso::enabled("LEONIDA_CONSOLE_MESH", true);
+    if (mesh && !mesh_on) return E_NOTIMPL;
     if (!mesh && !(d->vs.data && d->vs.size)) {
         static std::atomic<unsigned> refused{0};
         capture_slot57(desc_word, 100001 + refused.fetch_add(1, std::memory_order_relaxed));

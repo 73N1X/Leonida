@@ -1417,6 +1417,25 @@ private:
         bool incomplete = false;
     };
 
+    // LEONIDA_DEBUG_FIRST_USE=1 (diagnostic, with LEONIDA_PRESENT_DEBUG for the names): a pipeline's first draw or
+    // dispatch is logged with its programs, so a device loss can be laid next to the pipelines that ran first just
+    // before it.
+    static void note_first_use(std::uintptr_t pipeline, bool compute) {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_DEBUG_FIRST_USE");
+            return v && v[0] == '1';
+        }();
+        if (!on || !pipeline) return;
+        static std::mutex mutex;
+        static std::set<std::uintptr_t> seen;
+        {
+            std::lock_guard lock(mutex);
+            if (!seen.insert(pipeline).second) return;
+        }
+        std::fprintf(stderr, "[rt] first use: %s %s\n", compute ? "dispatch" : "draw",
+                     graphics_pipeline_debug_name(pipeline).c_str());
+    }
+
     // A draw or dispatch dropped because its root arguments are incomplete (RootState::incomplete): counted, and
     // logged the first time and then at powers of two.
     static void skipped_for_root(bool compute) {
@@ -1739,6 +1758,7 @@ private:
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         if (compute_.incomplete) return skipped_for_root(true);
         if (!pipeline_made(true)) return;
+        note_first_use(std::uintptr_t(compute_pipeline_), true);
         note_direct_heap_indexing(compute_.layout);
         count_recorded(true);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
@@ -1766,6 +1786,7 @@ private:
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         if (graphics_.incomplete) return skipped_for_root(false);
         if (!pipeline_made(false)) return;
+        note_first_use(std::uintptr_t(graphics_pipeline_), false);
         // The console graphics layout keeps root arguments from s8; s0..s3 are the driver's: the vertex-buffer table,
         // the base vertex (the start vertex of a non-indexed draw, as the zero-based vertex id leaves it out) and the
         // first instance (vertex_table).

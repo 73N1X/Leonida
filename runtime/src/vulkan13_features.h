@@ -38,6 +38,10 @@ public:
     bool subgroup_size_control = false;
     bool compute_full_subgroups = false;
     bool extended_dynamic_state = false;  // core on 1.3; on 1.2 both VK_EXT_extended_dynamic_state(2) extensions
+    // robustImageAccess (1.3): an image access out of bounds reads zeros and drops writes instead of being undefined.
+    // A console program whose target texture is not found writes through the 1x1 fallback of its bindless array
+    // with full-size coordinates; without it that lost the device during the world load.
+    bool robust_image_access = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -46,6 +50,7 @@ public:
                PFN_vkEnumerateDeviceExtensionProperties enumerate_extensions) {
         core = api_version >= VK_API_VERSION_1_3;
         dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
+        robust_image_access = false;
         extended_dynamic_state = false;
         if (!features2) return;
         if (core) {
@@ -56,6 +61,7 @@ public:
             synchronization2 = f13.synchronization2 == VK_TRUE;
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+            robust_image_access = f13.robustImageAccess == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
             return;
         }
@@ -102,6 +108,7 @@ public:
         synchronization2 = from.synchronization2;
         subgroup_size_control = from.subgroup_size_control;
         compute_full_subgroups = from.compute_full_subgroups;
+        robust_image_access = from.robust_image_access;
         extended_dynamic_state = from.extended_dynamic_state;
     }
 
@@ -114,6 +121,7 @@ public:
             enable13_.synchronization2 = VK_TRUE;
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
             enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
+            enable13_.robustImageAccess = robust_image_access ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {
