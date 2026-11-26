@@ -41,3 +41,6 @@ __pycache__/
 *.exp
 *.log
 .vs/
+
+# Packages (scripts/fetch_vkd3d_proton.py and the like)
+/dist/
