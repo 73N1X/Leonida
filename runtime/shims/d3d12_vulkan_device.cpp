@@ -3844,6 +3844,7 @@ struct PipelineStream {
     D3D12_SHADER_BYTECODE as{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
+    bool depth_bounds = false;        // DEPTH_STENCIL1/2's DepthBoundsTestEnable
 };
 
 // E_INVALIDARG for a PSO description, with the check that refused it logged once: the title's own descriptions come
@@ -3966,10 +3967,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
             D3D12_DEPTH_STENCIL_DESC1 d{};
             take(d);
-            if (ok && d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
+            if (ok) out.depth_bounds = d.DepthBoundsTestEnable != FALSE;
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
                                    d.StencilWriteMask, d.FrontFace, d.BackFace};
             break;
@@ -3978,10 +3976,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             D3D12_DEPTH_STENCIL_DESC2 d{};
             take(d);
             if (!ok) break;
-            if (d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
+            out.depth_bounds = d.DepthBoundsTestEnable != FALSE;
             // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
             if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
                                     d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
@@ -4213,7 +4208,7 @@ public:
     // a check on it could refuse the PSO on this device (words_could_refuse): then it is read and checked here, so the
     // answer stays the creation's.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr, bool depth_bounds = false) {
         auto& vk = device_.context->vk;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
         if (as && as->pShaderBytecode && as->BytecodeLength) {
@@ -4466,10 +4461,13 @@ public:
         // Rectangle lists (D3D12.X topology type 19) take triangle lists into a generated geometry stage that
         // completes each rectangle (src/rect_list_gs.h).
         const bool rects = !mesh && UINT(desc.PrimitiveTopologyType) == leonida::rect_list::kPipelineTopologyType;
-        if (rects && !leonida::rect_list::append_stage(vk.vkCreateShaderModule, dev,
-                                                       device_.info.features.geometryShader, vs_stage.words,
-                                                       modules_, stage_infos))
+        // The generated stage is made with the others when the pipeline is built (build()), from the VS's words.
+        if (rects && (!device_.info.features.geometryShader || desc.GS.BytecodeLength)) {
+            log_once("rectangle lists need the geometryShader feature and no geometry shader of their own; GS bytes",
+                     int(desc.GS.BytecodeLength));
             return E_NOTIMPL;
+        }
+        rects_ = rects;
         switch (mesh || rects ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : desc.PrimitiveTopologyType) {  // mesh: unused
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -4533,6 +4531,16 @@ public:
         depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth.depthCompareOp = compare_op(ds.DepthFunc);
         depth.stencilTestEnable = ds.StencilEnable;
+        // The depth-bounds test (a stream's DEPTH_STENCIL1/2), its bounds dynamic state set per draw from
+        // OMSetDepthBounds. Without the GPU feature it is left off: those draws then pass the test everywhere.
+        if (depth_bounds) {
+            if (device_.info.features.depthBounds)
+                depth.depthBoundsTestEnable = VK_TRUE;
+            else
+                log_once("no depthBounds feature: the depth-bounds test is left off; enabled", 1);
+            depth.minDepthBounds = 0.0f;
+            depth.maxDepthBounds = 1.0f;
+        }
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
@@ -4865,8 +4873,10 @@ public:
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
         auto& required_sizes = recipe_.required_sizes;
         const bool depth24_planned = depth24_fragment_;
+        std::vector<std::uint32_t> rect_vs;  // the VS's words for the rectangle-list stage (rects_)
         for (PlannedStage& stage : planned_) {
             if (!stage.entry) continue;
+            if (rects_ && stage.bit == VK_SHADER_STAGE_VERTEX_BIT) rect_vs = stage.words;
             // After the f16 link (read_words), which can also edit the pixel shader's words.
             if (depth24_fragment_ && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
                 std::string why;
@@ -4892,6 +4902,12 @@ public:
             info.pName = "main";
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
+        }
+        if (rects_ && !leonida::rect_list::append_stage(vk.vkCreateShaderModule, dev,
+                                                        device_.info.features.geometryShader, rect_vs, modules_,
+                                                        stage_infos)) {
+            log_once("rectangle-list stage could not be made for the VS; its words", int(rect_vs.size()));
+            return false;
         }
         if (depth24_fragment_ && !planned_[2].entry) {  // no pixel shader: a built-in one writes the depth
             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias_);
@@ -5117,7 +5133,7 @@ private:
             VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS,      VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -5164,7 +5180,8 @@ private:
         // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
         static constexpr VkDynamicState mesh_dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                                                  VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                                                 VK_DYNAMIC_STATE_DEPTH_BOUNDS};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         if (r.mesh) {
             dynamic.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
@@ -5227,6 +5244,7 @@ private:
         std::vector<std::uint32_t> words;  // read by create_graphics where words_could_refuse, else by the build
     };
     PlannedStage planned_[3];
+    bool rects_ = false;  // a rectangle-list pipeline (D3D12.X topology type 19): a generated geometry stage
     bool words_read_ = false;
     bool uses_bindless_ = false;    // a stage declares set-0 bindings: the layout holds the device's set 0
     bool depth24_fragment_ = false;
@@ -7355,7 +7373,7 @@ public:
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as, stream.depth_bounds);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
@@ -11864,6 +11882,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
+    enable.depthBounds = chosen_features.depthBounds;  // stream PSOs' depth-bounds test (OMSetDepthBounds)
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores

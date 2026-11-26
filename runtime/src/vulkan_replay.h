@@ -853,6 +853,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
+    PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;  // every graphics pipeline takes the bounds as dynamic state
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
@@ -4199,6 +4200,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+            if (vk.set_depth_bounds)
+                vk.set_depth_bounds(command_buffer, std::clamp(draw->depth_bounds_min, 0.0f, 1.0f),
+                                    std::clamp(draw->depth_bounds_max, 0.0f, 1.0f));
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;

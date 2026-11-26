@@ -263,11 +263,15 @@ int main() {
         bad = mesh_stream;
         bad.add(AsSubobject{.inner = vs});
         EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
-        bad = mesh_stream;
+        // The depth-bounds test is built (OMSetDepthBounds sets its bounds per draw); without the GPU feature it is
+        // left off and the PSO still made.
+        Stream bounded = mesh_stream;
         D3D12_DEPTH_STENCIL_DESC1 bounds{};
         bounds.DepthBoundsTestEnable = TRUE;
-        bad.add(DepthStencil1Subobject{.inner = bounds});
-        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        bounded.add(DepthStencil1Subobject{.inner = bounds});
+        Ref<ID3D12PipelineState> with_bounds;
+        EXPECT(SUCCEEDED(create(device.p, bounded, with_bounds)) && with_bounds.p);
+        with_bounds.reset();  // the device's references are counted at the end
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};

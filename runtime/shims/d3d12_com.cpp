@@ -471,6 +471,19 @@ public:
         front_stencil_ref_ = back_stencil_ref_ = reference;
     }
 
+    // GCL1. The bounds every later draw takes; a pipeline whose depth-stencil state enables the depth-bounds test
+    // uses them (vkCmdSetDepthBounds at replay, the bounds clamped to [0, 1]).
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
+        if (list_.closed()) return;
+        if (defer([=](GraphicsCommandList& l) {
+                l.depth_bounds_min_ = min;
+                l.depth_bounds_max_ = max;
+            }))
+            return;
+        depth_bounds_min_ = min;
+        depth_bounds_max_ = max;
+    }
+
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
         if (defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
@@ -501,6 +514,8 @@ public:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
+        draw.depth_bounds_min = depth_bounds_min_;
+        draw.depth_bounds_max = depth_bounds_max_;
         check(list_.draw(std::move(draw)));
     }
 
@@ -1276,6 +1291,8 @@ private:
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
+    FLOAT depth_bounds_min_ = 0.0f;
+    FLOAT depth_bounds_max_ = 1.0f;
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
@@ -1394,6 +1411,8 @@ private:
 
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
+        depth_bounds_min_ = 0.0f;
+        depth_bounds_max_ = 1.0f;
         compute_ = {};
         graphics_ = {};
         cbv_srv_uav_heap_ = nullptr;
@@ -1457,6 +1476,8 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        draw.depth_bounds_min = depth_bounds_min_;
+        draw.depth_bounds_max = depth_bounds_max_;
         check(list_.draw(std::move(draw)));
     }
 };
