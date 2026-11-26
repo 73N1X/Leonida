@@ -1718,9 +1718,12 @@ The copies:
   the copy and the title would never see it ([#1537](https://github.com/ubiquitarianism/leonida/issues/1537), the
   `WRITE_INVALID` stop at the world start). Every title range a submission's bindings reach is kept, and the next
   refresh copies those ranges from the copy to the title's pages *before* it copies the pages forward, so a page the
-  title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. Up to 8,192 ranges and
-  64 MiB a submission (a V# has no read/write bit, so a read-only view costs a copy too; past the caps the ranges are
-  left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
+  title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. The copy back asks the
+  write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
+  over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
+  writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
+  its pages stay guarded. Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
+  reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range
   another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
   waiting: past 64 of them the oldest go back without their ticket, logged once.
