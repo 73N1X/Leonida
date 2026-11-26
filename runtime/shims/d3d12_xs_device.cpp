@@ -80,9 +80,16 @@ struct PagePool {
     bool live;
 };
 
+// The first 0x58 bytes are the console device's as a title's inlined code reads them (ported from VIctory,
+// victory-gpu device.rs:103-119, GPL-3.0-or-later): +0x10 the GPU address of a null constant buffer (none: 0), and
+// +0x18 a block whose first byte, non-zero, sends the calls the title would otherwise inline to the table ("the
+// title tests byte 0x18 before inlining a device call", device.rs:479). Before, +0x10 was the PC vtable's address
+// and +0x18 the PC slot count, whose low byte only happened to be non-zero.
 struct DeviceProxy {
     void** vtable;          // offset 0: the caller's ID3D12Device* points here
     ID3D12Device* real;     // offset 8: the PC device every thunk forwards to
+    std::uint64_t null_constant_buffer;  // +0x10: 0
+    std::uint32_t out_of_line[16];       // +0x18: word 0 is 1, the rest reserved (0)
     void** real_vtable;
     unsigned slot_count;    // number of valid entries in real_vtable
     std::atomic<unsigned long> refs;
@@ -110,15 +117,25 @@ struct DeviceProxy {
     std::atomic<void*> present_context;
 };
 
+static_assert(offsetof(DeviceProxy, null_constant_buffer) == 0x10 && offsetof(DeviceProxy, out_of_line) == 0x18 &&
+                  offsetof(DeviceProxy, real_vtable) == 0x58,
+              "V device.rs:112: the console device's fields end at 0x58");
+
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
+// The console heap's fields after its header, as VIctory lays them out (victory-gpu descriptor.rs:49-54): the
+// description at +0x10 and the first descriptor's address at +0x20 (the CPU start, which on the console is the GPU
+// start too). Filled once from the real heap when the proxy is made.
 struct HeapProxy {
     void** vtable;          // offset 0: the caller's ID3D12DescriptorHeap* points here
     ID3D12DescriptorHeap* real;
+    D3D12_DESCRIPTOR_HEAP_DESC desc;  // +0x10
+    std::uint64_t start;              // +0x20
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     std::atomic<unsigned long> refs;
 };
+static_assert(offsetof(HeapProxy, desc) == 0x10 && offsetof(HeapProxy, start) == 0x20, "V descriptor.rs:49-54");
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
@@ -544,6 +561,15 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
 // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
 // 8-byte value in RAX. Call with both conventions and keep whichever produced a value, so a runtime that really
 // returns in RAX also works. The extra register is harmless when the callee ignores it.
+std::uint64_t real_heap_cpu_start(HeapProxy* self) {
+    constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    handle.ptr = kUnset;
+    using Fn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
+    const D3D12_CPU_DESCRIPTOR_HANDLE returned = reinterpret_cast<Fn>(self->real_vtable[9])(self->real, &handle);
+    return handle.ptr != kUnset ? handle.ptr : returned.ptr;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     note_heap_slot(9);
     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
@@ -622,6 +648,12 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->device = device;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->refs.store(1, std::memory_order_relaxed);
+    // +0x10 and +0x20 (V descriptor.rs:49-54), from the real heap's GetDesc (slot 8) and CPU start (slot 9), called
+    // without counting them as the title's calls. GetDesc is a struct return through the hidden pointer on the PC.
+    proxy->desc = {};
+    using DescFn = void*(WINAPI*)(ID3D12DescriptorHeap*, D3D12_DESCRIPTOR_HEAP_DESC*);
+    reinterpret_cast<DescFn>(proxy->real_vtable[8])(real, &proxy->desc);
+    proxy->start = real_heap_cpu_start(proxy);
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
     const HRESULT hr = heap_query_interface(proxy, &riid, out);
@@ -702,14 +734,18 @@ constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // PC slots (ID3D12Fence
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
     IUnknown* real;         // offset 8: the PC or Vulkan-layer object every thunk forwards to
+    // +0x10, right after the console object header, is what a title's inlined code reads (ported from VIctory,
+    // victory-gpu queue.rs:31-35 "the title reads the list type right after the header", list.rs:90-94, fence.rs:
+    // 24-29): a queue's and an allocator's command list type (the low word), and a console fence's value word (fence
+    // slot 12's address; written under g_fence_words_lock). Before, +0x10 was the device pointer below.
+    std::atomic<std::uint64_t> value_word;
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
     Layout layout;          // the device's
-    // A console fence's value word (fence slot 12) and its place in the list of words kept up to date; all three
-    // are written under g_fence_words_lock. Unused for queues, allocators and PC-layout fences (word_listed false).
-    std::atomic<std::uint64_t> value_word;
+    // A console fence's place in the list of value words kept up to date (value_word above); written under
+    // g_fence_words_lock. Unused for queues, allocators and PC-layout fences (word_listed false).
     ChildProxy* word_prev;
     ChildProxy* word_next;
     bool word_listed;
@@ -717,6 +753,7 @@ struct ChildProxy {
     std::atomic<ID3D12Fence*> stamp_fence;
     std::atomic<std::uint64_t> stamp_value;
 };
+static_assert(offsetof(ChildProxy, value_word) == 0x10, "V queue.rs:1048: the title reads the type at +0x10");
 
 template <ChildKind K>
 struct ChildStats {
@@ -1058,10 +1095,14 @@ constexpr GUID kConsoleList6Iid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0
 struct ListProxy {
     void** vtable;                      // +0x00
     ID3D12GraphicsCommandList* real;    // +0x08
-    DeviceProxy* device;                // +0x10: keeps the Xbox-ABI device alive; GetDevice returns it
+    // +0x10: the list's type, right after the console object header, where the title's inlined code reads it (ported
+    // from VIctory, victory-gpu list.rs:96-100, GPL-3.0-or-later). Before, +0x10 was the device pointer.
+    std::uint32_t list_type;
+    std::uint32_t reserved;
     // +0x18..: the console object body a title's inline writers read. +0x18 holds the write cursor, +0x28 and
     // +0x30 the record limits; the rest is room for the measured flags, header table and pipeline record.
     alignas(8) std::uint8_t console_fields[0x600];
+    DeviceProxy* device;                // keeps the Xbox-ABI device alive; GetDevice returns it
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
     std::vector<ValueWait> waits;       // slots 73/74 since the last reset, for the queue's ExecuteX
@@ -1075,6 +1116,7 @@ struct ListProxy {
     }
 };
 static_assert(offsetof(ListProxy, console_fields) == 0x18, "the console fields start at +0x18");
+static_assert(offsetof(ListProxy, list_type) == 0x10, "V list.rs:98: the type follows the header");
 
 // The real object behind a heap, queue, fence or list proxy, or null when `object` is none of them.
 IUnknown* proxy_real_object(const void* object) {
@@ -1449,7 +1491,7 @@ void** get_list_vtable() {
     return vtable;
 }
 
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out, std::uint32_t type) {
     if (out) *out = nullptr;
     if (!created) return E_FAIL;
     auto* proxy = new (std::nothrow) ListProxy();
@@ -1459,6 +1501,8 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     }
     proxy->vtable = get_list_vtable();
     proxy->real = static_cast<ID3D12GraphicsCommandList*>(created);
+    proxy->list_type = type;
+    proxy->reserved = 0;
     proxy->device = device;
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
@@ -1979,7 +2023,7 @@ void** get_child_vtable() {
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
 template <ChildKind K>
-HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void** out, std::uint32_t type = 0) {
     if (!created) return E_FAIL;
     ChildProxy* proxy = new (std::nothrow) ChildProxy;
     if (!proxy) {
@@ -1999,7 +2043,9 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     }
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->layout = device->layout;
-    proxy->value_word.store(0, std::memory_order_relaxed);
+    // A queue's or allocator's list type (V queue.rs:31-35, list.rs:90-94); a fence's value word is set when it is
+    // listed (list_fence_word, below).
+    proxy->value_word.store(K == ChildKind::fence ? 0 : type, std::memory_order_relaxed);
     proxy->word_prev = proxy->word_next = nullptr;
     proxy->word_listed = false;
     proxy->stamp_fence.store(nullptr, std::memory_order_relaxed);
@@ -2059,7 +2105,8 @@ HRESULT create_queue_proxy(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* de
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
-    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out,
+                                        desc ? static_cast<std::uint32_t>(desc->Type) : 0);
 }
 
 // Device slot 8: CreateCommandQueue(desc, riid, out), the PC description.
@@ -2260,7 +2307,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
                                                      __uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, riid, out, static_cast<std::uint32_t>(type));
 }
 
 // Device slot 12: CreateCommandList(node_mask, type, allocator, initial_state, riid, out). The console layout hands
@@ -2288,7 +2335,7 @@ HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, st
     const HRESULT hr = create(self->real, static_cast<UINT>(node_mask), list_type, list_allocator, pipeline,
                               &__uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, riid, out, static_cast<std::uint32_t>(list_type));
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -2304,7 +2351,9 @@ HRESULT proxy_create_command_queue1(DeviceProxy* self, std::uint64_t desc, std::
     void* created = nullptr;
     const HRESULT hr = create(self->real, desc, creator_id, &__uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
-    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
+    const std::uint32_t type =
+        desc ? static_cast<std::uint32_t>(reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc)->Type) : 0;
+    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out, type);
 }
 
 // Device slot 36: CreateFence(initial_value, flags, riid, out).
@@ -2359,7 +2408,7 @@ HRESULT proxy_create_command_allocator(DeviceProxy* self, std::uint64_t type, co
         allocator->Release();
         return asked;
     }
-    return wrap_child<ChildKind::allocator>(allocator, self, riid, out);
+    return wrap_child<ChildKind::allocator>(allocator, self, riid, out, static_cast<std::uint32_t>(list_type));
 }
 
 // Device slot 32: OpenSharedHandle(handle, riid, out). The object is opened as asked; when it is a fence (whatever
@@ -3086,6 +3135,59 @@ HRESULT proxy_create_committed_resource3(DeviceProxy* self, std::uint64_t heap, 
 // The Xbox routes (48, 73 and 78-81 unless moved, see XboxDeviceSlotRoutes): true, with `result` set, when `slot` is
 // one of them. Checked before the PC vtable is indexed: the routes would otherwise reach unrelated PC methods (78/79
 // are CreateReservedResource2/CreateSampler2 on an ID3D12Device11, 80 and 81 are past its table).
+// Device slot 13 in the console layout: CheckFeatureSupport(feature, data, size), ported from VIctory (victory-gpu
+// device.rs:240-347, GPL-3.0-or-later).
+//   - Feature 0 (OPTIONS): the console's structure has 16 words, one more than the PC's 15: a console-only field at
+//     index 11, after StandardSwizzle64KBSupported (V device.rs:254-273). A 64-byte query gets the device's PC answer
+//     with that word 0 inserted; the PC runtime refuses the size outright (E_INVALIDARG), which left the title
+//     without its options. A 60-byte query is the PC's and goes on unchanged.
+//   - Feature 2 (FEATURE_LEVELS): the console hardware is feature level 12_2 (V device.rs:97-98, 320-347): the
+//     highest requested level up to 12_2, or DXGI_ERROR_UNSUPPORTED (with 0 written) when none is. The PC device
+//     behind the proxy caps at 12_1; the console title was built for 12_2 hardware and asks the device it runs on.
+//   - Everything else is the PC method's, as before.
+constexpr std::uint32_t kFeatureOptions = 0, kFeatureLevels = 2;
+constexpr std::uint32_t kConsoleOptionsWords = 16, kConsoleOnlyOptionsWord = 11;
+constexpr std::uint32_t kConsoleHighestFeatureLevel = 0xc200;  // D3D_FEATURE_LEVEL_12_2
+static_assert(sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS) == (kConsoleOptionsWords - 1) * 4,
+              "the PC options are the console's without its word 11");
+static_assert(offsetof(D3D12_FEATURE_DATA_D3D12_OPTIONS, CrossNodeSharingTier) == kConsoleOnlyOptionsWord * 4,
+              "the console-only word sits where the PC's CrossNodeSharingTier is");
+
+HRESULT console_check_feature_support(DeviceProxy* self, std::uint64_t feature_word, std::uint64_t data_word,
+                                      std::uint64_t size_word) {
+    const auto feature = static_cast<std::uint32_t>(feature_word);
+    const auto size = static_cast<std::uint32_t>(size_word);
+    void* const data = reinterpret_cast<void*>(data_word);
+    if (feature == kFeatureOptions && size == kConsoleOptionsWords * 4) {
+        if (!data) return E_INVALIDARG;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS pc{};
+        const HRESULT hr = self->real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &pc, sizeof(pc));
+        if (FAILED(hr)) return hr;
+        std::uint32_t words[kConsoleOptionsWords] = {};
+        std::memcpy(words, &pc, kConsoleOnlyOptionsWord * 4);
+        std::memcpy(words + kConsoleOnlyOptionsWord + 1,
+                    reinterpret_cast<const std::uint8_t*>(&pc) + kConsoleOnlyOptionsWord * 4,
+                    sizeof(pc) - kConsoleOnlyOptionsWord * 4);
+        std::memcpy(data, words, sizeof(words));
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: CheckFeatureSupport(OPTIONS) in the console's 16-word layout\n");
+        return hr;
+    }
+    if (feature == kFeatureLevels && size == sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) {
+        auto* levels = static_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(data);
+        if (!levels || !levels->pFeatureLevelsRequested) return E_INVALIDARG;
+        std::uint32_t best = 0;
+        for (UINT i = 0; i < levels->NumFeatureLevels; ++i) {
+            const auto level = static_cast<std::uint32_t>(levels->pFeatureLevelsRequested[i]);
+            if (level <= kConsoleHighestFeatureLevel && level > best) best = level;
+        }
+        levels->MaxSupportedFeatureLevel = static_cast<D3D_FEATURE_LEVEL>(best);
+        return best ? S_OK : DXGI_ERROR_UNSUPPORTED;
+    }
+    return self->real->CheckFeatureSupport(static_cast<D3D12_FEATURE>(feature), data, size);
+}
+
 bool routed_call(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                  std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
@@ -3211,6 +3313,9 @@ __forceinline std::uint64_t device_call(DeviceProxy* self, std::uint64_t a1, std
         note_slot(Slot);
         proxy_create_sampler_x(self, a1, a2);  // (desc, handle), no result
         return 0;
+    } else if constexpr (M == DeviceMethod::feature_support) {
+        note_slot(Slot);
+        return hr_to_u64(console_check_feature_support(self, a1, a2, a3));  // (feature, data, size)
     } else if constexpr (M == DeviceMethod::committed_resource3) {
         return hr_to_u64(proxy_create_committed_resource3(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
     } else if constexpr (M == DeviceMethod::placed_resource_x) {
@@ -3337,6 +3442,9 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     if (!proxy) return E_OUTOFMEMORY;
     proxy->vtable = get_vtable();
     proxy->real = real;
+    proxy->null_constant_buffer = 0;
+    std::memset(proxy->out_of_line, 0, sizeof(proxy->out_of_line));
+    proxy->out_of_line[0] = 1;  // V device.rs:118: every call through the table
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->slot_count = detect_slot_count(real);
     proxy->refs.store(1, std::memory_order_relaxed);

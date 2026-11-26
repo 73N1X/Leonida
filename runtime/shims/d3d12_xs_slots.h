@@ -60,6 +60,7 @@ enum class DeviceMethod : std::uint8_t {
     placed_view,           // 70, 71: a view of title memory (rt::d3d12_xs::set_placed_view_handler)
     sampler_x,             // 61: the console's sampler description (rt::d3d12_xs::set_sampler_x_handler)
     stream_pso,            // 86 in the console layout: PC CreatePipelineState with the console's stream renumbered
+    feature_support,       // 13 in the console layout: the console's OPTIONS layout and feature level 12_2 (V device.rs)
 };
 
 struct DeviceSlot {
@@ -92,7 +93,9 @@ inline constexpr DeviceEntry kDeviceEntries[] = {
     {11, DeviceMethod::forward, DeviceMethod::forward, "CreateComputePipelineState"},
     // V device.rs:413 and list.rs:566: the list has the console layout (L: the PC list in the pc layout).
     {12, DeviceMethod::create_list, DeviceMethod::create_list, "CreateCommandList"},
-    {13, DeviceMethod::forward, DeviceMethod::forward, "CheckFeatureSupport"},
+    // V device.rs:240-347: the console's OPTIONS query is 16 words (one console-only field at index 11, after PC's
+    // StandardSwizzle64KBSupported), and the hardware is feature level 12_2. Other features are the PC method's.
+    {13, DeviceMethod::forward, DeviceMethod::feature_support, "CheckFeatureSupport"},
     {14, DeviceMethod::create_heap, DeviceMethod::create_heap, "CreateDescriptorHeap -> heap proxy"},
     {15, DeviceMethod::forward, DeviceMethod::forward, "GetDescriptorHandleIncrementSize"},
     {16, DeviceMethod::forward, DeviceMethod::forward, "CreateRootSignature"},
