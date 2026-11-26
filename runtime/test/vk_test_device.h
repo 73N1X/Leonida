@@ -118,6 +118,8 @@ public:
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
+    bool request_maintenance8 = false;  // set before create(): enable VK_KHR_maintenance8 where available
+    bool maintenance8 = false;          // VK_KHR_maintenance8 and maintenance8 are enabled
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -432,6 +434,8 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        // Translated shaders write storage images declared without a format, as d3d12_depth_twin_test's does.
+        enable.shaderStorageImageWriteWithoutFormat = features.features.shaderStorageImageWriteWithoutFormat;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
@@ -529,6 +533,21 @@ public:
             mesh_features.meshShader = VK_TRUE;
             *v13_.next() = &mesh_features;
         }
+        // VK_KHR_maintenance8 (copies between depth/stencil and colour images among others), for the tests that ask.
+        VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+        if (request_maintenance8 && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance8_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            maintenance8 = maintenance8_features.maintenance8 == VK_TRUE;
+        }
+        if (maintenance8) {
+            maintenance8_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR, *v13_.next()};
+            maintenance8_features.maintenance8 = VK_TRUE;
+            *v13_.next() = &maintenance8_features;
+        }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -606,6 +625,7 @@ public:
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        if (maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

@@ -309,7 +309,7 @@ frames (black so far). The stops passed, in order:
 |---|---|---|
 | int3 `+0x19f4f58` after slot 41 | console argument type 105 (DISPATCH_SINGLE) refused | taken as DISPATCH, as VIctory (`6fa8690cb`) |
 | int3 `+0x344196` (size check) | A8_UNORM with RT/UAV and in 1D refused | R8-backed A8 in any dimension (`6fa8690cb`) |
-| same | depth texture with unordered access (console-only) | UAV flag dropped, UAVs null (`6fa8690cb`) |
+| same | depth texture with unordered access (console-only) | UAV flag dropped, UAVs null (`6fa8690cb`); now colour twins carry its UAVs (docs/d3d12_vulkan.md 4.2) |
 | read of `0x200` at `+0x4d9f113` | plain 16-byte heap descriptions: stack words taken as a console heap address | tail taken only when its size is count x increment (`6fa8690cb`) |
 | int3 `+0x344196` | console formats 118-120 (16-bit depth/stencil) | 24-bit family, as VIctory's `pc_format` (`6fa8690cb`) |
 | int3 `+0x2474606` (device-removed handler), ~26 s | GPU device lost | open: see below |
@@ -332,5 +332,6 @@ no build translated, are captured at run time and translated by the shaders stag
    tessellation: the corpus has no hull, domain or amplification shaders (tools/feature_scan.py, question 10).
 4. A8_UNORM render targets: done as R8 attachments with the alpha splatted (`src/spirv_output_splat.h`); check them
    on screen once the title draws.
-5. Depth textures with unordered access: VIctory's colour twin (victory-gpu descriptor/host.rs).
+5. Depth textures with unordered access: done as VIctory's colour twins (docs/d3d12_vulkan.md 4.2); check on a run that
+   the title moves the texture into UNORDERED_ACCESS (the device's line at release counts the copies and shader writes).
 6. Frame time toward 30 fps; frame-counted systems.

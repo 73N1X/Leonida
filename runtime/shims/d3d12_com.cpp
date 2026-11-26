@@ -1160,6 +1160,8 @@ private:
             if (!g::decode(words, image)) return false;
             const bool volume = image.type == g::ImageType::image_3d;
             out.buffer = false;
+            // A depth texture's UAV is a view of its colour twin (rt::d3d12::unordered_access_resource): clear that.
+            out.resource = resource_id(unordered_access_resource(resource, image.address));
             out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));
             out.mip = image.first_mip;
             out.first_layer = volume ? 0 : image.first_layer;  // a 3D view clears every slice of its mip

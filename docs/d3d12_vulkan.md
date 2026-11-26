@@ -2394,6 +2394,46 @@ title's own 30 s hang detector fired.
   no cross-adapter sharing), an unknown descriptor heap type (accepted by the host), and the driver's own answers:
   R32G32B32 render targets, 2D textures wider than 16384, `L1` custom heaps, 16x MSAA and video formats and queues
   differ between the RX 9070 XT, an integrated Radeon and WARP. The rest of the table agrees on all three.
+- **Depth textures with unordered access (console only).** The console lets a texture be
+  `ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS`; the title makes a 2560x1440 `R32G8X24_TYPELESS` one (flags `0x6`),
+  and VIctory notes that its tiled lighting writes each pixel's material class into the stencil plane through a UAV.
+  The PC runtime refuses the pair and Vulkan has no storage usage on depth formats. The layer follows VIctory
+  (victory-gpu `resource.rs` `twin_texture`, `host.rs` `twin_use`): the depth image stays as it is (without storage
+  usage) and the texture gets **colour twins** of its size, mips and slices that carry its UAVs.
+  - Twins: `R32_TYPELESS` for a 32-bit depth plane (`D32`, the `R32` and `R32G8X24` families), `R16_TYPELESS` for a
+    16-bit one, and `R8_TYPELESS` for the stencil plane (`R32G8X24`, `R24G8`). A 24-bit depth plane has no twin (no
+    colour format holds its bits), so the console's 16-bit depth with stencil (118, a D24 texture here) and `R24G8`
+    get a stencil twin only and their depth-plane UAVs stay null. A multisampled texture gets none.
+  - Who gets them: the console proxy keeps both flags on slots 76 and 127 (and the allocation-info slots 25 and 108)
+    when the device behind it says it takes them (`rt::d3d12_xs::set_depth_unordered_handler`, which the Vulkan device
+    registers), and makes the call with `rt::d3d12_xs::console_depth_unordered()` set on the thread, so
+    `committed_resource_refusal` accepts the pair for the title and still refuses it to PC callers, as the PC runtime
+    does. A PC device behind the proxy, or `LEONIDA_DEPTH_TWINS=0`, drops the UAV flag as before (UAVs null).
+  - Views: a UAV of the texture is written as a UAV of a twin, the same mip and slices, plane 0: plane 1 or a stencil
+    format (`X32_TYPELESS_G8X24_UINT`, `X24_TYPELESS_G8_UINT`, R8) is the stencil twin's as `R8_UINT`, anything else the
+    depth plane twin's in its own R32/R16 colour format, or `R32_FLOAT`/`R16_UNORM` for a depth, typeless or plane
+    format. A UAV clear of such a view clears the twin (`rt::d3d12::unordered_access_resource`).
+  - Sync, in `vulkan_replay.h` (`detail::sync_twins`), as lists are emitted, so in submission order across the
+    device's queues; the state carries from list to list in the `LayoutTracker`. The twins are brought up to date (a
+    copy of the depth texture into them, if it was written since) when a barrier moves a plane into an unordered-access
+    state (legacy `UNORDERED_ACCESS`, an enhanced UAV layout or access) and before a UAV clear. Every draw, dispatch and
+    `ExecuteIndirect` while a plane is in that state counts as writing the twins: the replay does not see which views a
+    shader reads, as descriptors are found through the hash table. The depth texture is brought up to date (a copy of
+    the twins into it, if they were written since) when a barrier moves a plane out of unordered access, and before a
+    draw binds it as the depth target, a depth-stencil clear, and a copy or resolve from or into it; a draw counts as
+    writing its depth target, as do clears and copy destinations.
+  - Copies: the whole texture, every mip and slice of each plane with a twin, the images left in the layouts they had.
+    With `VK_KHR_maintenance8` (enabled when present), `vkCmdCopyImage` between the depth or stencil aspect and the
+    colour twin; without it, or with `LEONIDA_DEPTH_TWIN_COPY=buffer`, through a staging buffer of the depth plane's size
+    that the texture owns (a buffer copy into the depth and stencil aspects is allowed everywhere). Counted in
+    `leonida::depth_twin_counts()`, which the device prints at release next to the arena line.
+  - Left out from VIctory: the pass that draws an R32 twin into a 24-bit depth plane (its `pass_plane`), its prelude
+    that copies at submission what a list found behind (not needed when the state is followed in submission order),
+    and its tracking by the views a draw's tables name (shortcut above: any shader work in the unordered stretch).
+  - `d3d12_depth_twin_test` (and `d3d12_depth_twin_buffer`, the buffer path): a 64x64 `R32G8X24_TYPELESS` texture made
+    through slot 76 (the PC method refuses it), its UAV T#s `8_UINT` and `32_FLOAT`, a compute shader writing part of
+    each plane through them across two lists, and copies of both planes matching the shader's texels and the clears
+    around them, two rounds, with validation clean (RTX 4060 Ti, 616.64).
 - `CreateHeap`: reserve a VA range with the requested size/alignment. `CreatePlacedResource`: assign the resource
   the range at `heap_va + offset`; a buffer uses that range in the arena, an image uses the offset as a key and
   binds its own memory. Vulkan image alignment can exceed D3D12's 64 KiB; because images do not share the arena,

@@ -3046,6 +3046,27 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Depth textures that also allow unordered access (console only): their UAVs are colour twins, kept in step
+      # with the depth texture where the title switches between the two. A compute shader writes the stencil and
+      # depth planes through their UAVs and copies read them back; the second run copies through a buffer instead of
+      # vkCmdCopyImage between depth and colour images (VK_KHR_maintenance8).
+      set(LEONIDA_TEST_CS_DEPTH_TWIN ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_depth_twin.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_DEPTH_TWIN}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_DEPTH_TWIN}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_depth_twin.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_depth_twin.comp
+        COMMENT "Compiling cs_depth_twin.comp"
+        VERBATIM)
+      add_executable(d3d12_depth_twin_test test/d3d12_depth_twin_test.cpp ${LEONIDA_TEST_CS_DEPTH_TWIN})
+      target_link_libraries(d3d12_depth_twin_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_depth_twin_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_DEPTH_TWIN_SPV="${LEONIDA_TEST_CS_DEPTH_TWIN}")
+      target_compile_options(d3d12_depth_twin_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_depth_twin COMMAND d3d12_depth_twin_test)
+      add_test(NAME d3d12_depth_twin_buffer COMMAND d3d12_depth_twin_test)
+      set_tests_properties(d3d12_depth_twin d3d12_depth_twin_buffer PROPERTIES SKIP_RETURN_CODE 77)
+      set_tests_properties(d3d12_depth_twin_buffer PROPERTIES ENVIRONMENT "LEONIDA_DEPTH_TWIN_COPY=buffer")
       # Bindless table churn on a direct and a compute queue: the table grows and live keys move without a
       # device-idle wait (D3D-314); the same shader, run twice (deferred retirement, and the old wait for timing).
       add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp
