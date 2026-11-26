@@ -2,7 +2,7 @@
 
 Leonida's runtime is DexNom's community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. This is our most complete tested build so far and the source for the FSR Quality 4K baseline. Game files, executables, saves and generated shader caches stay on your own computer.
 
-AMD Radeon is the primary target and the best-tested GPU path for this build. NVIDIA users can try the launcher with `--no-rt` and the game's display path. The NVIDIA configuration is untested. The current performance priorities are reducing VRAM use and improving FPS and frame-time stability.
+AMD Radeon is the primary target and the best-tested GPU path for this build. See [Experimental NVIDIA](#experimental-nvidia) for the untested NVIDIA launch options. The current performance priorities are reducing VRAM use and improving FPS and frame-time stability.
 
 The Radeon FSR Quality 4K build is our most stable tested baseline for shaders and texture streaming. See [Things to Be Done](#things-to-be-done) for open work and how to measure a contribution.
 
@@ -50,6 +50,22 @@ For a manual launch, use the same flags as the Quality shortcut.
 The **Leonida (Experimental RT)** shortcut enables ray tracing with the game's display path. The shortcuts share your local saves.
 
 Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XTX. The game builds and traverses its acceleration structures through translated Direct3D 12 compute shaders. Frame times can still reach several seconds. Interior lighting, shadows and performance vary by scene. [Ray-tracing implementation](docs/fork-ray-tracing.md) · [City testing](BENCHMARK.md)
+
+## Experimental NVIDIA
+
+NVIDIA gameplay is untested. Start with ray tracing off and the game's display path. Replace `--rt` with `--no-rt` and leave out `--fsr-quality`, `--fsr-balanced`, and `--fsr-performance`. After setup, run the following in PowerShell.
+
+```powershell
+$env:VICTORY_FSR_4K = '0'
+$env:VICTORY_AMBIENT_FALLBACK = '1'
+& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --no-rt --console series-x
+```
+
+`--no-rt` skips the ray-tracing builder, traversal, and lighting resolve. Supported material shaders use a lightweight diffuse ambient fill based on their base color. Some interiors can still look darker. [RT pass selection](crates/victory-gpu/src/pipeline/ray_tracing.rs) · [Ambient fill](crates/victory-shader/src/emit/mod.rs)
+
+For a separate partial RT experiment, replace `--no-rt` with `--rt-static-bvh` and keep the FSR preset off. This skips rebuilding the acceleration structure for dynamic geometry and still traces rays through the prebuilt world structure. Ray traversal and lighting resolve can still be expensive, and moving objects may have incomplete shadows or reflections. Baked lighting or a probe-based indirect-light fallback is future work. [Static BVH mode](crates/victory-gpu/src/pipeline/ray_tracing.rs)
+
+Keep the scene and resolution the same when comparing the two modes. Include the GPU actually used, its driver, frame times, and any lighting issues. The file `logs\latest.txt` points to the run log, which records the requested ray-tracing mode.
 
 ## Things to Be Done
 
