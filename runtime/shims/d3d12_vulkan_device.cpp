@@ -94,11 +94,33 @@ constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIG
 
 std::atomic<int> g_global_realtime_privilege_override{-1};
 
+// The last refusal logged on this thread (log_once, invalid_description), so a PSO creation that fails can say why
+// although its log line was printed once already. Plain data: no thread_local with a destructor in gta6rt.exe.
+thread_local char t_last_refusal[192] = {};
+
+void note_refusal(const char* what, int value) {
+    std::snprintf(t_last_refusal, sizeof(t_last_refusal), "%s %d", what ? what : "", value);
+}
+
 void log_once(const char* what, int value) {
+    note_refusal(what, value);
     static std::mutex mutex;
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// Stream PSOs refused, counted by the reason last noted on the thread: printed at the first of each reason and at
+// every power of two, so a burst of thousands of refusals shows what it is made of.
+void count_refused_pipeline(HRESULT hr) {
+    static std::mutex mutex;
+    static std::map<std::string, unsigned> counts;
+    const std::string why = t_last_refusal[0] ? t_last_refusal : "no reason noted";
+    std::lock_guard lock(mutex);
+    const unsigned n = ++counts[why];
+    if ((n & (n - 1)) == 0)
+        std::fprintf(stderr, "[rt] d3d12: stream PSOs refused (0x%08lx), %u so far: %s\n",
+                     static_cast<unsigned long>(hr), n, why.c_str());
 }
 
 // The console's 16-bit depth with 8-bit stencil, 118 (D16_UNORM_S8_UINT) and its plane views 119 (R16_UNORM_X8)
@@ -3850,6 +3872,7 @@ struct PipelineStream {
 // E_INVALIDARG for a PSO description, with the check that refused it logged once: the title's own descriptions come
 // through device slots 62 and 86, and a refusal that says nothing cannot be told apart from another.
 HRESULT invalid_description(const char* why) {
+    note_refusal(why, 0);
     static std::mutex mutex;
     static std::set<std::string> seen;
     std::lock_guard lock(mutex);
@@ -4361,6 +4384,7 @@ public:
                 return !vertex || layout_feeds(e, desc.InputLayout);
             });
             if (!stage.entry) {
+                note_refusal((std::string("no translated shader for stage ") + stage.name).c_str(), 0);
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
@@ -7411,12 +7435,17 @@ public:
         *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
-        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        t_last_refusal[0] = 0;
+        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) {
+            count_refused_pipeline(hr);
+            return d3d12_trace::result(method, hr);
+        }
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as, stream.depth_bounds);
         if (FAILED(hr)) {
+            count_refused_pipeline(hr);
             pipeline->Release();
             return d3d12_trace::result(method, hr);
         }
