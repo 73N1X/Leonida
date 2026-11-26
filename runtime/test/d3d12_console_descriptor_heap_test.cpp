@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -65,7 +66,9 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    // As the title asks for its device: ID3D12Device11 selects the console slot layouts (d3d12_xs_slots.h), whose
+    // slot 14 takes the console-extended heap description; a plain ID3D12Device keeps the PC layout.
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device11), &proxy_raw)) || !proxy_raw) {
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
