@@ -328,7 +328,8 @@ no build translated, are captured at run time and translated by the shaders stag
 
 1. GPU device loss: sparse title memory (`port/sparse-title-memory`).
 2. Translate the captured FSPX programs (a title run, then the shaders stage).
-3. Tessellation PSOs (hull and domain stages) are refused: over 8,192 slot-86 streams.
+3. The 8,192+ slot-86 stream PSOs refused before the depth-bounds fix: recount by reason (`79df04da4`). Not
+   tessellation: the corpus has no hull, domain or amplification shaders (tools/feature_scan.py, question 10).
 4. A8_UNORM render targets (null RTVs now): VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5), which both GPUs here have.
 5. Depth textures with unordered access: VIctory's colour twin (victory-gpu descriptor/host.rs).
 6. Frame time toward 30 fps; frame-counted systems.
