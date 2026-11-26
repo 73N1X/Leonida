@@ -12581,6 +12581,10 @@ class Gen:
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
                       else list(base["r"]) if base["k"] == "slist" else None)
+        # A 64-bit address held in the vcc pair as data (`s_mov_b64 vcc, s[..]` then `s_load_dwordx4 s[..], vcc, ..`:
+        # 79 of the title's captured compute programs and 8 console stages were refused on it).
+        if base["k"] == "special" and base.get("t") == "vcc":
+            base_slots = ["vcc_lo", "vcc_hi"]
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
