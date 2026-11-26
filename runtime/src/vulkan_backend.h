@@ -1253,6 +1253,21 @@ public:
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
     void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
 
+    // The buffer whose VA range holds `va`, as buffer_at finds it (one that holds all `bytes` first): its ID, where
+    // `va` lies in it, and in `bytes` how many of the bytes asked for it holds from there. False when none holds `va`.
+    // For the console list methods that name title memory by address (CopyMemoryToMemoryX, Write32/64).
+    bool resource_at(std::uint64_t va, std::uint64_t& bytes, ResourceId& id, std::uint64_t& offset) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit, bytes)) return false;
+        const ResourceBinding* b = resolve(hit.id);
+        if (!b || va - b->va >= b->size) return false;
+        id = hit.id;
+        offset = va - b->va;
+        bytes = std::min<std::uint64_t>(bytes, b->size - offset);
+        return true;
+    }
+
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
     void set_heap_base(std::uint64_t heap_base) {

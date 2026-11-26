@@ -34,6 +34,9 @@
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/d3d12_com.h"  // title memory (rt::d3d12::title_memory_visible)
+#endif
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
@@ -167,6 +170,13 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+#ifdef LEONIDA_VULKAN_DEVICE
+    // The title's GPU memory, as xmem sees it, goes to the Vulkan layer's title memory (src/title_memory.h).
+    static const rt::xmem::GraphicsListener title_memory{
+        [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
+        [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); }};
+    rt::xmem::set_graphics_listener(&title_memory);
+#endif
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");

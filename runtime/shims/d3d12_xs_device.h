@@ -121,6 +121,49 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
 
+// Console device slots 70 and 71 (V device.rs:443-444, descriptor.rs:795-818): views of memory the title placed itself,
+// `(resource desc, view desc, handle)`, with no result (V's methods return nothing; the proxy answers 0). The device
+// behind the proxy writes the view through this handler, which the Vulkan layer registers
+// (rt::d3d12::create_placed_view). With none registered the slots stay refused as before.
+using PlacedViewHandler = void (*)(ID3D12Device* real, bool uav, const void* resource_desc, const void* view_desc,
+                                   std::uint64_t handle);
+void set_placed_view_handler(PlacedViewHandler handler);
+
+// Console list methods that work on title addresses (V list.rs:1294-1314, 1409-1431, 1891-1983), done by the device
+// behind the list's device proxy, which registers them (the Vulkan layer). `real` is the PC list, `device` the PC
+// device. With no handler a slot records nothing and answers 0, as before.
+struct ListTitleHandlers {
+    // Slot 62, CopyMemoryToMemoryX(dst, src, size, flags): a GPU copy between title addresses. False: not recorded.
+    bool (*copy_memory)(ID3D12Device* device, ID3D12GraphicsCommandList* real, std::uint64_t dst, std::uint64_t src,
+                        std::uint64_t size);
+    // Slots 71/72, Write32/Write64(address, value, flush, flags): `bytes` (4 or 8) of `value` at the address once the
+    // list's earlier work has finished; flags 1 and 2 (64-bit form) ask for the GPU and the system timestamp instead.
+    bool (*write_value)(ID3D12Device* device, ID3D12GraphicsCommandList* real, std::uint64_t address,
+                        std::uint64_t value, unsigned bytes, std::uint32_t flags);
+    // Slot 148, AllocateUploadMemory(size, alignment): memory the list owns until it is reset, at an address the CPU
+    // writes and the GPU reads alike; null on failure. `owner` names the list.
+    void* (*allocate_upload)(ID3D12Device* device, const void* owner, std::uint64_t size, std::uint64_t alignment);
+    // The list `owner` was reset or released: its upload memory goes back once the GPU has finished with it.
+    void (*release_uploads)(ID3D12Device* device, const void* owner);
+};
+void set_list_title_handlers(const ListTitleHandlers* handlers);
+
+// The value waits (slots 73/74) a console list recorded since it was last reset, for the queue's ExecuteX: each is
+// (address, comparison, reference, 64-bit). Tests read them through this.
+struct ValueWait {
+    std::uint64_t address;
+    std::uint32_t comparison;
+    std::uint64_t reference;
+    bool wide;
+    // Whether `value` (the 32 or 64 bits at the address) meets the wait: the comparison codes are the D3D12 comparison
+    // functions' (1 never .. 8 always, the value against the reference), as V list.rs:1844-1857 takes them; a code
+    // not known counts as met.
+    bool met_by(std::uint64_t value) const;
+};
+std::size_t command_list_value_waits(const void* list, ValueWait* out, std::size_t capacity);
+// Submissions that went to the GPU with a value wait not met yet (they are not held: queue slot ExecuteX runs them).
+std::uint64_t unmet_value_wait_submissions();
+
 // True for slots the proxy handles itself rather than forwarding verbatim in the PC layout: IUnknown (0-2), 8 and 75
 // (queue proxies), 9 (allocator proxies), 12 (lists), 14, 25/26 (struct returns), 31/34/35/45/46/50 (proxies
 // unwrapped), 32 and 36 (fence proxies), the Xbox routes 48/73/78-81 at their configured indices, 62, 67, 76, 108,

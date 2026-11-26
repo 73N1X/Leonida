@@ -48,7 +48,7 @@ Boot, in order:
 | 4 | Queue 35 ExecuteX, 34 Signal2X, 32 PresentX (`queue.rs:597-610,757-841`) | 35 → PC 10, 34 → PC 14; 32 → `set_present_handler`, else S_OK with nothing shown. `XboxPresentation` is not attached: gta6rt has no window yet, and its FramePacer hands out its own tokens and models only the origin event |
 | 5 | Device 78-81 frame clock (`frame.rs:1-130`) | VIctory's clock per device (S_FALSE time-outs, token on time-out, flips on consecutive ticks) |
 | 6 | Lists from device slot 12 get the console layout (`list.rs:566`) | console list proxies (also as the console's List5/List6 IIDs); device 25/26/108 take the return buffer first; device 48 takes the console queue description |
-| 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | 139 → PC Reset, 80 → Dispatch, 86 → CopyResource; 71-74, 62 and 148 still return 0 (no Vulkan-layer implementation for title addresses) |
+| 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | 139 → PC Reset, 80 → Dispatch, 86 → CopyResource; on title memory (`L\src\title_memory.h`): 62 → copies between the imports, 71/72 → WriteBufferImmediate (MARKER_OUT; timestamps are the CPU clock at recording), 100 → DispatchMesh(x, 1, 1) (indirect dropped, as V does), 148 → the device's imported upload blocks, given back at reset; 73/74 recorded and waited for at ExecuteX up to `LEONIDA_VALUE_WAIT_MS` (100), not held as V holds them |
 | 8 | Queries at slots 28-30 (`list.rs:2114-2117,1330-1345`) | → PC 52-54; 59 is the console marker (ignored); 27, 31, 56-58 and 60 are named by no source and refused |
 | 9 | ~60,000 PSOs in the first 20 s; device 86 CreatePipelineState with streams (`pipeline.rs:6-11`) | every PSO compiled at creation (`d3d12_vulkan_device.cpp:3948,4061`), slot 86 E_NOTIMPL; the title's 30 s watchdog fires |
 
@@ -77,7 +77,13 @@ argument clamps (`indirect.rs`); GPU memory placement between 4 GiB and 2^40
 4. Title memory: a GPU address is the title's CPU address. Import xmem graphics
    memory with `VK_EXT_external_memory_host` (Leonida's `create_host_buffer`,
    `d3d12_vulkan_device.cpp:1974-2075`) as the default; keep copies only for
-   memory that cannot be imported. Port xmem's address placement.
+   memory that cannot be imported. Port xmem's address placement. Done on
+   capture-replay devices (`L\src\title_memory.h` has the measurements: heap
+   base 512 GiB, imports at heap base + address, sparse buffers holding the
+   windows' device addresses, imports merged per 2 MiB block); no copy
+   fallback yet: memory that cannot be imported (a GPU without
+   `bufferDeviceAddressCaptureReplay`, the AMD iGPU here) is logged, and
+   shaders do not reach it.
 5. Descriptors (sampler stride 16, CreateSamplerX, views over title memory,
    slot lifetimes), then textures (upload queue, partial residency, detiling via
    `L\src\resource_detile.h`), then indirect (clamps, mesh indirect, counts),
@@ -145,7 +151,11 @@ waited for, and 391 MB/frame of texture staging while streaming.
   4,096).
 - Buffer device addresses: a per-64 KiB page directory of device addresses (or
   one sparse 2^40 mirror buffer if imported memory can be sparse-bound) instead
-  of `heap_base + va`; removes VIctory's 1,023-slot directory limit.
+  of `heap_base + va`; removes VIctory's 1,023-slot directory limit. Measured
+  on the RTX 4060 Ti (616.64): imported memory cannot be sparse-bound (a sparse
+  buffer takes memory type 1 only, host pointers import as types 2 and 3), and
+  a 1 TiB sparse buffer is refused; but capture-replay device addresses keep
+  `heap_base + va` as it is (`L\src\title_memory.h`).
 - Resizable BAR (on, on the test machine): hot read-mostly buffers written
   straight into VRAM.
 - Asynchronous submission on timeline semaphores once copy-back is gone; real

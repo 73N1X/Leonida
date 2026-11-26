@@ -110,6 +110,25 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   after device slot 70 (a placed SRV over title memory) returned E_NOTIMPL.
   Next: the title-memory model and the slots that need it (device 70/71, list
   62, 71-74, 100, 148).
+- Title memory (`port/title-memory`, `runtime\src\title_memory.h`): a GPU
+  address is the title's CPU address. On the RTX 4060 Ti the driver takes
+  capture-replay device addresses for imported host memory, so the arena sits
+  at heap_base = 512 GiB and every xmem graphics range (now placed in [1, 4)
+  GiB for 32-bit memory and [64, 448) GiB otherwise, write-combining dropped as
+  VIctory does) is imported at heap_base + its address when committed or
+  mapped, and released before the title frees, decommits or remaps it. A
+  shader reaches title memory through a V# at a title address in a descriptor
+  heap in title memory (`d3d12_title_memory_test`). The retail boot imports
+  all of it (4.5 GB of pools, the 32-bit windows, slot 133's 174 MB buffer)
+  without a refusal. Device slots 70/71 write V#s at title addresses and make
+  textures from title memory (one 2D level of SW_4KB_S or SW_64KB_D detiled;
+  other layouts start zeroed, logged); list slots 62, 71, 72, 100 and 148 are
+  done, 73/74 waits are checked at ExecuteX with a 100 ms limit, not held.
+  The title still stops at its breakpoint `game_scarlett_master.exe+0x247af2d`,
+  about 5 s in, right after its two back buffers: a pool check
+  (`budget - used + [0x1475E6FF0] <= 0x1FFFFF`, budget 0x5200000 or 0x4000000
+  by a console-model test at 0x140075140) that slot 70 does not reach; slot 25
+  answers 33,423,360 bytes for each 3840x2160 RGBA8 target.
 - The title renders to 3840x2160 because it is told it is on a 4K console
   display; reporting a smaller display mode is a large frame-time lever for
   later (VIctory has `VICTORY_DISPLAY_MODE`).

@@ -37,8 +37,138 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "xmem.h"
+#include "../src/title_memory.h"
 
 namespace {
+
+namespace tm = leonida::title_memory;
+
+// ---- GPU-visible memory (xmem.h, set_graphics_listener) ----------------------------------------------------------
+// The visible ranges, non-overlapping, by start; the graphics reservations (XMemVirtualAlloc reserve-only with graphics
+// attributes, which a later commit makes visible). One lock covers both and every listener call.
+std::recursive_mutex g_graphics_mutex;
+std::map<uintptr_t, size_t> g_visible;
+std::map<uintptr_t, size_t> g_graphics_reserved;
+const rt::xmem::GraphicsListener* g_listener = nullptr;
+
+// With g_graphics_mutex held: true when [start, start + size) overlaps a map entry.
+bool overlaps(const std::map<uintptr_t, size_t>& ranges, uintptr_t start, size_t size) {
+    auto it = ranges.upper_bound(start);
+    if (it != ranges.begin() && std::prev(it)->first + std::prev(it)->second > start) return true;
+    return it != ranges.end() && it->first < start + size;
+}
+
+// With g_graphics_mutex held: removes [start, start + size) from the map, keeping the parts of entries outside it.
+void cut(std::map<uintptr_t, size_t>& ranges, uintptr_t start, size_t size) {
+    const uintptr_t end = start + size;
+    auto it = ranges.upper_bound(start);
+    if (it != ranges.begin()) --it;
+    while (it != ranges.end() && it->first < end) {
+        const uintptr_t a = it->first, b = it->first + it->second;
+        if (b <= start) {
+            ++it;
+            continue;
+        }
+        it = ranges.erase(it);
+        if (a < start) ranges.emplace(a, start - a);
+        if (b > end) ranges.emplace(end, b - end);
+    }
+}
+
+// `always`: tell the listener even when no visible range overlaps (the title's VirtualFree: the D3D12 layer may have
+// imported memory xmem did not report, on demand for a view of it).
+void make_gone(uintptr_t start, size_t size, bool always = false) {
+    if (!size) return;
+    const std::lock_guard lock(g_graphics_mutex);
+    const bool visible = overlaps(g_visible, start, size);
+    if (!visible && !always) return;
+    if (visible) cut(g_visible, start, size);
+    if (g_listener && g_listener->gone) g_listener->gone(start, size);
+}
+
+// The range is GPU memory from now on. A part that is already visible is not announced twice.
+void make_visible(uintptr_t start, size_t size) {
+    if (!size) return;
+    const std::lock_guard lock(g_graphics_mutex);
+    if (overlaps(g_visible, start, size)) {
+        // Announce only the gaps: the parts no visible range holds yet.
+        uintptr_t at = start;
+        const uintptr_t end = start + size;
+        auto it = g_visible.upper_bound(start);
+        if (it != g_visible.begin() && std::prev(it)->first + std::prev(it)->second > start) --it;
+        std::vector<std::pair<uintptr_t, size_t>> gaps;
+        for (; it != g_visible.end() && it->first < end; ++it) {
+            if (it->first > at) gaps.emplace_back(at, it->first - at);
+            at = (std::max)(at, it->first + it->second);
+        }
+        if (at < end) gaps.emplace_back(at, end - at);
+        for (const auto& [a, n] : gaps) {
+            g_visible.emplace(a, n);
+            if (g_listener && g_listener->visible) g_listener->visible(a, n);
+        }
+        return;
+    }
+    g_visible.emplace(start, size);
+    if (g_listener && g_listener->visible) g_listener->visible(start, size);
+}
+
+// The committed run of [start, start + size): what a commit of it left committed (all of it, normally).
+void make_committed_visible(uintptr_t start, size_t size) {
+    uintptr_t at = start;
+    const uintptr_t end = start + size;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) return;
+        const uintptr_t region_end = (std::min)(end, reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize);
+        if (info.State == MEM_COMMIT) make_visible(at, region_end - at);
+        at = region_end;
+    }
+}
+
+bool in_graphics_reservation(uintptr_t start, size_t size) {
+    const std::lock_guard lock(g_graphics_mutex);
+    return overlaps(g_graphics_reserved, start, size);
+}
+
+// The first XMemVirtualAlloc calls on stderr, with what came back: the title's pattern of reservations and commits
+// is what the D3D12 layer's imports follow.
+void note_virtual_alloc(void* address, SIZE_T size, DWORD type, uint64_t attributes, DWORD protect, void* result) {
+    static std::atomic<unsigned> count{0};
+    const unsigned n = count.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 48) return;
+    std::fprintf(stderr,
+                 "[rt] xmem: XMemVirtualAlloc(%p, 0x%llx, type 0x%lx, attributes 0x%llx, protect 0x%lx) -> %p\n",
+                 address, static_cast<unsigned long long>(size), static_cast<unsigned long>(type),
+                 static_cast<unsigned long long>(attributes), static_cast<unsigned long>(protect), result);
+}
+
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+
+// VirtualAlloc2 at an address of the host's choice inside `range` (title_memory.h's placement), with `alignment`
+// when it is larger than the allocation granularity. Null when the window has no room; the caller then asks without
+// the range, which is logged once.
+PVOID allocate_in(const tm::Range& range, SIZE_T size, ULONG type, ULONG protect, SIZE_T alignment) {
+    static const auto va2 = reinterpret_cast<VirtualAlloc2Fn>(
+        GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+    if (!va2) return nullptr;
+    MEM_ADDRESS_REQUIREMENTS requirements{};
+    requirements.LowestStartingAddress = reinterpret_cast<void*>(static_cast<uintptr_t>(range.first));
+    requirements.HighestEndingAddress = reinterpret_cast<void*>(static_cast<uintptr_t>(range.last));
+    requirements.Alignment = alignment > 0x10000 ? alignment : 0;
+    MEM_EXTENDED_PARAMETER parameter{};
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &requirements;
+    return va2(GetCurrentProcess(), nullptr, size, type, protect, &parameter, 1);
+}
+
+void note_unplaced(SIZE_T size, uint64_t attributes) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] xmem: no room for 0x%llx bytes (attributes 0x%llx) in the GPU address window; placed by the "
+                     "host instead, where the GPU cannot reach it at its address (logged once)\n",
+                     static_cast<unsigned long long>(size), static_cast<unsigned long long>(attributes));
+}
 
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
@@ -216,11 +346,16 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 
 // The console's PAGE_GRAPHICS_* protection bits (winnt.h: PAGE_GRAPHICS_NOACCESS 0x800 .. PAGE_GRAPHICS_NOCACHE
 // 0x40000). The host refuses them with ERROR_INVALID_PARAMETER, and the D3D12 layer reads guest memory through the
-// CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004.
+// CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004. Write-combining
+// and uncached (PAGE_WRITECOMBINE 0x400, PAGE_NOCACHE 0x200) are dropped too, as VIctory drops them (V xmem.rs:60-64,
+// HOST_PROTECTION = 0x1ff): the GPU reaches this memory through imports of the CPU's pages (src/title_memory.h), and a
+// write-combined page is not imported (an import of one read wrong bytes on an RTX 5090: d3d12_vulkan_device.cpp,
+// create_host_buffer).
 constexpr DWORD kPageGraphicsMask = 0x0007F800;
+constexpr DWORD kHostProtection = 0x1ff;
 
 DWORD host_protect(DWORD p) {
-    const DWORD cpu = p & ~kPageGraphicsMask;
+    const DWORD cpu = p & ~kPageGraphicsMask & kHostProtection;
     return cpu ? cpu : PAGE_NOACCESS;
 }
 
@@ -326,12 +461,17 @@ bool isolate_placeholder(void* address, SIZE_T size) {
     return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
 }
 
-PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
+// `range`, for a reservation at an address of the host's choice: where it must lie (title_memory.h's placement).
+PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment, const tm::Range* range = nullptr) {
     MEM_ADDRESS_REQUIREMENTS requirements{};
     MEM_EXTENDED_PARAMETER parameter{};
     ULONG parameter_count = 0;
-    if (!address && alignment > kXmemPageSize64k) {
-        requirements.Alignment = alignment;
+    if (!address && (alignment > kXmemPageSize64k || range)) {
+        if (alignment > kXmemPageSize64k) requirements.Alignment = alignment;
+        if (range) {
+            requirements.LowestStartingAddress = reinterpret_cast<void*>(static_cast<uintptr_t>(range->first));
+            requirements.HighestEndingAddress = reinterpret_cast<void*>(static_cast<uintptr_t>(range->last));
+        }
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
         parameter_count = 1;
@@ -347,8 +487,13 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+//
+// Placement (VIctory xmem.rs:73-88, decision 0001 there): an allocation at an address of the host's choice lies where the
+// title's GPU memory has to, as src/title_memory.h's placement gives it from the attribute word: the 32-bit window
+// below 4 GiB for 32-bit memory (attribute bit 2: the shaders truncate descriptor-table pointers to 32 bits), else
+// [4 GiB, 512 GiB), so that the D3D12 layer can give it the device address heap_base + its CPU address. A window
+// with no room left falls back to the host's choice, logged once.
+void* virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -432,8 +577,13 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
                                                 nullptr, 0);
     }
+    const tm::Range range = tm::placement(attributes);
     if (new_placeholder || window) {
-        void* const result = reserve_placeholder(address, size, base_granularity);
+        void* result = reserve_placeholder(address, size, base_granularity, address ? nullptr : &range);
+        if (!result && !address) {
+            note_unplaced(size, attributes);
+            result = reserve_placeholder(address, size, base_granularity);
+        }
         if (result && window) {
             const std::lock_guard lock(g_phys_mutex);
             record_window(result, size, host_prot);
@@ -441,6 +591,9 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return result;
     }
     if (page_mode == kXmemLargePages && address == nullptr) {
+        if (void* const placed = allocate_in(range, size, host_type | MEM_RESERVE, host_prot, kXmemPageSize2m))
+            return placed;
+        note_unplaced(size, attributes);
         MEM_ADDRESS_REQUIREMENTS requirements{};
         requirements.Alignment = kXmemPageSize2m;
         MEM_EXTENDED_PARAMETER parameter{};
@@ -449,7 +602,34 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
                                                 &parameter, 1);
     }
+    if (address == nullptr) {
+        if (void* const placed = allocate_in(range, size, host_type | MEM_RESERVE, host_prot, base_granularity))
+            return placed;
+        note_unplaced(size, attributes);
+    }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+
+// What virtual_alloc made GPU-visible (xmem.h, set_graphics_listener): a commit of graphics memory, or any commit
+// inside a graphics reservation; a reserve-only allocation with graphics attributes is remembered for the commits
+// that follow. 64 KiB-page windows become visible as pages are mapped into them (XMemMapPhysicalPages).
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    void* const result = virtual_alloc(address, size, allocation_type, attributes, protect);
+    note_virtual_alloc(address, size, allocation_type, attributes, protect, result);
+    if (!result) return result;
+    const DWORD host_type = (allocation_type & kXmemHostAllocationTypeMask) ? allocation_type & kXmemHostAllocationTypeMask
+                                                                            : MEM_RESERVE | MEM_COMMIT;
+    const auto start = reinterpret_cast<uintptr_t>(result);
+    const bool graphics = tm::graphics_attributes(attributes);
+    if ((host_type & MEM_COMMIT) && !(host_type & MEM_RESERVE_PLACEHOLDER)) {
+        if (graphics || in_graphics_reservation(start, size)) make_committed_visible(start, size);
+    } else if (graphics && (host_type & MEM_RESERVE) && !(allocation_type & kXmemPageModeMask)) {
+        const std::lock_guard lock(g_graphics_mutex);
+        cut(g_graphics_reserved, start, size);
+        g_graphics_reserved.emplace(start, size);
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
@@ -655,6 +835,52 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
     return TRUE;
 }
 
+// With g_phys_mutex held: newly mapped pages, gathered into runs of consecutive addresses, each committed (a mapped
+// page is otherwise committed on its first touch, and an import needs committed pages) and made GPU-visible as one
+// range, when a listener (the D3D12 layer) is there to import them. flush() ends the current run; the destructor
+// flushes too.
+class PageRuns {
+public:
+    PageRuns() = default;
+    PageRuns(const PageRuns&) = delete;
+    PageRuns& operator=(const PageRuns&) = delete;
+    ~PageRuns() { flush(); }
+    void add(uintptr_t page) {
+        if (size_ && page == start_ + size_) {
+            size_ += kPhysicalPageSize;
+            return;
+        }
+        flush();
+        start_ = page;
+        size_ = kPhysicalPageSize;
+    }
+    void flush() {
+        if (!size_) return;
+        {
+            // Nobody imports them (no D3D12 layer listens): the pages keep being committed on first touch.
+            const std::lock_guard lock(g_graphics_mutex);
+            if (!g_listener) {
+                size_ = 0;
+                return;
+            }
+        }
+        bool committed = true;
+        {
+            const FaultLockShared lock;
+            for (uintptr_t at = start_; at < start_ + size_; at += kPhysicalPageSize) {
+                DWORD protect = 0;
+                if (commit_mapped_page(at, at, protect) == PageCommit::failed) committed = false;
+            }
+        }
+        if (committed) make_visible(start_, size_);
+        size_ = 0;
+    }
+
+private:
+    uintptr_t start_ = 0;
+    size_t size_ = 0;
+};
+
 // PVOID XMemMapPhysicalPages(PVOID address, UINT64 pageCount, UINT64* pageArray). Measured at twelve call sites: RCX
 // is an address in a window XMemVirtualAlloc reserved, RDX a 64-bit count, R8 the pages to map there one after another,
 // or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
@@ -674,6 +900,8 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const std::lock_guard lock(g_phys_mutex);
+    // The pages there leave the GPU before they change (xmem.h, set_graphics_listener).
+    make_gone(start, static_cast<size_t>(page_count * kPhysicalPageSize));
     if (!page_array) {
         for (uint64_t i = 0; i < page_count; ++i) {
             if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
@@ -686,9 +914,16 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const DWORD protect = view_protect(*window);
+    PageRuns runs;
     for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+        const uintptr_t at = start + i * kPhysicalPageSize;
+        if (!map_page(at, page_array[i], protect)) {
+            runs.flush();
+            return nullptr;
+        }
+        if (page_array[i]) runs.add(at);
     }
+    runs.flush();
     return address;
 }
 
@@ -706,6 +941,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
         return FALSE;
     }
     const std::lock_guard lock(g_phys_mutex);
+    PageRuns runs;  // made visible when it goes out of scope, failure or not
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
         if (!aligned_page_address(address)) {
@@ -713,6 +949,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return FALSE;
         }
         const uint64_t page = page_array ? page_array[i] : 0;
+        make_gone(address, kPhysicalPageSize);
         if (page == 0) {
             if (!unmap_page(address)) return FALSE;
             continue;
@@ -723,6 +960,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return FALSE;
         }
         if (!map_page(address, page, view_protect(*window))) return FALSE;
+        runs.add(address);
     }
     return TRUE;
 }
@@ -787,18 +1025,83 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
 // 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
 // NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
-// the rest is passed through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). Not done: whether
-// graphics memory has to come from an arena the D3D12 layer can see (#313).
+// the rest is passed through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). MEM_GRAPHICS memory at
+// an address of the host's choice is placed like XMemVirtualAlloc's graphics memory (title_memory.h), and becomes
+// GPU-visible when committed, as does a commit inside an XMemVirtualAlloc graphics reservation.
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    const DWORD type = allocation_type & ~(kMemGraphics | kMemTitle);
+    const DWORD host_prot = host_protect(protect);
+    const bool graphics = (allocation_type & kMemGraphics) != 0;
+    void* result = nullptr;
+    if (graphics && !address && size) {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        result = allocate_in(tm::placement(3), size, type | MEM_RESERVE, host_prot, info.dwAllocationGranularity);
+        if (!result) note_unplaced(size, 3);
+    }
+    if (!result) result = VirtualAlloc(address, size, type, host_prot);
+    if (result && (type & MEM_COMMIT)) {
+        const auto start = reinterpret_cast<uintptr_t>(result);
+        if (graphics || in_graphics_reservation(start, size)) make_committed_visible(start, size);
+    }
+    return result;
+}
+
+// kernel32!VirtualFree as a title calls it: GPU-visible memory in the range leaves the GPU first (xmem.h), so the D3D12
+// layer can release its imports, which would otherwise keep the old pages on the GPU after the CPU has let them go.
+// MEM_RELEASE covers the whole allocation `address` starts; MEM_DECOMMIT [address, address + size), or the rest of
+// the allocation for a size of 0.
+BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
+    const auto start = reinterpret_cast<uintptr_t>(address);
+    MEMORY_BASIC_INFORMATION info{};
+    if (address && VirtualQuery(address, &info, sizeof(info))) {
+        uintptr_t end = start;
+        if ((free_type & MEM_RELEASE) || !size) {
+            // The allocation's regions from `address` on.
+            uintptr_t at = start;
+            MEMORY_BASIC_INFORMATION region{};
+            while (VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region)) &&
+                   region.AllocationBase == info.AllocationBase && region.State != MEM_FREE) {
+                at = reinterpret_cast<uintptr_t>(region.BaseAddress) + region.RegionSize;
+            }
+            end = at;
+            if ((free_type & MEM_RELEASE) && size) end = (std::min)(end, start + size);
+        } else {
+            end = start + size;
+        }
+        if (end > start) {
+            const uintptr_t first = start & ~static_cast<uintptr_t>(0xfff);
+            make_gone(first, static_cast<size_t>(end - first), true);
+            if (free_type & MEM_RELEASE) {
+                const std::lock_guard lock(g_graphics_mutex);
+                cut(g_graphics_reserved, first, static_cast<size_t>(end - first));
+            }
+        }
+    }
+    return VirtualFree(address, size, free_type);
 }
 
 }  // namespace
 
 namespace rt::xmem {
+
+void set_graphics_listener(const GraphicsListener* listener) {
+    const std::lock_guard lock(g_graphics_mutex);
+    g_listener = listener;
+    if (listener && listener->visible)
+        for (const auto& [start, size] : g_visible) listener->visible(start, size);
+}
+
+std::size_t graphics_visible_bytes(std::size_t* ranges) {
+    const std::lock_guard lock(g_graphics_mutex);
+    std::size_t bytes = 0;
+    for (const auto& [start, size] : g_visible) bytes += size;
+    if (ranges) *ranges = g_visible.size();
+    return bytes;
+}
 
 bool commit_physical_range(const void* address, size_t size) {
     if (size == 0) return true;
@@ -933,7 +1236,7 @@ bool physical_pages_known(const uint64_t* pages, size_t count, size_t offset, si
 
 }
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)},                                  {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,
