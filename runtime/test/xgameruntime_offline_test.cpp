@@ -293,22 +293,31 @@ int main() {
     check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
               at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
           "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
-    void* synth = reinterpret_cast<void*>(1);
-    check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
-          "XSpeechSynthesizerCreate fails offline and nulls the handle");
-    void* stream = reinterpret_cast<void*>(1);
-    size_t size = 5, got = 5;
-    check(at<SpeechClose>(acc, 10)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 11)(acc, nullptr) == E_INVALIDARG &&
-              at<SpeechClose>(acc, 12)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 14)(acc, nullptr) == E_INVALIDARG,
-          "close and set-voice calls on a null handle: E_INVALIDARG");
-    check(at<SpeechStream>(acc, 13)(acc, nullptr, "hi", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromText on a null synthesizer: E_INVALIDARG, no stream");
-    stream = reinterpret_cast<void*>(1);
-    check(at<SpeechStream>(acc, 21)(acc, nullptr, "<speak/>", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromSsml on a null synthesizer: E_INVALIDARG, no stream");
-    check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
-              at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
-          "stream size and data on a null stream: E_INVALIDARG, zero written");
+    // Silent speech, as VIctory's speech.rs test (streams_are_empty_wave_files): a synthesizer, a stream from text or
+    // SSML, and the stream is an empty 16 kHz mono 16-bit WAVE file.
+    void* synth = nullptr;
+    check(at<SpeechCreate>(acc, 9)(acc, &synth) == S_OK && synth != nullptr &&
+              at<SpeechCreate>(acc, 9)(acc, nullptr) == E_POINTER,
+          "XSpeechSynthesizerCreate hands out a synthesizer");
+    check(at<SpeechClose>(acc, 11)(acc, synth) == S_OK && at<SpeechClose>(acc, 12)(acc, synth) == S_OK,
+          "set-voice calls are accepted");
+    void* stream = nullptr;
+    check(at<SpeechStream>(acc, 13)(acc, synth, "Hello", &stream) == S_OK && stream != nullptr,
+          "CreateStreamFromText hands out a stream");
+    void* ssml = nullptr;
+    check(at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &ssml) == S_OK && ssml != nullptr,
+          "CreateStreamFromSsml hands out a stream");
+    size_t size = 0, got = 0;
+    check(at<StreamSize>(acc, 15)(acc, stream, &size) == S_OK && size == 44, "the stream is 44 bytes");
+    uint8_t wav[64] = {};
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof wav, wav, &got) == S_OK && got == 44 &&
+              std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVEfmt ", 8) == 0 &&
+              std::memcmp(wav + 36, "data", 4) == 0 && wav[24] == 0x80 && wav[25] == 0x3e && wav[40] == 0,
+          "a WAVE file of 16 kHz with an empty data chunk");
+    check(at<StreamData>(acc, 16)(acc, stream, 8, wav, &got) == static_cast<HRESULT>(0x8007007A),
+          "too small a buffer: E_NOT_SUFFICIENT_BUFFER");
+    check(at<SpeechClose>(acc, 14)(acc, stream) == S_OK && at<SpeechClose>(acc, 10)(acc, synth) == S_OK,
+          "closing the stream and the synthesizer");
     bool speech_to_text_fails = true;
     for (int slot : {6, 7, 17, 18, 19, 20}) speech_to_text_fails = speech_to_text_fails && FAILED(at<NoArgs>(acc, slot)(acc));
     check(speech_to_text_fails, "speech-to-text display calls fail offline");
