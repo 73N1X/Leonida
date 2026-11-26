@@ -11439,8 +11439,8 @@ public:
             const auto it = variants_.find(unbound);
             return it == variants_.end() ? VkPipeline(VK_NULL_HANDLE) : it->second;
         };
-        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes &&
-                          big_compiles() != BigCompiles::unlimited;
+        graphics_large_module_ = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
+        graphics_.large = graphics_large_module_ && big_compiles() != BigCompiles::unlimited;
         graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
@@ -11794,7 +11794,8 @@ private:
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline compile worker failed: %s\n", e.what());
                 }
-            }, !compute);  // a graphics build may also take the graphics worker
+            }, !compute,  // a graphics build may also take the graphics worker
+               compute ? big_compute(stage_bytes_) : graphics_large_module_);  // the pool's heavy count
         } catch (...) {
         }
         // Not queued (refused by a stop that came after the check above, or out of memory): no request stays
@@ -12211,6 +12212,9 @@ private:
     std::atomic<std::uint32_t> early_{0};             // request_early: the last mask asked for, plus one
     std::string profile_shaders_;  // populated only with compile tracing enabled
     std::size_t stage_bytes_ = 0;
+    // A graphics pipeline of PipelineCompiles::large_spirv_bytes or more, whatever LEONIDA_SERIAL_BIG_COMPILES says:
+    // the compile pool's heavy count (CompilePool) caps these and large compute builds alike.
+    bool graphics_large_module_ = false;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
