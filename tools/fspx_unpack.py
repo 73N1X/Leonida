@@ -191,7 +191,9 @@ def unpack_payload(payload: bytes, graphics: bool = False):
     if status:
         return None, status
     blob = {k: payload[o:o + s] for k, (o, s) in entries.items()}
-    start, end = code_range(blob[6], last=graphics)
+    # To the last s_endpgm for every program: the title's own compute programs end early on some paths too (13 of
+    # them branched past the first, "branch target outside code"); the DLL's 29 hold exactly one, so theirs is unchanged.
+    start, end = code_range(blob[6], last=True)
     meta = {
         "version": struct.unpack_from("<I", payload, 4)[0],
         "directory": {str(k): [o, s] for k, (o, s) in sorted(entries.items())},
