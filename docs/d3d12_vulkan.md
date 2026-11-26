@@ -2549,7 +2549,10 @@ Pipeline creation:
   queued on the compile workers as a warm-up at its recorded rank: after every demanded build, one warm-up at a time
   and none while a demanded build runs (`PipelineCompiler`; the compile-gate finding in "Compile workers" below is
   why), ahead of the compute warm-up's size order and before the cache checkpoint. A variant 0 built at create is
-  skipped. Records are taken in order until their recorded build times add up to
+  skipped. A console stream kept for its first bind (`LEONIDA_PIPELINE_COMPILE=on-demand`) is otherwise parsed only
+  there, which would leave the prewarm no lead: when its pipeline is in the plan, the parse is queued as its first
+  prewarm job instead (at the rank of its first recorded variant, on a compile worker), and its variants follow with
+  their ranks. A bind that comes first waits for that parse, which it would otherwise have done itself. Records are taken in order until their recorded build times add up to
   `LEONIDA_PIPELINE_PREWARM_BUDGET_MS` (default 300000; a record with no build time counts 1000 ms), and at most
   `LEONIDA_PIPELINE_PREWARM_MAX_ENTRIES` (default 4096). Compute records are left to the compute warm-up and to
   `gta6rt --precompile-pipelines`. A missing or unreadable file, a file with no readable record and a file from
