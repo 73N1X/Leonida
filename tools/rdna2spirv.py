@@ -17138,6 +17138,30 @@ VOP3_TWO_DESTS = frozenset({
 })
 
 
+def widen_wave64_masks(insns):
+    """A wave64 program's VALU lane-mask operands as SGPR pairs. The corpus listings come from llvm-mc in its gfx10
+    default, wave32, which prints a VOP3 SDST or mask source as one SGPR (v_cmp_lt_f32_e64 s4, ...,
+    v_cndmask_b32_e64 v1, 0, 1, s0) where a wave64 one reads or writes the pair s[4:5] (RDNA2 ISA: SDST / SSRC2 of
+    a lane mask are 64-bit in wave64, as VCC is; VCC itself prints as vcc_lo and is already the whole VCC here).
+    Taken as one SGPR, a compare's high word stayed what it was, so a later s_and_b64 vcc, exec, s[4:5] read stale
+    bits for lanes 32..63 (18,439 of the 23,841 wave64 corpus shaders read such a pair). Widened in place: the SDST
+    of v_cmp*_e64 / v_cmp_class*_e64, the carry or flag SDST of the VOP3b two-destination ops and the carry-in of
+    v_*_co_ci_u32_e64, the mask of v_cndmask_b32_e64."""
+    def pair(x):
+        if x.get("k") == "sgpr" and x.get("n", 1) == 1:
+            x["n"] = 2
+    for ins in insns:
+        op, a = base_op(ins["op"]), ins["args"]
+        if op.startswith("v_cmp") and not op.startswith("v_cmpx") and ins["op"].endswith("_e64") and len(a) == 3:
+            pair(a[0])
+        elif op in VOP3_TWO_DESTS and len(a) >= 4 and a[1].get("k") == "sgpr":
+            pair(a[1])
+            if op.endswith("_co_ci_u32") and len(a) == 5:
+                pair(a[4])
+        elif op == "v_cndmask_b32" and ins["op"].endswith("_e64") and len(a) == 4:
+            pair(a[3])
+
+
 def same_encoding(raw, printed, op, operand_count):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
     hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
@@ -17565,6 +17589,8 @@ def translate(path):
         g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    if g.wave64:
+        widen_wave64_masks(insns)
     if stage == "gs":
         ins_by_reg = {}
         for reg, mask, sv, ctype in input_signature(path, info["name"]):
