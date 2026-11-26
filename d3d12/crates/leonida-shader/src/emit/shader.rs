@@ -310,6 +310,11 @@ impl Shader {
         if let Some(g) = self.lds {
             return g;
         }
+        if self.lds_dwords > 8192 {
+            // Leonida: D3D12 takes at most 32 KiB of group-shared memory; more makes the host
+            // refuse the pipeline with E_INVALIDARG.
+            eprintln!("LDS-OVER-32K dwords={} threads={:?}", self.lds_dwords, self.threads);
+        }
         let arr = self.m.array(self.lds_dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);

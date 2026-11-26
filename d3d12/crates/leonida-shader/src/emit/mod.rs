@@ -608,10 +608,14 @@ pub fn emit(
                 }
             }
         }
-        // Leonida, last of all (`LEONIDA_WAVE_LDS_LOOSE=0`: not tried): LDS read and
-        // written inside one lane-branch region, the host waves meeting only around it
-        // (`lower::with_lds_loose`, approximate). Refused, every dispatch is dropped.
-        if !strict && std::env::var_os("LEONIDA_WAVE_LDS_LOOSE").is_none_or(|v| v != "0") {
+        // Leonida, last of all, only with `LEONIDA_WAVE_LDS_LOOSE=1`: LDS read and written
+        // inside one lane-branch region, the host waves meeting only around it
+        // (`lower::with_lds_loose`, approximate). Off by default: on, it also let the
+        // exposure histogram's programs through, computed wrong - the picture blew out to
+        // white for hundreds of frames at a time (runs run3 against ab3: 0 of 1,064 frames
+        // blown out with it off). The water programs it was for still pass D3D12's 32 KiB
+        // of group-shared memory (`LDS-OVER-32K`), so it gained nothing visible.
+        if !strict && std::env::var_os("LEONIDA_WAVE_LDS_LOOSE").is_some_and(|v| v == "1") {
             let loose = lower::with_lds_loose(|| emit_program(c, native, p, st, io, res));
             report("loose LDS (APPROXIMATE)", &loose);
             if done(&loose) {

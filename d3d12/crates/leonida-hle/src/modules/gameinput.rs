@@ -1387,10 +1387,54 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(held_from_file());
+        down
+    }
+
+    /// Leonida: `LEONIDA_KEYS_FILE=<path>`: the keys named in that file are
+    /// held for as long as they are named there, with or without focus (a
+    /// test script writes `W D`, then an empty line). Names as in
+    /// `LEONIDA_KEYS`, plus `Shift` (left shift) and `Space`. Read again at
+    /// most every 50 ms.
+    #[cfg(feature = "diagnostics")]
+    fn held_from_file() -> Vec<u8> {
+        use std::sync::Mutex;
+        static PATH: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("LEONIDA_KEYS_FILE").map(Into::into));
+        static LAST: Mutex<Option<(Instant, Vec<u8>)>> = Mutex::new(None);
+        let Some(path) = PATH.as_ref() else { return Vec::new() };
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, keys)) = last.as_ref()
+            && at.elapsed() < Duration::from_millis(50)
+        {
+            return keys.clone();
+        }
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let keys: Vec<u8> = text
+            .split(|c: char| c.is_whitespace() || c == ',' || c == '+')
+            .filter_map(|key| match key {
+                "" => None,
+                "Enter" => Some(0x0D),
+                "Esc" => Some(0x1B),
+                "Tab" => Some(0x09),
+                "Back" => Some(0x08),
+                "Space" => Some(0x20),
+                "Shift" => Some(0xA0),
+                "Up" => Some(0x26),
+                "Down" => Some(0x28),
+                "Left" => Some(0x25),
+                "Right" => Some(0x27),
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => Some(k.as_bytes()[0].to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect();
+        *last = Some((Instant::now(), keys.clone()));
+        keys
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
