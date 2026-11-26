@@ -92,6 +92,9 @@ static_assert(sizeof(kOfflineSku) <= SKU_ID_SIZE, "fits licensableSku");
 
 std::mutex g_mutex;
 std::unordered_set<const void*> g_contexts, g_licenses, g_queries;
+// Licenses the user does not hold (durables, VIctory xstore.rs license_for_durables_async): real handles the title
+// may close, which XStoreIsLicenseValid answers false for.
+std::unordered_set<const void*> g_unowned_licenses;
 uint64_t g_next_token = 1;
 
 template <class T> T* new_handle(std::unordered_set<const void*>& set) {
@@ -136,11 +139,11 @@ template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
 // ---- Async: every served *Async completes at once on the title's queue ----
 
 const char kProductsIdentity = 0, kLicenseIdentity = 0, kCanAcquireIdentity = 0, kGameLicenseIdentity = 0,
-           kAddOnsIdentity = 0, kUpdatesIdentity = 0;
+           kAddOnsIdentity = 0, kUpdatesIdentity = 0, kUnownedLicenseIdentity = 0;
 
 size_t result_size(const void* identity) {
     if (identity == &kProductsIdentity) return sizeof(XStoreProductQueryHandle);
-    if (identity == &kLicenseIdentity) return sizeof(XStoreLicenseHandle);
+    if (identity == &kLicenseIdentity || identity == &kUnownedLicenseIdentity) return sizeof(XStoreLicenseHandle);
     if (identity == &kCanAcquireIdentity) return sizeof(XStoreCanAcquireLicenseResult);
     if (identity == &kGameLicenseIdentity) return sizeof(XStoreGameLicense);
     return 0;   // add-ons, updates: a count of 0, no buffer
@@ -162,6 +165,8 @@ HRESULT CALLBACK store_provider(XAsyncOp op, const XAsyncProviderData* data) {
             *static_cast<XStoreProductQueryHandle*>(data->buffer) = new_handle<XStoreProductQuery>(g_queries);
         } else if (identity == &kLicenseIdentity) {
             *static_cast<XStoreLicenseHandle*>(data->buffer) = new_handle<XStoreLicense>(g_licenses);
+        } else if (identity == &kUnownedLicenseIdentity) {
+            *static_cast<XStoreLicenseHandle*>(data->buffer) = new_handle<XStoreLicense>(g_unowned_licenses);
         } else if (identity == &kCanAcquireIdentity) {
             auto* r = static_cast<XStoreCanAcquireLicenseResult*>(data->buffer);
             *r = XStoreCanAcquireLicenseResult{};
@@ -269,7 +274,10 @@ HRESULT STDMETHODCALLTYPE store_acquire_package_result(void*, XAsyncBlock* async
 bool STDMETHODCALLTYPE store_is_license_valid(void*, XStoreLicenseHandle h) { return live(g_licenses, h); }
 
 // 23: void XStoreCloseLicenseHandle(XStoreLicenseHandle storeLicenseHandle)
-void STDMETHODCALLTYPE store_close_license(void*, XStoreLicenseHandle h) { close_handle(g_licenses, h); }
+void STDMETHODCALLTYPE store_close_license(void*, XStoreLicenseHandle h) {
+    if (live(g_unowned_licenses, h)) close_handle(g_unowned_licenses, h);
+    else close_handle(g_licenses, h);
+}
 
 // 24: HRESULT XStoreCanAcquireLicenseForStoreIdAsync(context, const char* storeProductId, XAsyncBlock*)
 // 26: HRESULT XStoreCanAcquireLicenseForPackageAsync(context, const char* packageIdentifier, XAsyncBlock*)
@@ -335,6 +343,21 @@ HRESULT STDMETHODCALLTYPE store_query_package_identifier(void*, const char* stor
     if (!store_id || !out) return E_INVALIDARG;
     if (size) out[0] = '\0';
     return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+// 71: HRESULT XStoreAcquireLicenseForDurablesAsync(context, const char* storeId, XAsyncBlock*) (IXStoreImpl3).
+// Ported from VIctory victory-hle src/modules/xstore.rs (GPL-3.0-or-later): the user owns no durables, so the call
+// succeeds with a license XStoreIsLicenseValid answers false for, rather than failing as a store-service call.
+HRESULT STDMETHODCALLTYPE store_acquire_durables_async(void*, XStoreContextHandle c, const char* store_id,
+                                                       XAsyncBlock* a) {
+    if (!store_id) return E_INVALIDARG;
+    return begin(c, a, &kUnownedLicenseIdentity, "XStoreAcquireLicenseForDurablesAsync");
+}
+// 72: HRESULT XStoreAcquireLicenseForDurablesResult(XAsyncBlock* async, XStoreLicenseHandle* storeLicenseHandle)
+HRESULT STDMETHODCALLTYPE store_acquire_durables_result(void*, XAsyncBlock* async, XStoreLicenseHandle* out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    return XAsyncGetResult(async, &kUnownedLicenseIdentity, sizeof(*out), out, nullptr);
 }
 
 // 66: HRESULT XStoreRegisterGameLicenseChanged(context, XTaskQueueHandle, void* context, callback, token*)
@@ -460,8 +483,8 @@ const void* const kStoreVtable[] = {
     FN(store_register),                      // 68 XStoreRegisterPackageLicenseLost
     FN(store_unregister),                    // 69 XStoreUnregisterPackageLicenseLost
     FN(unknown_slot<70>),                    // 70 XStoreIsAvailabilityPurchasable (2; no documented signature)
-    FN(offline_failure<71>),                 // 71 XStoreAcquireLicenseForDurablesAsync (3)
-    FN(offline_failure<72>),                 // 72 XStoreAcquireLicenseForDurablesResult (3)
+    FN(store_acquire_durables_async),        // 71 XStoreAcquireLicenseForDurablesAsync (3)
+    FN(store_acquire_durables_result),       // 72 XStoreAcquireLicenseForDurablesResult (3)
     FN(offline_failure<73>),                 // 73 XStoreShowAssociatedProductsUIAsync (4)
     FN(offline_failure<74>),                 // 74 XStoreShowAssociatedProductsUIResult (4)
     FN(offline_failure<75>),                 // 75 XStoreShowProductPageUIAsync (4)

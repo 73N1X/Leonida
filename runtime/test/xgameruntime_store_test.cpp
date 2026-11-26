@@ -159,6 +159,15 @@ int main() {
     at<Close>(store, 23)(store, package_license);
     check(!at<IsValid>(store, 22)(store, package_license), "a closed license is not valid");
 
+    // ---- durables: the user owns none (VIctory xstore.rs) ----
+    async = XAsyncBlock{};
+    Handle durable_license = nullptr;
+    check(at<CtxIdAsync>(store, 71)(store, context, "9DURABLE0001", &async) == S_OK && finished(&async) &&
+              at<HandleResult>(store, 72)(store, &async, &durable_license) == S_OK && durable_license,
+          "XStoreAcquireLicenseForDurables completes with a license handle");
+    check(!at<IsValid>(store, 22)(store, durable_license), "a durable's license is not valid: the user owns none");
+    at<Close>(store, 23)(store, durable_license);
+
     // ---- product queries are empty ----
     async = XAsyncBlock{};
     Handle products = nullptr;
