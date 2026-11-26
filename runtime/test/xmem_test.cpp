@@ -7,7 +7,9 @@
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
 // graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
-// contents across unmap and remap, alias when mapped twice, and scatter-map per address.
+// contents across unmap and remap, alias when mapped twice, and scatter-map per address. XMemAlloc and XMemFree call
+// the title's __XMemAllocationHooks__ routines (a stand-in export here) and the Default variants never do; the default
+// allocator honours the attributes' alignment and gives graphics memory pages of its own in the GPU address window.
 #include <windows.h>
 #include <psapi.h>
 
@@ -20,11 +22,13 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "shims.h"
 #include "startup_trace.h"
 #include "xmem.h"
+#include "../src/title_memory.h"
 
 namespace {
 
@@ -309,6 +313,184 @@ void test_default_alloc(XMemAllocFn alloc, XMemFreeFn free_mem, XMemAllocFn allo
     free_default(b, 0);
     free_default(zero, 0);
     check(true, "XMemFree releases an XMemAllocDefault block and XMemFreeDefault an XMemAlloc block");
+}
+
+// ---- The title's allocation hooks (__XMemAllocationHooks__, rt::xmem::set_allocation_hooks) ----------------------
+// A stand-in for the export of a title's exe: two routine pointers. Its alloc routine forwards to XMemAllocDefault, as
+// the measured title's handlers do, and once tries the XMemAlloc import from inside itself, which must take the default
+// allocator instead of coming round again.
+struct HookLog {
+    XMemAllocFn alloc_default = nullptr;
+    XMemFreeFn free_default = nullptr;
+    XMemAllocFn alloc_import = nullptr;
+    XMemFreeFn free_import = nullptr;
+    int allocs = 0, frees = 0, others = 0;
+    size_t size = 0;
+    uint64_t attributes = 0;
+    void* returned = nullptr;
+    void* freed = nullptr;
+    uint64_t free_attributes = 0;
+    bool nest = false;
+    void* nested = nullptr;
+};
+HookLog g_hook_log;
+void* g_hook_table[2] = {};
+
+void* __stdcall fake_alloc_hook(size_t size, uint64_t attributes) {
+    ++g_hook_log.allocs;
+    g_hook_log.size = size;
+    g_hook_log.attributes = attributes;
+    if (g_hook_log.nest) {
+        g_hook_log.nest = false;
+        g_hook_log.nested = g_hook_log.alloc_import(32, 0);  // the import from inside the hook: the default allocator
+        g_hook_log.free_import(g_hook_log.nested, 0);
+    }
+    g_hook_log.returned = g_hook_log.alloc_default(size, attributes);
+    return g_hook_log.returned;
+}
+
+void __stdcall fake_free_hook(void* p, uint64_t attributes) {
+    ++g_hook_log.frees;
+    g_hook_log.freed = p;
+    g_hook_log.free_attributes = attributes;
+    g_hook_log.free_default(p, attributes);
+}
+
+void* __stdcall other_alloc_hook(size_t size, uint64_t attributes) {
+    ++g_hook_log.others;
+    return g_hook_log.alloc_default(size, attributes);
+}
+
+void test_allocation_hooks(XMemAllocFn alloc, XMemFreeFn free_mem, XMemAllocFn alloc_default,
+                           XMemFreeFn free_default) {
+    g_hook_log = HookLog{alloc_default, free_default, alloc, free_mem};
+    check(!rt::xmem::has_allocation_hooks(), "no allocation hooks before a title names them");
+    g_hook_table[0] = reinterpret_cast<void*>(&fake_alloc_hook);
+    g_hook_table[1] = reinterpret_cast<void*>(&fake_free_hook);
+    rt::xmem::set_allocation_hooks(g_hook_table);
+    check(rt::xmem::has_allocation_hooks(), "the hooks are set from the export's two routines");
+
+    g_hook_log.nest = true;
+    void* const p = alloc(200, 0x5e50000);
+    check(g_hook_log.allocs == 1 && g_hook_log.size == 200 && g_hook_log.attributes == 0x5e50000,
+          "XMemAlloc calls the title's alloc routine once, with its size and attributes");
+    check(p != nullptr && p == g_hook_log.returned, "XMemAlloc returns what the title's routine returned");
+    check(g_hook_log.nested != nullptr && g_hook_log.allocs == 1,
+          "an XMemAlloc from inside the title's routine takes the default allocator (no second hook call)");
+    check(g_hook_log.frees == 0, "an XMemFree from inside the title's routine does not reach its free routine");
+
+    free_mem(p, 0x5e50000);
+    check(g_hook_log.frees == 1 && g_hook_log.freed == p && g_hook_log.free_attributes == 0x5e50000,
+          "XMemFree calls the title's free routine with the block and its attributes");
+
+    void* const d = alloc_default(64, 0);
+    free_default(d, 0);
+    check(d != nullptr && g_hook_log.allocs == 1 && g_hook_log.frees == 1,
+          "XMemAllocDefault and XMemFreeDefault never call the title's routines");
+
+    void* const t = rt::xmem::title_alloc(48, 0x99);
+    rt::xmem::title_free(t, 0x99);
+    check(t != nullptr && g_hook_log.allocs == 2 && g_hook_log.frees == 2 && g_hook_log.freed == t,
+          "rt::xmem::title_alloc / title_free reach the title's routines as the imports do");
+
+    // The table is the title's data: a routine it writes there later is the one called.
+    g_hook_table[0] = reinterpret_cast<void*>(&other_alloc_hook);
+    void* const o = alloc(16, 0);
+    check(o != nullptr && g_hook_log.others == 1 && g_hook_log.allocs == 2,
+          "the routines are read at each call (a rewritten table entry is called)");
+    free_mem(o, 0);
+    g_hook_table[0] = nullptr;
+    check(!rt::xmem::has_allocation_hooks(), "a null routine in the table is no hook");
+    void* const n = alloc(16, 0);
+    check(n != nullptr && g_hook_log.others == 1 && g_hook_log.allocs == 2,
+          "XMemAlloc takes the default allocator for a null alloc routine");
+    free_mem(n, 0);  // the free routine is still the title's
+    check(g_hook_log.frees == 4 && g_hook_log.freed == n, "XMemFree still calls a non-null free routine");
+
+    rt::xmem::set_allocation_hooks(nullptr);
+    check(!rt::xmem::has_allocation_hooks(), "set_allocation_hooks(nullptr) clears the hooks");
+    void* const after = alloc(16, 0);
+    free_mem(after, 0);
+    check(after != nullptr && g_hook_log.frees == 4 && g_hook_log.others == 1,
+          "without hooks XMemAlloc and XMemFree are the default allocator again");
+}
+
+// XMemAllocDefault decodes the attribute word (src/title_memory.h): the alignment for CPU blocks, and whole pages in
+// the GPU address window for graphics memory, announced to the graphics listener and taken off it before they go.
+struct ListenerLog {
+    std::vector<std::pair<uintptr_t, size_t>> visible, gone;
+    bool committed_when_gone = false;
+};
+ListenerLog g_listener_log;
+const rt::xmem::GraphicsListener kLogListener{
+    [](std::uintptr_t start, std::size_t size) { g_listener_log.visible.emplace_back(start, size); },
+    [](std::uintptr_t start, std::size_t size) {
+        g_listener_log.gone.emplace_back(start, size);
+        MEMORY_BASIC_INFORMATION info{};
+        g_listener_log.committed_when_gone = VirtualQuery(reinterpret_cast<void*>(start), &info, sizeof(info)) &&
+                                             info.State == MEM_COMMIT;
+    }};
+
+void test_default_gpu_blocks(XMemAllocFn alloc_default, XMemFreeFn free_default) {
+    namespace tm = leonida::title_memory;
+    void* const aligned = alloc_default(100, uint64_t(12) << 24);
+    check(aligned && (reinterpret_cast<uintptr_t>(aligned) & 0xfff) == 0,
+          "XMemAllocDefault honours the attributes' alignment (log2 12: 4 KiB) for CPU memory");
+    free_default(aligned, uint64_t(12) << 24);
+
+    rt::xmem::set_graphics_listener(&kLogListener);
+    // What was visible already is replayed; only the blocks below count. Earlier tests free graphics memory with the
+    // host's VirtualFree, which xmem does not see, so a block may land on a range still listed as visible: it is
+    // taken off the listener (gone) before the block is announced.
+    g_listener_log = ListenerLog{};
+
+    // The D3D runtime's attributes for a 3840x2160 back buffer, the size the title's pool asks for (64 MiB).
+    constexpr uint64_t kBackBuffer = 0x30808000;
+    static_assert(kBackBuffer == tm::resource_attributes(33423360, 0x10000, true));
+    constexpr size_t kPool = 64 << 20;
+    auto* const pool = static_cast<uint8_t*>(alloc_default(kPool, kBackBuffer));
+    const auto at = reinterpret_cast<uintptr_t>(pool);
+    check(pool && (at & (kPage2m - 1)) == 0, "a 2 MiB-page graphics block is 2 MiB-aligned");
+    check(pool && at >= tm::kWindowStart && at + kPool <= tm::kWindowEnd,
+          "a graphics block lies in the GPU address window");
+    check(pool && tm::addressable(at, kPool), "the block can have the device address heap_base + its address");
+    MEMORY_BASIC_INFORMATION info{};
+    check(pool && VirtualQuery(pool, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+              info.Protect == PAGE_READWRITE && info.RegionSize >= kPool,
+          "the graphics block is committed read-write");
+    bool zero = pool != nullptr;
+    for (size_t i = 0; pool && i < kPool; i += 4096) zero = zero && pool[i] == 0;
+    check(zero, "the graphics block reads as zero");
+    check(g_listener_log.visible.size() == 1 && g_listener_log.visible[0] == std::make_pair(at, kPool),
+          "the graphics block is announced to the listener as visible, once");
+    for (const auto& [start, size] : g_listener_log.gone)
+        check(start == at && size == kPool, "a stale visible range under a new block is taken off it first");
+    g_listener_log.gone.clear();
+
+    // 64 KiB pages below 2 MiB, CPU-visible (memory type 3), and a 32-bit address.
+    void* const small = alloc_default(100, tm::resource_attributes(0x10000, 0x10000, false));
+    check(small && (reinterpret_cast<uintptr_t>(small) & (kPage64k - 1)) == 0 &&
+              tm::addressable(reinterpret_cast<uintptr_t>(small), kPage64k),
+          "a 64 KiB-page graphics block is 64 KiB-aligned in the GPU window");
+    void* const low = alloc_default(4096, uint64_t(1) << 33);
+    check(low && tm::addressable(reinterpret_cast<uintptr_t>(low), 4096) &&
+              reinterpret_cast<uintptr_t>(low) + 4096 <= tm::kLow32End,
+          "a 32-bit allocation lies in the 32-bit GPU window");
+    check(g_listener_log.visible.size() == 3, "each graphics block is announced");
+    g_listener_log.gone.clear();  // stale ranges under the two small blocks, if any
+    const size_t visible_with = rt::xmem::graphics_visible_bytes();
+
+    free_default(pool, kBackBuffer);
+    check(g_listener_log.gone.size() == 1 && g_listener_log.gone[0] == std::make_pair(at, kPool),
+          "freeing the block takes it off the GPU (the listener's gone)");
+    check(g_listener_log.committed_when_gone, "the listener hears of it while the pages are still there");
+    check(VirtualQuery(pool, &info, sizeof(info)) && info.State == MEM_FREE, "then the block's pages are released");
+    free_default(small, 0);  // the free finds a block by its address, whatever attributes come with it
+    free_default(low, uint64_t(1) << 33);
+    check(g_listener_log.gone.size() == 3, "every graphics block leaves the GPU when freed");
+    check(visible_with - rt::xmem::graphics_visible_bytes() == kPool + 2 * kPage64k,
+          "the blocks (64 MiB and two of 64 KiB) are no longer visible GPU memory");
+    rt::xmem::set_graphics_listener(nullptr);
 }
 
 uint32_t read_u32(const void* base, size_t offset) {
@@ -934,7 +1116,11 @@ int main() {
 
     test_title_virtual_alloc();
 
-    if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
+    if (alloc_default && free_default) {
+        test_default_alloc(alloc, free_mem, alloc_default, free_default);
+        test_allocation_hooks(alloc, free_mem, alloc_default, free_default);
+        test_default_gpu_blocks(alloc_default, free_default);
+    }
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);

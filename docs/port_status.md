@@ -150,6 +150,20 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   (`budget - used + [0x1475E6FF0] <= 0x1FFFFF`, budget 0x5200000 or 0x4000000
   by a console-model test at 0x140075140) that slot 70 does not reach; slot 25
   answers 33,423,360 bytes for each 3840x2160 RGBA8 target.
+- The title's allocator (`port/xmem-hooks`, from VIctory's xmem.rs and
+  resource.rs): XMemAlloc/XMemFree call the routines the exe exports as
+  `__XMemAllocationHooks__`, and committed resources take their memory from
+  them with VIctory's attributes (`title_memory::resource_attributes`), as the
+  console's D3D runtime does; a buffer sits on that memory's import, a texture
+  reports the address and keeps an image of its own. XMemAllocDefault gives
+  graphics memory types pages of their own in the GPU window. The retail
+  title's hook takes a 64 MiB render-target pool from XMemAllocDefault
+  (attributes 0x30808000), hands both back buffers out of it, and the pool
+  check passes. Next, about 5 s in: without `LEONIDA_SHADERS`,
+  XboxBvhBuilder.dll throws a C++ exception (exit code 0xE06D7363) under
+  `game_scarlett_master.exe+0x2479455`, right after the first device slot 62
+  pipeline finds no translated shaders; with them the title runs to about
+  33 s and writes to address 0 at `game_scarlett_master.exe+0x2215c35`.
 - The title renders to 3840x2160 because it is told it is on a 4K console
   display; reporting a smaller display mode is a large frame-time lever for
   later (VIctory has `VICTORY_DISPLAY_MODE`).

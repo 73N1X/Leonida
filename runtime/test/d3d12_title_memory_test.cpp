@@ -12,7 +12,11 @@
 //   - console list slots 62 (CopyMemoryToMemoryX), 71/72 (Write32/Write64), 73 (WaitValue32, recorded) and 148
 //     (AllocateUploadMemory) on title addresses;
 //   - device slot 133 on mapped xmem physical pages: the buffer is bound to their import, at heap_base + its address;
-//   - the title's VirtualFree takes the imports off the GPU first.
+//   - the title's VirtualFree takes the imports off the GPU first;
+//   - with the title's allocator (its __XMemAllocationHooks__ through xmem, rt::d3d12::set_title_allocator), a slot-127
+//     texture and committed buffers take their memory from it with VIctory's attributes, zeroed; the buffers sit on
+//     that title memory at heap_base + the address (a GPU copy lands in the title's pages), the texture reports the
+//     address, and each goes back through the title's free routine when released.
 // 77 when the GPU has no bufferDeviceAddressCaptureReplay or VK_EXT_external_memory_host (title memory off). No game
 // data. Set LEONIDA_VK_VALIDATION=1 for the validation layer.
 #include "shader_fixture_path.h"
@@ -58,6 +62,8 @@ struct Ref {
 };
 
 using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+using XMemAllocFn = void*(__stdcall*)(std::size_t, std::uint64_t);
+using XMemFreeFn = void(__stdcall*)(void*, std::uint64_t);
 using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 using XMemAllocatePhysicalPagesFn = BOOL(WINAPI*)(std::uint64_t, std::uint64_t*, std::uint64_t*);
 using XMemFreePhysicalPagesFn = BOOL(WINAPI*)(std::uint64_t, const std::uint64_t*);
@@ -171,6 +177,46 @@ struct Runner {
         return ok && rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success;
     }
 };
+
+// A title's __XMemAllocationHooks__ (rt::xmem::set_allocation_hooks), as the retail title's render-target pool does
+// it: the first allocation takes a 64 MiB pool from XMemAllocDefault with the D3D runtime's attributes, the rest are
+// handed out of it in order (each 64 KiB-aligned). The pool's bytes are dirtied first: a committed resource must start
+// zeroed whatever the allocator gives.
+struct TitleAllocatorLog {
+    XMemAllocFn alloc_default = nullptr;
+    XMemFreeFn free_default = nullptr;
+    std::uint8_t* pool = nullptr;
+    std::uint64_t used = 0;
+    int allocs = 0, frees = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> given;  // (address, attributes)
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> freed;
+    std::vector<std::uint64_t> sizes;
+};
+TitleAllocatorLog g_title;
+constexpr std::uint64_t kTitlePool = 64 << 20;
+
+void* __stdcall title_pool_alloc(std::size_t size, std::uint64_t attributes) {
+    ++g_title.allocs;
+    if (!g_title.pool) {
+        g_title.pool = static_cast<std::uint8_t*>(g_title.alloc_default(kTitlePool, attributes));
+        if (!g_title.pool) return nullptr;
+        std::memset(g_title.pool, 0xcd, kTitlePool);
+    }
+    const std::uint64_t at = (g_title.used + 0xffff) & ~std::uint64_t(0xffff);
+    if (at + size > kTitlePool) return nullptr;
+    g_title.used = at + size;
+    void* const p = g_title.pool + at;
+    g_title.given.emplace_back(reinterpret_cast<std::uint64_t>(p), attributes);
+    g_title.sizes.push_back(size);
+    return p;
+}
+
+void __stdcall title_pool_free(void* p, std::uint64_t attributes) {
+    ++g_title.frees;
+    g_title.freed.emplace_back(reinterpret_cast<std::uint64_t>(p), attributes);
+}
+
+void* g_title_hooks[2] = {reinterpret_cast<void*>(&title_pool_alloc), reinterpret_cast<void*>(&title_pool_free)};
 
 const rt::xmem::GraphicsListener kListener{
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
@@ -469,6 +515,139 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     return 0;
 }
 
+// Committed resources from the title's allocator (rt::d3d12::set_title_allocator), wired as gta6rt wires it: xmem's
+// XMemAlloc/XMemFree, which call the title's __XMemAllocationHooks__ routines (title_pool_alloc above).
+int run_title_allocator(ID3D12Device* inner, void* device) {
+    g_title = TitleAllocatorLog{};
+    g_title.alloc_default = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAllocDefault"));
+    g_title.free_default = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFreeDefault"));
+    EXPECT(g_title.alloc_default && g_title.free_default);
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_RESOURCE_DESC one_block = buffer_desc(1 << 16);
+
+    // Without an allocator a committed buffer is the layer's own, in the arena, as before.
+    {
+        Ref<ID3D12Resource> before_hooks;
+        EXPECT(SUCCEEDED(inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &one_block,
+                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&before_hooks.p))));
+        EXPECT(before_hooks->GetGPUVirtualAddress() < tm::kLow32Start && g_title.allocs == 0);
+    }
+
+    rt::xmem::set_allocation_hooks(g_title_hooks);
+    rt::d3d12::set_title_allocator(&rt::xmem::title_alloc, &rt::xmem::title_free);
+
+    // A back buffer through the console's slot 127 (CreateCommittedResource3), with the title's arguments: heap flag
+    // ALLOW_DISPLAY, flags RENDER_TARGET | UNORDERED_ACCESS, barrier layout 3.
+    D3D12_RESOURCE_DESC1 target{};
+    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    target.Width = 256;
+    target.Height = 256;
+    target.DepthOrArraySize = 1;
+    target.MipLevels = 1;
+    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target.SampleDesc.Count = 1;
+    target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x5);
+    D3D12_RESOURCE_DESC plain{};
+    std::memcpy(&plain, &target, sizeof(plain));
+    const D3D12_RESOURCE_ALLOCATION_INFO target_info = inner->GetResourceAllocationInfo(0, 1, &plain);
+    using Slot127 = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                           std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                           std::uint64_t);
+    const GUID resource_iid = __uuidof(ID3D12Resource);
+    Ref<ID3D12Resource> back_buffer;
+    EXPECT(hr_from(reinterpret_cast<Slot127>((*static_cast<void***>(device))[127])(
+               device, word(&default_heap), D3D12_HEAP_FLAG_ALLOW_DISPLAY, word(&target), 3, 0, 0, 0, 0,
+               word(&resource_iid), word(&back_buffer.p))) == S_OK);
+    EXPECT(back_buffer.p && g_title.allocs == 1 && g_title.given.size() == 1);
+    const std::uint64_t texture_at = g_title.given[0].first;
+    EXPECT(g_title.sizes[0] == target_info.SizeInBytes);
+    EXPECT(g_title.given[0].second ==
+           tm::resource_attributes(target_info.SizeInBytes, target_info.Alignment, true));
+    EXPECT(back_buffer->GetGPUVirtualAddress() == texture_at);
+    EXPECT(rt::d3d12::vulkan_image(back_buffer.p) != VK_NULL_HANDLE);
+    const auto pool = reinterpret_cast<std::uint64_t>(g_title.pool);
+    EXPECT(pool && (pool & 0xffff) == 0 && tm::addressable(pool, kTitlePool));  // 64 KiB pages: under 2 MiB
+    for (std::uint64_t i = 0; i < target_info.SizeInBytes; i += 4096)
+        EXPECT(g_title.pool[texture_at - pool + i] == 0);  // zeroed over the pool's 0xcd
+
+    // Buffers: on their title memory, at heap_base + the title address. The upload buffer maps at its title address;
+    // a copy into the default-heap buffer lands in the title's pages.
+    constexpr UINT64 kBytes = 1 << 16;
+    const D3D12_RESOURCE_DESC upload_desc = buffer_desc(kBytes);
+    D3D12_RESOURCE_DESC uav = buffer_desc(kBytes);
+    uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    Ref<ID3D12Resource> source, destination;
+    EXPECT(SUCCEEDED(inner->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                    IID_PPV_ARGS(&source.p))));
+    EXPECT(SUCCEEDED(inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                    D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    IID_PPV_ARGS(&destination.p))));
+    EXPECT(g_title.allocs == 3 && g_title.given.size() == 3);
+    const std::uint64_t S = g_title.given[1].first, D = g_title.given[2].first;
+    EXPECT(g_title.given[1].second == tm::resource_attributes(kBytes, 0x10000, false));
+    EXPECT(g_title.given[2].second == tm::resource_attributes(kBytes, 0x10000, true));
+    EXPECT(source->GetGPUVirtualAddress() == S && destination->GetGPUVirtualAddress() == D);
+    EXPECT(rt::d3d12::title_memory_device_address(inner, S) == tm::kHeapBase + S);
+    EXPECT(rt::d3d12::title_memory_device_address(inner, D + kBytes - 4) == tm::kHeapBase + D + kBytes - 4);
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(source->Map(0, nullptr, &mapped)) && reinterpret_cast<std::uint64_t>(mapped) == S);
+    EXPECT(destination->Map(0, nullptr, &mapped) == E_INVALIDARG);  // a default heap, as on the PC
+    auto* src = reinterpret_cast<std::uint8_t*>(S);
+    auto* dst = reinterpret_cast<std::uint8_t*>(D);
+    for (UINT64 i = 0; i < kBytes; ++i) EXPECT(src[i] == 0 && dst[i] == 0);
+    for (UINT64 i = 0; i < kBytes; ++i) src[i] = std::uint8_t(i * 7 + 3);
+    {
+        Runner runner;
+        EXPECT(runner.init(inner));
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(SUCCEEDED(inner->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(inner->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                  IID_PPV_ARGS(&list.p))));
+        list->CopyBufferRegion(destination.p, 0, source.p, 0, kBytes);
+        EXPECT(SUCCEEDED(list->Close()));
+        EXPECT(runner.run(list.p));
+    }
+    EXPECT(std::memcmp(dst, src, kBytes) == 0);
+    std::printf("title memory: committed resources from the title's allocator: a slot-127 texture reports 0x%llx, "
+                "buffers sit at 0x%llx and 0x%llx on their title memory; a GPU copy lands in the title's pages\n",
+                static_cast<unsigned long long>(texture_at), static_cast<unsigned long long>(S),
+                static_cast<unsigned long long>(D));
+
+    // Released: each goes back through the title's free routine with its address and attributes.
+    EXPECT(g_title.frees == 0);
+    back_buffer.reset();
+    EXPECT(g_title.frees == 1 && g_title.freed[0] == g_title.given[0]);
+    destination.reset();
+    source.reset();
+    EXPECT(g_title.frees == 3 && g_title.freed[1] == g_title.given[2] && g_title.freed[2] == g_title.given[1]);
+
+    // A refusal from the allocator is E_OUTOFMEMORY, with nothing made.
+    const D3D12_RESOURCE_DESC too_big_desc = buffer_desc(kTitlePool * 2);
+    Ref<ID3D12Resource> too_big;
+    EXPECT(inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &too_big_desc,
+                                          D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&too_big.p)) ==
+           E_OUTOFMEMORY);
+    EXPECT(!too_big.p && g_title.frees == 3);
+
+    rt::d3d12::set_title_allocator(nullptr, nullptr);
+    rt::xmem::set_allocation_hooks(nullptr);
+    {
+        Ref<ID3D12Resource> after_hooks;
+        EXPECT(SUCCEEDED(inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &one_block,
+                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&after_hooks.p))));
+        EXPECT(after_hooks->GetGPUVirtualAddress() < tm::kLow32Start && g_title.allocs == 4);
+    }
+    g_title.free_default(g_title.pool, 0);
+    EXPECT(rt::d3d12::title_memory_device_address(inner, pool) == 0);
+    std::printf("title memory: released committed resources went back through the title's free routine\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -507,7 +686,8 @@ int main() {
     }
     rt::d3d12::set_device_outer(inner, static_cast<IUnknown*>(device));
     rt::xmem::set_graphics_listener(&kListener);
-    const int failures = run(inner, device, container);
+    int failures = run(inner, device, container);
+    if (!failures) failures = run_title_allocator(inner, device);
     rt::xmem::set_graphics_listener(nullptr);
     static_cast<IUnknown*>(device)->Release();
     if (!failures) std::printf("d3d12_title_memory_test: PASS\n");

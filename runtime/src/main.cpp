@@ -35,7 +35,7 @@
 #include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
 #ifdef LEONIDA_VULKAN_DEVICE
-#include "../shims/d3d12_com.h"  // title memory (rt::d3d12::title_memory_visible)
+#include "../shims/d3d12_com.h"  // title memory (rt::d3d12::title_memory_visible, set_title_allocator)
 #endif
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
@@ -186,6 +186,15 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // __XMemAllocationHooks__ (VIctory xmem.rs:243-300, d3d12x.rs:20): the title's allocation routines. XMemAlloc
+        // and XMemFree call them from now on, and committed resources take their memory from them, as the console's
+        // D3D runtime gives them (the title counts its back buffers against a pool of its own that way).
+        if (const auto hooks = main_module.exports.find("__XMemAllocationHooks__"); hooks != main_module.exports.end()) {
+            rt::xmem::set_allocation_hooks(hooks->second);
+#ifdef LEONIDA_VULKAN_DEVICE
+            rt::d3d12::set_title_allocator(&rt::xmem::title_alloc, &rt::xmem::title_free);
+#endif
+        }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {

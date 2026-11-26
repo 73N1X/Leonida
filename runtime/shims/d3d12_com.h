@@ -273,6 +273,19 @@ struct TitleMemoryStats {
 TitleMemoryStats title_memory_stats(ID3D12Device* device);
 std::uint64_t title_memory_device_address(ID3D12Device* device, std::uint64_t va);
 
+// The title's general allocator (VIctory resource.rs:925-933, use_allocator): gta6rt names xmem's XMemAlloc and
+// XMemFree when the title's exe exports __XMemAllocationHooks__. From then on the committed resources the title makes
+// on a device from create_vulkan_device* (CreateCommittedResource*, and the console's slots 76 and 127 through the
+// proxy) take their memory from `alloc`, as the console's D3D runtime gives it: GetResourceAllocationInfo's size, the
+// attributes of title_memory::resource_attributes, zeroed. A buffer sits at that title address on the title-memory
+// import there, so its GPU virtual address is the title address; a texture reports that address too, and its image
+// keeps memory of its own (an optimal-tiled image is not bound to imported host memory here). When the resource goes,
+// the memory goes back through `free` with the same attributes, after the GPU has finished the work submitted until
+// then. Without an allocator (null routines: PC programs, stand-in titles) committed resources are the layer's own.
+using TitleAllocRoutine = void* (*)(std::size_t size, std::uint64_t attributes);
+using TitleFreeRoutine = void (*)(void* address, std::uint64_t attributes);
+void set_title_allocator(TitleAllocRoutine alloc, TitleFreeRoutine free);
+
 // Xbox device slots 70 and 71 (rt::d3d12_xs::set_placed_view_handler): a shader-resource (uav false) or unordered-access
 // view of memory the title placed itself, written at `handle`. `resource_desc` is the 56-byte resource description,
 // `view_desc` 16 words: the PC view description (words 0-9) and the title address of the resource (words 10-11).

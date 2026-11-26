@@ -6,6 +6,19 @@
 
 namespace rt::xmem {
 
+// The title's allocation hooks (VIctory xmem.rs:243-300): `table` is the export __XMemAllocationHooks__ of the title's
+// exe, two routine pointers, alloc(size, attributes) and free(address, attributes), read at every call. From then on
+// the XMemAlloc and XMemFree imports call them; XMemAllocDefault and XMemFreeDefault never do (the title's routines
+// call those). An XMemAlloc or XMemFree made from inside the routines takes the default allocator, not the routines
+// again. gta6rt sets it once the title is mapped, before any of its code runs; null clears it.
+void set_allocation_hooks(const void* table);
+// Whether the title's routines are set (both non-null now).
+bool has_allocation_hooks();
+// XMemAlloc and XMemFree as an import reaches them: the title's routines when set, else the default allocator. The
+// D3D12 layer's committed resources take their memory through these (rt::d3d12::set_title_allocator).
+void* title_alloc(std::size_t size, std::uint64_t attributes);
+void title_free(void* address, std::uint64_t attributes);
+
 bool commit_physical_range(const void* address, std::size_t size);
 bool commit_physical_pages(const std::uint64_t* page_array, std::size_t count);
 

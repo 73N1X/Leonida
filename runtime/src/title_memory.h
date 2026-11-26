@@ -91,4 +91,37 @@ constexpr Range placement(std::uint64_t attributes) {
     return {kWindowStart, end - 1};
 }
 
+// XMemAlloc attribute words, another layout than XMemVirtualAlloc's above (VIctory xmem.rs:228-233 and resource.rs:
+// 951-963, GPL-3.0-or-later, Marvisak and contributors, DexNom fork): bits 14-15 the page size (1: 64 KiB, 2: 2 MiB),
+// 16-23 the allocator id, 24-28 the alignment as log2, 29-32 the memory type, bit 33 a 32-bit address.
+// ASSUMPTION: memory type 0 is the CPU heap and every other type memory both processors reach. VIctory gives its
+// committed resources type 1 (a default heap, write-combined on the console) or 3 (the CPU-visible heaps, cacheable);
+// no other type has been seen.
+constexpr unsigned alloc_page_size(std::uint64_t attributes) { return unsigned(attributes >> 14 & 3); }
+constexpr unsigned alloc_allocator_id(std::uint64_t attributes) { return unsigned(attributes >> 16 & 0xff); }
+constexpr unsigned alloc_alignment_log2(std::uint64_t attributes) { return unsigned(attributes >> 24 & 0x1f); }
+constexpr unsigned alloc_memory_type(std::uint64_t attributes) { return unsigned(attributes >> 29 & 0xf); }
+constexpr bool alloc_32bit(std::uint64_t attributes) { return (attributes >> 33 & 1) != 0; }
+// Whether XMemAllocDefault gives GPU memory (pages in the window above, visible to the D3D12 layer) for these
+// attributes: a graphics memory type or a 32-bit address (VIctory's XMemAllocDefault takes 32-bit graphics memory
+// for the latter).
+constexpr bool alloc_gpu_memory(std::uint64_t attributes) {
+    return alloc_memory_type(attributes) != 0 || alloc_32bit(attributes);
+}
+
+// The attributes of a committed resource's memory, as the console's D3D runtime asks the title's allocator for it
+// (VIctory resource.rs:951-963, resource_attributes): the graphics allocator id 128, 2 MiB pages from 2 MiB up (else
+// 64 KiB), the alignment as log2, memory type 1 for a default heap and 3 for the CPU-visible ones. VIctory's own
+// note: the console runtime's page size and memory type are not known, these are the plausible ones.
+inline constexpr std::uint64_t kGraphicsAllocatorId = 128;
+constexpr std::uint64_t resource_attributes(std::uint64_t size, std::uint64_t alignment, bool default_heap) {
+    std::uint64_t log2 = 0;
+    for (std::uint64_t a = alignment ? alignment : 1; !(a & 1) && log2 < 63; a >>= 1) ++log2;  // trailing zeros
+    const std::uint64_t pages = size >= (std::uint64_t(2) << 20) ? 2 : 1;
+    const std::uint64_t memory = default_heap ? 1 : 3;
+    return kGraphicsAllocatorId << 16 | pages << 14 | (log2 & 0x1f) << 24 | memory << 29;
+}
+static_assert(resource_attributes(33423360, 0x10000, true) == 0x30808000);  // a 3840x2160 RGBA8 back buffer
+static_assert(resource_attributes(0x10000, 0x10000, false) == 0x70804000);
+
 }  // namespace leonida::title_memory
