@@ -11451,7 +11451,8 @@ class Gen:
                 # Until 2026-11-22 it was dropped. A partial write like the other f16 results: the high half of vdst is
                 # kept (SHADER-430, measured on gfx1036 with tools/hw_oracle: a preset 0xdead high half survived every
                 # case). It used to be zeroed.
-                self.write_lo16(a[0], self.f16_res(self.clamp_f16(f, mods)))
+                # OP_SEL[3] (check_printed_encodings marks it: llvm-mc does not print it) writes the high half.
+                self.write_half16(a[0], self.f16_res(self.clamp_f16(f, mods)), bool(ins.get("dst_hi")))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op in SOPC_CMP32_OPS:
@@ -17590,6 +17591,13 @@ def check_printed_encodings(path, info):
         enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
         if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
+            # v_interp_p2_f16 with VOP3 OP_SEL[3] (word 0 bit 14): the f16 result goes to the high half of vdst.
+            # llvm-mc can neither print nor assemble op_sel on this op (its `high` is word 1 bit 8, the attribute's
+            # upper half), so it prints the word without the bit; the console compiler sets it (32 console stages).
+            if (base_op(ins["op"]) == "v_interp_p2_f16" and len(raw) == len(enc) == 8 and
+                    int.from_bytes(raw, "little") ^ int.from_bytes(enc, "little") == 1 << 14):
+                ins["dst_hi"] = True
+                continue
             literal = mix_literal(raw, enc, base_op(ins["op"]))
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
