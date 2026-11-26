@@ -139,6 +139,7 @@ _ALWAYS_BARRIER_OPS = frozenset({
     "v_permlane16_b32", "v_permlanex16_b32",
     "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
     "s_wqm_b32", "s_wqm_b64",
+    "ds_append", "ds_consume",      # two exchange rounds (rdna2spirv ds_append_wave64)
 })
 
 _VOTED_BRANCHES = frozenset({
