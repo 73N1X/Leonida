@@ -192,6 +192,7 @@ public:
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
           maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)),
           recreate_surface_fn_(std::move(recreate_surface_fn)) {
+        context.add_checkpoint_queue(queue);  // its checkpoints read back after a device loss
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -851,6 +852,9 @@ private:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk.vkBeginCommandBuffer(commands, &begin);
+        // A checkpoint (LEONIDA_GPU_CHECKPOINTS): a device loss in the present blit is named too.
+        if (vk.vkCmdSetCheckpointNV)
+            vk.vkCmdSetCheckpointNV(commands, reinterpret_cast<const void*>(kCheckpointCommand + (std::uintptr_t(48) << 1)));
 
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -968,6 +972,9 @@ private:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk.vkBeginCommandBuffer(commands, &begin);
+        // A checkpoint (LEONIDA_GPU_CHECKPOINTS): a device loss in the present compose is named too.
+        if (vk.vkCmdSetCheckpointNV)
+            vk.vkCmdSetCheckpointNV(commands, reinterpret_cast<const void*>(kCheckpointCommand + (std::uintptr_t(49) << 1)));
 
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -1081,6 +1088,9 @@ private:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk.vkBeginCommandBuffer(commands, &begin);
+        // A checkpoint (LEONIDA_GPU_CHECKPOINTS): a device loss in the present capture is named too.
+        if (vk.vkCmdSetCheckpointNV)
+            vk.vkCmdSetCheckpointNV(commands, reinterpret_cast<const void*>(kCheckpointCommand + (std::uintptr_t(50) << 1)));
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         detail::image_barrier(fn, commands, target_of(image), range, VK_IMAGE_LAYOUT_UNDEFINED,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,

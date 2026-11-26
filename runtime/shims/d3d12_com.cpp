@@ -1175,6 +1175,7 @@ public:
             if (!pipeline_made(true)) return;
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
+            note_user_data(std::uintptr_t(compute_pipeline_), compute_.data);
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1500,6 +1501,32 @@ private:
                      graphics_pipeline_debug_name(pipeline).c_str());
     }
 
+    // LEONIDA_DEBUG_USER_DATA=<part of a program name> (diagnostic, with LEONIDA_PRESENT_DEBUG for the names): the
+    // user data of the first four dispatches whose program's name holds the part, and for each word whether title
+    // memory is readable at it (a 32-bit table pointer the program widens with a high word of 0 must be).
+    template <typename Data>
+    static void note_user_data(std::uintptr_t pipeline, const Data& data) {
+        static const std::string part = [] {
+            const char* v = std::getenv("LEONIDA_DEBUG_USER_DATA");
+            return std::string(v ? v : "");
+        }();
+        if (part.empty() || !pipeline) return;
+        static std::atomic<unsigned> logged{0};
+        if (logged.load(std::memory_order_relaxed) >= 4) return;
+        const std::string name = graphics_pipeline_debug_name(pipeline);
+        if (name.find(part) == std::string::npos) return;
+        if (logged.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+        std::string line = "[rt] user data of " + name + ":";
+        for (std::size_t i = 0; i < 16 && i < data.size(); ++i) {
+            char word[48];
+            const std::uint32_t v = data[i];
+            const bool readable = v >= 0x10000 && !IsBadReadPtr(reinterpret_cast<const void*>(std::uintptr_t(v)), 16);
+            std::snprintf(word, sizeof word, " s%zu=0x%08x%s", i, v, readable ? "(r)" : "");
+            line += word;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+
     // A draw or dispatch dropped because its root arguments are incomplete (RootState::incomplete): counted, and
     // logged the first time and then at powers of two.
     static void skipped_for_root(bool compute) {
@@ -1823,6 +1850,7 @@ private:
         if (compute_.incomplete) return skipped_for_root(true);
         if (!pipeline_made(true)) return;
         note_first_use(std::uintptr_t(compute_pipeline_), true);
+        note_user_data(std::uintptr_t(compute_pipeline_), compute_.data);
         note_direct_heap_indexing(compute_.layout);
         count_recorded(true);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));

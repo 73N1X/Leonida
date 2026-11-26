@@ -895,6 +895,10 @@ enum class ReplayResult {
     unsupported
 };
 
+// A checkpoint marker for a command that is not a draw or dispatch (those carry their pipeline id): this plus twice
+// the command's alternative in Command. Pipeline ids are heap addresses, far above it.
+inline constexpr std::uintptr_t kCheckpointCommand = 0x7e000000;
+
 struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -3927,6 +3931,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        // Every other command gets a checkpoint too (draws and dispatches mark their pipeline below): a marker of
+        // kCheckpointCommand + its kind (Command's alternative), so a device loss in a copy, clear, barrier or
+        // ExecuteIndirect is named as well.
+        if (vk.set_checkpoint && !std::holds_alternative<Draw>(command) && !std::holds_alternative<Dispatch>(command))
+            vk.set_checkpoint(command_buffer,
+                              reinterpret_cast<const void*>(kCheckpointCommand + (std::uintptr_t(command.index()) << 1)));
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;

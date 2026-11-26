@@ -1572,7 +1572,12 @@ public:
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
         retire_tickets_.record(ticket, progress, value);
+        std::uint64_t& last = last_submitted_[progress];
+        if (value > last) last = value;
     }
+    // Under submit_mutex(): the last value submitted to signal each progress semaphore (every queue's, and the title
+    // memory binds'), so work that must come after everything already on the GPU can wait for all of it.
+    const std::unordered_map<VkSemaphore, std::uint64_t>& last_submitted_locked() const { return last_submitted_; }
     void retire_queue_idle_locked(VkSemaphore progress) {
         retire_tickets_.queue_idle(progress);
     }
@@ -1613,6 +1618,25 @@ public:
                 vk.vkGetQueueCheckpointDataNV(queue, &count, data.data());
                 for (std::uint32_t i = 0; i < count; ++i) {
                     const auto id = reinterpret_cast<std::uintptr_t>(data[i].pCheckpointMarker);
+                    if (id >= kCheckpointCommand && id < kCheckpointCommand + 0x100) {
+                        // Command's alternatives, in order (command_list.h).
+                        static const char* const kinds[] = {
+                            "TransitionBarrier", "UavBarrier", "AliasingBarrier", "GlobalBarrier", "BufferBarrier",
+                            "TextureBarrier", "ClearRenderTarget", "ClearDepthStencil", "CopyBuffer", "CopyTexture",
+                            "CopyResource", "ResolveSubresource", "Predication", "ClearUnorderedAccess",
+                            "DiscardResource", "WriteImmediate", "AtomicCopyBuffer", "BeginQuery", "EndQuery",
+                            "ResolveQueries", "DebugMarker", "ExecuteIndirect", "BuildAccelerationStructure", "Dispatch",
+                            "Draw", "CopyAccelerationStructure", "AccelerationStructurePostbuild"};
+                        const std::size_t kind = (id - kCheckpointCommand) >> 1;
+                        std::fprintf(stderr, "[rt] vulkan: checkpoint: queue %p stage 0x%x command %s\n",
+                                     static_cast<void*>(queue), unsigned(data[i].stage),
+                                     kind < std::size(kinds) ? kinds[kind]
+                                     : kind == 48             ? "present blit"
+                                     : kind == 49             ? "present compose"
+                                     : kind == 50             ? "present capture"
+                                                              : "?");
+                        continue;
+                    }
                     const std::string name = checkpoint_name_ && id ? checkpoint_name_(id & ~std::uintptr_t{1}) : "";
                     std::fprintf(stderr, "[rt] vulkan: checkpoint: queue %p stage 0x%x %s pipeline 0x%llx %s\n",
                                  static_cast<void*>(queue), unsigned(data[i].stage), (id & 1) ? "compute" : "graphics",
@@ -1889,6 +1913,7 @@ private:
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
     alignas(64) std::mutex submit_mutex_;
+    std::unordered_map<VkSemaphore, std::uint64_t> last_submitted_;  // submit_mutex_ (record_submit_locked)
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;

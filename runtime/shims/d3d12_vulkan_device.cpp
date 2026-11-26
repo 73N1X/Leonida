@@ -200,6 +200,14 @@ bool queue_test_setting(const char* name, char* text, size_t size, rt::d3d12::Qu
     size_t length = 0;
     if (getenv_s(&length, text, size, name) != 0 || length <= 1) return false;
     if (settings == rt::d3d12::QueueTestSettings::apply) return true;
+    // LEONIDA_VK_QUEUE_TEST_FOR_GAME=1 (diagnostic): the game's device applies them too, to tell a race between its
+    // Vulkan queues from other GPU faults (every D3D12 queue then shares one VkQueue).
+    char game[4] = {};
+    size_t game_length = 0;
+    if (getenv_s(&game_length, game, sizeof(game), "LEONIDA_VK_QUEUE_TEST_FOR_GAME") == 0 && game[0] == '1') {
+        std::fprintf(stderr, "[rt] d3d12: %s applies to the game's device (LEONIDA_VK_QUEUE_TEST_FOR_GAME)\n", name);
+        return true;
+    }
     std::fprintf(stderr, "[rt] d3d12: %s is a test setting; the game's device ignores it (all its Vulkan queues)\n",
                  name);
     return false;
@@ -3935,21 +3943,36 @@ private:
             if (!binds[i].empty())
                 infos.push_back({windows_[i].buffer, std::uint32_t(binds[i].size()), binds[i].data()});
         const std::uint64_t wait = issued_, signal = issued_ + 1;
-        VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        values.waitSemaphoreValueCount = wait ? 1 : 0;
-        values.pWaitSemaphoreValues = &wait;
-        values.signalSemaphoreValueCount = 1;
-        values.pSignalSemaphoreValues = &signal;
-        VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &values};
-        info.waitSemaphoreCount = wait ? 1 : 0;
-        info.pWaitSemaphores = &timeline_;
-        info.bufferBindCount = std::uint32_t(infos.size());
-        info.pBufferBinds = infos.data();
-        info.signalSemaphoreCount = 1;
-        info.pSignalSemaphores = &timeline_;
         VkResult result;
         {
             std::lock_guard submit(device_.context->submit_mutex());
+            // The binds wait for everything already submitted on every queue, not only for the binds before them: a
+            // page the title unmaps or maps elsewhere may still be read by work in flight on another VkQueue (a
+            // compute dispatch read an unbound page twice, VK_EXT_device_fault "read invalid", runs 112 and 115), and
+            // an unbind that overtakes that work faults the GPU. On the console the title's own fences order it.
+            std::vector<VkSemaphore> wait_semaphores;
+            std::vector<std::uint64_t> wait_values;
+            if (wait) {
+                wait_semaphores.push_back(timeline_);
+                wait_values.push_back(wait);
+            }
+            for (const auto& [semaphore, value] : device_.context->last_submitted_locked()) {
+                if (semaphore == timeline_ || !value) continue;
+                wait_semaphores.push_back(semaphore);
+                wait_values.push_back(value);
+            }
+            VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            values.waitSemaphoreValueCount = std::uint32_t(wait_values.size());
+            values.pWaitSemaphoreValues = wait_values.data();
+            values.signalSemaphoreValueCount = 1;
+            values.pSignalSemaphoreValues = &signal;
+            VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &values};
+            info.waitSemaphoreCount = std::uint32_t(wait_semaphores.size());
+            info.pWaitSemaphores = wait_semaphores.data();
+            info.bufferBindCount = std::uint32_t(infos.size());
+            info.pBufferBinds = infos.data();
+            info.signalSemaphoreCount = 1;
+            info.pSignalSemaphores = &timeline_;
             result = vk.vkQueueBindSparse(device_.info.queue, 1, &info, VK_NULL_HANDLE);
             if (result == VK_SUCCESS) device_.context->record_submit_locked(timeline_, signal);
         }
@@ -6642,6 +6665,24 @@ public:
                              entry->name.c_str());
                 return E_INVALIDARG;
             }
+        // LEONIDA_REFUSE_EMULATED_WAVE64=1: a wave64 compute program translated through the workgroup emulation
+        // (--wave64-emulate, tier C) is refused, as VIctory's NVIDIA forks refuse the wave64 programs a 32-lane GPU
+        // cannot run (VItoriaBr README: 397 of them on an RTX 5060 Ti, the world loads without them). The emulated
+        // family of dispatch state a13adb02... read invalid addresses and lost the device (runs 112, 115, 119, 121).
+        static const bool refuse_emulated = [] {
+            const char* v = std::getenv("LEONIDA_REFUSE_EMULATED_WAVE64");
+            return v && v[0] == '1';
+        }();
+        // Only the title's captured FSPX programs: XboxBvhBuilder.dll throws when one of its own (bvh/...) is
+        // refused and the process ends (run 122).
+        if (refuse_emulated && entry->emulated() && entry->name.rfind("fspx-captured/", 0) == 0) {
+            static std::atomic<unsigned> refused{0};
+            const unsigned n = refused.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: emulated wave64 compute program refused (LEONIDA_REFUSE_EMULATED_WAVE64; "
+                                     "%u so far, first %s)\n", n, entry->name.c_str());
+            return E_INVALIDARG;
+        }
         if (entry->binding_count) register_literal_samplers(device_, *entry);
         if (pso_debug_names()) {  // its name for the diagnostics (graphics_pipeline_debug_name takes any id)
             DebugPipelineNames& registry = debug_pipeline_names();
