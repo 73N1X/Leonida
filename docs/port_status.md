@@ -186,6 +186,20 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   2560x1440 (`LEONIDA_RENDER_SCALE=0.75` renders 1080p into it). Other sizes
   are refused (1920x1080 still gave 2560x1440 buffers). Its frame-time effect
   is not measured yet: the title stops before its first frame.
+- Time step (`port/frame-timing`, `runtime/src/frame_step.h`): the title's
+  timer (+0x22264d0, once a frame) steps its time sets by the measured
+  QueryPerformanceCounter delta held to [1/30 s, 1/15 s]: the floor is
+  1 / the target frame rate (+0x6849844, from the graphics settings), the cap a
+  1/15 constant, both in +0x2226040 and again for the camera's set. Under
+  VIctory (game time +0xabbef40, frames +0xabbef44, watched against the wall
+  clock): menus at 30 fps 999-1003 game ms a second; the loading screen at
+  38-47 fps 1301-1612 (too fast); the world at 0.6-2.4 fps 40-160, i.e. one
+  1/15 s step a frame. The patch moves the floor to the timer's minimum step
+  (1/3000 s) and the cap to 1 s; `LEONIDA_TIME_STEP=stock` turns it off.
+  The same patch written into VIctory's running title: menus 1.000 of real
+  time, loading screen at 70 fps 1.000, world at 1.6 fps 1.000 over its frames
+  under 1 s (236 of 257; the other 21, 2.6 s on average, step 1 s, so 0.79
+  overall against 0.10 before).
 - The title asks the device for three interfaces it does not know
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
