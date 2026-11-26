@@ -138,6 +138,7 @@ int compile_gate() {
     }
     SubmitMutex m;
     m.set_gate_wait_limit_ms(0);  // no limit: gate_wait_limit checks the limit
+    m.set_gate_adaptive(false);   // gate_adapts checks the switch
     // Nothing in the driver: a submission passes at once.
     {
         const std::int64_t start = now_ms();
@@ -208,6 +209,7 @@ int gate_wait_limit() {
     if (!std::getenv("LEONIDA_COMPILE_GATE_WAIT_MS") && !std::getenv("LEONIDA_TITLE_WATCHDOG_KICK"))
         EXPECT(SubmitMutex::default_gate_wait_limit_ms() == SubmitMutex::kDefaultGateWaitMs);
     SubmitMutex m;
+    m.set_gate_adaptive(false);  // as LEONIDA_COMPILE_GATE=1: it never turns off
     m.set_gate_wait_limit_ms(150);
     EXPECT(m.gate_wait_limit_ms() == 150);
     // A create that stays in the driver until it is let go (one that takes longer than the limit).
@@ -267,6 +269,7 @@ int gate_wait_limit() {
     EXPECT(!third_ahead && third_entered_at >= short_left_at.load() && long_still_in);
     const SubmitMutex::GateStats stats = m.gate_stats();
     EXPECT(stats.submits == 2 && stats.ahead == 1);
+    EXPECT(m.gate_verdict() == SubmitMutex::GateVerdict::pending);  // quick probes, but not adaptive
     // Both gone: a submission passes at once.
     {
         const std::int64_t start = now_ms();
@@ -279,12 +282,113 @@ int gate_wait_limit() {
     return 0;
 }
 
+int gate_adapts() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): adaptive switch not checked\n");
+        return 0;
+    }
+    using Verdict = SubmitMutex::GateVerdict;
+    // Quick probes: the gate goes off once two, a second apart, came back with the create still in the driver.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(100);
+        std::atomic<bool> in{false}, release{false};
+        std::thread create([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            in = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        const bool entered = eventually([&] { return in.load(); });
+        bool first_ahead = false;
+        {
+            const SubmitMutex::SubmitTurn turn(m);  // goes ahead at the limit: the first quick probe
+            first_ahead = turn.went_ahead();
+        }
+        { const SubmitMutex::SubmitTurn turn(m); }  // the second, too soon after the first
+        const Verdict soon = m.gate_verdict();
+        std::this_thread::sleep_for(1100ms);
+        { const SubmitMutex::SubmitTurn turn(m); }  // the third, a second later
+        const Verdict later = m.gate_verdict();
+        // Off: a create that enters now holds no submission back.
+        std::atomic<bool> fresh_in{false}, release_fresh{false};
+        std::thread fresh([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            fresh_in = true;
+            while (!release_fresh) std::this_thread::sleep_for(1ms);
+        });
+        const bool fresh_entered = eventually([&] { return fresh_in.load(); });
+        const std::int64_t start = now_ms();
+        bool fresh_ahead = true;
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            fresh_ahead = turn.went_ahead();
+        }
+        const std::int64_t passed = now_ms() - start;
+        release = true;
+        release_fresh = true;
+        create.join();
+        fresh.join();
+        EXPECT(entered && fresh_entered && first_ahead);
+        EXPECT(soon == Verdict::pending);
+        EXPECT(later == Verdict::driver_does_not_hold);
+        EXPECT(passed < 50 && !fresh_ahead);
+    }
+    std::printf("compile gate: off after two quick probes a second apart, not after two within the second\n");
+    // A held probe: the gate stays on, and quick probes after it change nothing.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(100);
+        std::atomic<bool> in{false}, release{false};
+        std::thread create([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            in = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        const bool entered = eventually([&] { return in.load(); });
+        {
+            const SubmitMutex::SubmitTurn turn(m);  // goes ahead, then stays "in the driver" for 2.1 s
+            std::this_thread::sleep_for(2100ms);
+        }
+        const Verdict held = m.gate_verdict();
+        { const SubmitMutex::SubmitTurn turn(m); }
+        std::this_thread::sleep_for(1100ms);
+        { const SubmitMutex::SubmitTurn turn(m); }
+        const Verdict still = m.gate_verdict();
+        // Still gating: a create that enters now is waited for.
+        m.set_gate_wait_limit_ms(5000);
+        std::atomic<bool> short_in{false};
+        std::atomic<std::int64_t> short_left_at{0};
+        std::thread short_create([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            short_in = true;
+            std::this_thread::sleep_for(200ms);
+            short_left_at = now_ms();
+        });
+        const bool short_entered = eventually([&] { return short_in.load(); });
+        std::int64_t entered_at = 0;
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            entered_at = now_ms();
+        }
+        release = true;
+        create.join();
+        short_create.join();
+        EXPECT(entered && short_entered);
+        EXPECT(held == Verdict::driver_holds && still == Verdict::driver_holds);
+        EXPECT(entered_at >= short_left_at.load());
+    }
+    std::printf("compile gate: a probe held 2.1 s keeps it on, later quick probes do not turn it off\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
-        compile_gate() || gate_wait_limit())
+        compile_gate() || gate_wait_limit() || gate_adapts())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;
