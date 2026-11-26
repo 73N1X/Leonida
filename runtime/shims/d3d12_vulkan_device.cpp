@@ -10197,8 +10197,12 @@ public:
         std::memcpy(key.words.data(), words, sizeof(key.words));
         key.words[1] = 0;   // V resource.rs:2383-2396: the description's padding, which the title leaves as its stack
         key.words[13] = 0;  // had it; not part of what a texture is
-        std::lock_guard lock(placed_mutex_);
-        if (const auto it = placed_textures_.find(key); it != placed_textures_.end()) return it->second;
+        {
+            std::lock_guard lock(placed_mutex_);
+            if (const auto it = placed_textures_.find(key); it != placed_textures_.end()) return it->second;
+        }
+        // Made and filled outside placed_mutex_: a world load makes thousands, each detiled and uploaded, and the
+        // present path and the fill worker take the mutex too (presents waited behind them: 0-8 frames a second).
         D3D12_RESOURCE_DESC desc{};
         std::memcpy(&desc, key.words.data(), sizeof(desc));
         const std::uint32_t xbox_layout = static_cast<std::uint32_t>(desc.Layout);
@@ -10211,17 +10215,23 @@ public:
                                     __uuidof(ID3D12Resource), reinterpret_cast<void**>(&made))) ||
             !made) {
             log_once("a texture the title placed (device slots 70/71) could not be made; format", int(desc.Format));
-            placed_textures_.emplace(key, nullptr);
-            return nullptr;
+            std::lock_guard lock(placed_mutex_);
+            return placed_textures_.emplace(key, nullptr).first->second;  // or what another thread made meanwhile
         }
         auto* texture = Resource::from<Resource>(made);
         texture->attach_device(nullptr);  // the device holds it: a reference back would keep the device alive
         fill_from_title(*texture, address, desc, xbox_layout);
-        placed_textures_.emplace(key, texture);  // holds the reference `made` came with
+        std::lock_guard lock(placed_mutex_);
+        const auto [it, inserted] = placed_textures_.emplace(key, texture);  // holds the reference `made` came with
+        if (!inserted) {  // another thread made the same texture meanwhile: its one is the texture
+            texture->Release();
+            return it->second;
+        }
         // The title streams a texture's bytes in after it makes the first view (the start screen's draws sampled
         // textures still zero, so every frame was black): its bytes are checked again until they stop changing
         // (refresh_placed_textures), as VIctory keeps its copies of the title's textures up to date.
         pending_fills_.push_back({texture, address, desc, xbox_layout, 0, 0});
+        has_fills_.store(true, std::memory_order_release);
         return texture;
     }
 
@@ -10255,6 +10265,7 @@ public:
         texture->AddRef();
         std::lock_guard lock(placed_mutex_);
         pending_fills_.push_back(fill);
+        has_fills_.store(true, std::memory_order_release);
     }
 
     // Placed textures whose title bytes changed since their last upload are uploaded again (fill_from_title), up to
@@ -10264,9 +10275,11 @@ public:
     // from 30 to 3-6 frames a second. placed_mutex_ is held only to pick and update an entry, never over the read,
     // so the title's view creation (placed_texture) does not wait on a pass.
     void refresh_placed_textures() {
+        // Never placed_mutex_ here: this is the present path, and textures are made under it.
+        if (!has_fills_.load(std::memory_order_acquire)) return;
         {
-            std::lock_guard lock(placed_mutex_);
-            if (pending_fills_.empty()) return;
+            std::lock_guard lock(fill_mutex_);
+            if (fill_stop_.load(std::memory_order_relaxed)) return;
             if (!fill_worker_.joinable())
                 fill_worker_ = std::thread([this] { fill_worker_loop(); });
             fill_requested_ = true;
@@ -10276,8 +10289,8 @@ public:
 
     void stop_fill_worker() {
         {
-            std::lock_guard lock(placed_mutex_);
-            fill_stop_ = true;
+            std::lock_guard lock(fill_mutex_);
+            fill_stop_.store(true, std::memory_order_relaxed);
         }
         fill_cv_.notify_one();
         if (fill_worker_.joinable()) fill_worker_.join();
@@ -10294,9 +10307,9 @@ public:
     void fill_worker_loop() {
         for (;;) {
             {
-                std::unique_lock lock(placed_mutex_);
-                fill_cv_.wait(lock, [this] { return fill_stop_ || fill_requested_; });
-                if (fill_stop_) return;
+                std::unique_lock lock(fill_mutex_);
+                fill_cv_.wait(lock, [this] { return fill_stop_.load(std::memory_order_relaxed) || fill_requested_; });
+                if (fill_stop_.load(std::memory_order_relaxed)) return;
                 fill_requested_ = false;
             }
             refresh_pass();
@@ -12536,9 +12549,12 @@ private:
     std::vector<PlacedFill> pending_fills_;  // guarded by placed_mutex_
     std::size_t next_fill_ = 0;              // round-robin position in pending_fills_
     std::thread fill_worker_;                // refresh_placed_textures' passes; started with the first pending fill
-    std::condition_variable fill_cv_;        // with placed_mutex_
-    bool fill_requested_ = false;            // guarded by placed_mutex_
-    bool fill_stop_ = false;                 // guarded by placed_mutex_
+    std::mutex fill_mutex_;                  // the worker's signalling only: the present path takes it, never
+                                             // placed_mutex_
+    std::condition_variable fill_cv_;        // with fill_mutex_
+    bool fill_requested_ = false;            // guarded by fill_mutex_
+    std::atomic<bool> fill_stop_{false};     // set under fill_mutex_
+    std::atomic<bool> has_fills_{false};     // a texture was ever put on the watch
     struct UploadBlock {
         std::uint8_t* base;
         std::uint64_t size;

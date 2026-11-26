@@ -1410,7 +1410,23 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        // The bound signature does not fit this bind point, or an argument went past the 32 user dwords (the
+        // console's spill array is not modelled): the shaders would read zeros for some of their addresses, and one
+        // that writes through them loses the device (a write at 0x0 during the world load). Draws and dispatches
+        // are dropped while it is set (skipped_for_root).
+        bool incomplete = false;
     };
+
+    // A draw or dispatch dropped because its root arguments are incomplete (RootState::incomplete): counted, and
+    // logged the first time and then at powers of two.
+    static void skipped_for_root(bool compute) {
+        static std::atomic<unsigned> skipped{0};
+        const unsigned n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: a %s with incomplete root arguments is dropped (spill array or a signature "
+                                 "that does not fit its bind point; %u so far)\n",
+                         compute ? "dispatch" : "draw", n);
+    }
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
     // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
@@ -1430,8 +1446,10 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.incomplete = false;
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
+            state.incomplete = true;
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
                                    : "SetGraphicsRootSignature(signature that does not fit the graphics layout)");
             check(false);
@@ -1457,10 +1475,12 @@ private:
 
     // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
     void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
-        if (dword < rt::rootsig::kMaxUserSgprs)
+        if (dword < rt::rootsig::kMaxUserSgprs) {
             state.data[dword] = value;
-        else
+        } else {
+            state.incomplete = true;
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+        }
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
@@ -1717,6 +1737,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        if (compute_.incomplete) return skipped_for_root(true);
         if (!pipeline_made(true)) return;
         note_direct_heap_indexing(compute_.layout);
         count_recorded(true);
@@ -1743,6 +1764,7 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        if (graphics_.incomplete) return skipped_for_root(false);
         if (!pipeline_made(false)) return;
         // The console graphics layout keeps root arguments from s8; s0..s3 are the driver's: the vertex-buffer table,
         // the base vertex (the start vertex of a non-indexed draw, as the zero-based vertex id leaves it out) and the
