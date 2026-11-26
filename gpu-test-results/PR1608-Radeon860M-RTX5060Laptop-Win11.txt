@@ -13,6 +13,7 @@ Adapter selection: LEONIDA_VK_DEVICE=860M or RTX 5060 Laptop. A separate cs_stor
 Profile selection: LEONIDA_W64_EMULATE=0 or 1.
 Command: python -u -I scripts/run_gpu_tests.py --build <test-root>/build --work <test-root>/work-<adapter>-<profile> --require-pass
 Build: standalone Windows Vulkan executables, LEONIDA_BUILD_WINDOWS_RUNTIME=OFF. The broader MinGW build hit unsupported MSVC SEH syntax. The matching commit had no Runtime CI artifact. The d3d12_texture_uav_test.exe prerequisite is absent, so cs_texture_uav was reported as a failed setup case. Harness-delegated rows were not run separately.
+Failures: the two failures are the same in all four runs. cs_imgatomic_ext is the known fixture issue that open PR #1518 (GPU-IMG-ATOMIC-EXT-VOLUME-TAG) fixes. cs_texture_uav is a setup failure: its D3D12 test executable was not built here, so the case is unverified, not a GPU result.
 
 radeon860m-native — 243 passed, 2 failed, 19 skipped (exit=1 seconds=165.4655759)
 274 shaders: 274 translated, 274 pass spirv-val
@@ -74,8 +75,8 @@ Skip reasons:
   1 × SKIP (run by w64_graphics.py)
   1 × SKIP (this device cannot require a 64-wide fragment subgroup: subgroup 32..32)
 
-Diagnostic, separate from the baseline results
-Both adapters reproduced the exact image-atomic mismatch with the same baseline SPIR-V. The 3D texture kept its fill values.
-db19bbd34 changed the whole-mip volume descriptor in runtime/test/vk_store_test.cpp. The fixture still supplied the old descriptor. In a separate worktree only, changing fixture s12 to 0x80000055 and s15 to 0xd7801800 yielded 1/1 pass on both adapters in both profiles. The baseline checkout is clean.
+Check of PR #1518, separate from the baseline results
+Both adapters reproduce the cs_imgatomic_ext mismatch already reported in #1608 and #14 and fixed by open PR #1518 (PierreEbele). The 3D texture kept its fill values.
+#1518 changes the fixture's volume T# words to s12 = 0x80000055 and s15 = 0xd7801800, the key vk_store_test expects since db19bbd34. With those two values applied in a separate worktree, cs_imgatomic_ext passed 1/1 on both adapters in both profiles. This confirms #1518 on Radeon 860M and RTX 5060 Laptop. It is not a separate fix. The baseline checkout is clean.
 AI-assisted with Codex for setup, execution, diagnosis, and reporting.
 
