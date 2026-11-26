@@ -321,9 +321,17 @@ three things from `D3D12XboxCreateDevice`, ported from VIctory (`victory-gpu/src
   changes it in the mapped executable before any of its code runs (`main.cpp`), after checking the four places it
   patches hold the 1.0.2.1 executable's bytes; the title's DXGI output (console slot 21, see
   [docs/runtime_imports.md](../docs/runtime_imports.md#the-titles-window-and-its-display-mode)) reports the same mode.
+- **The time step.** The title steps its world by the measured frame time, but held to 1/30 s at least (one frame at
+  the 30 fps it aims for) and 1/15 s at most: real time only between 15 and 30 fps, fps/30 times too fast above (the
+  console's doubled speed when a glitch doubles its frame rate) and fps/15 of real time below (0.13 at 2 fps).
+  `src/frame_step.h` moves the two loads of each of its two step computations to the timer's own minimum step
+  (1/3000 s) and its 1.0 constant, after checking all six places hold the 1.0.2.1 executable's bytes (`main.cpp`,
+  before any title code runs): the step is the measured frame time from 1 to 3000 fps. Systems that count frames
+  instead of reading the step stay frame-paced (see the header).
 
 | variable | default | what it changes |
 |---|---|---|
+| `LEONIDA_TIME_STEP` | `measured` | `stock` (or `0`, `off`): the title keeps its own step, 1/30 to 1/15 s a frame (see "The time step" above). |
 | `LEONIDA_DISPLAY_MODE` | `3840x2160` | `2560x1440`: the title outputs 2560x1440 (its window and scanout buffers; measured: both 2560x1440 instead of 3840x2160) and renders its scene at that size with no temporal upscale. Any other `WxH` (W in 640..7680, H in 360..4320) is only the mode the console output lists (as VIctory's `VICTORY_DISPLAY_MODE`): the executable is left as it is, since with a 1920x1080 SDR mode the title still made 2560x1440 buffers. |
 | `LEONIDA_RENDER_SCALE` | `1` | With `LEONIDA_DISPLAY_MODE=2560x1440`: the scene renders at this part of the output (0.25..1; 0.75 is VIctory's `VICTORY_RENDER_1080P`, 1920x1080 scaled up to 2560x1440). Ignored otherwise. |
 | `LEONIDA_CAPTURE_DIR` | unset | Screenshots on request into this folder (made if missing): a thread of the runtime reads the request file every 100 ms, and when the number in it is above the last one taken (0 at the start) the next presented frame is copied (by the frame's own command buffer, nothing read on the present path) and written by that thread as `capture-<number>.png`, 8-bit RGB at the window's size, through a `.part` file and a rename, so a file that exists is complete. `[rt] capture: request N: frame F (WxH) saved as <path>` says when. As VIctory's `VICTORY_CAPTURE_REQUEST`. |

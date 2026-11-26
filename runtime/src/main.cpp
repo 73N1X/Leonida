@@ -30,6 +30,7 @@
 #include "base_reservation.h"
 #include "code_hooks.h"
 #include "display_profile.h"
+#include "frame_step.h"
 #include "host_cpu.h"
 #include "mods.h"
 #include "pe_loader.h"
@@ -89,6 +90,26 @@ void apply_display_profile(const rt::Module& module) {
     else
         std::fprintf(stderr, "[rt] display: %s keeps its 3840x2160 output: %s (nothing patched)\n",
                      module.name.c_str(), error.c_str());
+}
+
+// The title's time step (src/frame_step.h): the measured frame time at any frame rate, unless LEONIDA_TIME_STEP=stock.
+void apply_frame_step(const rt::Module& module) {
+    char value[32] = {};
+    const DWORD length = GetEnvironmentVariableA("LEONIDA_TIME_STEP", value, sizeof(value));
+    bool known = true;
+    const bool wanted = leonida::frame_step::wanted(length < sizeof(value) ? value : "?", &known);
+    if (!known) std::fprintf(stderr, "[rt] time step: LEONIDA_TIME_STEP is not measured or stock; measured\n");
+    if (!wanted) {
+        std::fprintf(stderr, "[rt] time step: %s keeps its own step (1/30 to 1/15 s a frame)\n", module.name.c_str());
+        return;
+    }
+    std::string error;
+    if (leonida::frame_step::apply_to_image(module.base, module.size, leonida::frame_step::plan(), &error))
+        std::fprintf(stderr, "[rt] time step: %s steps by the measured frame time (1/3000 to 1 s a frame; "
+                             "LEONIDA_TIME_STEP=stock for its own)\n", module.name.c_str());
+    else
+        std::fprintf(stderr, "[rt] time step: %s keeps its own step: %s (nothing patched)\n", module.name.c_str(),
+                     error.c_str());
 }
 
 int usage() {
@@ -225,7 +246,10 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
-        if (init || run) apply_display_profile(main_module);
+        if (init || run) {
+            apply_display_profile(main_module);
+            apply_frame_step(main_module);
+        }
         // __XMemAllocationHooks__ (VIctory xmem.rs:243-300, d3d12x.rs:20): the title's allocation routines. XMemAlloc
         // and XMemFree call them from now on, and committed resources take their memory from them, as the console's
         // D3D runtime gives them (the title counts its back buffers against a pool of its own that way).

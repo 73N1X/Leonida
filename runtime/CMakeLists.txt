@@ -568,6 +568,10 @@ if(BUILD_TESTING)
   add_executable(present_window_parts_test test/present_window_parts_test.cpp)
   add_test(NAME present_window_parts COMMAND present_window_parts_test)
 
+  # The title's time step patch (src/frame_step.h) on a stand-in image, and the step it gives at 1 to 1000 fps.
+  add_executable(frame_step_test test/frame_step_test.cpp)
+  add_test(NAME frame_step COMMAND frame_step_test)
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 
