@@ -217,6 +217,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       target_compile_definitions(device_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_compile_options(device_proxy_test PRIVATE /W4 /permissive- /utf-8)
       target_link_options(device_proxy_test PRIVATE /OPT:NOREF)
+      # d3d12_xs.dll's IID_ID3D12Device data import and D3D12ConfigureVirtualMemoryX's range: no device, no GPU.
+      add_executable(d3d12_xs_exports_test
+        test/d3d12_xs_exports_test.cpp
+        shims/registry.cpp
+        shims/d3d12_xs.cpp
+        shims/d3d12_xs_device.cpp
+      )
+      target_include_directories(d3d12_xs_exports_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+      target_link_libraries(d3d12_xs_exports_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY})
+      target_compile_definitions(d3d12_xs_exports_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_xs_exports_test PRIVATE /W4 /permissive- /utf-8)
+      target_link_options(d3d12_xs_exports_test PRIVATE /OPT:NOREF)
     else()
       message(STATUS "dxgi.lib not found: device_proxy_test is not built")
     endif()
@@ -1092,6 +1104,7 @@ if(BUILD_TESTING)
 
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
+    add_test(NAME d3d12_xs_exports COMMAND d3d12_xs_exports_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
     # With --trace-d3d12 the 24 D3D12XboxCreateDevice parameter words still print (docs/boot.md, question 1),
     # and the line with run-specific pointers does not.

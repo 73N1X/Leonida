@@ -253,6 +253,10 @@ constexpr D3D12_HEAP_PROPERTIES kMockHeapProperties{D3D12_HEAP_TYPE_CUSTOM, D3D1
                                                     D3D12_MEMORY_POOL_L0, 1, 1};
 // What the mock queue's GetDesc (18) writes.
 constexpr D3D12_COMMAND_QUEUE_DESC kMockQueueDesc{D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 1};
+// What a mock heap's GetDesc (8) and CPU start (9) write.
+constexpr D3D12_DESCRIPTOR_HEAP_DESC kMockHeapDesc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 64,
+                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+constexpr std::uint64_t kMockHeapStart = 0x5a5a0000;
 
 // `words` are the call's first five words (a1..a5), copied into the thunk's own frame.
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
@@ -281,6 +285,19 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 26:  // GetCustomHeapProperties(this, buffer, node_mask, heap_type)
                 std::memcpy(reinterpret_cast<void*>(a1), &kMockHeapProperties, sizeof(kMockHeapProperties));
                 return a1;
+            case 13:  // CheckFeatureSupport(feature, data, size): the PC sizes only, as the PC runtime
+                if (a1 == D3D12_FEATURE_D3D12_OPTIONS) {
+                    if (a3 != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS) || !a2) return static_cast<std::uint32_t>(E_INVALIDARG);
+                    auto* w = reinterpret_cast<std::uint32_t*>(a2);
+                    for (std::uint32_t i = 0; i < 15; ++i) w[i] = 100 + i;  // word i of the PC structure
+                    return S_OK;
+                }
+                if (a1 == D3D12_FEATURE_FEATURE_LEVELS) {  // the PC device: 12_1 at most
+                    auto* levels = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(a2);
+                    levels->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_1;
+                    return S_OK;
+                }
+                return S_OK;
             case 22:  // CreateSampler(desc, handle): the description is the caller's, so it is copied
                 if (a1) std::memcpy(&m->sampler, reinterpret_cast<const void*>(a1), sizeof(m->sampler));
                 break;
@@ -324,6 +341,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return a1;
     }
     if (m->kind == Kind::command_list && slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
+    if (m->kind == Kind::heap && slot == 8) {  // GetDesc(this, buffer)
+        std::memcpy(reinterpret_cast<void*>(a1), &kMockHeapDesc, sizeof(kMockHeapDesc));
+        return a1;
+    }
+    if (m->kind == Kind::heap && (slot == 9 || slot == 10)) {  // GetCPU/GPUDescriptorHandleForHeapStart(this, buffer)
+        *reinterpret_cast<std::uint64_t*>(a1) = kMockHeapStart;
+        return a1;
+    }
     return S_OK;
 }
 
@@ -1432,6 +1457,7 @@ int check_slot_tables() {
         {8, DeviceMethod::create_queue, DeviceMethod::create_queue},
         {9, DeviceMethod::create_allocator, DeviceMethod::create_allocator},
         {12, DeviceMethod::create_list, DeviceMethod::create_list},
+        {13, DeviceMethod::forward, DeviceMethod::feature_support},
         {14, DeviceMethod::create_heap, DeviceMethod::create_heap},
         {25, DeviceMethod::struct_return, DeviceMethod::struct_return},
         {26, DeviceMethod::struct_return, DeviceMethod::struct_return},
@@ -2095,8 +2121,10 @@ int check_console_device() {
     const std::uint64_t display_heap = D3D12_HEAP_FLAG_ALLOW_DISPLAY | D3D12_HEAP_FLAG_SHARED;
     EXPECT(hr_of(raw(device, 127, word(&default_heap), display_heap, word(&back_buffer), 0, 0, 0x7777, 0, 0,
                      word(&resource_iid), word(&resource))) == S_OK);
+    // The heap flags and the barrier layout are 32-bit arguments: the upper half of their registers is undefined.
     EXPECT(mock->calls[76] == 1 && mock->args[76][0] == word(&default_heap) &&
-           mock->args[76][1] == D3D12_HEAP_FLAG_SHARED && mock->args[76][3] == 0);
+           static_cast<std::uint32_t>(mock->args[76][1]) == D3D12_HEAP_FLAG_SHARED &&
+           static_cast<std::uint32_t>(mock->args[76][3]) == 0);
     EXPECT(mock->resource_desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
            static_cast<std::uint32_t>(mock->resource_desc.Flags) == 0x1 && mock->resource_desc.Width == 1920);
     EXPECT(!resource);  // nulled first; the mock makes no object
@@ -2109,8 +2137,9 @@ int check_console_device() {
         void* device9 = make_device(m9, 9, true, false);
         EXPECT(hr_of(raw(device9, 127, word(&default_heap), display_heap, word(&back_buffer), 0, 0, 0, 0, 0,
                          word(&resource_iid), word(&resource))) == S_OK);
-        EXPECT(m9->calls[76] == 0 && m9->calls[27] == 1 && m9->args[27][1] == D3D12_HEAP_FLAG_SHARED &&
-               m9->args[27][3] == D3D12_RESOURCE_STATE_COMMON &&
+        EXPECT(m9->calls[76] == 0 && m9->calls[27] == 1 &&
+               static_cast<std::uint32_t>(m9->args[27][1]) == D3D12_HEAP_FLAG_SHARED &&
+               static_cast<std::uint32_t>(m9->args[27][3]) == D3D12_RESOURCE_STATE_COMMON &&
                m9->resource_desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(release(device9) == 0);
     }
@@ -2294,6 +2323,134 @@ int check_frame_clock() {
     return 0;
 }
 
+// ---- 17. What the title's inlined code reads after the object headers (VIctory's layouts) ----
+
+template <class T>
+T field(const void* object, std::size_t offset) {
+    T value{};
+    std::memcpy(&value, static_cast<const std::uint8_t*>(object) + offset, sizeof(value));
+    return value;
+}
+
+int check_console_headers() {
+    Mock* mock = nullptr;
+    void* device = make_console_device(mock);
+    EXPECT(device);
+    // V device.rs:103-119, 479: the null constant buffer at +0x10 (none) and the out-of-line byte at +0x18.
+    EXPECT(field<std::uint64_t>(device, 0x10) == 0 && field<std::uint8_t>(device, 0x18) == 1);
+    for (std::size_t at = 0x1c; at < 0x58; at += 4) EXPECT(field<std::uint32_t>(device, at) == 0);
+
+    // V queue.rs:31-35, 1048: a queue's list type right after the header, for slot 8 and the console's slot 48.
+    void* direct = make_queue(device);
+    const std::uint32_t compute_x[4] = {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, 1, 0};  // the title's compute queue
+    void* compute = nullptr;
+    EXPECT(hr_of(raw(device, 48, word(compute_x), word(&kQueueIid), word(&compute))) == S_OK && direct && compute);
+    EXPECT(field<std::uint32_t>(direct, 0x10) == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+           field<std::uint32_t>(compute, 0x10) == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    // GetDevice (7) still finds the device, which moved off +0x10.
+    void* got = nullptr;
+    const IID device_iid = __uuidof(ID3D12Device);
+    EXPECT(hr_of(raw(compute, 7, word(&device_iid), word(&got))) == S_OK && got == device);
+    release(got);
+
+    // V list.rs:90-100: an allocator's and a list's type at +0x10; the list's console body still at +0x18.
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_COPY, word(&allocator_iid), word(&allocator))) == S_OK);
+    EXPECT(field<std::uint32_t>(allocator, 0x10) == D3D12_COMMAND_LIST_TYPE_COPY);
+    const std::uint32_t list_desc[4] = {D3D12_COMMAND_LIST_TYPE_COPY, 0, 0, 0};
+    const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(list_desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
+    EXPECT(field<std::uint32_t>(list, 0x10) == D3D12_COMMAND_LIST_TYPE_COPY);
+    const std::uint64_t cursor = field<std::uint64_t>(list, 0x18);
+    EXPECT(cursor && cursor == field<std::uint64_t>(list, 0x28) && cursor == field<std::uint64_t>(list, 0x30));
+    void* list12 = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE, word(allocator), 0, word(&list_iid),
+                     word(&list12))) == S_OK);
+    EXPECT(field<std::uint32_t>(list12, 0x10) == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    EXPECT(hr_of(raw(list, 7, word(&device_iid), word(&got))) == S_OK && got == device);
+    release(got);
+
+    // V fence.rs:24-29, 136-139: a console fence's value at +0x10, which is where slot 12 points.
+    void* fence = make_fence(device);
+    EXPECT(fence && raw(fence, 12) == word(fence) + 0x10 && field<std::uint64_t>(fence, 0x10) == kCompletedValue);
+    EXPECT(hr_of(raw(fence, 10, 21)) == S_OK && field<std::uint64_t>(fence, 0x10) == 21);
+
+    // V descriptor.rs:49-54: a heap's description at +0x10 and its first descriptor at +0x20.
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 64,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* heap = nullptr;
+    EXPECT(hr_of(raw(device, 14, word(&heap_desc), word(&heap_iid), word(&heap))) == S_OK && xs::is_heap_proxy(heap));
+    const auto seen = field<D3D12_DESCRIPTOR_HEAP_DESC>(heap, 0x10);
+    EXPECT(seen.Type == kMockHeapDesc.Type && seen.NumDescriptors == kMockHeapDesc.NumDescriptors &&
+           seen.Flags == kMockHeapDesc.Flags && seen.NodeMask == kMockHeapDesc.NodeMask);
+    EXPECT(field<std::uint64_t>(heap, 0x20) == kMockHeapStart && raw(heap, 9) == kMockHeapStart);
+
+    EXPECT(release(heap) == 0 && release(fence) == 0 && release(list12) == 0 && release(list) == 0);
+    EXPECT(release(allocator) == 0 && release(compute) == 0 && release(direct) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: console headers: device +0x10/+0x18, queue/allocator/list type and fence value at +0x10, heap "
+                "description and start at +0x10/+0x20\n", g_label);
+    return 0;
+}
+
+// ---- 18. CheckFeatureSupport in the console layout (V device.rs:240-347) ----
+
+int check_console_features() {
+    Mock* mock = nullptr;
+    void* device = make_console_device(mock);
+    EXPECT(device);
+    // OPTIONS in the console's 16 words: the PC's 15 with a 0 inserted at word 11.
+    std::uint32_t options[16];
+    std::memset(options, 0xcc, sizeof(options));
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_D3D12_OPTIONS, word(options), sizeof(options))) == S_OK);
+    for (std::uint32_t i = 0; i < 11; ++i) EXPECT(options[i] == 100 + i);
+    EXPECT(options[11] == 0);
+    for (std::uint32_t i = 12; i < 16; ++i) EXPECT(options[i] == 100 + i - 1);
+    // The PC's own size goes to the device unchanged; any other size is the device's to refuse.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS pc{};
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_D3D12_OPTIONS, word(&pc), sizeof(pc))) == S_OK &&
+           pc.DoublePrecisionFloatShaderOps == 100 && pc.ResourceHeapTier == 114);
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_D3D12_OPTIONS, word(options), 12)) == E_INVALIDARG);
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_D3D12_OPTIONS, 0, sizeof(options))) == E_INVALIDARG);
+
+    // Feature levels: up to 12_2, the console's (the mock device stops at 12_1).
+    const D3D_FEATURE_LEVEL asked[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_1,
+                                       static_cast<D3D_FEATURE_LEVEL>(0xc200), static_cast<D3D_FEATURE_LEVEL>(0xd000)};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS levels{4, asked, D3D_FEATURE_LEVEL(0)};
+    const unsigned before = mock->calls[13];
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == S_OK &&
+           static_cast<std::uint32_t>(levels.MaxSupportedFeatureLevel) == 0xc200 && mock->calls[13] == before);
+    levels = {2, asked, D3D_FEATURE_LEVEL(0)};
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == S_OK &&
+           levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_12_1);
+    levels = {1, asked + 3, D3D_FEATURE_LEVEL_11_0};
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) ==
+               DXGI_ERROR_UNSUPPORTED &&
+           levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL(0));
+    levels = {1, nullptr, D3D_FEATURE_LEVEL(0)};
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == E_INVALIDARG);
+
+    // Any other feature is the device's.
+    D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
+    EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_ARCHITECTURE, word(&architecture), sizeof(architecture))) == S_OK &&
+           mock->calls[13] == before + 1 && mock->args[13][0] == D3D12_FEATURE_ARCHITECTURE);
+
+    // The PC layout is unchanged: the 16-word query reaches the device, which refuses it.
+    Mock* pc_mock = nullptr;
+    void* pc_device = make_device(pc_mock, 11, true);
+    EXPECT(pc_device && hr_of(raw(pc_device, 13, D3D12_FEATURE_D3D12_OPTIONS, word(options), sizeof(options))) ==
+                            E_INVALIDARG);
+    levels = {4, asked, D3D_FEATURE_LEVEL(0)};
+    EXPECT(hr_of(raw(pc_device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == S_OK &&
+           levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_12_1);
+    EXPECT(release(pc_device) == 0 && release(device) == 0 && mock->refs == 0 && pc_mock->refs == 0);
+    std::printf("%s: console CheckFeatureSupport: 16-word OPTIONS and feature level 12_2\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -2307,7 +2464,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_slot_tables() || check_list_table() || check_console_queue() || check_value_waits() || check_page_mappings() ||
         check_console_fence() ||
-        check_console_device() || check_frame_clock())
+        check_console_device() || check_frame_clock() || check_console_headers() || check_console_features())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
