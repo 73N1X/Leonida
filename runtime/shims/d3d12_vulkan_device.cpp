@@ -100,6 +100,47 @@ void log_once(const char* what, int value) {
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
+// The console's 16-bit depth with 8-bit stencil, 118 (D16_UNORM_S8_UINT) and its plane views 119 (R16_UNORM_X8)
+// and 120 (X16_G8_UINT), have no PC format: the 24-bit family stands in, as in VIctory (victory-gpu resource.rs
+// pc_format). The title makes a 2560x1440 one and asserts at game+0x344196 when it is refused.
+DXGI_FORMAT pc_format(DXGI_FORMAT format) {
+    switch (static_cast<UINT>(format)) {
+    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    default: return format;
+    }
+}
+
+// `desc` with a console format made a PC one (pc_format), in `storage` when it changes; else `desc` itself.
+const D3D12_RESOURCE_DESC* pc_resource_desc(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_DESC& storage) {
+    if (!desc || pc_format(desc->Format) == desc->Format) return desc;
+    storage = *desc;
+    storage.Format = pc_format(desc->Format);
+    return &storage;
+}
+const D3D12_CLEAR_VALUE* pc_clear_value(const D3D12_CLEAR_VALUE* clear, D3D12_CLEAR_VALUE& storage) {
+    if (!clear || pc_format(clear->Format) == clear->Format) return clear;
+    storage = *clear;
+    storage.Format = pc_format(clear->Format);
+    return &storage;
+}
+
+// A descriptor handle that is null or in the first 64 KiB, which Windows never maps. The title passed 0x200 to
+// CreateConstantBufferView from one of its binding records (game+0x4da8f63, the record's word at +0x38 never set);
+// the view is skipped and counted instead of written through.
+bool unusable_destination(SIZE_T ptr) {
+    if (ptr >= 0x10000) return false;
+    if (ptr) {
+        static std::atomic<unsigned> seen{0};
+        const unsigned n = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: a view for unmapped descriptor handle 0x%llx was skipped (%u so far)\n",
+                         static_cast<unsigned long long>(ptr), n);
+    }
+    return true;
+}
+
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
 // queues share a VkQueue runs on any GPU; both together give the Intel UHD 770 on Windows and lavapipe (one family,
 // one queue). LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N (1 to 16): at most N VkQueues per queue family (unset, or not a
@@ -276,7 +317,7 @@ constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
 Format vulkan_format(DXGI_FORMAT format, bool depth) {
     constexpr VkImageAspectFlags color = VK_IMAGE_ASPECT_COLOR_BIT, d = VK_IMAGE_ASPECT_DEPTH_BIT,
                                  ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-    switch (format) {
+    switch (pc_format(format)) {
     case DXGI_FORMAT_R32G32B32A32_TYPELESS: return {VK_FORMAT_R32G32B32A32_SFLOAT, color, true};
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return {VK_FORMAT_R32G32B32A32_SFLOAT, color};
     case DXGI_FORMAT_R32G32B32A32_UINT: return {VK_FORMAT_R32G32B32A32_UINT, color};
@@ -983,11 +1024,22 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
+        // A8_UNORM is an R8 image whose views read (0, 0, 0, r): any dimension (the title sizes a 128x1 1D one and
+        // asserts at game+0x344196 when it is refused), single-sampled and never depth.
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
+            (desc.SampleDesc.Count != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
             return {};
+        // The title asks for A8_UNORM textures that allow unordered access or rendering (its allocation-size query
+        // asserts on a refusal, game_scarlett_master.exe+0x344196). The R8 image behind A8 takes a typed UAV store as
+        // the console does (the one channel the shader stores lands in the byte); its RTVs stay null for now, see
+        // CreateRenderTargetView.
+        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+            if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !storage_usable(VK_FORMAT_R8_UNORM)) ||
+                ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !color_attachment_usable(VK_FORMAT_R8_UNORM)))
+                return {};
+            log_once("A8_UNORM texture with unordered access or rendering, backed by R8_UNORM; flags", int(desc.Flags));
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -6839,11 +6891,45 @@ public:
                                                      ID3D12RootSignature* root_signature, REFIID riid,
                                                      void** out) override {
         if (out) *out = nullptr;
+        // Which check refuses a description, with its arguments: the first 8 refusals, so a title's set-up that stops
+        // on one says why.
+        const auto refuse = [&](const char* why) {
+            static std::atomic<int> count{0};
+            if (count.fetch_add(1, std::memory_order_relaxed) < 8 && desc) {
+                char types[96] = {};
+                int used = 0;
+                for (UINT i = 0; i < desc->NumArgumentDescs && i < 12 && desc->pArgumentDescs; ++i)
+                    used += std::snprintf(types + used, sizeof(types) - used, "%s%d", i ? " " : "",
+                                          static_cast<int>(desc->pArgumentDescs[i].Type));
+                std::fprintf(stderr, "[rt] d3d12: CreateCommandSignature refused (%s): %u argument(s) [%s], stride %u, "
+                                     "node mask 0x%x, root signature %s\n",
+                             why, desc->NumArgumentDescs, types, desc->ByteStride, desc->NodeMask,
+                             root_signature ? "given" : "none");
+            }
+            return E_INVALIDARG;
+        };
+        // The console's own argument type 105 is a single dispatch (VIctory victory-gpu list.rs:1703, DISPATCH_SINGLE
+        // taken as DISPATCH). The title's first command signature is one: one argument, stride 12, no root signature.
+        constexpr D3D12_INDIRECT_ARGUMENT_TYPE kConsoleDispatchSingle = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);
+        std::vector<D3D12_INDIRECT_ARGUMENT_DESC> pc_args;
+        D3D12_COMMAND_SIGNATURE_DESC pc_desc{};
+        if (desc && desc->pArgumentDescs && desc->NumArgumentDescs) {
+            const auto* first = desc->pArgumentDescs;
+            if (std::any_of(first, first + desc->NumArgumentDescs,
+                            [&](const D3D12_INDIRECT_ARGUMENT_DESC& a) { return a.Type == kConsoleDispatchSingle; })) {
+                pc_args.assign(first, first + desc->NumArgumentDescs);
+                for (auto& a : pc_args)
+                    if (a.Type == kConsoleDispatchSingle) a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+                pc_desc = *desc;
+                pc_desc.pArgumentDescs = pc_args.data();
+                desc = &pc_desc;
+            }
+        }
         // The host refuses these with E_INVALIDARG (compare_invalid_arguments, "command signature:"): one node, a
         // known type per argument, exactly one draw or dispatch and it comes last, a root signature for root
         // arguments, and a stride that is a multiple of 4 and holds every argument.
         if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || (desc->NodeMask & ~1u))
-            return E_INVALIDARG;
+            return refuse("empty description or node mask");
         UINT64 size = 0;  // 64-bit: a large Num32BitValuesToSet must not wrap past ByteStride
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
@@ -6860,23 +6946,38 @@ public:
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS); break;
-            default: return E_INVALIDARG;
+            default: return refuse("unknown argument type");
             }
             const bool draw = arg.Type <= D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH ||
                               arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS ||
                               arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
             const bool root_argument = !draw && arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW &&
                                        arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
-            if (draw != (i + 1 == desc->NumArgumentDescs) || (root_argument && !root_signature)) return E_INVALIDARG;
+            if (draw != (i + 1 == desc->NumArgumentDescs)) return refuse("the draw or dispatch is not the last argument");
+            if (root_argument && !root_signature) return refuse("a root argument without a root signature");
         }
-        if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
+        if (desc->ByteStride % 4 || desc->ByteStride < size) return refuse("stride not a multiple of 4 or too small");
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
         leonida::IndirectKind kind;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
-        default: return E_NOTIMPL;
+        default: {
+            // Mesh and ray dispatches through a signature are not executed yet (VIctory: victory-gpu indirect.rs). The
+            // title creates mesh-dispatch signatures during its graphics set-up and stops at its own breakpoint when
+            // one is refused (E_NOTIMPL here stopped it ~5 s in), so the signature is made and its ExecuteIndirect
+            // calls are skipped, logged once per type, until mesh indirect execution is ported.
+            const int type = static_cast<int>(desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type);
+            static std::atomic<std::uint32_t> logged{0};
+            const std::uint32_t bit = 1u << (static_cast<unsigned>(type) & 31u);
+            if (!(logged.fetch_or(bit, std::memory_order_relaxed) & bit))
+                std::fprintf(stderr, "[rt] d3d12: command signature ending in indirect argument type %d accepted; its "
+                                     "ExecuteIndirect calls are skipped until it is implemented\n",
+                             type);
+            return create_command_signature(leonida::IndirectKind::dispatch, desc->ByteStride, riid, out, identity(),
+                                            type);
+        }
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
     }
@@ -7245,7 +7346,7 @@ public:
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
         leonida::TargetView view{};
         leonida::ResourceId rid = 0;
         D3D12_RESOURCE_DESC rd{};
@@ -7296,6 +7397,9 @@ public:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
+                // An R8 attachment would store the pixel shader's red output, not its alpha: null until A8 renders
+                // through VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5).
+                log_once("A8_UNORM render-target view left null; format", int(rd.Format));
                 view = {};
             } else if (r && r->uint_backed() == VK_FORMAT_A1R5G5B5_UNORM_PACK16) {
                 // An R16_UINT-backed B5G5R5A1 UAV texture (Format::uint_backed) renders through an A1R5G5B5 view, in
@@ -7379,7 +7483,13 @@ public:
     void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateDepthStencilView");
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
+        D3D12_DEPTH_STENCIL_VIEW_DESC pc_view;
+        if (desc && pc_format(desc->Format) != desc->Format) {  // console formats 118-120 (pc_format)
+            pc_view = *desc;
+            pc_view.Format = pc_format(desc->Format);
+            desc = &pc_view;
+        }
         leonida::TargetView view{};
         if (const Resource* r = Resource::from<Resource>(resource)) {
             const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
@@ -7448,7 +7558,7 @@ public:
     void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
@@ -7538,7 +7648,13 @@ public:
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
         using leonida::gfx10::ImageType;
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
+        D3D12_SHADER_RESOURCE_VIEW_DESC pc_view;
+        if (desc && pc_format(desc->Format) != desc->Format) {  // console formats 118-120 (pc_format)
+            pc_view = *desc;
+            pc_view.Format = pc_format(desc->Format);
+            desc = &pc_view;
+        }
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
@@ -7737,7 +7853,7 @@ public:
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView");
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
@@ -7801,7 +7917,7 @@ public:
     void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc,
                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateSampler");
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kSamplerDescriptorSize);
         if (!desc) return;
         const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc, &state_));
@@ -7840,7 +7956,7 @@ public:
     // 14-15 (anisotropy bias and threshold) and 21-26 (tuning) are not read, as in VIctory.
     void create_sampler_x(const std::uint32_t* words, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
         d3d12_trace::record("Xbox CreateSamplerX (device slot 61)");
-        if (!destination.ptr) return;
+        if (unusable_destination(destination.ptr)) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kSamplerDescriptorSize);
         if (!words) return;
         const leonida::gfx10::SamplerWords s = sampler_x_words(words);
@@ -8935,6 +9051,10 @@ public:
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        D3D12_RESOURCE_DESC pc_desc_storage;
+        D3D12_CLEAR_VALUE pc_clear_storage;
+        desc = pc_resource_desc(desc, pc_desc_storage);  // console formats 118-120 (pc_format)
+        clear = pc_clear_value(clear, pc_clear_storage);
         if (heap->host_address()) {
             // An existing heap is not an arena range, and the placed path addresses resources by arena offset.
             log_once("a placed resource in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
@@ -9934,7 +10054,8 @@ private:
         D3D12_RESOURCE_ALLOCATION_INFO total{0, 1};
         bool failed = count && !descs;
         for (UINT i = 0; i < count; ++i) {
-            const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(get(i));
+            const auto pc = [](D3D12_RESOURCE_DESC d) { d.Format = pc_format(d.Format); return d; };
+            const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(pc(get(i)));
             failed = failed || one.SizeInBytes == UINT64_MAX;
             if (failed) {
                 if (each) each[i] = {UINT64_MAX, one.Alignment, UINT64_MAX};
@@ -10124,6 +10245,10 @@ private:
         const auto finish = [&](HRESULT hr) { return method ? d3d12_trace::result(method, hr) : hr; };
         if (out) *out = nullptr;
         if (!heap || !desc) return finish(E_INVALIDARG);
+        D3D12_RESOURCE_DESC pc_desc_storage;
+        D3D12_CLEAR_VALUE pc_clear_storage;
+        desc = pc_resource_desc(desc, pc_desc_storage);  // console formats 118-120 (pc_format)
+        clear = pc_clear_value(clear, pc_clear_storage);
         if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
                                                          acceleration_structures(), state_.uma)) {
             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")

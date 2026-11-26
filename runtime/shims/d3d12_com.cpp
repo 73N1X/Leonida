@@ -137,15 +137,20 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride, int unsupported_type = -1)
+        : kind_(kind), stride_(byte_stride), unsupported_type_(unsupported_type) {}
 
     leonida::IndirectKind kind() const { return kind_; }
     UINT stride() const { return stride_; }
+    // The D3D12_INDIRECT_ARGUMENT_TYPE of a signature the layer accepts but cannot execute yet (mesh or ray
+    // dispatches), else -1. Its ExecuteIndirect calls are skipped.
+    int unsupported_type() const { return unsupported_type_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
     leonida::IndirectKind kind_;
     UINT stride_;
+    int unsupported_type_;
 };
 
 class CommandAllocator final
@@ -825,6 +830,17 @@ public:
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        // A signature the layer accepted without being able to run it (mesh or ray dispatches): the work is skipped,
+        // as a draw without a host pipeline is, and the list stays usable. Logged once per argument type.
+        if (const CommandSignature* s = CommandSignature::from(signature); s && s->unsupported_type() >= 0) {
+            static std::atomic<std::uint32_t> logged{0};
+            const std::uint32_t bit = 1u << (static_cast<unsigned>(s->unsupported_type()) & 31u);
+            if (!(logged.fetch_or(bit, std::memory_order_relaxed) & bit))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with indirect argument type %d is skipped (not "
+                                     "implemented yet: mesh and ray dispatches through command signatures)\n",
+                             s->unsupported_type());
+            return;
+        }
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
@@ -2077,10 +2093,10 @@ bool command_queue_vulkan(ID3D12CommandQueue* queue, VkQueue* vk_queue, std::uin
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device) {
+                                 IUnknown* device, int unsupported_type) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride);
+    auto* sig = new CommandSignature(kind, byte_stride, unsupported_type);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }

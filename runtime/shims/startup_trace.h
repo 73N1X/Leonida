@@ -183,6 +183,19 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            // An access violation's registers name the object a bad pointer was read from (the title's own
+            // structures have no symbols), so the field behind it can be found in the next run.
+            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info.ContextRecord) {
+                const CONTEXT& c = *info.ContextRecord;
+                const std::pair<const char*, DWORD64> regs[] = {
+                    {"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
+                    {"rbp", c.Rbp}, {"rsp", c.Rsp}, {"r8", c.R8},   {"r9", c.R9},   {"r10", c.R10}, {"r11", c.R11},
+                    {"r12", c.R12}, {"r13", c.R13}, {"r14", c.R14}, {"r15", c.R15}};
+                f += ",\"regs\":{";
+                for (std::size_t i = 0; i < std::size(regs); ++i)
+                    f += std::string(i ? "," : "") + quote(regs[i].first) + ":" + quote(hex(regs[i].second));
+                f += "}";
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }

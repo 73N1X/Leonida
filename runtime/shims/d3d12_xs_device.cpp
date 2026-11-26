@@ -2452,9 +2452,14 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. The title also passes the plain
+            // 16-byte description (its CPU-only view heaps of 3128 descriptors), and then the words after it are its
+            // stack: 0x20, 0xa00 or a stack address were taken as heap starts, and descriptors were written at 0x200
+            // (game+0x4d9f113). The tail is a placement only when its size is the heap's, count times increment, as
+            // VIctory tells them apart (victory-gpu descriptor.rs create_heap).
+            const std::uint64_t heap_bytes = std::uint64_t(desc->NumDescriptors) *
+                                             self->real->GetDescriptorHandleIncrementSize(desc->Type);
+            if (address != 0 && size == heap_bytes && heap_bytes != 0) {
                 console_extended = true;
                 hr = rt::d3d12::create_console_descriptor_heap(
                     self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
@@ -2472,6 +2477,24 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
+    // Each heap the title makes, with the start it will be told: its descriptor tables are built from these starts
+    // (a binding record holding 0x200 sent the title to game+0x4d9f113 with a read of 0x200).
+    static std::atomic<unsigned> heaps_logged{0};
+    if (desc && heaps_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
+        std::uint64_t tail[2]{};
+        if (readable_range(bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC), sizeof(tail)))
+            std::memcpy(tail, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC), sizeof(tail));
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: descriptor heap type %d, %u descriptors, flags 0x%x, console address 0x%llx size "
+                     "0x%llx -> CPU start 0x%llx, GPU start 0x%llx\n",
+                     static_cast<int>(desc->Type), desc->NumDescriptors, static_cast<unsigned>(desc->Flags),
+                     static_cast<unsigned long long>(tail[0]), static_cast<unsigned long long>(tail[1]),
+                     static_cast<unsigned long long>(heap->GetCPUDescriptorHandleForHeapStart().ptr),
+                     static_cast<unsigned long long>((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                                                         ? heap->GetGPUDescriptorHandleForHeapStart().ptr
+                                                         : 0));
+    }
     hr = create_heap_proxy(heap, self, *riid, out);
     if (FAILED(hr)) heap->Release();
     return hr;
@@ -2577,6 +2600,25 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
+// The console lets a depth texture allow unordered access as well (the title asks for a 2560x1440 R32G8X24_TYPELESS
+// one, flags 0x6, and asserts at game+0x344196 when its size is refused); the PC runtime refuses the pair. The UAV
+// flag is dropped, so the texture is made and its unordered-access views are left null (CreateUnorderedAccessView
+// logs them). VIctory gives such a texture a colour twin that carries its UAVs (victory-gpu descriptor/host.rs:3283).
+template <class Desc>
+void drop_depth_unordered_access(Desc& desc) {
+    const auto flags = static_cast<std::uint32_t>(desc.Flags);
+    constexpr std::uint32_t depth_and_uav = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if ((flags & depth_and_uav) != depth_and_uav) return;
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags & ~std::uint32_t(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: a depth texture that allows unordered access (format %d, %llux%u) is made without "
+                     "it; its UAVs stay null\n",
+                     static_cast<int>(desc.Format), static_cast<unsigned long long>(desc.Width), desc.Height);
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -2594,6 +2636,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    drop_depth_unordered_access(pc_desc);
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -2635,6 +2678,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // for everything else, as slot 76 does.
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    drop_depth_unordered_access(pc_desc);
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -2667,6 +2711,7 @@ void make_pc_desc(D3D12_RESOURCE_DESC& desc) {
     desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(desc.Flags) & kPcResourceFlagMask);
     desc.Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                     : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    drop_depth_unordered_access(desc);
 }
 
 // D3D12_RESOURCE_DESC1 starts like the plain description (V resource.rs:2225-2231); its sampler feedback region is
@@ -2676,6 +2721,7 @@ void make_pc_desc(D3D12_RESOURCE_DESC1& desc) {
     desc.Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                     : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.SamplerFeedbackMipRegion = {};
+    drop_depth_unordered_access(desc);
 }
 
 // A copy of `count` descriptions with make_pc_desc applied, for the allocation-info calls. Up to 8 inline, more
@@ -2762,6 +2808,21 @@ std::uint64_t device_struct_return(DeviceProxy* first, std::uint64_t a1, std::ui
                          static_cast<unsigned>(first->Layout), static_cast<unsigned>(first->Flags),
                          static_cast<unsigned long long>(info->SizeInBytes),
                          static_cast<unsigned long long>(info->Alignment));
+        // A refusal (SizeInBytes UINT64_MAX) stops the title at its check game+0x344196, so each one is logged with
+        // the PC description it was answered for.
+        static std::atomic<unsigned> refused{0};
+        const auto* pc_first = descs.data() ? reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs.data()) : first;
+        if (info && pc_first && a3 && info->SizeInBytes == ~0ull &&
+            refused.fetch_add(1, std::memory_order_relaxed) < 32)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: device slot %u refused a description: dimension %d, %llux%ux%u, %u mips, "
+                         "format %d, samples %u/%u, layout %d, alignment %llu, flags 0x%x (%u description(s))\n",
+                         Slot, static_cast<int>(pc_first->Dimension), static_cast<unsigned long long>(pc_first->Width),
+                         pc_first->Height, static_cast<unsigned>(pc_first->DepthOrArraySize),
+                         static_cast<unsigned>(pc_first->MipLevels), static_cast<int>(pc_first->Format),
+                         pc_first->SampleDesc.Count, pc_first->SampleDesc.Quality, static_cast<int>(pc_first->Layout),
+                         static_cast<unsigned long long>(pc_first->Alignment), static_cast<unsigned>(pc_first->Flags),
+                         static_cast<unsigned>(a3));
     }
     return out;
 }

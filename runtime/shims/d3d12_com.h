@@ -59,8 +59,10 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
+// unsupported_type >= 0: a signature whose final argument (that D3D12_INDIRECT_ARGUMENT_TYPE: mesh or ray dispatches)
+// the layer cannot execute yet; it is created so the title's set-up goes on, and its ExecuteIndirect calls are skipped.
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device = nullptr);
+                                 IUnknown* device = nullptr, int unsupported_type = -1);
 bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
