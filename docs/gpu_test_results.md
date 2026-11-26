@@ -17,6 +17,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32..32 | NVIDIA 617.42, Vulkan 1.4.351, Windows 11 Pro 26300 | `21625bc` | 257/257 translated and valid (run_gpu_tests.py) | run via run_gpu_tests.py | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX5070Ti.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
 | NVIDIA GeForce RTX 3080 (Ampere, GA102, 10 GB GDDR6X), subgroup 32..32 | NVIDIA 580.178.04, Vulkan 1.4.312, Ubuntu 26.04 LTS | `d2cd6c0` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; see #280) | [local note](../gpu-test-results/RTX3080.txt) |
+| NVIDIA GeForce RTX 5060 Ti (Blackwell), subgroup 32..32 | NVIDIA 610.88, Windows 11 | `5d74c27` | 270/270 translated and valid | 176/211 pass, 35 skipped | 192/241 passed, 48 skipped (native); 25/26 (`LEONIDA_W64_EMULATE=1 --filter w64`) | `ms_wave_info_s3` (known #8608) | [#166](https://github.com/ItsNotRexed/Leonida/issues/166) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -125,3 +126,26 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+## NVIDIA GeForce RTX 5060 Ti — 2026-11-24
+
+```
+GPU:        NVIDIA GeForce RTX 5060 Ti (Blackwell), subgroup 32..32
+Driver:     NVIDIA 610.88
+Subgroup:   32..32 (native 32-wide)
+OS:         Windows 11
+Commit:     5d74c272363f2703265d44e6aaab1a1df8ddfaf3 (main, 2026-11-24)
+Tools:      MSVC 19.52 (Visual Studio 2026) + Windows SDK 10.0.26100.0, Vulkan SDK 1.4.363.0, llvm-mc 21.1.8 (native), CMake 4.4.4, Python 3.14.4
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (6 mesh fixtures not built by build.py)
+check.py:   176 of 211 pass, 35 skipped (0 failures)
+run_gpu_tests.py (native): 192/241 passed, 48 skipped, 1 failed
+run_gpu_tests.py (LEONIDA_W64_EMULATE=1 --filter w64): 25/26 passed, 1 skipped (0 failures)
+ctest:      263/265 passed (2 known failures: d3d12_vulkan_device, d3d12_depth_resolve); 8/8 D3D12 shader tests passed after rebuilding with llvm-mc
+Failed:     ms_wave_info_s3: at (0,0) got (-1.0000,-1.0000,-1.0000,-1.0000), want (0.0078,0.0078,0.5,1.0) — known issue, PR #8608.
+Skipped:    35/48 skips are 64-wide subgroup / mesh / D3D12-delegated tests.
+```
+
+Setup: `cmake -S runtime -B runtime/build -DLLVM_MC=<path-to-llvm-mc.exe>`; `cmake --build runtime/build --config RelWithDebInfo --parallel`.
+All 8 D3D12 shader tests (`d3d12_translated_draw`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m3_first_pass`, `d3d12_m4_compute`, `d3d12_buffer_uav`, `d3d12_subgroup`) passed 8/8.
+
+AI-assisted: built `main` at `5d74c2723`, ran `ctest`, `build.py`, `check.py`, and `run_gpu_tests.py` on this GPU with synthetic inputs only (no game files).
