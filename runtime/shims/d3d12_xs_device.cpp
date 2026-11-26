@@ -1122,6 +1122,7 @@ private:
 std::atomic<const ListTitleHandlers*> g_list_title{nullptr};
 std::atomic<PlacedViewHandler> g_placed_view{nullptr};
 std::atomic<SamplerXHandler> g_sampler_x{nullptr};
+std::atomic<PageMapper> g_page_mapper{nullptr};
 std::atomic<std::uint64_t> g_unmet_waits{0};
 
 // Reads the 32 or 64 bits at `address` without faulting on memory that is not there (false then).
@@ -1571,6 +1572,85 @@ void wait_for_values(std::uint64_t lists, std::uint64_t count) {
     }
 }
 
+// Console queue slot 31, CopyPageMappingsBatchX(count, batches, pool, pool pages, flags), ported from VIctory
+// (GPL-3.0-or-later, Marvisak and contributors, DexNom fork), victory-gpu queue.rs:897-962: maps pages of a pool (64 KiB
+// pages the title mapped physical pages into, device slot 74) at the batches' addresses, through the page mapper
+// (set_page_mapper: xmem's). The title streams textures into pool pages and maps them into its tiled heap this way
+// (V: ranges of one constant page or of unmapped pages). A range is a kind, a first pool page and a page count: 0 maps
+// that many pool pages in order, 1 maps the one pool page at each page, 2 unmaps, 3 leaves the pages as they are. Done
+// at once on the CPU, as V does: work already submitted keeps the pages it had (title memory leaves the GPU before it
+// is remapped, src/title_memory.h), and work submitted later sees the new ones. A range that reaches past the pool, or
+// a page the mapper refuses, is logged once; the call still answers S_OK, as V's does.
+// shortcut: work the queue holds (behind a value or fence wait) runs after the remap, not before it.
+struct PageRange {
+    std::uint32_t kind, start, count;
+};
+struct PageBatch {
+    std::uint64_t destination;
+    std::uint32_t count;
+    const PageRange* ranges;
+};
+static_assert(sizeof(PageRange) == 12 && sizeof(PageBatch) == 24 && offsetof(PageBatch, ranges) == 16);
+constexpr std::uint64_t kMappedPage = 64 * 1024;
+
+HRESULT queue_copy_page_mappings(std::uint64_t count_word, std::uint64_t batches_word, std::uint64_t pool,
+                                 std::uint64_t pool_pages_word) {
+    const PageMapper map = g_page_mapper.load(std::memory_order_acquire);
+    if (!map) return E_INVALIDARG;
+    const auto count = static_cast<std::uint32_t>(count_word);
+    const auto pool_pages = static_cast<std::uint32_t>(pool_pages_word);
+    const auto* const batches = reinterpret_cast<const PageBatch*>(batches_word);
+    if (!batches && count) return E_INVALIDARG;
+    bool ok = true;
+    std::uint64_t mapped = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const PageBatch& batch = batches[i];
+        if (!batch.ranges) continue;
+        std::uint64_t at = batch.destination;
+        for (std::uint32_t j = 0; j < batch.count; ++j) {
+            const PageRange& r = batch.ranges[j];
+            const std::uint64_t len = std::uint64_t(r.count) * kMappedPage;
+            const auto inside = [&](std::uint32_t pages) { return std::uint64_t(r.start) + pages <= pool_pages; };
+            const std::uint64_t source = pool + std::uint64_t(r.start) * kMappedPage;
+            switch (r.kind) {
+                case 0:
+                    ok = inside(r.count) && map(at, source, len) && ok;
+                    break;
+                case 1: {
+                    bool all = inside(1);
+                    for (std::uint32_t k = 0; all && k < r.count; ++k) all = map(at + k * kMappedPage, source, kMappedPage);
+                    ok = all && ok;
+                    break;
+                }
+                case 2:
+                    ok = map(at, 0, len) && ok;
+                    break;
+                case 3:
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+            if (r.kind <= 2) mapped += r.count;
+            at += len;
+        }
+    }
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: queue slot 31 CopyPageMappingsBatchX: %u batches, %llu pages from pool 0x%llx "
+                     "(%u pages)%s\n",
+                     count, static_cast<unsigned long long>(mapped), static_cast<unsigned long long>(pool),
+                     pool_pages, ok ? "" : "; a mapping failed");
+    if (!ok) {
+        static std::atomic<bool> failed{false};
+        if (!failed.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a page mapping from pool 0x%llx failed (logged once)\n",
+                         static_cast<unsigned long long>(pool));
+    }
+    return S_OK;
+}
+
 // GetDesc into `out`: the PC method (this, hidden return pointer), which returns the pointer.
 std::uint64_t queue_get_desc(ChildProxy* self, std::uint64_t out) {
     using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t);
@@ -1629,6 +1709,14 @@ std::uint64_t console_queue_call(ChildProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[entry.pc])(self->real, unwrap_object(a1), a2));
         } else if constexpr (entry.method == QueueMethod::get_desc) {
             return queue_get_desc(self, a1);
+        } else if constexpr (entry.method == QueueMethod::page_mappings) {
+            return hr_to_u64(queue_copy_page_mappings(a1, a2, a3, a4));
+        } else if constexpr (entry.method == QueueMethod::accept) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u (%s) accepted: nothing suspends a title here\n",
+                             Slot, entry.name);
+            return hr_to_u64(S_OK);
         } else {
             static_assert(entry.method == QueueMethod::present);
             return hr_to_u64(queue_present_x(self, a1, a2, a3));
@@ -2609,8 +2697,8 @@ void proxy_create_sampler_x(DeviceProxy* self, std::uint64_t desc, std::uint64_t
 }
 
 // Console device slots 74 and 75 (V resource.rs:2187-2223): page pools, 64 KiB pages the title maps into its tiled
-// resources by page index (through queue slot 31, CopyPageMappingsBatchX, which is still open). Kept per device: the
-// first address and the page count; a handle is an index plus one, and a removed pool keeps its index.
+// resources by page index (through queue slot 31, CopyPageMappingsBatchX, which takes the pool by address). Kept per
+// device: the first address and the page count; a handle is an index plus one, and a removed pool keeps its index.
 HRESULT register_page_pool(DeviceProxy* self, std::uint64_t address, std::uint64_t pages_word, std::uint64_t out_word) {
     const auto pages = static_cast<std::uint32_t>(pages_word);
     auto* const out = reinterpret_cast<std::uint64_t*>(out_word);  // a usize in V
@@ -3064,6 +3152,10 @@ D3D12_SAMPLER_DESC console_sampler_desc(const std::uint32_t* w) {
     desc.MinLOD = real(9);
     desc.MaxLOD = mip == 0 ? desc.MinLOD : real(10);  // without a mip filter the console samples mip 0 only
     return desc;
+}
+
+void set_page_mapper(PageMapper mapper) {
+    g_page_mapper.store(mapper, std::memory_order_release);
 }
 
 void set_placed_view_handler(PlacedViewHandler handler) {

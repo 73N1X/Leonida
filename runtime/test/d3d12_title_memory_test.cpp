@@ -569,6 +569,70 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     EXPECT(rt::d3d12::title_memory_device_address(inner, W) == 0);
     EXPECT(free_pages(count, pages));
 
+    // ---- Queue slot 31, CopyPageMappingsBatchX: a page pool's pages mapped again into another window (VIctory's page
+    // mapper, rt::xmem::map_alias). The CPU and the GPU see the pool's bytes there, and a kind-2 range unmaps it.
+    {
+        rt::d3d12_xs::set_page_mapper(&rt::xmem::map_alias);
+        constexpr std::uint64_t kPoolPages = 4, P = 0x10000;
+        auto* pool_window = static_cast<std::uint8_t*>(
+            virtual_alloc(nullptr, kPoolPages * P, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+        auto* tiled = static_cast<std::uint8_t*>(
+            virtual_alloc(nullptr, 4 * P, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+        EXPECT(pool_window && tiled);
+        std::uint64_t pool_pages[kPoolPages]{};
+        std::uint64_t pool_count = kPoolPages;
+        EXPECT(allocate_pages(0x280, &pool_count, pool_pages) && pool_count == kPoolPages);
+        EXPECT(map_pages(pool_window, kPoolPages, pool_pages) == pool_window);
+        for (std::uint64_t p = 0; p < kPoolPages; ++p)
+            for (std::uint64_t i = 0; i < P; ++i) pool_window[p * P + i] = std::uint8_t(0x40 * p + i % 61);
+        const auto PW = reinterpret_cast<std::uint64_t>(pool_window), D = reinterpret_cast<std::uint64_t>(tiled);
+        std::uint64_t pool_handle = 0;
+        EXPECT(call(device, 74, PW, kPoolPages, word(&pool_handle)) == S_OK && pool_handle);
+        struct Range {
+            std::uint32_t kind, start, count;
+        };
+        struct Batch {
+            std::uint64_t destination;
+            std::uint32_t count;
+            const Range* ranges;
+        };
+        // Pool pages 2 and 3 at D and D + 64 KiB; pool page 0 at D + 128 KiB and D + 192 KiB.
+        const Range ranges[] = {{0, 2, 2}, {1, 0, 2}};
+        const Batch batch{D, 2, ranges};
+        ConsoleQueue gq;
+        EXPECT(gq.make(device, D3D12_COMMAND_LIST_TYPE_DIRECT));
+        EXPECT(call(gq.queue, 31, 1, word(&batch), PW, kPoolPages, 0) == S_OK);
+        EXPECT(std::memcmp(tiled, pool_window + 2 * P, 2 * P) == 0);
+        EXPECT(std::memcmp(tiled + 2 * P, pool_window, P) == 0 && std::memcmp(tiled + 3 * P, pool_window, P) == 0);
+        tiled[3 * P + 5] = 0x77;  // the same physical page as pool page 0
+        EXPECT(pool_window[5] == 0x77 && tiled[2 * P + 5] == 0x77);
+        EXPECT(rt::d3d12::title_memory_device_address(inner, D + P) == tm::kHeapBase + D + P);
+        // The GPU reads the alias: CopyMemoryToMemoryX from D + 64 KiB (pool page 3) into the graphics memory at A.
+        const IID fence_iid = __uuidof(ID3D12Fence);
+        void* copied = nullptr;
+        EXPECT(call(device, 36, 0, 0, word(&fence_iid), word(&copied)) == S_OK);
+        std::memset(pool + (3 << 20), 0, P);
+        call(gq.list, 62, A + (3 << 20), D + P, P, 0);
+        EXPECT(gq.execute() && call(gq.queue, 16, word(copied), 1) == S_OK);
+        EXPECT(within(5000, [&] { return completed(copied) == 1; }));
+        EXPECT(std::memcmp(pool + (3 << 20), pool_window + 3 * P, P) == 0);
+        static_cast<IUnknown*>(copied)->Release();
+        // Kind 2 unmaps the window's pages: its title memory leaves the GPU, and the pool keeps its pages.
+        const Range unmap{2, 0, 4};
+        const Batch unmap_batch{D, 1, &unmap};
+        EXPECT(call(gq.queue, 31, 1, word(&unmap_batch), PW, kPoolPages, 0) == S_OK);
+        EXPECT(rt::d3d12::title_memory_device_address(inner, D) == 0 &&
+               rt::d3d12::title_memory_device_address(inner, D + 3 * P) == 0);
+        MEMORY_BASIC_INFORMATION region{};
+        EXPECT(VirtualQuery(tiled, &region, sizeof(region)) && region.State == MEM_RESERVE);
+        EXPECT(pool_window[5] == 0x77 && rt::d3d12::title_memory_device_address(inner, PW) == tm::kHeapBase + PW);
+        EXPECT(call(device, 75, pool_handle) == S_OK);
+        EXPECT(map_pages(pool_window, kPoolPages, nullptr) == pool_window && free_pages(pool_count, pool_pages));
+        rt::d3d12_xs::set_page_mapper(nullptr);
+        std::printf("title memory: queue slot 31 mapped page-pool pages into another window (in order and one page "
+                    "twice); the CPU and a GPU copy read them there, and an unmap range took them off the GPU\n");
+    }
+
     // ---- The title's VirtualFree takes the pool's imports off the GPU first.
     const std::uint64_t before = rt::d3d12::title_memory_stats(inner).imports;
     EXPECT(title_free(pool, 0, MEM_RELEASE));

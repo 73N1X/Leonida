@@ -172,6 +172,8 @@ enum class QueueMethod : std::uint8_t {
     wait,      // the PC Wait with the fence unwrapped
     get_desc,  // the PC GetDesc; the return buffer may come first (resolved per call)
     present,   // PresentX: the device's present handler, or accepted (V queue.rs:757-841 always answers S_OK)
+    page_mappings,  // CopyPageMappingsBatchX: the page mapper (rt::d3d12_xs::set_page_mapper)
+    accept,    // S_OK, nothing done
 };
 
 struct QueueSlot {
@@ -203,10 +205,12 @@ inline constexpr QueueEntry kQueueEntries[] = {
     {14, QueueMethod::signal, 14, "Signal"},
     {15, QueueMethod::wait, 15, "Wait"},
     {16, QueueMethod::forward, 16, "GetTimestampFrequency"},
-    {21, QueueMethod::open, 0, "SuspendX"},  // V queue.rs:983: suspend and resume at 0xb8/0xc0 in the newer layout
-    {22, QueueMethod::open, 0, "ResumeX"},
+    // V queue.rs:998: suspend and resume at 0xb8/0xc0 in the newer layout (V leaves them E_NOTIMPL). Nothing here
+    // suspends a title, so there is no queue state to stop or bring back: accepted.
+    {21, QueueMethod::accept, 0, "SuspendX"},
+    {22, QueueMethod::accept, 0, "ResumeX"},
     {26, QueueMethod::get_desc, 18, "GetDesc"},
-    {29, QueueMethod::open, 0, "CopyPageMappingsBatchX"},  // V queue.rs:897-948: needs the page mapper (open)
+    {29, QueueMethod::page_mappings, 0, "CopyPageMappingsBatchX"},  // V queue.rs:897-962
     {30, QueueMethod::present, 0, "PresentX"},
     {32, QueueMethod::signal, 14, "Signal2X"},   // V queue.rs:600-610: signals at once, the sync settings unused
     {33, QueueMethod::execute, 10, "ExecuteX"},  // V queue.rs:595-599: the frame token and flags unused

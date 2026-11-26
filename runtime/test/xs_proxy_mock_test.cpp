@@ -1477,9 +1477,9 @@ int check_slot_tables() {
     queue_want[16] = {QueueMethod::signal, 14};
     queue_want[17] = {QueueMethod::wait, 15};
     queue_want[18] = {QueueMethod::forward, 16};  // GetTimestampFrequency
-    queue_want[23] = queue_want[24] = {QueueMethod::open, 0};  // SuspendX, ResumeX
+    queue_want[23] = queue_want[24] = {QueueMethod::accept, 0};  // SuspendX, ResumeX
     queue_want[28] = {QueueMethod::get_desc, 18};
-    queue_want[31] = {QueueMethod::open, 0};  // CopyPageMappingsBatchX
+    queue_want[31] = {QueueMethod::page_mappings, 0};  // CopyPageMappingsBatchX
     queue_want[32] = {QueueMethod::present, 0};
     queue_want[34] = {QueueMethod::signal, 14};   // Signal2X
     queue_want[35] = {QueueMethod::execute, 10};  // ExecuteX
@@ -1681,6 +1681,8 @@ int check_console_queue() {
             a2 = 40 + slot;
         } else if (entry.method == slots::QueueMethod::get_desc) {
             a1 = word(&desc);
+        } else if (entry.method == slots::QueueMethod::page_mappings) {
+            a1 = 0;  // no batches (and no page mapper: E_INVALIDARG, as V answers)
         }
         const std::uint64_t result = raw(queue, slot, a1, a2, a3, a4);
         unsigned changed = 0, at = 0;
@@ -1715,6 +1717,12 @@ int check_console_queue() {
                 break;
             case slots::QueueMethod::marker:
                 ok = changed == 0 && result == 0;
+                break;
+            case slots::QueueMethod::accept:  // SuspendX, ResumeX
+                ok = changed == 0 && hr_of(result) == S_OK;
+                break;
+            case slots::QueueMethod::page_mappings:
+                ok = changed == 0 && hr_of(result) == E_INVALIDARG;
                 break;
             default:  // refuse, open
                 ok = changed == 0 && hr_of(result) == E_NOTIMPL;
@@ -1855,6 +1863,53 @@ int check_value_waits() {
            mock->refs == 0);
     std::printf("%s: list slots 73/74: a device that holds waits in the list gets them (ExecuteX does not stand at "
                 "them, PresentX forces them); without one ExecuteX checks them\n", g_label);
+    return 0;
+}
+
+// ---- 13b. Queue slot 31, CopyPageMappingsBatchX (V queue.rs:897-962) through the page mapper ----
+
+struct MapCall {
+    std::uint64_t to, from, len;
+};
+MapCall g_maps[16];
+unsigned g_map_count = 0;
+
+int check_page_mappings() {
+    Mock* mock = nullptr;
+    void* device = make_console_device(mock);
+    void* queue = make_queue(device);
+    struct Range {
+        std::uint32_t kind, start, count;
+    };
+    struct Batch {
+        std::uint64_t destination;
+        std::uint32_t count;
+        const Range* ranges;
+    };
+    static_assert(sizeof(Range) == 12 && sizeof(Batch) == 24);
+    constexpr std::uint64_t P = 64 * 1024, pool = 0x7e0000000000ull, dest = 0x7f0000000000ull;
+    // 3 pool pages from page 2; pool page 5 at each of 2 pages; 4 pages unmapped; 1 page left; 2 pages from page 15
+    // of a 16-page pool, which reaches past it.
+    const Range ranges[] = {{0, 2, 3}, {1, 5, 2}, {2, 0, 4}, {3, 0, 1}, {0, 15, 2}};
+    const Batch batches[] = {{dest, 5, ranges}, {dest + 0x1000000, 3, nullptr}};
+    EXPECT(hr_of(raw(queue, 31, 2, word(batches), pool, 16, 0)) == E_INVALIDARG);  // no page mapper (V)
+    xs::set_page_mapper([](std::uint64_t to, std::uint64_t from, std::uint64_t len) {
+        if (g_map_count < std::size(g_maps)) g_maps[g_map_count++] = {to, from, len};
+        return true;
+    });
+    EXPECT(hr_of(raw(queue, 31, 2, word(batches), pool, 16, 0)) == S_OK && g_map_count == 4);
+    EXPECT(g_maps[0].to == dest && g_maps[0].from == pool + 2 * P && g_maps[0].len == 3 * P);
+    EXPECT(g_maps[1].to == dest + 3 * P && g_maps[1].from == pool + 5 * P && g_maps[1].len == P);
+    EXPECT(g_maps[2].to == dest + 4 * P && g_maps[2].from == pool + 5 * P && g_maps[2].len == P);
+    EXPECT(g_maps[3].to == dest + 5 * P && g_maps[3].from == 0 && g_maps[3].len == 4 * P);
+    EXPECT(hr_of(raw(queue, 31, 0, 0, pool, 16, 0)) == S_OK && g_map_count == 4);
+    EXPECT(hr_of(raw(queue, 31, 1, 0, pool, 16, 0)) == E_INVALIDARG);
+    xs::set_page_mapper(nullptr);
+    // SuspendX and ResumeX (23/24) are accepted.
+    EXPECT(hr_of(raw(queue, 23, 0)) == S_OK && hr_of(raw(queue, 24, 0)) == S_OK);
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 31 maps pool pages (in order, one page repeated, unmapped, left) through the page "
+                "mapper; SuspendX/ResumeX accepted\n", g_label);
     return 0;
 }
 
@@ -2196,7 +2251,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
-        check_slot_tables() || check_list_table() || check_console_queue() || check_value_waits() ||
+        check_slot_tables() || check_list_table() || check_console_queue() || check_value_waits() || check_page_mappings() ||
         check_console_fence() ||
         check_console_device() || check_frame_clock())
         return 1;

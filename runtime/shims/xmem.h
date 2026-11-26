@@ -20,6 +20,13 @@ struct GraphicsListener {
     void (*gone)(std::uintptr_t start, std::size_t size);
 };
 void set_graphics_listener(const GraphicsListener* listener);
+
+// The physical pages mapped at [from, from + len) mapped again at `to` (both 64 KiB aligned; the last page in full), or
+// with `from` 0 the pages at [to, to + len) unmapped: VIctory's page mapper (victory-hle xmem.rs:754-791), for the
+// console queue's CopyPageMappingsBatchX (rt::d3d12_xs::set_page_mapper). The title memory at `to` leaves the GPU and
+// comes back as it does for XMemMapPhysicalPages. False when a page of `from` has no physical page mapped, or a page
+// of `to` is not in a physical-page window (the pages before it are mapped).
+bool map_alias(std::uint64_t to, std::uint64_t from, std::uint64_t len);
 // Bytes visible now, and how many ranges hold them. For tests and logs.
 std::size_t graphics_visible_bytes(std::size_t* ranges = nullptr);
 
