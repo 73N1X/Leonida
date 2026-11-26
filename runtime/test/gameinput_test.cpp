@@ -814,8 +814,12 @@ void test_keyboard_pad(IGameInput* input) {
 
     set_env("LEONIDA_KEYBOARD_PAD", nullptr);
     rt::gameinput::reload_config();
+    check(rt::gameinput::config().keyboard_pad == rt::gameinput::KeyboardPadMode::Focused,
+          "keyboard pad: on (with focus) by default");
+    set_env("LEONIDA_KEYBOARD_PAD", "0");
+    rt::gameinput::reload_config();
     rt::gameinput::poll();
-    check(rt::gameinput::connected_count() == 0, "keyboard pad: off by default");
+    check(rt::gameinput::connected_count() == 0, "keyboard pad: LEONIDA_KEYBOARD_PAD=0 turns it off");
 
     set_env("LEONIDA_KEYBOARD_PAD", "1");
     rt::gameinput::reload_config();
@@ -863,6 +867,11 @@ void test_keyboard_pad(IGameInput* input) {
         {'E', GameInputGamepadRightShoulder, "keyboard pad: E is the right shoulder"},
         {VK_ESCAPE, GameInputGamepadMenu, "keyboard pad: Esc is Menu"},
         {VK_TAB, GameInputGamepadView, "keyboard pad: Tab is View"},
+        {VK_SPACE, GameInputGamepadA, "keyboard pad: Space is A"},
+        {'F', GameInputGamepadY, "keyboard pad: F is Y"},
+        {'R', GameInputGamepadB, "keyboard pad: R is B"},
+        {VK_LSHIFT, GameInputGamepadLeftThumbstick, "keyboard pad: Left Shift is the left stick click"},
+        {'C', GameInputGamepadRightThumbstick, "keyboard pad: C is the right stick click"},
     };
     for (const Expect& e : expect) {
         g_keys[e.vk] = true;
@@ -916,7 +925,7 @@ void test_keyboard_pad(IGameInput* input) {
               (kb->GetDeviceStatus() & GameInputDeviceConnected),
           "keyboard pad: on again is the same device object");
 
-    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    set_env("LEONIDA_KEYBOARD_PAD", "0");
     rt::gameinput::reload_config();
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
@@ -1063,7 +1072,7 @@ void test_active_input() {
     // Clean up: everything off and unplugged.
     set_env("LEONIDA_PROMPTS", nullptr);
     set_env("LEONIDA_PROMPTS_SWITCH_MS", nullptr);
-    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    set_env("LEONIDA_KEYBOARD_PAD", "0");
     rt::gameinput::reload_config();
     detach(ds);
     detach(ds4);
@@ -1699,6 +1708,8 @@ int main() {
                              SDL_HINT_JOYSTICK_GAMEINPUT, SDL_HINT_XINPUT_ENABLED, SDL_HINT_JOYSTICK_DIRECTINPUT})
         SDL_SetHintWithPriority(hint, "0", SDL_HINT_OVERRIDE);
     set_env("LEONIDA_GAMEINPUT_THREAD", "0");
+    // The keyboard pad is on by default; the controller tests count pads without it (test_keyboard_pad turns it on).
+    set_env("LEONIDA_KEYBOARD_PAD", "0");
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
     set_env("LEONIDA_RUMBLE", nullptr);

@@ -167,8 +167,10 @@ rt::gameinput::Config read_config() {
     }
     if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
     if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
+    // The keyboard pad is on by default while the game's window has focus: the title only reads pads, and a player
+    // without one has no other way in. LEONIDA_KEYBOARD_PAD=0 turns it off.
     const std::string k = env("LEONIDA_KEYBOARD_PAD");
-    if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
+    if (k.empty() || k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
     else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
     else if (!k.empty() && k != "0" && k != "off")
         std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
@@ -1667,6 +1669,13 @@ constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
     {'E', SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "E"},
     {VK_ESCAPE, SDL_GAMEPAD_BUTTON_START, "Esc"},
     {VK_TAB, SDL_GAMEPAD_BUTTON_BACK, "Tab"},
+    // PC-style keys beside the pad-named ones: confirm/jump on Space, interact on F, back/reload on R, the stick
+    // clicks on Left Shift and C.
+    {VK_SPACE, SDL_GAMEPAD_BUTTON_SOUTH, "Space"},
+    {'F', SDL_GAMEPAD_BUTTON_NORTH, "F"},
+    {'R', SDL_GAMEPAD_BUTTON_EAST, "R"},
+    {VK_LSHIFT, SDL_GAMEPAD_BUTTON_LEFT_STICK, "LShift"},
+    {'C', SDL_GAMEPAD_BUTTON_RIGHT_STICK, "C"},
 };
 
 // WASD on the left stick: a full press is the edge of the stick; a diagonal sits on the round gate, as a real stick
@@ -1834,9 +1843,9 @@ bool attach_keyboard_pad() {
         g_keyboard.failed = true;
         return false;
     }
-    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
-                         "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
-                         "button LT/RT)\n");
+    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter/Space A, Backspace/R B, X X, "
+                         "Y/F Y, Q/E shoulders, Left Shift/C stick clicks, Esc Menu, Tab View, WASD left stick, mouse "
+                         "right stick, right/left button LT/RT)\n");
     start_raw_mouse();
     return true;
 }
