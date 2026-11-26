@@ -504,11 +504,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Reflect && (constant > 0.0 || reflect_most() == 0.0) {
         return false;
     }
-    static SAID: Mutex<u32> = Mutex::new(0);
+    // The first two of each role (one count for all hid the later roles).
+    static SAID: Mutex<[u8; 4]> = Mutex::new([0; 4]);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
-            *said += 1;
+        let n = &mut said[role as usize];
+        if *n < 2 {
+            *n += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
     }
