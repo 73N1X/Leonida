@@ -942,7 +942,13 @@ int run_title_allocator(ID3D12Device* inner, void* device) {
     EXPECT(rt::d3d12::title_memory_device_address(inner, D + kBytes - 4) == tm::kHeapBase + D + kBytes - 4);
     void* mapped = nullptr;
     EXPECT(SUCCEEDED(source->Map(0, nullptr, &mapped)) && reinterpret_cast<std::uint64_t>(mapped) == S);
-    EXPECT(destination->Map(0, nullptr, &mapped) == E_INVALIDARG);  // a default heap, as on the PC
+    // A default heap: the import path refuses it as the PC does; sparse title memory maps it at its title address,
+    // as the console (one memory) does, since the title maps such buffers (create_title_span).
+    {
+        void* default_mapped = nullptr;
+        const HRESULT hr = destination->Map(0, nullptr, &default_mapped);
+        EXPECT(hr == E_INVALIDARG || (SUCCEEDED(hr) && reinterpret_cast<std::uint64_t>(default_mapped) == D));
+    }
     auto* src = reinterpret_cast<std::uint8_t*>(S);
     auto* dst = reinterpret_cast<std::uint8_t*>(D);
     for (UINT64 i = 0; i < kBytes; ++i) EXPECT(src[i] == 0 && dst[i] == 0);
