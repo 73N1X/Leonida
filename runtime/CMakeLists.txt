@@ -87,6 +87,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   # Host CPU preflight of --init/--run (src/host_cpu.h): AVX, OSXSAVE and XCR0 YMM state. The test feeds synthetic
   # CPUID/XCR0 words.
+  # Console-only CPU instructions (src/console_insn.*): decoder, SSE4a fields and the emulation on a hand-made
+  # CONTEXT; nothing is executed, so AMD and Intel hosts mean the same. No game files.
+  add_executable(console_insn_test test/console_insn_test.cpp src/console_insn.cpp shims/registry.cpp)
+  target_include_directories(console_insn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(console_insn_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(console_insn_test PRIVATE /W4 /permissive- /utf-8)
   add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
   target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_options(host_cpu_test PRIVATE /W4 /permissive- /utf-8)
@@ -122,6 +128,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(gta6rt
     src/main.cpp
     src/host_cpu.cpp
+    src/console_insn.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -1432,6 +1439,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET host_cpu_test)
     add_test(NAME host_cpu COMMAND host_cpu_test)
+    add_test(NAME console_insn COMMAND console_insn_test)
   endif()
   if(WIN32 AND TARGET root_signature_oracle_test)
     add_test(NAME root_signature_oracle COMMAND root_signature_oracle_test)

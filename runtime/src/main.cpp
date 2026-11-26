@@ -43,6 +43,7 @@
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
+#include "console_insn.h"
 #include "../shims/startup_trace.h"
 #include "../shims/xmem.h"
 
@@ -265,6 +266,10 @@ int wmain(int argc, wchar_t** argv) {
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         // GetModuleHandle(NULL) and GetModuleFileName(NULL) in mapped code name the title, not gta6rt.exe.
         rt::shims::set_main_image(main_module.base);
+        // CLZERO, CLWB, MONITORX, SSE4a and the rest of the console CPU's instructions a PC's may lack are emulated
+        // in the mapped images (src/console_insn.h). Added after the startup trace's handler, so it runs first and an
+        // emulated instruction is no exception event.
+        rt::console_insn::install();
         if (init || run) {
             apply_display_profile(main_module);
             apply_frame_step(main_module);
