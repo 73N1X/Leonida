@@ -1599,6 +1599,34 @@ public:
     // report (the device's debug names; none: ids only).
     void add_checkpoint_queue(VkQueue queue) {
         if (!vk.vkGetQueueCheckpointDataNV || !queue) return;
+        // With the checkpoints on (a diagnostic run of the game), a thread that logs any timeline that stops
+        // advancing while work is pending on it, before a device loss makes the counters unreadable. The process's,
+        // never stopped (as the pipeline workers).
+        static std::once_flag watcher;
+        std::call_once(watcher, [this] {
+            std::thread([this] {
+                std::unordered_map<VkSemaphore, std::pair<std::uint64_t, int>> seen;  // reached, seconds unchanged
+                while (!is_device_lost()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    std::vector<std::pair<VkSemaphore, std::uint64_t>> now;
+                    {
+                        std::lock_guard lock(submit_mutex_);
+                        now.assign(last_submitted_.begin(), last_submitted_.end());
+                    }
+                    for (const auto& [semaphore, submitted] : now) {
+                        std::uint64_t reached = 0;
+                        if (vk.vkGetSemaphoreCounterValue(device_, semaphore, &reached) != VK_SUCCESS) continue;
+                        auto& [last, still] = seen[semaphore];
+                        still = (reached == last && reached < submitted) ? still + 1 : 0;
+                        last = reached;
+                        if (still == 2 || still == 5 || still == 10)
+                            std::fprintf(stderr, "[rt] vulkan: timeline %p stalled %d s at %llu of %llu submitted\n",
+                                         static_cast<void*>(semaphore), still, static_cast<unsigned long long>(reached),
+                                         static_cast<unsigned long long>(submitted));
+                    }
+                }
+            }).detach();
+        });
         std::lock_guard lock(checkpoint_mutex_);
         if (std::find(checkpoint_queues_.begin(), checkpoint_queues_.end(), queue) == checkpoint_queues_.end())
             checkpoint_queues_.push_back(queue);
@@ -1648,8 +1676,28 @@ public:
         }
     }
 
+    // After a device loss: for each timeline work was submitted on (every queue's progress semaphore and the title
+    // memory binds'), the last value submitted and the value the GPU reached. A timeline that stopped short with no
+    // checkpoint passed waited for something that never came.
+    void report_timelines() noexcept {
+        if (!vk.vkGetSemaphoreCounterValue) return;
+        try {
+            std::lock_guard lock(submit_mutex_);
+            for (const auto& [semaphore, submitted] : last_submitted_) {
+                std::uint64_t reached = 0;
+                const VkResult r = vk.vkGetSemaphoreCounterValue(device_, semaphore, &reached);
+                std::fprintf(stderr, "[rt] vulkan: timeline %p: submitted %llu, reached %llu%s\n",
+                             static_cast<void*>(semaphore), static_cast<unsigned long long>(submitted),
+                             static_cast<unsigned long long>(reached), r == VK_SUCCESS ? "" : " (query failed)");
+            }
+            std::fflush(stderr);
+        } catch (...) {
+        }
+    }
+
     void report_device_fault() noexcept {
         report_checkpoints();
+        report_timelines();
 #ifdef VK_EXT_device_fault
         if (!fault_info_) {
             std::fprintf(stderr, "[rt] vulkan: device lost (no VK_EXT_device_fault to say where)\n");
