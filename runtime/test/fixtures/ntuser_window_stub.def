@@ -1,0 +1,3 @@
+LIBRARY "ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll"
+EXPORTS
+    CreateWindowExA=stub_create_window_ex_a

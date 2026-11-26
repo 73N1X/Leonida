@@ -296,6 +296,43 @@ The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs`
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.
 
+### The title's window, PresentX and screenshots
+
+On the Vulkan device (`LEONIDA_D3D12=vulkan`), a title whose device is an `ID3D12Device11` (the console layouts) gets
+three things from `D3D12XboxCreateDevice`, ported from VIctory (`victory-gpu/src/host.rs`, `dxgi.rs`, `capture.rs`,
+`frame.rs`; `victory-hle/src/modules/lifecycle.rs`):
+
+- **A window and presentation.** The title's `CreateWindowExA` (`shims/title_window.cpp`) makes the window it asks for,
+  shrunk to the primary monitor's work area and centred; closing it ends the run. Console queue slot 32 (`PresentX`)
+  goes to `shims/xbox_window.cpp`: at the first present it takes that window (or, when the title made none, opens one
+  of the runtime's with a client area of the first frame's size, fitted the same way, on a thread that pumps its
+  messages), makes a Vulkan swapchain on the queue the title presents on, and composes the title's planes into it
+  through `XboxPresentation` (`shims/xbox_present.h`). The caption reads `Leonida | <fps> fps <ms> ms/frame`, set once
+  a second by a thread of its own, so presenting never waits for the window. A present that cannot be shown is logged
+  and answered `S_OK`, as VIctory's is.
+- **The frame clock.** Device slots 78-81 are VIctory's clock (`d3d12_xs_device.cpp`): a tick per interval, blocking
+  waits that end on ticks, tokens that count frames. `XboxPresentation` takes its tokens from it
+  (`use_device_frame_clock`) instead of handing out its own, and does not pace: presents go out without waiting for a
+  vblank (MAILBOX, else IMMEDIATE), as VIctory presents with `Present(0, 0)`. So `ImmediateThresholdPercent` has
+  nothing to tear and is ignored, and `LEONIDA_PRESENT_UNCAP`, which uncaps `XboxPresentation`'s own frame calls, does
+  not apply: the title never reaches those.
+- **The display mode.** The title's output size is a constant in the executable (3840x2160, its scene rendered at
+  2/3 of that and scaled up). `src/display_profile.h`, VIctory's native 1440p profile (upstream `native_1440p.rs`),
+  changes it in the mapped executable before any of its code runs (`main.cpp`), after checking the four places it
+  patches hold the 1.0.2.1 executable's bytes; the title's DXGI output (console slot 21, see
+  [docs/runtime_imports.md](../docs/runtime_imports.md#the-titles-window-and-its-display-mode)) reports the same mode.
+
+| variable | default | what it changes |
+|---|---|---|
+| `LEONIDA_DISPLAY_MODE` | `3840x2160` | `2560x1440`: the title outputs 2560x1440 (its window and scanout buffers; measured: both 2560x1440 instead of 3840x2160) and renders its scene at that size with no temporal upscale. Any other `WxH` (W in 640..7680, H in 360..4320) is only the mode the console output lists (as VIctory's `VICTORY_DISPLAY_MODE`): the executable is left as it is, since with a 1920x1080 SDR mode the title still made 2560x1440 buffers. |
+| `LEONIDA_RENDER_SCALE` | `1` | With `LEONIDA_DISPLAY_MODE=2560x1440`: the scene renders at this part of the output (0.25..1; 0.75 is VIctory's `VICTORY_RENDER_1080P`, 1920x1080 scaled up to 2560x1440). Ignored otherwise. |
+| `LEONIDA_CAPTURE_DIR` | unset | Screenshots on request into this folder (made if missing): a thread of the runtime reads the request file every 100 ms, and when the number in it is above the last one taken (0 at the start) the next presented frame is copied (by the frame's own command buffer, nothing read on the present path) and written by that thread as `capture-<number>.png`, 8-bit RGB at the window's size, through a `.part` file and a rename, so a file that exists is complete. `[rt] capture: request N: frame F (WxH) saved as <path>` says when. As VIctory's `VICTORY_CAPTURE_REQUEST`. |
+| `LEONIDA_CAPTURE_REQUEST` | `<LEONIDA_CAPTURE_DIR>\request.txt` | The request file. |
+
+`run_tiny_present` and `run_tiny_present_title_window` (`test/check_tiny_present.py`) run a stand-in title that does
+all of this through `gta6rt --run` and check the screenshot's pixels; a window shows on the desktop for a few seconds.
+`present_window_parts` checks the PNG writer, the caption's figures and the mode parser without a window.
+
 ## Tests
 
 For a Visual Studio build, pass CTest the same configuration you built above.
@@ -444,10 +481,9 @@ blocks the import-driven work:
   measured-slot proxy, but its parameter and flag layout is unmeasured, and the Xbox device vtable is only partly
   measured: the FSR DLL's calls confirm device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76, slot 67 is a
   console-only pipeline call, and the rest is open (`docs/d3d12_vulkan.md`, question 2).
-- The command-queue and fence extensions: the proxies forward the public slots, and the console's own methods past
-  them (`PresentX`, `SuspendX`, `ResumeX`) have unknown slots, so they are refused with a log.
-  `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
-  nothing reaches them yet: their queue and device slots are unmeasured.
+- The command-queue and fence extensions: the console layouts (`shims/d3d12_xs_slots.h`, from VIctory) route
+  `PresentX` (queue slot 32) to the title's window and the frame events (device slots 78-81) to VIctory's frame clock
+  ([above](#the-titles-window-presentx-and-screenshots)); `SuspendX` and `ResumeX` are still refused with a log.
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
   `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
   `XPersistentLocalStorageImpl` and `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.

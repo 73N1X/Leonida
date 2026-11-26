@@ -24,6 +24,13 @@
 // the vsync swapchain is created with FIFO plus IMMEDIATE (FIFO_RELAXED when the surface cannot switch to IMMEDIATE),
 // and a present that asks for it is queued in that mode alone. Without the extension, or without either mode, a
 // request is ignored and the frame waits for the vblank.
+//
+// Snapshots (the screenshots of LEONIDA_CAPTURE_DIR, shims/xbox_window.cpp): request_snapshot() copies the next
+// presented frame, in the same command buffer as its blit, into a host-visible buffer of its own, and hands that buffer
+// to the caller's sink once the frame's fence has signalled, which the presenter sees at a later present (it waits for
+// that fence there anyway) or when it recreates the swapchain. Nothing is read or converted on the present path: the
+// sink owns the pixels and frees them on whatever thread it likes. Unlike the capture below, only a requested frame is
+// copied.
 
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
@@ -51,6 +58,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -110,8 +118,65 @@ inline bool blit_unsupported_format(VkFormat format) {
 }
 }  // namespace detail
 
+// A presented frame copied for VulkanPresenter::request_snapshot: the swapchain image as it was presented, 4 bytes a
+// texel in `format`'s order (B8G8R8A8 or R8G8B8A8, UNORM or sRGB; A2B10G10R10 or A2R10G10B10 for an HDR10 swapchain),
+// rows `extent.width * 4` bytes apart, in host-visible memory of the presenter's device. It owns that memory and frees
+// it when destroyed, on any thread; that must happen before the Vulkan device is destroyed.
+class PresentSnapshot {
+public:
+    PresentSnapshot() = default;
+    PresentSnapshot(const PresentSnapshot&) = delete;
+    PresentSnapshot& operator=(const PresentSnapshot&) = delete;
+    PresentSnapshot(PresentSnapshot&& other) noexcept { *this = std::move(other); }
+    PresentSnapshot& operator=(PresentSnapshot&& other) noexcept {
+        if (this != &other) {
+            reset();
+            pixels_ = other.pixels_;
+            extent = other.extent;
+            format = other.format;
+            frame = other.frame;
+            device_ = other.device_;
+            buffer_ = other.buffer_;
+            memory_ = other.memory_;
+            destroy_buffer_ = other.destroy_buffer_;
+            free_memory_ = other.free_memory_;
+            other.pixels_ = nullptr;
+            other.buffer_ = VK_NULL_HANDLE;
+            other.memory_ = VK_NULL_HANDLE;
+        }
+        return *this;
+    }
+    ~PresentSnapshot() { reset(); }
+
+    const std::uint8_t* pixels() const { return pixels_; }
+    VkExtent2D extent{};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint64_t frame = 0;  // VulkanPresenter::presented() once this frame had been presented
+
+    void reset() {
+        if (memory_ && free_memory_) free_memory_(device_, memory_, nullptr);  // unmaps
+        if (buffer_ && destroy_buffer_) destroy_buffer_(device_, buffer_, nullptr);
+        pixels_ = nullptr;
+        memory_ = VK_NULL_HANDLE;
+        buffer_ = VK_NULL_HANDLE;
+    }
+
+private:
+    friend class VulkanPresenter;
+    const std::uint8_t* pixels_ = nullptr;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    PFN_vkDestroyBuffer destroy_buffer_ = nullptr;
+    PFN_vkFreeMemory free_memory_ = nullptr;
+};
+
 class VulkanPresenter {
 public:
+    // Receives a snapshot (request_snapshot). Called with the presenter's lock held, on the thread of a present: it
+    // must only hand the snapshot on (to a queue, a worker) and must not call the presenter.
+    using SnapshotSink = std::function<void(PresentSnapshot)>;
+
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
                     bool swapchain_maintenance1 = false,
@@ -145,6 +210,7 @@ public:
         LEONIDA_DEVICE_FN(vkDestroyFence)
         LEONIDA_DEVICE_FN(vkWaitForFences)
         LEONIDA_DEVICE_FN(vkResetFences)
+        LEONIDA_DEVICE_FN(vkGetFenceStatus)
 #undef LEONIDA_DEVICE_FN
         if (!vkCreateSwapchainKHR_ || !vkQueuePresentKHR_ || !vkCmdBlitImage_ || !vkCreateFence_) return;
 
@@ -213,6 +279,9 @@ public:
         // A capture still pending has its copy complete once the queue is idle: write it before the buffer goes.
         finish_pending_capture();
         release_capture();
+        // A snapshot not handed on yet is dropped: its sink may belong to an owner that is going too.
+        snapshot_in_flight_.reset();
+        snapshot_sink_ = nullptr;
         composer_.reset();
         for (Frame& frame : frames_) {
             drop_views(frame);
@@ -347,6 +416,34 @@ public:
             return false;
         }
         return true;
+    }
+
+    // From now on the swapchain can be copied from (TRANSFER_SRC usage), which request_snapshot() needs; nothing is
+    // copied until a snapshot is requested. False, with nothing changed, when the surface cannot do it.
+    bool enable_snapshots() {
+        std::lock_guard lock(present_mutex_);
+        if (!ok_) return false;
+        if (snapshots_) return true;
+        snapshots_ = true;
+        stale_ = true;
+        if (!recreate(vsync_, swapchain_srgb_, swapchain_hdr_req_)) {
+            snapshots_ = false;
+            stale_ = true;  // the next present makes the swapchain again without the usage
+            return false;
+        }
+        return true;
+    }
+
+    // The next frame presented (after this call) is copied as it is presented and given to `sink` (see the top comment
+    // and PresentSnapshot); a later request before that frame replaces this one. Needs enable_snapshots(). The sink gets
+    // nothing when the presenter is destroyed first, or when the swapchain format is not one PresentSnapshot lists.
+    void request_snapshot(SnapshotSink sink) {
+        std::lock_guard lock(present_mutex_);
+        snapshot_sink_ = std::move(sink);
+    }
+    bool snapshot_pending() const {
+        std::lock_guard lock(present_mutex_);
+        return snapshot_sink_ || snapshot_recording_ || snapshot_in_flight_;
     }
 
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
@@ -496,6 +593,7 @@ private:
             return stop(waited);
         // Every submit copies into the same mapped buffer, even if its frame is outside the disk capture stride.
         if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
+        deliver_snapshot(false);  // an earlier frame's snapshot whose frame has finished goes to its sink
 
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
@@ -516,6 +614,9 @@ private:
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
         // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
         if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
+        // A requested snapshot is copied by this frame (finish_image), into a buffer of its own.
+        if (snapshot_sink_ && snapshots_ && !snapshot_recording_ && !snapshot_in_flight_)
+            arm_snapshot(frame.done, std::size_t(frame_index_ % frames_.size()));
 
         bool recorded = false;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
@@ -570,9 +671,13 @@ private:
                         context_.tracker_.set(plane_rollbacks[i].id, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
                                               plane_rollbacks[i].layout);
         };
-        if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
+        if (!recorded) {  // released by another thread since presentable()
+            cancel_snapshot();
+            return give_back(frame, VK_ERROR_UNKNOWN);
+        }
         if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
             rollback();
+            cancel_snapshot();
             return stop(reset);
         }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -613,7 +718,10 @@ private:
             if (tracker_lock.owns_lock()) tracker_lock.unlock();
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
-        if (submitted != VK_SUCCESS) return give_back(frame, submitted);
+        if (submitted != VK_SUCCESS) {
+            cancel_snapshot();
+            return give_back(frame, submitted);
+        }
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
@@ -632,6 +740,11 @@ private:
             captured_ = true;
             captured_extent_ = extent_;
             captured_format_ = format_;
+        }
+        if (snapshot_recording_) {  // submitted: the copy is in flight with the frame
+            snapshot_recording_->snapshot.frame = presented_;
+            snapshot_in_flight_ = std::move(snapshot_recording_);
+            snapshot_recording_.reset();
         }
         if (result == VK_ERROR_SURFACE_LOST_KHR) {
             // The surface was lost during the present (display disconnected, a driver reset of the window's
@@ -983,8 +1096,108 @@ private:
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
+        if (snapshot_recording_) {
+            // The requested frame, into its own buffer, made visible to the host reads its sink will do.
+            if (layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+                detail::image_barrier(fn, commands, target_of(image), range, layout,
+                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, access, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                access = VK_ACCESS_TRANSFER_READ_BIT;
+            }
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {extent_.width, extent_.height, 1};
+            fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    snapshot_recording_->snapshot.buffer_, 1, &copy);
+            VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_host.buffer = snapshot_recording_->snapshot.buffer_;
+            to_host.size = VK_WHOLE_SIZE;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                                &to_host, 0, nullptr);
+        }
         detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, access,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
+
+    static bool snapshot_format(VkFormat format) {
+        return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_UNORM ||
+               format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R8G8B8A8_SRGB ||
+               format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    }
+
+    // A buffer for the requested snapshot, copied by the frame of `fence` (frames_ slot `slot`). Without memory for it,
+    // or for a swapchain format PresentSnapshot does not list, the request is dropped (logged).
+    void arm_snapshot(VkFence fence, std::size_t slot) {
+        auto& vk = context_.vk;
+        const VkDevice device = context_.device();
+        const auto drop = [&](const char* why) {
+            std::fprintf(stderr, "[rt] present: a snapshot was requested but %s; nothing is copied\n", why);
+            snapshot_sink_ = nullptr;
+        };
+        if (!snapshot_format(format_)) return drop("the swapchain format is not 8-bit or 10-bit RGBA");
+        PresentSnapshot snapshot;
+        snapshot.device_ = device;
+        snapshot.destroy_buffer_ = vk.vkDestroyBuffer;
+        snapshot.free_memory_ = vk.vkFreeMemory;
+        snapshot.extent = extent_;
+        snapshot.format = format_;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = VkDeviceSize(extent_.width) * extent_.height * 4;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vk.vkCreateBuffer(device, &info, nullptr, &snapshot.buffer_) != VK_SUCCESS) return drop("no buffer was made");
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device, snapshot.buffer_, &requirements);
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
+        // Host-cached memory first: the sink reads every byte, and reads from write-combined memory are slow.
+        constexpr VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        std::uint32_t type = UINT32_MAX;
+        for (const VkMemoryPropertyFlags wanted : {visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, visible}) {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; ++i)
+                if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted)
+                    type = i;
+            if (type != UINT32_MAX) break;
+        }
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = type;
+        void* mapped = nullptr;
+        if (type == UINT32_MAX || vk.vkAllocateMemory(device, &allocate, nullptr, &snapshot.memory_) != VK_SUCCESS ||
+            vk.vkBindBufferMemory(device, snapshot.buffer_, snapshot.memory_, 0) != VK_SUCCESS ||
+            vk.vkMapMemory(device, snapshot.memory_, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+            return drop("no host-visible memory was had for it");
+        snapshot.pixels_ = static_cast<const std::uint8_t*>(mapped);
+        snapshot_recording_.emplace();
+        snapshot_recording_->snapshot = std::move(snapshot);
+        snapshot_recording_->fence = fence;
+        snapshot_recording_->slot = slot;
+        snapshot_recording_->sink = std::move(snapshot_sink_);
+        snapshot_sink_ = nullptr;
+    }
+
+    // The frame that was to copy the snapshot was not submitted: the request waits for the next one (unless a newer
+    // request came meanwhile), and the buffer goes.
+    void cancel_snapshot() {
+        if (!snapshot_recording_) return;
+        if (!snapshot_sink_) snapshot_sink_ = std::move(snapshot_recording_->sink);
+        snapshot_recording_.reset();
+    }
+
+    // Hands the snapshot in flight to its sink once its frame has finished (`idle`: the queue was just waited for).
+    void deliver_snapshot(bool idle) {
+        if (!snapshot_in_flight_) return;
+        if (!idle && vkGetFenceStatus_ &&
+            vkGetFenceStatus_(context_.device(), snapshot_in_flight_->fence) != VK_SUCCESS)
+            return;
+        SnapshotCopy done = std::move(*snapshot_in_flight_);
+        snapshot_in_flight_.reset();
+        if (done.sink) done.sink(std::move(done.snapshot));
     }
 
     // (Re)creates the capture buffer for the current swapchain size: host visible, coherent, persistently mapped.
@@ -1148,6 +1361,7 @@ private:
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
         }
         if (finish_pending_capture() != VK_SUCCESS) return false;
+        deliver_snapshot(true);  // its copy is done: the queue is idle
         stale_ = true;  // until this succeeds
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
@@ -1180,7 +1394,7 @@ private:
             return true;
         }
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (capture_ || snapshots_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((caps.supportedUsageFlags & usage) != usage) return false;
         // Not used by the presenter itself (it blits or copies into the images), but overlays that hook the swapchain
         // draw their own frame into its images through a framebuffer, which needs COLOR_ATTACHMENT: without it
@@ -1455,6 +1669,17 @@ private:
     int capture_limit_ = 24;  // files at most
     VkFence pending_capture_ = VK_NULL_HANDLE;  // owns the shared staging bytes until written
     std::uint64_t capture_written_ = 0;
+    // Snapshots (request_snapshot): the request, the copy the frame being recorded makes, and the copy in flight.
+    struct SnapshotCopy {
+        PresentSnapshot snapshot;
+        VkFence fence = VK_NULL_HANDLE;  // the fence of the frame that copies it
+        std::size_t slot = 0;            // that frame's frames_ slot
+        SnapshotSink sink;
+    };
+    bool snapshots_ = false;  // enable_snapshots(): the swapchain has TRANSFER_SRC usage
+    SnapshotSink snapshot_sink_;
+    std::optional<SnapshotCopy> snapshot_recording_;
+    std::optional<SnapshotCopy> snapshot_in_flight_;
 
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ = nullptr;
@@ -1476,6 +1701,7 @@ private:
     PFN_vkDestroyFence vkDestroyFence_ = nullptr;
     PFN_vkWaitForFences vkWaitForFences_ = nullptr;
     PFN_vkResetFences vkResetFences_ = nullptr;
+    PFN_vkGetFenceStatus vkGetFenceStatus_ = nullptr;
 };
 
 } // namespace leonida

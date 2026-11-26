@@ -29,6 +29,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "display_profile.h"
 #include "host_cpu.h"
 #include "mods.h"
 #include "pe_loader.h"
@@ -49,6 +50,42 @@ const char* binding_name(rt::Binding b) {
         case rt::Binding::Module: return "module";
         default: return "UNIMPLEMENTED";
     }
+}
+
+// The title's output size (src/display_profile.h, VIctory's native 1440p profile): LEONIDA_DISPLAY_MODE other than
+// 3840x2160, or LEONIDA_RENDER_SCALE, patches the mapped executable before any of its code runs.
+void apply_display_profile(const rt::Module& module) {
+    char mode_text[64] = {}, scale_text[32] = {};
+    const DWORD mode_length = GetEnvironmentVariableA("LEONIDA_DISPLAY_MODE", mode_text, sizeof(mode_text));
+    const DWORD scale_length = GetEnvironmentVariableA("LEONIDA_RENDER_SCALE", scale_text, sizeof(scale_text));
+    leonida::DisplayMode mode;
+    if (mode_length && (mode_length >= sizeof(mode_text) || !leonida::parse_display_mode(mode_text, &mode))) {
+        std::fprintf(stderr, "[rt] display: LEONIDA_DISPLAY_MODE is not WxH with W in 640..7680 and H in 360..4320; "
+                             "the title keeps its 3840x2160\n");
+        return;
+    }
+    float scale = 0.0f;
+    if (scale_length) {
+        char* end = nullptr;
+        scale = scale_length < sizeof(scale_text) ? std::strtof(scale_text, &end) : 0.0f;
+        if (!end || end == scale_text || *end || !(scale >= 0.25f && scale <= 1.0f)) {
+            std::fprintf(stderr, "[rt] display: LEONIDA_RENDER_SCALE is not a number in 0.25..1; ignored\n");
+            scale = 0.0f;
+        }
+    }
+    const leonida::display_profile::Plan plan = leonida::display_profile::plan(mode, scale);
+    if (plan.refused)
+        std::fprintf(stderr, "[rt] display: %s keeps its 3840x2160 output: %s\n", module.name.c_str(), plan.refused);
+    if (plan.patches.empty()) return;
+    std::string error;
+    if (leonida::display_profile::apply_to_image(module.base, module.size, plan, &error))
+        std::fprintf(stderr, "[rt] display: %s outputs %ux%u and renders its scene at %ux%u (scale %.3f, scanout "
+                             "reservation 0x%X): SDR mode, scanout reservation, scene scale and Settings viewport "
+                             "patched\n", module.name.c_str(), plan.output.width, plan.output.height,
+                     plan.render_width, plan.render_height, plan.scale, plan.pool);
+    else
+        std::fprintf(stderr, "[rt] display: %s keeps its 3840x2160 output: %s (nothing patched)\n",
+                     module.name.c_str(), error.c_str());
 }
 
 int usage() {
@@ -176,6 +213,7 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        if (init || run) apply_display_profile(main_module);
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {

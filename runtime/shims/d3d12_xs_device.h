@@ -139,9 +139,9 @@ bool command_object_proxy_console_layout(const void* object);
 // Console queue slot 32, PresentX(plane count, planes, parameters): what the device's queues call. `queue` is the real
 // queue behind the proxy the title presented on; `planes` and `parameters` are the title's (the layouts are
 // rt::d3d12::XboxPresentPlaneParameters and XboxPresentParameters, shims/xbox_present.h). Without a handler PresentX
-// is accepted and nothing is shown, as VIctory does (queue.rs:757-841 always answers S_OK). Leonida's
-// XboxPresentation is the intended handler, but its FramePacer hands out its own tokens and models only the origin
-// event, while the device's frame calls (78-81) are VIctory's clock; attaching it is left to whoever owns the window.
+// is accepted and nothing is shown, as VIctory does (queue.rs:757-841 always answers S_OK). On the Vulkan device,
+// D3D12XboxCreateDevice sets rt::d3d12::attach_title_presentation's handler (xbox_window.h): an XboxPresentation in a
+// window that takes its tokens from the device's frame calls (78-81, VIctory's clock; see device_frames_begun).
 using PresentHandler = HRESULT (*)(void* context, ID3D12CommandQueue* queue, std::uint32_t plane_count,
                                    const void* planes, const void* parameters);
 // `device` is the proxy or its DXGI pointer; false (nothing set) for anything else. A null handler detaches.
