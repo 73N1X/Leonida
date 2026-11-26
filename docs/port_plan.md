@@ -132,6 +132,18 @@ write the translator commit and flag profile into `index.json` and refuse a
 mismatch; on a miss, log the hashes, dump the container and let `make_game.py`
 translate it.
 
+## From VIctory `ab34a8b21` (merged 2026-11-25): candidates to port
+
+- `apps/victory/src/native_1440p.rs`, `fsr_preset.rs`: the title told a 1440p
+  display with FSR at Quality: the display-mode lever (`port/present`).
+- `crates/victory-hle/src/modules/fidelityfx.rs` (+ `tests/fidelityfx.rs`): the
+  title's `amd_fidelityfx_upscaler_xbox.dll` served on the host; Leonida's
+  shader stage translates only 18 of the 29 FidelityFX programs.
+- `crates/victory-gpu/src/texture/ahead.rs`, `texture/upload.rs`, `tiles.rs`,
+  `resource/small.rs`: texture streaming ahead of use, tiled resources, small
+  resources; candidates for Leonida's texture step.
+- `crates/victory-gpu/src/pipeline/ray_tracing.rs`: ray-tracing pipelines.
+
 ## Frame time: where Leonida can beat VIctory
 
 VIctory's world frames cost 240-970 ms, mostly host copies of title memory
