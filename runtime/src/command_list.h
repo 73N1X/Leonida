@@ -443,6 +443,16 @@ struct Draw {
     // OMSetDepthBounds, for pipelines with the depth-bounds test. Last, as the draws are aggregate-initialised in order.
     float depth_bounds_min = 0.0f;
     float depth_bounds_max = 1.0f;
+    // A mesh draw from ExecuteIndirect (a command signature ending in DISPATCH_MESH): its group counts are read from
+    // indirect_buffer (D3D12_DISPATCH_MESH_ARGUMENTS, the layout of VkDrawMeshTasksIndirectCommandEXT), up to
+    // indirect_max records indirect_stride apart, and with an indirect_count_buffer at most the count it holds. The
+    // rest of the draw's state is what DispatchMesh would record. 0: a direct draw.
+    ResourceId indirect_buffer = 0;
+    std::uint64_t indirect_offset = 0;
+    ResourceId indirect_count_buffer = 0;
+    std::uint64_t indirect_count_offset = 0;
+    std::uint32_t indirect_stride = 0;
+    std::uint32_t indirect_max = 0;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.

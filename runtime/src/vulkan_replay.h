@@ -986,6 +986,9 @@ struct ReplayFunctions {
     PFN_vkCmdDrawIndirectCount draw_indirect_count = nullptr;
     PFN_vkCmdDrawIndexedIndirectCount draw_indexed_indirect_count = nullptr;
     PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
+    // VK_EXT_mesh_shader: mesh draws from ExecuteIndirect (Draw::indirect_buffer). Null: those draws are unsupported.
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     // A DISPATCH-only ExecuteIndirect signature with a GPU count buffer needs a compute prepass to clamp
     // the number of commands. The resulting scratch buffer is owned by the queue's timeline-retained batch.
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
@@ -1165,6 +1168,11 @@ struct PreparedDraw {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+    // An indirect mesh draw's argument and count buffers (Draw::indirect_buffer), resolved; null for a direct draw.
+    VkBuffer indirect_buffer = VK_NULL_HANDLE;
+    VkDeviceSize indirect_offset = 0;
+    VkBuffer indirect_count_buffer = VK_NULL_HANDLE;
+    VkDeviceSize indirect_count_offset = 0;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
@@ -1181,6 +1189,10 @@ struct PreparedDraw {
         index_type = VK_INDEX_TYPE_UINT16;
         area = {};
         layers = 1;
+        indirect_buffer = VK_NULL_HANDLE;
+        indirect_offset = 0;
+        indirect_count_buffer = VK_NULL_HANDLE;
+        indirect_count_offset = 0;
     }
 };
 
@@ -2201,6 +2213,28 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
+    if (draw.indirect_buffer) {
+        // An indirect mesh draw: the records (and the count) must lie in their buffers, as ExecuteIndirect's.
+        if (!draw.mesh || !draw.indirect_stride || !draw.indirect_max) return ReplayResult::invalid_draw;
+        if (draw.indirect_count_buffer ? !vk.draw_mesh_tasks_indirect_count : !vk.draw_mesh_tasks_indirect)
+            return ReplayResult::unsupported;
+        const ResourceBinding* args = resolve(draw.indirect_buffer);
+        if (!args || !args->buffer) return ReplayResult::unresolved_resource;
+        const VkDeviceSize span = VkDeviceSize(draw.indirect_stride) * (draw.indirect_max - 1) +
+                                  sizeof(VkDrawMeshTasksIndirectCommandEXT);
+        if (!within(draw.indirect_offset, span, args->size) || !indirect_range(*args, draw.indirect_offset, span))
+            return ReplayResult::invalid_indirect_arguments;
+        p.indirect_buffer = args->buffer;
+        p.indirect_offset = args->buffer_offset + draw.indirect_offset;
+        if (draw.indirect_count_buffer) {
+            const ResourceBinding* count = resolve(draw.indirect_count_buffer);
+            if (!count || !count->buffer) return ReplayResult::unresolved_resource;
+            if (!indirect_range(*count, draw.indirect_count_offset, sizeof(std::uint32_t)))
+                return ReplayResult::invalid_indirect_arguments;
+            p.indirect_count_buffer = count->buffer;
+            p.indirect_count_offset = count->buffer_offset + draw.indirect_count_offset;
+        }
+    }
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -4607,7 +4641,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
-            if (draw->mesh) {
+            if (draw->mesh && d.indirect_buffer && d.indirect_count_buffer) {
+                vk.draw_mesh_tasks_indirect_count(command_buffer, d.indirect_buffer, d.indirect_offset,
+                                                  d.indirect_count_buffer, d.indirect_count_offset, draw->indirect_max,
+                                                  draw->indirect_stride);
+            } else if (draw->mesh && d.indirect_buffer) {
+                vk.draw_mesh_tasks_indirect(command_buffer, d.indirect_buffer, d.indirect_offset, draw->indirect_max,
+                                            draw->indirect_stride);
+            } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);

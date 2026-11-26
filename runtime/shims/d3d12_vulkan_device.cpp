@@ -8533,8 +8533,10 @@ public:
         if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || (desc->NodeMask & ~1u))
             return refuse("empty description or node mask");
         UINT64 size = 0;  // 64-bit: a large Num32BitValuesToSet must not wrap past ByteStride
+        UINT args_offset = 0;  // where the final (draw or dispatch) argument starts in a record
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
+            if (i + 1 == desc->NumArgumentDescs) args_offset = static_cast<UINT>((std::min)(size, UINT64{UINT32_MAX}));
             switch (arg.Type) {
             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: size += sizeof(D3D12_DRAW_ARGUMENTS); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: size += sizeof(D3D12_DRAW_INDEXED_ARGUMENTS); break;
@@ -8578,10 +8580,11 @@ public:
                                      "ExecuteIndirect calls are skipped until it is implemented\n",
                              type);
             return create_command_signature(leonida::IndirectKind::dispatch, desc->ByteStride, riid, out, identity(),
-                                            type);
+                                            type, args_offset, desc->NumArgumentDescs - 1);
         }
         }
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        return create_command_signature(kind, desc->ByteStride, riid, out, identity(), -1, args_offset,
+                                        desc->NumArgumentDescs - 1);
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(

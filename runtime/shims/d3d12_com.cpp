@@ -323,20 +323,28 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride, int unsupported_type = -1)
-        : kind_(kind), stride_(byte_stride), unsupported_type_(unsupported_type) {}
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride, int unsupported_type = -1, UINT args_offset = 0,
+                     UINT prefix_args = 0)
+        : kind_(kind), stride_(byte_stride), unsupported_type_(unsupported_type), args_offset_(args_offset),
+          prefix_args_(prefix_args) {}
 
     leonida::IndirectKind kind() const { return kind_; }
     UINT stride() const { return stride_; }
     // The D3D12_INDIRECT_ARGUMENT_TYPE of a signature the layer accepts but cannot execute yet (mesh or ray
     // dispatches), else -1. Its ExecuteIndirect calls are skipped.
     int unsupported_type() const { return unsupported_type_; }
+    // Where in each record the draw or dispatch arguments start: after the arguments the signature lists before them
+    // (root constants and views, vertex and index buffer views), of which there are prefix_args().
+    UINT args_offset() const { return args_offset_; }
+    UINT prefix_args() const { return prefix_args_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
     leonida::IndirectKind kind_;
     UINT stride_;
     int unsupported_type_;
+    UINT args_offset_;
+    UINT prefix_args_;
 };
 
 class CommandAllocator final
@@ -723,6 +731,47 @@ public:
         check(list_.draw(std::move(draw)));
     }
 
+    // ExecuteIndirect through a signature ending in DISPATCH_MESH: one mesh draw with the state DispatchMesh records,
+    // its group counts read on the GPU (vkCmdDrawMeshTasksIndirect[Count]EXT; D3D12_DISPATCH_MESH_ARGUMENTS is
+    // VkDrawMeshTasksIndirectCommandEXT). The title's GPU-driven passes draw through these.
+    void execute_mesh_indirect(const CommandSignature& sig, UINT max_command_count, ID3D12Resource* argument_buffer,
+                               UINT64 argument_buffer_offset, ID3D12Resource* count_buffer, UINT64 count_buffer_offset) {
+        if (!argument_buffer || argument_buffer_offset % 4) return check(false);
+        const UINT stride = sig.stride();
+        const UINT64 record = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
+        if (!stride || stride % 4 || sig.args_offset() + record > stride) return check(false);
+        const auto arg_desc = argument_buffer->GetDesc();
+        if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset > arg_desc.Width ||
+            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
+            return check(false);
+        if (count_buffer) {
+            const auto count_desc = count_buffer->GetDesc();
+            if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || count_buffer_offset % 4 != 0 ||
+                count_desc.Width < sizeof(UINT) || count_buffer_offset > count_desc.Width - sizeof(UINT))
+                return check(false);
+        } else if (count_buffer_offset != 0) {
+            return check(false);
+        }
+        if (!max_command_count) return;
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        if (!pipeline_made(false)) return;
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, 1, 1, 1, 0, 0};
+        draw.mesh = true;
+        draw.depth_bounds_min = depth_bounds_min_;
+        draw.depth_bounds_max = depth_bounds_max_;
+        draw.indirect_buffer = resource_id(argument_buffer);
+        draw.indirect_offset = argument_buffer_offset + sig.args_offset();
+        draw.indirect_count_buffer = count_buffer ? resource_id(count_buffer) : 0;
+        draw.indirect_count_offset = count_buffer ? count_buffer_offset : 0;
+        draw.indirect_stride = stride;
+        draw.indirect_max = max_command_count;
+        count_recorded(false);
+        note_draw_targets(draw);
+        check(list_.draw(std::move(draw)));
+    }
+
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResourceBarrier");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
@@ -1061,7 +1110,20 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         // A signature the layer accepted without being able to run it (mesh or ray dispatches): the work is skipped,
         // as a draw without a host pipeline is, and the list stays usable. Logged once per argument type.
-        if (const CommandSignature* s = CommandSignature::from(signature); s && s->unsupported_type() >= 0) {
+        const CommandSignature* const sig = CommandSignature::from(signature);
+        if (sig && sig->prefix_args()) {
+            // Root constants, views and vertex or index buffer views a signature sets per command are not applied
+            // yet: every command runs with the arguments the list had set. Logged once.
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with %u argument(s) before its draw or dispatch: "
+                                     "they are not applied per command yet (first: stride %u, type %d)\n",
+                             sig->prefix_args(), sig->stride(), sig->unsupported_type());
+        }
+        if (sig && sig->unsupported_type() == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)
+            return execute_mesh_indirect(*sig, max_command_count, argument_buffer, argument_buffer_offset, count_buffer,
+                                         count_buffer_offset);
+        if (const CommandSignature* s = sig; s && s->unsupported_type() >= 0) {
             static std::atomic<std::uint32_t> logged{0};
             const std::uint32_t bit = 1u << (static_cast<unsigned>(s->unsupported_type()) & 31u);
             if (!(logged.fetch_or(bit, std::memory_order_relaxed) & bit))
@@ -1098,12 +1160,14 @@ public:
         if (argument_buffer_offset > arg_desc.Width ||
             UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
             return check(false);
+        const UINT args_offset = sig ? sig->args_offset() : 0;
+        if (max_command_count && args_offset + record_size > stride) return check(false);
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
         cmd.max_count = max_command_count;
         cmd.argument_buffer = resource_id(argument_buffer);
-        cmd.argument_offset = argument_buffer_offset;
+        cmd.argument_offset = argument_buffer_offset + args_offset;
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
@@ -2477,10 +2541,10 @@ bool command_queue_vulkan(ID3D12CommandQueue* queue, VkQueue* vk_queue, std::uin
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device, int unsupported_type) {
+                                 IUnknown* device, int unsupported_type, UINT args_offset, UINT prefix_args) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride, unsupported_type);
+    auto* sig = new CommandSignature(kind, byte_stride, unsupported_type, args_offset, prefix_args);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }
