@@ -29,6 +29,7 @@
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/spirv_output_splat.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
@@ -4594,6 +4595,22 @@ public:
                 dest_alpha_one(blends[i].srcAlphaBlendFactor, false);
                 dest_alpha_one(blends[i].dstAlphaBlendFactor, false);
             }
+            // A8_UNORM: an R8 attachment that holds the target's alpha (the pixel shader's .w, splatted to every
+            // component at build: a8_targets_). Its one channel blends as D3D12 blends alpha: the alpha factors and op,
+            // with the destination's alpha being the stored red. The alpha write bit writes it.
+            if (desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM) {
+                const auto dest_alpha_is_red = [](VkBlendFactor f) {
+                    if (f == VK_BLEND_FACTOR_DST_ALPHA) return VK_BLEND_FACTOR_DST_COLOR;
+                    if (f == VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA) return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+                    return f;
+                };
+                blends[i].srcColorBlendFactor = dest_alpha_is_red(blends[i].srcAlphaBlendFactor);
+                blends[i].dstColorBlendFactor = dest_alpha_is_red(blends[i].dstAlphaBlendFactor);
+                blends[i].colorBlendOp = blends[i].alphaBlendOp;
+                blends[i].colorWriteMask =
+                    (b.RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_ALPHA) ? VK_COLOR_COMPONENT_R_BIT : 0;
+                a8_targets_ |= 1u << i;
+            }
         }
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         blend.attachmentCount = std::uint32_t(blends.size());
@@ -4641,7 +4658,8 @@ public:
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
-            graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            // A8_UNORM: the R8 attachment of its R8 image (texture_storage_format); the alpha goes there at build.
+            graphics_.color_formats[i] = texture_storage_format(desc.RTVFormats[i], false).format;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -4901,6 +4919,20 @@ public:
         for (PlannedStage& stage : planned_) {
             if (!stage.entry) continue;
             if (rects_ && stage.bit == VK_SHADER_STAGE_VERTEX_BIT) rect_vs = stage.words;
+            // A8_UNORM targets are R8 attachments: their output's alpha is stored in every component, so the one
+            // channel holds it (src/spirv_output_splat.h). A module without that output keeps its words.
+            if (a8_targets_ && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                for (std::uint32_t target = 0; target < 8; ++target) {
+                    if (!(a8_targets_ & (1u << target))) continue;
+                    std::string why;
+                    std::vector<std::uint32_t> splat = leonida::splat_output_alpha(stage.words, target, why);
+                    if (splat.empty())
+                        log_once(("A8_UNORM target keeps the pixel shader's red: " + why + "; target").c_str(),
+                                 int(target));
+                    else
+                        stage.words = std::move(splat);
+                }
+            }
             // After the f16 link (read_words), which can also edit the pixel shader's words.
             if (depth24_fragment_ && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
                 std::string why;
@@ -5311,6 +5343,7 @@ private:
     };
     PlannedStage planned_[3];
     bool rects_ = false;  // a rectangle-list pipeline (D3D12.X topology type 19): a generated geometry stage
+    std::uint32_t a8_targets_ = 0;  // render targets in A8_UNORM: the pixel shader's alpha is splatted there at build
     bool words_read_ = false;
     bool uses_bindless_ = false;    // a stage declares set-0 bindings: the layout holds the device's set 0
     bool depth24_fragment_ = false;
@@ -7521,10 +7554,12 @@ public:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
-                // An R8 attachment would store the pixel shader's red output, not its alpha: null until A8 renders
-                // through VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5).
-                log_once("A8_UNORM render-target view left null; format", int(rd.Format));
-                view = {};
+                // An A8 texture is an R8 image, rendered through in its own format: pipelines with an A8 target store
+                // the pixel shader's alpha into that one channel (splat_output_alpha). A view that changes to or from
+                // A8 has no such image behind it.
+                if (rd.Format != DXGI_FORMAT_A8_UNORM ||
+                    (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_A8_UNORM))
+                    view = {};
             } else if (r && r->uint_backed() == VK_FORMAT_A1R5G5B5_UNORM_PACK16) {
                 // An R16_UINT-backed B5G5R5A1 UAV texture (Format::uint_backed) renders through an A1R5G5B5 view, in
                 // its own format only.
