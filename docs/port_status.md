@@ -300,16 +300,35 @@ refused as VIctory refuses them; the FidelityFX slot-67 programs the shader stag
 creation, then writes to `0x20` at `+0x24844a9` about 10 s in. No list had bound a pipeline yet, and the frame
 clock had begun no frame.
 
+## Boot on Vulkan, 2026-11-25
+
+The title now runs for 25-140 s on `LEONIDA_D3D12=vulkan` (RTX 4060 Ti, 616.64), creates its window and presents
+frames (black so far). The stops passed, in order:
+
+| Stop | Cause | Fix (commit) |
+|---|---|---|
+| int3 `+0x19f4f58` after slot 41 | console argument type 105 (DISPATCH_SINGLE) refused | taken as DISPATCH, as VIctory (`6fa8690cb`) |
+| int3 `+0x344196` (size check) | A8_UNORM with RT/UAV and in 1D refused | R8-backed A8 in any dimension (`6fa8690cb`) |
+| same | depth texture with unordered access (console-only) | UAV flag dropped, UAVs null (`6fa8690cb`) |
+| read of `0x200` at `+0x4d9f113` | plain 16-byte heap descriptions: stack words taken as a console heap address | tail taken only when its size is count x increment (`6fa8690cb`) |
+| int3 `+0x344196` | console formats 118-120 (16-bit depth/stencil) | 24-bit family, as VIctory's `pc_format` (`6fa8690cb`) |
+| int3 `+0x2474606` (device-removed handler), ~26 s | GPU device lost | open: see below |
+
+The device loss: with `LEONIDA_TITLE_MEMORY_LOG=1` the title-memory imports thrash (8,766 imports in 25 s, ranges of
+up to 420 MiB imported again as single 64 KiB pages are mapped), single pages the title has just unmapped are refused
+("not committed"), and VK_EXT_device_fault reports no address on this driver. `port/sparse-title-memory` (in progress)
+replaces the per-range imports with one sparse buffer over the title's windows, bound to one import of the physical
+page pool, so a page mapping is a sparse bind and an unmapped page reads zero, as on the console.
+
+Also this session: depth-bounds PSOs are built (`166c49386`); the title's 2,680 slot-67 FSPX compute programs, which
+no build translated, are captured at run time and translated by the shaders stage (`349be3469`, docs/fspx.md);
+`port/pipelines`, `port/wave64-tiers` and `port/rect-lists` are merged.
+
 ## Open items, in order
 
-1. Build `gta6rt` and run it on the real executable (`--dry-run`, `--init`,
-   `--run`); list where it first fails.
-2. Port VIctory's loader and system-call fixes into Leonida's shims until the
-   title boots and presents frames.
-3. Vulkan rendering of menus, then the world: port the GPU-side fixes VIctory
-   needed, using Leonida's Vulkan layer.
-4. Shaders: install the shader-stage tools, translate the corpus, port the
-   translator rules VIctory needed (wave64 on 32-lane GPUs, sampler selection,
-   vertex output interpolation and signature order, ...).
-5. Frame time: title GPU memory in host-visible VRAM or imported host memory
-   with buffer device addresses, instead of per-frame copies. Target 30 fps.
+1. GPU device loss: sparse title memory (`port/sparse-title-memory`).
+2. Translate the captured FSPX programs (a title run, then the shaders stage).
+3. Tessellation PSOs (hull and domain stages) are refused: over 8,192 slot-86 streams.
+4. A8_UNORM render targets (null RTVs now): VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5), which both GPUs here have.
+5. Depth textures with unordered access: VIctory's colour twin (victory-gpu descriptor/host.rs).
+6. Frame time toward 30 fps; frame-counted systems.
