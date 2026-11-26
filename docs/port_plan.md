@@ -61,7 +61,8 @@ and slice detiled with the console's layout, `L\src\gfx10_tiling.h`
 `ConsoleTexture`, from `victory-formats` `texture.rs`); textures the title
 writes after the first view (open: a view keeps its first copy); vertex,
 index, constant and root views at title addresses outside any resource
-(`shadow.rs:230-247`); rectangle lists via a geometry shader (`primitive.rs`).
+(`shadow.rs:230-247`); rectangle lists via a geometry shader (`primitive.rs`;
+done, `L\src\rect_list_gs.h`).
 
 World: page pools (device 74/75, queue 31 CopyPageMappingsBatchX,
 `resource.rs:2190-2230`, `queue.rs:897-948`; done: `rt::xmem::map_alias`,
@@ -115,9 +116,12 @@ tools or GPU):
    so one counter per wave, and an early-exiting wave must not stall barrier
    rounds.
 2. **Rectangle lists** (topology 19) through a generated geometry shader
-   (`VS\emit\rect.rs:1-27`, `683ad7a99`); Leonida refuses the topology
-   (`runtime\shims\d3d12_vulkan_device.cpp:3712-3718`). Full-screen passes and
-   tiled lighting use it.
+   (`VS\emit\rect.rs:1-27`, `683ad7a99`). Full-screen passes and tiled
+   lighting use it. Done in the runtime, not the translator:
+   `L\src\rect_list_gs.h` makes the stage from the VS's SPIR-V outputs at
+   pipeline creation (cached per output signature) and the pipeline takes
+   triangle lists; tested by `tests/test_rect_list_gs.py` and
+   `d3d12_rect_list_test` (RTX 4060 Ti).
 3. **Literal sampler compare**: the console writes `DEPTH_COMPARE_FUNC =
    LESS_EQUAL` into every static S#, so whether a sample compares is decided by
    the instruction (`VS\emit\sampler.rs:13-15`, `2286e038c`). Leonida enables

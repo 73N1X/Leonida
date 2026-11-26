@@ -25,6 +25,7 @@
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/conservative_raster.h"
+#include "../src/rect_list_gs.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
@@ -4462,7 +4463,14 @@ public:
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        switch (mesh ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : desc.PrimitiveTopologyType) {  // mesh: not used
+        // Rectangle lists (D3D12.X topology type 19) take triangle lists into a generated geometry stage that
+        // completes each rectangle (src/rect_list_gs.h).
+        const bool rects = !mesh && UINT(desc.PrimitiveTopologyType) == leonida::rect_list::kPipelineTopologyType;
+        if (rects && !leonida::rect_list::append_stage(vk.vkCreateShaderModule, dev,
+                                                       device_.info.features.geometryShader, vs_stage.words,
+                                                       modules_, stage_infos))
+            return E_NOTIMPL;
+        switch (mesh || rects ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : desc.PrimitiveTopologyType) {  // mesh: unused
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
