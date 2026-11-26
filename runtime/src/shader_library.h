@@ -821,6 +821,10 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // Whether the index lists the module's capabilities (the translator writes them), and FragmentFullyCoveredEXT
+    // among them: pipeline creation decides an inner-coverage refusal from this without reading the module.
+    bool capabilities_listed = false;
+    bool fully_covered_capability = false;
 };
 
 class ShaderLibrary {
@@ -1020,6 +1024,12 @@ private:
                 for (const Json& item : in->array) e.inputs.push_back(u32(&item));
             if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
                 for (const Json& item : o->array) e.outputs.push_back(u32(&item));
+            if (const Json* c = meta.find("capabilities"); c && c->kind == Json::Kind::array) {
+                e.capabilities_listed = true;
+                for (const Json& item : c->array)
+                    if (item.kind == Json::Kind::string && item.string == "FragmentFullyCoveredEXT")
+                        e.fully_covered_capability = true;
+            }
             if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
                 for (const auto& [key, val] : fh->object) {
                     if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;

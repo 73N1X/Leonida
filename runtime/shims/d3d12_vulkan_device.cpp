@@ -34,6 +34,7 @@
 #include "../src/vulkan13_features.h"
 #include "../src/gfx10_tiling.h"
 #include "../src/title_memory.h"
+#include "../src/pipeline_queue.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -816,6 +817,16 @@ struct DeviceState {
             }
         }
         return shader_library.loaded() ? &shader_library : nullptr;
+    }
+
+    // The title's device reads the index on a thread from its creation on, so its first PSO finds it read, or waits
+    // only for the rest: the 1.0.2.1 corpus's index.json is 57 MB, about 3.5 s to read (measured on the test machine).
+    std::thread library_prefetch;
+    void prefetch_library() {
+        if (!library_prefetch.joinable()) library_prefetch = std::thread([this] { library(); });
+    }
+    ~DeviceState() {
+        if (library_prefetch.joinable()) library_prefetch.join();
     }
 
     bool depth_usable(VkFormat format) const {
@@ -3876,6 +3887,37 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     return S_OK;
 }
 
+// The early list (src/pipeline_queue.h): `early-pipelines.txt` beside pipeline_cache.bin, written once the console
+// frame clock runs; or the file LEONIDA_EARLY_PIPELINES names, written whenever it changes ("0": no list). Decided at
+// the first PSO.
+void configure_early_pipelines() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::wstring value(32768, L'\0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_EARLY_PIPELINES", value.data(), DWORD(value.size()));
+        auto& list = leonida::pipelines::EarlyList::get();
+        if (n && n < value.size()) {
+            value.resize(n);
+            if (value == L"0") list.configure({}, false);
+            else list.configure(std::filesystem::path(value), true);
+            return;
+        }
+        const std::filesystem::path cache = pipeline_cache_path();
+        list.configure(cache.empty() ? std::filesystem::path() : cache.parent_path() / L"early-pipelines.txt", false);
+    });
+}
+
+// What the early list (src/pipeline_queue.h) knows a stream PSO by: the description's key, with the mesh and
+// amplification stages a plain description has no place for.
+leonida::cached_pso::Key stream_pipeline_key(const PipelineStream& stream) {
+    if (stream.has_cs) return pipeline_key(stream.compute);
+    leonida::cached_pso::KeyBuilder key;
+    key.tag("stream").text(pipeline_key(stream.graphics).c_str());
+    key_shader(key, "ms", stream.ms);
+    key_shader(key, "as", stream.as);
+    return leonida::sha256_hex(key.data());
+}
+
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
@@ -3885,6 +3927,8 @@ public:
     explicit PipelineState(DeviceState& device) : device_(device) {}
 
     ~PipelineState() override {
+        // A queued build is not run, a running one is finished first (src/pipeline_queue.h).
+        if (job_) job_->retire();
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
@@ -3957,9 +4001,37 @@ public:
         return S_OK;
     }
 
-    bool compute() const { return registered_ && !is_graphics_; }
-    bool graphics() const { return registered_ && is_graphics_; }
+    // What kind of PSO it is, from creation on; its Vulkan pipeline may still be being made (job()).
+    bool compute() const { return created_ && !is_graphics_; }
+    bool graphics() const { return created_ && is_graphics_; }
+    // Filled by the build: complete once job()->finished().
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
+
+    // The Vulkan pipeline is made by a worker (src/pipeline_queue.h, after VIctory's make.rs): creation records what
+    // it is made from and, for a pipeline an earlier run bound (the early list), starts it; the first bind starts any
+    // other and waits for it within the frame's budget.
+    const std::shared_ptr<leonida::pipelines::Job>& job() const { return job_; }
+    const std::string& early_key() const { return early_key_; }
+
+    // After a successful create_*: the key the early list knows the pipeline by (a hash of its description, the same
+    // across runs), and an early start if an earlier run bound it.
+    void created(const leonida::cached_pso::Key& key) {
+        configure_early_pipelines();
+        early_key_ = key.substr(0, 32);
+        if (!early_key_.empty() && leonida::pipelines::EarlyList::get().wanted(early_key_))
+            leonida::pipelines::Builder::get().start(job_, leonida::pipelines::kEarly);
+    }
+
+    // The bind site (SetPipelineState): notes the pipeline for the next run's early list, starts it, and waits for it
+    // while the frame's budget lasts.
+    const leonida::pipelines::Job* bind() {
+        if (!used_.exchange(true, std::memory_order_relaxed)) leonida::pipelines::EarlyList::get().note_used(early_key_);
+        if (!job_->finished()) {
+            leonida::pipelines::Builder::get().start(job_, leonida::pipelines::kRequested);
+            leonida::pipelines::Builder::get().wait(*job_);
+        }
+        return job_.get();
+    }
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
@@ -3971,10 +4043,13 @@ public:
     // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
+    // Everything the description and the translator's index decide is checked here, on the caller's thread; the
+    // modules, the layout and the pipeline are made by build_graphics on a worker. The SPIR-V is read there too, unless
+    // a check on it could refuse the PSO on this device (words_could_refuse): then it is read and checked here, so the
+    // answer stays the creation's.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr) {
         auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
         if (as && as->pShaderBytecode && as->BytecodeLength) {
             log_once("amplification shaders are not supported (the game has none); bytes", int(as->BytecodeLength));
@@ -4075,19 +4150,16 @@ public:
             const D3D12_SHADER_BYTECODE& code;
             const leonida::ShaderEntry* entry = nullptr;
             std::vector<std::uint8_t> fssm;
-            std::vector<std::uint32_t> words;
         };
         Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
                                 : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
                            {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
-        // stage_infos.size() indexes the recipe's per-stage required-size structs: one for every table entry.
+        // The build's stage_infos.size() indexes the recipe's per-stage required-size structs: one per table entry.
         static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
                       "Recipe::required_sizes needs an entry per graphics stage");
+        static_assert(std::size(stages) == std::size(decltype(planned_){}), "planned_ holds the stage table");
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
-        std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
-        // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
-        auto& required_sizes = recipe_.required_sizes;
         const Stage* code_stage = nullptr;
         // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU): the pixel stage writes the depth D24
         // would hold, biased in D24 units and quantised (src/depth24_fragment.h, D3D-309), and the rasterizer's own
@@ -4149,94 +4221,14 @@ public:
                 }
                 code_stage = &stage;
             }
-            stage.words = library->spirv(*stage.entry);
-            if (stage.words.empty()) return E_FAIL;
-            const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
-            if (!inner.valid) return E_INVALIDARG;
-            if (inner.fully_covered &&
-                (stage.bit != VK_SHADER_STAGE_FRAGMENT_BIT ||
-                 device_.conservative_raster_tier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
-                 (inner.post_depth && !device_.conservative_post_depth_coverage))) {
-                log_once("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage", int(stage.bit));
-                return E_NOTIMPL;
-            }
+            if (!module_present(*library, *stage.entry)) return E_FAIL;
         }
-        // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
-        // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
-        // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
-        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
-        Stage& vs_stage = stages[0];
-        Stage& gs_stage = stages[1];
-        Stage& ps_stage = stages[2];
-        if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
-            log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
-        }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
-            (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
-            std::string link_error;
-            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error, device_.f16_half_top_location)) {
-                std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
-                return E_FAIL;
-            }
-        }
-        // A stage that declares a storage image or buffer it may write needs a device feature outside compute
-        // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
-        // VUID-RuntimeSpirv-NonWritable-06340 / -06341, so the PSO is refused here with the stage named.
-        for (const Stage& stage : stages) {
-            if (!stage.entry) continue;
-            const bool pixel = stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT;
-            const VkBool32 allowed = pixel ? device_.info.features.fragmentStoresAndAtomics
-                                           : device_.info.features.vertexPipelineStoresAndAtomics;
-            if (allowed || !leonida::spirv_declares_writable_storage(stage.words)) continue;
-            std::fprintf(stderr,
-                         "[rt] d3d12: %s (%s) writes a storage image or buffer, which needs the Vulkan feature %s; "
-                         "the device does not have it enabled, so the pipeline is refused\n",
-                         stage.entry->name.c_str(), stage.name,
-                         pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
-            return E_NOTIMPL;
-        }
-        for (Stage& stage : stages) {
-            if (!stage.entry) continue;
-            // After the f16 link above, which can also edit the pixel shader's words.
-            if (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
-                std::string why;
-                std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(stage.words, depth24_bias, why);
-                if (patched.empty()) {
-                    std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
-                                 stage.entry->name.c_str(), why.c_str());
-                    depth24_fragment = false;
-                } else {
-                    stage.words = std::move(patched);
-                }
-            }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
-            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            info.stage = stage.bit;
-            info.module = module;
-            info.pName = "main";
-            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
-            stage_infos.push_back(info);
-        }
-        if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
-            const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
-                return E_FAIL;
-            modules_.push_back(module);
-            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-            info.module = module;
-            info.pName = "main";
-            stage_infos.push_back(info);
+        for (std::size_t i = 0; i < std::size(stages); ++i) planned_[i] = {stages[i].name, stages[i].bit, stages[i].entry, {}};
+        uses_bindless_ = uses_bindless;
+        depth24_fragment_ = depth24_fragment;
+        depth24_bias_ = depth24_bias;
+        if (words_could_refuse()) {
+            if (const HRESULT hr = read_words(); FAILED(hr)) return hr;
         }
 
         // Input layout -> vertex input, by semantic. A mesh pipeline has none.
@@ -4504,23 +4496,11 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
-        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
-        if (uses_bindless) {
-            set0_layout = device_.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0_layout;
-            graphics_.bindless_set = device_.bindless->set();
-        }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
-        // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
+        // Kept for the build, and for variants: a draw that leaves a slot unbound needs this pipeline with that format
+        // undefined. The stages and the layout are the build's.
         graphics_.mesh = mesh;
         recipe_.mesh = mesh;
-        recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
         recipe_.divisors = std::move(divisors);
@@ -4533,9 +4513,6 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
-        if (!graphics_.pipeline) return E_FAIL;
-        graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -4545,15 +4522,267 @@ public:
             code_base_ = offset;
             graphics_.code_base = offset;
         }
-        device_.context->add_graphics_pipeline(id(), graphics_);
-        registered_ = true;
+        // Shadow maps and depth prepasses feed later draws: an early start makes them first (make.rs Queue::push).
+        const bool depth_only = graphics_.depth_format != VK_FORMAT_UNDEFINED &&
+                                std::all_of(graphics_.color_formats.begin(), graphics_.color_formats.end(),
+                                            [](VkFormat f) { return f == VK_FORMAT_UNDEFINED; });
+        job_ = std::make_shared<leonida::pipelines::Job>(false, depth_only);
+        job_->set_work([this] { return reported(build_graphics()); });
         is_graphics_ = true;
+        created_ = true;
         return S_OK;
     }
 
-    HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
+    // Whether a check on the SPIR-V could refuse this PSO on this device, so that create_graphics reads the words: a
+    // stage that may store without the feature for its stage, --f16-interp-fallback halves to link, or a module that
+    // declares FragmentFullyCoveredEXT where the device is short of Tier 3 with post-depth coverage (the standalone
+    // device always is: it does not opt into the inner-coverage ABI). The capability leads the module, so only its
+    // first bytes are read for that (declares_fully_covered). The game's modules declare none (the translator does not
+    // emit it), so on a GPU with the store features nothing is read here and the build reads the words.
+    bool words_could_refuse() const {
+        const VkPhysicalDeviceFeatures& f = device_.info.features;
+        if (!f.fragmentStoresAndAtomics || !f.vertexPipelineStoresAndAtomics) return true;
+        for (const PlannedStage& stage : planned_)
+            if (stage.entry && !stage.entry->f16_halves.empty()) return true;
+        if (device_.conservative_raster_tier == D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 &&
+            device_.conservative_post_depth_coverage)
+            return false;
+        const leonida::ShaderLibrary* library = device_.library();
+        for (const PlannedStage& stage : planned_)
+            if (stage.entry && (!library || declares_fully_covered(*library, *stage.entry))) return true;
+        return false;
+    }
+
+    // Whether the module file of `entry` is there, as creation answered when it read the module (E_FAIL without):
+    // asked of the file system once per file for the process, nothing read.
+    static bool module_present(const leonida::ShaderLibrary& library, const leonida::ShaderEntry& entry) {
+        static std::mutex* mutex = new std::mutex();  // never destroyed: build threads may outlive static destructors
+        static auto* seen = new std::unordered_map<std::string, bool>();
+        std::filesystem::path path = library.directory();
+        path += "/" + entry.name + ".spv";
+        const std::string key = path.string();
+        {
+            std::lock_guard lock(*mutex);
+            if (const auto it = seen->find(key); it != seen->end()) return it->second;
+        }
+        std::error_code ec;
+        const bool present = std::filesystem::file_size(path, ec) >= 20 && !ec;  // a SPIR-V header at least
+        std::lock_guard lock(*mutex);
+        seen->emplace(key, present);
+        if (!present) std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry.name.c_str());
+        return present;
+    }
+
+    // Whether the module of `entry` declares FragmentFullyCoveredEXT (5265). The translator lists each module's
+    // capabilities in the index (none of the 26,503 entries of the 1.0.2.1 corpus has this one), so that answers with
+    // no file read; for an index without the list (hand-written ones), the module's OpCapability instructions lead it,
+    // so the first 4 KiB of its file tell, once per file for the process. True where they do not tell.
+    static bool declares_fully_covered(const leonida::ShaderLibrary& library, const leonida::ShaderEntry& entry) {
+        if (entry.capabilities_listed) return entry.fully_covered_capability;
+        static std::mutex* mutex = new std::mutex();  // never destroyed: build threads may outlive static destructors
+        static auto* seen = new std::unordered_map<std::string, bool>();
+        std::filesystem::path path = library.directory();
+        path += "/" + entry.name + ".spv";
+        const std::string key = path.string();
+        {
+            std::lock_guard lock(*mutex);
+            if (const auto it = seen->find(key); it != seen->end()) return it->second;
+        }
+        std::uint32_t words[1024] = {};
+        std::ifstream file(path, std::ios::binary);
+        file.read(reinterpret_cast<char*>(words), sizeof(words));
+        const std::size_t count = std::size_t(file.gcount()) / 4;
+        bool declares = true;  // unless the capabilities are seen to end without it
+        if (count > 5 && words[0] == 0x07230203u) {
+            for (std::size_t at = 5; at < count;) {
+                const std::uint32_t op = words[at] & 0xffffu, length = words[at] >> 16;
+                if (!length || at + length > count) break;  // past what was read: cannot tell
+                if (op != 17) {  // the first instruction that is not OpCapability: none was FragmentFullyCoveredEXT
+                    declares = false;
+                    break;
+                }
+                if (length >= 2 && words[at + 1] == 5265) break;
+                at += length;
+            }
+        }
+        std::lock_guard lock(*mutex);
+        seen->emplace(key, declares);
+        return declares;
+    }
+
+    // Each planned stage's SPIR-V, with the checks only the words decide (the program's are create_graphics's).
+    HRESULT read_words() {
+        const leonida::ShaderLibrary* library = device_.library();
+        if (!library) return E_FAIL;
+        for (PlannedStage& stage : planned_) {
+            if (!stage.entry) continue;
+            stage.words = library->spirv(*stage.entry);
+            if (stage.words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", stage.entry->name.c_str());
+                return E_FAIL;
+            }
+            const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
+            if (!inner.valid) {
+                std::fprintf(stderr, "[rt] d3d12: %s.spv: its fragment coverage built-ins do not parse\n",
+                             stage.entry->name.c_str());
+                return E_INVALIDARG;
+            }
+            if (inner.fully_covered &&
+                (stage.bit != VK_SHADER_STAGE_FRAGMENT_BIT ||
+                 device_.conservative_raster_tier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
+                 (inner.post_depth && !device_.conservative_post_depth_coverage))) {
+                log_once("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage", int(stage.bit));
+                return E_NOTIMPL;
+            }
+        }
+        // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
+        // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
+        // The table is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is [2], and with a
+        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        PlannedStage& vs_stage = planned_[0];
+        PlannedStage& gs_stage = planned_[1];
+        PlannedStage& ps_stage = planned_[2];
+        if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
+            log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
+        }
+        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
+            (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
+            std::string link_error;
+            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
+                                          &link_error, device_.f16_half_top_location)) {
+                std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
+                return E_FAIL;
+            }
+        }
+        // A stage that declares a storage image or buffer it may write needs a device feature outside compute
+        // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
+        // VUID-RuntimeSpirv-NonWritable-06340 / -06341, so the PSO is refused here with the stage named.
+        for (const PlannedStage& stage : planned_) {
+            if (!stage.entry) continue;
+            const bool pixel = stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT;
+            const VkBool32 allowed = pixel ? device_.info.features.fragmentStoresAndAtomics
+                                           : device_.info.features.vertexPipelineStoresAndAtomics;
+            if (allowed || !leonida::spirv_declares_writable_storage(stage.words)) continue;
+            std::fprintf(stderr,
+                         "[rt] d3d12: %s (%s) writes a storage image or buffer, which needs the Vulkan feature %s; "
+                         "the device does not have it enabled, so the pipeline is refused\n",
+                         stage.entry->name.c_str(), stage.name,
+                         pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
+            return E_NOTIMPL;
+        }
+        words_read_ = true;
+        return S_OK;
+    }
+
+    // On a worker: the modules, the layout and the pipeline create_graphics planned, registered for replay; whether the
+    // pipeline was made.
+    bool build_graphics() {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
+        if (!words_read_ && FAILED(read_words())) return false;
+        std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
+        // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
+        auto& required_sizes = recipe_.required_sizes;
+        const bool depth24_planned = depth24_fragment_;
+        for (PlannedStage& stage : planned_) {
+            if (!stage.entry) continue;
+            // After the f16 link (read_words), which can also edit the pixel shader's words.
+            if (depth24_fragment_ && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                std::string why;
+                std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(stage.words, depth24_bias_, why);
+                if (patched.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
+                                 stage.entry->name.c_str(), why.c_str());
+                    depth24_fragment_ = false;
+                } else {
+                    stage.words = std::move(patched);
+                }
+            }
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = stage.words.size() * 4;
+            module_info.pCode = stage.words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return false;
+            modules_.push_back(module);
+            std::vector<std::uint32_t>().swap(stage.words);  // the module has its own copy
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = stage.bit;
+            info.module = module;
+            info.pName = "main";
+            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
+            stage_infos.push_back(info);
+        }
+        if (depth24_fragment_ && !planned_[2].entry) {  // no pixel shader: a built-in one writes the depth
+            const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias_);
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
+                return false;
+            modules_.push_back(module);
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            info.module = module;
+            info.pName = "main";
+            stage_infos.push_back(info);
+        }
+        if (depth24_planned && !depth24_fragment_ && depth24_bias_.any()) {
+            // The pixel stage could not be patched: the rasterizer biases, as for a target that is not D24.
+            VkPipelineRasterizationStateCreateInfo& raster = recipe_.raster;
+            raster.depthBiasEnable = VK_TRUE;
+            raster.depthBiasConstantFactor = float(depth24_bias_.constant);
+            raster.depthBiasClamp = depth24_bias_.clamp;
+            raster.depthBiasSlopeFactor = depth24_bias_.slope;
+            if (raster.depthBiasClamp != 0.0f && !device_.info.features.depthBiasClamp) {
+                log_once("a depth-bias clamp needs depthBiasClamp, which the device lacks; clamp x1000",
+                         int(raster.depthBiasClamp * 1000));
+                return false;
+            }
+        }
+        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (uses_bindless_) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            graphics_.bindless_set = device_.bindless->set();
+        }
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return false;
+        recipe_.stages = std::move(stage_infos);
+        graphics_.pipeline = build(0);
+        if (!graphics_.pipeline) return false;
+        graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        device_.context->add_graphics_pipeline(id(), graphics_);
+        registered_ = true;
+        return true;
+    }
+
+    // A build that made no pipeline is named: its draws or dispatches are dropped from here on (VIctory pipeline.rs
+    // `translated`: "its pipelines' draws are dropped"). The first 16, then every power of two.
+    bool reported(bool made) {
+        if (made) return true;
+        static std::atomic<unsigned> failures{0};
+        const unsigned n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > 16 && (n & (n - 1))) return false;
+        std::string names;
+        if (is_graphics_) {
+            for (const PlannedStage& stage : planned_)
+                if (stage.entry) names += (names.empty() ? "" : " + ") + stage.entry->name;
+        } else if (compute_entry_) {
+            names = compute_entry_->name;
+        }
+        std::fprintf(stderr, "[rt] d3d12: pipelines: the %s pipeline of %s could not be made (%u so far); its %s are "
+                             "dropped\n",
+                     is_graphics_ ? "graphics" : "compute", names.c_str(), n, is_graphics_ ? "draws" : "dispatches");
+        return false;
+    }
+
+    // As create_graphics: the description and the translator's index are checked here, the pipeline is made on a worker.
+    HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
@@ -4616,16 +4845,40 @@ public:
                 }
             }
         }
+        if (!module_present(*library, *entry)) return E_FAIL;
+        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
+        // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
+        const std::vector<std::uint8_t>& code = program.bytes;
+        VkDeviceSize offset = 0;
+        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
+        std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
+        code_bytes_ = code.size();
+        code_base_ = offset;
+        pipeline_.code_base = offset;
+        // The module, the layout and the pipeline are made by build_compute on a worker (src/pipeline_queue.h).
+        compute_entry_ = entry;
+        job_ = std::make_shared<leonida::pipelines::Job>(true, false);
+        job_->set_work([this] { return reported(build_compute()); });
+        created_ = true;
+        return S_OK;
+    }
+
+    // On a worker: the compute pipeline create_compute planned, registered for replay; whether it was made.
+    bool build_compute() {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        const leonida::ShaderLibrary* library = device_.library();
+        if (!library) return false;
+        const leonida::ShaderEntry* entry = compute_entry_;
         const std::vector<std::uint32_t> words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
-            return E_FAIL;
+            return false;
         }
-
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = words.size() * 4;
         module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return false;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -4637,7 +4890,7 @@ public:
             layout_info.pSetLayouts = &set0_layout;
             pipeline_.bindless_set = device_.bindless->set();
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return false;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -4648,20 +4901,10 @@ public:
         pipeline_info.layout = pipeline_.layout;
         if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
-            return E_FAIL;
-
-        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
-        // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
-        const std::vector<std::uint8_t>& code = program.bytes;
-        VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-        std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
-        code_bytes_ = code.size();
-        code_base_ = offset;
-        pipeline_.code_base = offset;
+            return false;
         device_.context->add_pipeline(id(), pipeline_);
         registered_ = true;
-        return S_OK;
+        return true;
     }
 
 private:
@@ -4792,8 +5035,25 @@ private:
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
-    bool registered_ = false;
+    bool registered_ = false;  // the build registered the pipeline with the context (replay finds it)
     bool is_graphics_ = false;
+    bool created_ = false;     // create_* accepted the description: the job makes the pipeline
+    // What build_graphics makes the modules from, per entry of create_graphics's stage table (VS or MS, GS, PS).
+    struct PlannedStage {
+        const char* name = nullptr;
+        VkShaderStageFlagBits bit{};
+        const leonida::ShaderEntry* entry = nullptr;
+        std::vector<std::uint32_t> words;  // read by create_graphics where words_could_refuse, else by the build
+    };
+    PlannedStage planned_[3];
+    bool words_read_ = false;
+    bool uses_bindless_ = false;    // a stage declares set-0 bindings: the layout holds the device's set 0
+    bool depth24_fragment_ = false;
+    leonida::Depth24Bias depth24_bias_{};
+    const leonida::ShaderEntry* compute_entry_ = nullptr;
+    std::shared_ptr<leonida::pipelines::Job> job_;
+    std::string early_key_;
+    std::atomic<bool> used_{false};  // a bind has noted it for the early list
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
     leonida::cached_pso::Key cache_key_;
 };
@@ -6153,6 +6413,7 @@ public:
             state_.bindless.reset();
         }
         state_.report_arena();
+        leonida::pipelines::EarlyList::get().save(true);  // what this run bound, for the next (src/pipeline_queue.h)
         if (state_.context && state_.arena.buffer) {
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
@@ -6175,6 +6436,7 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    void prefetch_shader_library() { state_.prefetch_library(); }
     IUnknown* holder() { return identity(); }
     // Slot 14's console form (rt::d3d12::create_console_descriptor_heap): as CreateDescriptorHeap, with the title's
     // address and size, so the heap's CPU handle start is that address. The caller has checked the description.
@@ -6742,6 +7004,7 @@ public:
             pipeline->Release();
             return hr;
         }
+        pipeline->created(key);
         pipeline->set_cache_key(std::move(key));
         return hand_out(pipeline, riid, out);
     }
@@ -6759,6 +7022,7 @@ public:
             pipeline->Release();
             return hr;
         }
+        pipeline->created(key);
         pipeline->set_cache_key(std::move(key));
         return hand_out(pipeline, riid, out);
     }
@@ -6858,6 +7122,7 @@ public:
             pipeline->Release();
             return d3d12_trace::result(method, hr);
         }
+        pipeline->created(stream_pipeline_key(stream));
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
@@ -9889,7 +10154,29 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
-    return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
+    if (!p || !(p->compute() || p->graphics())) return nullptr;
+    p->job()->run_now();  // the build fills them
+    return &p->subgroup_requests();
+}
+
+const leonida::pipelines::Job* pipeline_bound(ID3D12PipelineState* pipeline) {
+    PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && (p->compute() || p->graphics()) ? p->bind() : nullptr;
+}
+
+const leonida::pipelines::Job* pipeline_job(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && (p->compute() || p->graphics()) ? p->job().get() : nullptr;
+}
+
+std::string pipeline_early_key(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p ? p->early_key() : std::string();
+}
+
+bool make_pipeline_now(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && (p->compute() || p->graphics()) && p->job()->run_now();
 }
 
 IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
@@ -10113,6 +10400,12 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
     if (!real) real = device;
     if (auto* d = Device::from<Device>(real)) return d->info().max_push_constants_size;
     return 0;
+}
+
+void prefetch_shader_library(ID3D12Device* device) {
+    if (!device) return;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device)) d->prefetch_shader_library();
 }
 
 bool device_push_constants_need_fallback(ID3D12Device* device) {

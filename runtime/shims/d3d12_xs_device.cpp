@@ -30,6 +30,7 @@
 #include "d3d12_xs_slots.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#include "../src/pipeline_queue.h"  // the pipelines' frame budget follows the frame clock (slot 80)
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"  // rt::d3d12::create_console_descriptor_heap for slot 14 (Vulkan device only)
 #endif
@@ -2004,6 +2005,7 @@ HRESULT frame_wait(DeviceProxy* self, std::uint64_t kind_word, std::uint64_t tim
     if (kind == kFrameOrigin && (hr == S_OK || (flags & kTokenOnTimeout))) {
         const std::uint64_t frame = self->frames_begun.fetch_add(1, std::memory_order_relaxed) + 1;
         if (auto* token = reinterpret_cast<std::uint64_t*>(token_word)) *token = frame;
+        leonida::pipelines::begin_frame();  // a new budget for waiting on pipelines (make.rs `wait`)
     }
     return hr;
 }

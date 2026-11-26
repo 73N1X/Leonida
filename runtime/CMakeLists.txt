@@ -582,6 +582,11 @@ if(BUILD_TESTING)
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
+  # The pipeline builder (src/pipeline_queue.h, after VIctory's make.rs/library.rs): the frame budget's window, the
+  # queue's order, drops and the early list's file. Pure stdlib, no Vulkan device.
+  add_executable(pipeline_queue_test test/pipeline_queue_test.cpp)
+  target_link_libraries(pipeline_queue_test PRIVATE Threads::Threads)
+  add_test(NAME pipeline_queue COMMAND pipeline_queue_test)
   # XMA2 frame decoder and SHAPE XMA context machine (src/xma_decode.h, src/xma_context.h): pure stdlib, streams built
   # in memory, including VIctory's noise tests of damaged packets and frames.
   add_executable(xma_test test/xma_test.cpp src/xma_decode.cpp src/xma_context.cpp)
@@ -1460,7 +1465,7 @@ endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
-          vk_xdxr_build_test vk_queue_test vk_sandbox)
+          vk_xdxr_build_test vk_queue_test vk_sandbox vk_pipeline_paths)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
@@ -3033,6 +3038,18 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_pipeline_library_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
       set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
+      # PSOs made on worker threads (src/pipeline_queue.h): draws dropped and counted until made, the frame budget,
+      # the early list written and read back, and console device slot 86.
+      add_executable(d3d12_async_pipeline_test test/d3d12_async_pipeline_test.cpp
+                     ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_async_pipeline_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_async_pipeline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_async_pipeline_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_async_pipeline COMMAND d3d12_async_pipeline_test)
+      set_tests_properties(d3d12_async_pipeline PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # ExecuteBundle: what a bundle's draws inherit and hand back, against the host runtime and WARP.
       add_executable(d3d12_bundle_test test/d3d12_bundle_test.cpp ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_bundle_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

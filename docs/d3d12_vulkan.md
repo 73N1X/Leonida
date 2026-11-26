@@ -2087,6 +2087,33 @@ Pipeline creation:
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
 
+**Pipelines made off the creating thread** (`runtime/src/pipeline_queue.h`, ported from VIctory's
+`pipeline/make.rs` and `pipeline/library.rs`). The title creates about 60,000 PSOs in its first 20 s and draws with
+few of them; compiled where they are created, its first `CreateComputePipelineState` held the main thread until the
+title's own 30 s hang detector fired.
+- **Creation** checks the description and the translator's index (the program's hash and entry, bindless, mesh limits,
+  code base, workgroup memory, that the module file is there) and returns. The modules, the layout and the pipeline
+  are made by a worker (half the logical processors, 2 to 8, below normal priority; `LEONIDA_PIPELINE_WORKERS`, 0
+  builds on the binding thread). The SPIR-V is read at creation only where a check on it could refuse the PSO on
+  this device (stores without `fragmentStoresAndAtomics`/`vertexPipelineStoresAndAtomics`, f16 halves to link, or a
+  module whose index entry lists `FragmentFullyCoveredEXT` on a device short of Tier 3), so those answers stay the
+  creation's; the game's index lists none, so on the RTX 4060 Ti creation reads no module.
+- **Bind** (`SetPipelineState`, a bundle's when it runs): starts the build if it has not started and waits for it while
+  the frame's budget lasts, `LEONIDA_PIPELINE_WAIT_MS` (500) per frame and kind (graphics, compute), one window the
+  binding threads share (`LEONIDA_PIPELINE_WAIT_SHARED`), never for a pipeline the driver has held over 3 s (10 s
+  compute). Requests go before early starts. A draw, mesh draw, dispatch or indirect dispatch recorded while its
+  pipeline is not made is dropped and counted (once a second in the log); the list stays valid. A frame is the
+  console frame clock's (device slot 80); the title's device is bounded from its creation (frame 0 before the first
+  tick, as in VIctory). A device of no title (the PC interface, the tests) waits however long the build takes until a
+  frame begins, so nothing is dropped there.
+- **Early list**: the PSOs a run bound, by a key of their description (`early-pipelines.txt` beside
+  `pipeline_cache.bin`, or `LEONIDA_EARLY_PIPELINES`; at most 8,192, earlier runs' kept), written every 20 s and
+  when the builder runs dry; the next run starts those at creation, depth-only ones first.
+- The builds share the device's `VkPipelineCache` (seeded from `pipeline_cache.bin`). The index is read on a thread
+  from the title's device creation on (57 MB, about 3.5 s on the test machine).
+- Open: VIctory's loading allowance (longer waits while a world loads); the attachment-format variants, still made
+  where replay meets them.
+
 **Implemented (D3D-29): pipeline state streams, mesh PSOs and `DispatchMesh`.**
 - **Device:** `VK_EXT_mesh_shader` with `meshShader` is enabled where the GPU has it (`VulkanDeviceInfo::mesh_shader`).
   `taskShader` is not enabled, since the corpus has no amplification shaders. `D3D12_OPTIONS7` reports
