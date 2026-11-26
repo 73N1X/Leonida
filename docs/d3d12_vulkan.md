@@ -2882,6 +2882,18 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
   instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
   submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
+- **A bounded wait at the compile gate** (`SubmitMutex::enter_submit`, `src/vulkan_device_fault.h`). The gate keeps a
+  `vkQueueSubmit` out of the driver while a create is in it, since on NVIDIA 630.20 one that entered during a long
+  `vkCreateComputePipelines` waited 10 s and lost the device. The waiting submission holds the submit lock, so all
+  queues stop: on an RTX 4070 Laptop (NVIDIA 621.40) one compute create of a 2.3 MB module stayed in the driver for
+  more than 54 s during the story load, the submission waited for all of it and the title's 30 s hang watchdog ended
+  the process; with `LEONIDA_COMPILE_GATE=0` the same build went past that point. A submission now waits at most
+  `LEONIDA_COMPILE_GATE_WAIT_MS` (15 s by default) and then goes ahead; the creates in the driver at that moment hold
+  no later submission back, and creates that enter after it are waited for again. On 630.20 that loses only creates
+  over 25 s (15 s here, then the driver's 10 s), which the watchdog ends anyway. With the watchdog kept kicked
+  (`LEONIDA_TITLE_WATCHDOG=0` and `LEONIDA_TITLE_WATCHDOG_KICK`) the default is no limit, as before. The log names
+  each submission that goes ahead and how long it then took in the driver, which tells whether that driver holds a
+  submission behind a create at all. Tested by `submit_mutex` (no GPU); not yet measured in the title.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

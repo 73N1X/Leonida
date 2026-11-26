@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 
@@ -136,6 +137,7 @@ int compile_gate() {
         return 0;
     }
     SubmitMutex m;
+    m.set_gate_wait_limit_ms(0);  // no limit: gate_wait_limit checks the limit
     // Nothing in the driver: a submission passes at once.
     {
         const std::int64_t start = now_ms();
@@ -197,12 +199,92 @@ int compile_gate() {
     return 0;
 }
 
+int gate_wait_limit() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): wait limit not checked\n");
+        return 0;
+    }
+    // The default with neither LEONIDA_COMPILE_GATE_WAIT_MS nor the watchdog kick set.
+    if (!std::getenv("LEONIDA_COMPILE_GATE_WAIT_MS") && !std::getenv("LEONIDA_TITLE_WATCHDOG_KICK"))
+        EXPECT(SubmitMutex::default_gate_wait_limit_ms() == SubmitMutex::kDefaultGateWaitMs);
+    SubmitMutex m;
+    m.set_gate_wait_limit_ms(150);
+    EXPECT(m.gate_wait_limit_ms() == 150);
+    // A create that stays in the driver until it is let go (one that takes longer than the limit).
+    std::atomic<bool> long_in{false}, release_long{false};
+    std::atomic<std::int64_t> long_left_at{0};
+    std::thread long_create([&] {
+        const SubmitMutex::CompileTurn turn(m);
+        long_in = true;
+        while (!release_long) std::this_thread::sleep_for(1ms);
+        long_left_at = now_ms();
+    });
+    EXPECT(eventually([&] { return long_in.load(); }));
+    // The submission goes ahead at the limit, the create still in the driver.
+    std::int64_t first_waited = 0;
+    bool first_ahead = false;
+    {
+        const std::int64_t start = now_ms();
+        const SubmitMutex::SubmitTurn turn(m);
+        first_waited = now_ms() - start;
+        first_ahead = turn.went_ahead();
+    }
+    // The next one passes at once: the create the first went past holds no submission back.
+    std::int64_t second_waited = 0;
+    bool second_ahead = true;
+    {
+        const std::int64_t start = now_ms();
+        const SubmitMutex::SubmitTurn turn(m);
+        second_waited = now_ms() - start;
+        second_ahead = turn.went_ahead();
+    }
+    // A create that enters after that is waited for again, until it leaves (well within the limit now), while the
+    // long one is still in the driver.
+    m.set_gate_wait_limit_ms(5000);
+    std::atomic<bool> short_in{false};
+    std::atomic<std::int64_t> short_left_at{0};
+    std::thread short_create([&] {
+        const SubmitMutex::CompileTurn turn(m);
+        short_in = true;
+        std::this_thread::sleep_for(200ms);
+        short_left_at = now_ms();
+    });
+    const bool short_entered = eventually([&] { return short_in.load(); });
+    std::int64_t third_entered_at = 0;
+    bool third_ahead = true;
+    {
+        const SubmitMutex::SubmitTurn turn(m);
+        third_entered_at = now_ms();
+        third_ahead = turn.went_ahead();
+    }
+    const bool long_still_in = long_left_at.load() == 0;
+    release_long = true;
+    long_create.join();
+    short_create.join();
+    EXPECT(short_entered);
+    EXPECT(first_ahead && first_waited >= 140 && first_waited < 1000);
+    EXPECT(!second_ahead && second_waited < 50);
+    EXPECT(!third_ahead && third_entered_at >= short_left_at.load() && long_still_in);
+    const SubmitMutex::GateStats stats = m.gate_stats();
+    EXPECT(stats.submits == 2 && stats.ahead == 1);
+    // Both gone: a submission passes at once.
+    {
+        const std::int64_t start = now_ms();
+        const SubmitMutex::SubmitTurn turn(m);
+        EXPECT(now_ms() - start < 50 && !turn.went_ahead());
+    }
+    std::printf("compile gate: a submission went ahead after %lld ms (limit 150 ms) with the create still in the "
+                "driver, the next passed in %lld ms, and a create that entered later was waited for again\n",
+                static_cast<long long>(first_waited), static_cast<long long>(second_waited));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
-        compile_gate())
+        compile_gate() || gate_wait_limit())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;
