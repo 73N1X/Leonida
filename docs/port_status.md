@@ -162,6 +162,17 @@ saves), made under VIctory, is kept outside the repository:
   the logs. Not reported upstream.
 - Two D3D12.X pipeline-creation methods are not implemented (console-ABI
   slots `0x218` and `0x1c8`); the title goes without those pipelines.
+- With the user's save (`VICTORY_DATA_DIR=G:\gta6port\data-save`) the setup and
+  legal screens are skipped: start screen, A, loading screen, and the world
+  (the waterfront house) about 40 s after the press. World frame time on the
+  RTX 4060 Ti, first minutes, with Leonida's shader translation running on 6
+  CPU threads beside it: 0.4-2.8 fps (355-2,390 ms/frame), 5,000-14,000
+  draws/frame, 300-3,300 draws/frame dropped while graphics pipelines are made
+  (the warm-up only makes compute pipelines), 70-200 ms/frame preparing on the
+  CPU, 12-500 ms on the GPU, ~8.5 GB working set. Visible: stair-stepped,
+  blocky edges (very low internal resolution or a broken temporal resolve)
+  and black interiors (no ray-traced light). This is the reference Leonida
+  has to beat.
 
 ## Changes on top of the merged sources
 
