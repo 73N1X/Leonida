@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <map>
@@ -231,10 +232,26 @@ int wmain(int argc, wchar_t** argv) {
     // Queue slot 31, CopyPageMappingsBatchX, maps xmem's physical pages (VIctory d3d12x.rs: use_page_mapper).
     rt::d3d12_xs::set_page_mapper(&rt::xmem::map_alias);
 #ifdef LEONIDA_VULKAN_DEVICE
-    // The title's GPU memory, as xmem sees it, goes to the Vulkan layer's title memory (src/title_memory.h).
+    // The title's GPU memory, as xmem sees it, goes to the Vulkan layer's title memory (src/title_memory.h). With
+    // LEONIDA_TITLE_MEMORY=sparse xmem tells physical pages apart (their pools, and which pool bytes a mapped page
+    // shows), which the layer binds into sparse buffers; otherwise it reports them as visible ranges, as before.
+    char title_memory_mode[16] = {};
+    const DWORD title_memory_length =
+        GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY", title_memory_mode, sizeof(title_memory_mode));
+    const bool sparse_title_memory = title_memory_length && title_memory_length < sizeof(title_memory_mode) &&
+                                     std::strcmp(title_memory_mode, "sparse") == 0;
+    using Mapped = void (*)(std::uintptr_t, std::size_t, const void*);
+    using Pool = void (*)(const void*, std::size_t, bool);
+    static const Mapped mapped = [](std::uintptr_t start, std::size_t size, const void* backing) {
+        rt::d3d12::title_memory_mapped(start, size, backing);
+    };
+    static const Pool pool = [](const void* backing, std::size_t size, bool alive) {
+        rt::d3d12::title_memory_pool(backing, size, alive);
+    };
     static const rt::xmem::GraphicsListener title_memory{
         [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
-        [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); }};
+        [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); },
+        sparse_title_memory ? mapped : nullptr, sparse_title_memory ? pool : nullptr};
     rt::xmem::set_graphics_listener(&title_memory);
 #endif
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {

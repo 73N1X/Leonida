@@ -267,6 +267,11 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 // with them (the parts of an import outside the range are imported again).
 void title_memory_visible(std::uint64_t start, std::uint64_t size);
 void title_memory_gone(std::uint64_t start, std::uint64_t size);
+// Physical pages, for sparse title memory (LEONIDA_TITLE_MEMORY=sparse; rt::xmem::GraphicsListener's `mapped` and
+// `pool`): [start, start + size) now shows the physical-page pool bytes at `backing`, and a pool (one allocation's own
+// view of its pages) comes or goes. A device on imports takes a mapped range as visible.
+void title_memory_mapped(std::uint64_t start, std::uint64_t size, const void* backing);
+void title_memory_pool(const void* backing, std::uint64_t size, bool alive);
 // What a device does with title memory. For tests and logs: whether it keeps it (heap_base is
 // title_memory::kHeapBase), its imports and their bytes, and the device address the import holding `va` gives it (0
 // when no import holds it).
@@ -276,6 +281,8 @@ struct TitleMemoryStats {
     std::uint64_t imports = 0;
     std::uint64_t bytes = 0;
     std::uint64_t failed = 0;  // imports the driver refused since the device was made
+    bool sparse = false;       // LEONIDA_TITLE_MEMORY=sparse took: title VAs are sparse buffers, pages bound into them
+    std::uint64_t binds = 0;   // sparse: pages bound or unbound since the device was made
 };
 TitleMemoryStats title_memory_stats(ID3D12Device* device);
 std::uint64_t title_memory_device_address(ID3D12Device* device, std::uint64_t va);

@@ -36,6 +36,17 @@
 //   - device addresses go to imports 2 MiB at a time: an import that ends inside a 2 MiB block takes the rest of it,
 //     one that starts inside a block another holds is refused, and from 64 MiB on one must start on a 2 MiB line. The
 //     retail title's 32-bit windows lie side by side on 1 MiB lines, so imports that share a block are merged.
+//
+// Sparse title memory (LEONIDA_TITLE_MEMORY=sparse, opt-in; SparseTitleMemory in shims/d3d12_vulkan_device.cpp,
+// docs/d3d12_vulkan.md section 3.3): sparse buffers over both windows at heap_base + VA, xmem's physical-page pools
+// imported once each (in 256 MiB pieces) and every mapped page a sparse bind of its VA to its pool's import, every
+// unmapped page bound to nothing (it reads zero), the title's other GPU memory imported once per range and bound at its
+// own address. ON NVIDIA THAT BIND IS OUTSIDE THE VULKAN SPEC: the host imports' memory types (2, 3) are not in the
+// sparse buffers' memoryTypeBits (1), which breaks VUID-VkSparseMemoryBind-memory-01096 (the validation layer:
+// "memory has a type index (2) that is not among the allowed types mask (0x2) for this resource"). The driver does it
+// correctly (measured above), so the path runs only after a self-test on the device passes; otherwise the imports
+// below run.
+//
 // So heap_base is fixed at 512 GiB and the arena lies at [heap_base, heap_base + arena size). xmem places the title's
 // 32-bit graphics memory (VIctory xmem.rs:69-88, attribute bit 2) in [1 GiB, 4 GiB), where the descriptor-table
 // pointers the shaders truncate to 32 bits need it (docs/d3d12_vulkan.md, "Descriptor-table high-dword truncation"),

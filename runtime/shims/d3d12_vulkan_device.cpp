@@ -51,6 +51,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <chrono>
 #include <map>
 #include <cstring>
 #include <memory>
@@ -1904,6 +1905,9 @@ public:
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
         }
+        // A committed buffer on title memory in a sparse window: the GPU is done with the work submitted so far before
+        // the title's allocator gets the memory back below.
+        if (title_span_ && title_memory_) device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
@@ -1936,6 +1940,19 @@ public:
             why = "the device keeps no title memory";
         else if (initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
             why = "an acceleration structure";
+        if (!why) {
+            // Sparse title memory: the window that holds it, once its pages are bound.
+            VkBuffer window = VK_NULL_HANDLE;
+            std::uint64_t window_va = 0;
+            if (title_window_span(va, desc_.Width, window, window_va)) {
+                if (SUCCEEDED(create_title_span(window, window_va, va))) return S_OK;
+                title_span_ = false;
+                mapped_ = nullptr;
+                va_ = buffer_va_ = gpu_va_ = 0;
+                memory_flags_ = 0;
+            }
+            if (title_window_span_kept()) why = "its pages are not all bound into the sparse title memory";
+        }
         if (!why) {
             Resource* import = title_import_cover(va, desc_.Width);
             if (!import) {
@@ -2306,6 +2323,47 @@ public:
         device_.log_va(title_memory_ ? "committed buffer on title memory" : "title-placed buffer", va_, desc_.Width);
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(pages) : nullptr;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    // Sparse title memory (SparseTitleMemory): one window of title VAs, `buffer`, a sparse buffer at heap_base + va that
+    // this resource owns from now on. It is registered without a VA: VulkanContext::set_title_windows finds it for a VA
+    // no other buffer holds, so the VA index keeps short ranges, and copies by resource reach it as any buffer.
+    HRESULT create_title_window(VkBuffer buffer, std::uint64_t va) {
+        buffer_ = buffer;
+        va_ = va;
+        buffer_va_ = gpu_va_ = device_.arena.address + va;
+        memory_flags_ = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        leonida::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    // A buffer at title address `va` in a window of sparse title memory (create_title_window): `window`, whose first
+    // byte is title address `window_va`, holds it, so its device address is heap_base + va like every title address.
+    // The window stays the device's; this resource does not own it. What the GPU reads there is whatever pages are
+    // bound at those VAs, as on the console.
+    HRESULT create_title_span(VkBuffer window, std::uint64_t window_va, std::uint64_t va) {
+        if (!window || va < window_va) return E_INVALIDARG;
+        title_span_ = true;
+        void* const pages = reinterpret_cast<void*>(static_cast<std::uintptr_t>(va));
+        memory_flags_ = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        mapped_ = cpu_visible() ? pages : nullptr;
+        va_ = va;
+        buffer_va_ = gpu_va_ = device_.arena.address + va;
+        device_.log_va(title_memory_ ? "committed buffer on title memory" : "title-placed buffer", va_, desc_.Width);
+        leonida::ResourceBinding binding{};
+        binding.buffer = window;
+        binding.buffer_offset = va - window_va;
         binding.size = desc_.Width;
         binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(pages) : nullptr;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
@@ -2859,12 +2917,17 @@ private:
     VkDeviceSize import_offset_ = 0;  // a host import: where va_ lies in memory_ (the import starts on a host page)
     // A buffer on title memory another import holds (create_title_alias): its memory, held through a reference.
     Resource* title_import_ = nullptr;
+    bool title_span_ = false;  // a part of a sparse title-memory window (create_title_span)
     // Memory from the title's allocator (adopt_title_memory): its address, its attributes, and the routine that gives
     // it back.
     void* title_memory_ = nullptr;
     std::uint64_t title_attributes_ = 0;
     TitleFreeRoutine title_free_ = nullptr;
     Resource* title_import_cover(std::uint64_t va, std::uint64_t bytes);  // TitleMemory::cover, after TitleMemory
+    // Sparse title memory (TitleMemory::span, after TitleMemory): the window that holds [va, va + bytes) with every
+    // page bound, and whether the device keeps title memory that way at all (then imports are never made).
+    bool title_window_span(std::uint64_t va, std::uint64_t bytes, VkBuffer& window, std::uint64_t& window_va);
+    bool title_window_span_kept() const;
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -2879,6 +2942,863 @@ private:
     // A placed buffer's heap range, held as a D3D12 placed resource holds its heap: the app may release the heap
     // first, and the range must not go to another allocation while this buffer lives.
     std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
+};
+
+// ---- Sparse title memory (src/title_memory.h, "Sparse title memory"; LEONIDA_TITLE_MEMORY=sparse) -----------------
+// The console's model: a GPU VA maps to a physical page, and a VA with no page reads zero. Here every title VA the
+// GPU can reach (title_memory.h's two windows) lies in one of a few sparse buffers ("windows") at the capture-replay
+// device address heap_base + VA, created before anything is imported. What is bound in them:
+//   - a physical page the title maps (XMemMapPhysicalPages and the like, queue slot 31): the page of its pool's
+//     import. xmem keeps each XMemAllocatePhysicalPages allocation in one section with a view of all of it (xmem.h,
+//     `pool`); that view is imported once, in pieces of kPoolPiece, when a page of the piece is first mapped. A remap
+//     is a bind to another page of a pool, an unmap a bind to nothing, which reads zero;
+//   - the title's other GPU memory (committed with XMemVirtualAlloc, or the allocator's): one import per range, bound
+//     at its own address, released (and the parts that stay imported again) when the title frees or decommits it.
+// Mapping and unmapping change a page table here (bound_) and queue the change (pending_). The changes go to the GPU in
+// one vkQueueBindSparse on the device's graphics VkQueue when any queue next submits (VulkanContext::set_title_windows):
+// the binds signal a timeline semaphore, and that submission and every later one wait for it, so work submitted after a
+// remap sees it; work submitted before it may already see it, as on the console, where the CPU's page table is the
+// GPU's. Memory a range or pool gave up is freed after the unbinds, once the GPU has finished the work submitted until
+// then.
+//
+// OUTSIDE THE VULKAN SPEC on NVIDIA (measured on an RTX 4060 Ti, 616.64): a sparse buffer there lists memory type 1
+// alone, and host imports have types 2 and 3, so binding a host import into a sparse buffer breaks
+// VUID-VkSparseMemoryBind-memory-01096 (the validation layer: "memory has a type index (2) that is not among the
+// allowed types mask (0x2) for this resource"). The driver does it correctly all the same (test/vk_sparse_title_
+// memory_test.cpp --force-bind), so this path is opt-in and runs only after a self-test on the device passes.
+class SparseTitleMemory {
+public:
+    static constexpr std::uint64_t kPage = 0x10000;                      // a sparse buffer page (64 KiB measured)
+    static constexpr std::uint64_t kPoolPiece = std::uint64_t(256) << 20;  // a pool is imported in pieces of this
+
+    explicit SparseTitleMemory(DeviceState& device) : device_(device) {}
+    SparseTitleMemory(const SparseTitleMemory&) = delete;
+    SparseTitleMemory& operator=(const SparseTitleMemory&) = delete;
+    // With the GPU idle (the device's destructor, or a start that failed).
+    ~SparseTitleMemory() {
+        auto& vk = device_.context->vk;
+        const VkDevice device = device_.info.device;
+        if (registered_) device_.context->set_title_windows({});
+        for (auto& [va, range] : ranges_) vk.vkFreeMemory(device, range.memory, nullptr);
+        for (auto& [base, pool] : pools_)
+            for (VkDeviceMemory memory : pool.pieces)
+                if (memory) vk.vkFreeMemory(device, memory, nullptr);
+        for (VkDeviceMemory memory : release_) vk.vkFreeMemory(device, memory, nullptr);
+        for (Window& window : windows_) {
+            if (window.resource)
+                window.resource->Release();  // owns its buffer
+            else if (window.buffer)
+                vk.vkDestroyBuffer(device, window.buffer, nullptr);
+        }
+        if (timeline_) vk.vkDestroySemaphore(device, timeline_, nullptr);
+    }
+
+    // The windows, their registration with the context and the self-test. False, with the reason in `why`, when this
+    // device cannot keep title memory this way: then nothing of it is left (the caller destroys this object at once,
+    // and the windows' addresses are free for imports).
+    bool start(std::string& why) {
+        auto& vk = device_.context->vk;
+        const VkPhysicalDeviceFeatures& f = device_.info.features;
+        if (!f.sparseBinding || !f.sparseResidencyBuffer) return fail(why, "the device has no sparse residency buffers");
+        if (!vk.vkQueueBindSparse || !vk.vkCmdCopyBuffer || !vk.vkCmdFillBuffer || !device_.info.queue)
+            return fail(why, "the device has no vkQueueBindSparse");
+        if (!device_.get_host_pointer_properties) return fail(why, "the device has no VK_EXT_external_memory_host");
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        if (vk.vkCreateSemaphore(device_.info.device, &semaphore, nullptr, &timeline_) != VK_SUCCESS) {
+            timeline_ = VK_NULL_HANDLE;
+            return fail(why, "no timeline semaphore");
+        }
+        namespace tm = leonida::title_memory;
+        if (!make_window(tm::kLow32Start, tm::kLow32End - tm::kLow32Start, why)) return false;
+        // The main window in pieces of 64 GiB where the driver allows (one of 128 GiB was refused on the RTX 4060 Ti).
+        for (std::uint64_t at = tm::kWindowStart; at < tm::kWindowEnd;) {
+            std::uint64_t made = 0;
+            for (const std::uint64_t piece : {std::uint64_t(64) << 30, std::uint64_t(32) << 30, std::uint64_t(16) << 30}) {
+                const std::uint64_t bytes = std::min(piece, tm::kWindowEnd - at);
+                if (make_window(at, bytes, why)) {
+                    made = bytes;
+                    break;
+                }
+            }
+            if (!made) return false;
+            at += made;
+        }
+        if (!self_test(why)) return false;
+        // The windows become resources the context resolves title VAs to (copies by resource, buffer_at, host_at).
+        leonida::VulkanContext::TitleWindows windows;
+        for (Window& window : windows_) {
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = window.size;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+            heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+            heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+            // Not attached to the device: the device owns this object, and a reference back would keep it alive.
+            window.resource = new Resource(device_, desc, heap, D3D12_HEAP_FLAG_NONE);
+            window.resource->create_title_window(window.buffer, window.va);
+            windows.windows.push_back({window.va, window.size, window.resource->id()});
+        }
+        windows.host = [this](std::uint64_t va, std::uint64_t bytes) { return host(va, bytes); };
+        windows.flush = [this] { return flush(); };
+        windows.timeline = timeline_;
+        device_.context->set_title_windows(std::move(windows));
+        registered_ = true;
+        return true;
+    }
+
+    // What the startup line says about the windows and the memory types.
+    std::string describe() const {
+        char text[320];
+        const bool in_spec = (window_types_ & host_types_) != 0;
+        std::snprintf(text, sizeof(text),
+                      "%zu sparse buffers over [0x%llx, 0x%llx) and [0x%llx, 0x%llx), self-test passed; %s (sparse "
+                      "buffers take memory types 0x%x, host imports 0x%x)",
+                      windows_.size(), static_cast<unsigned long long>(leonida::title_memory::kLow32Start),
+                      static_cast<unsigned long long>(leonida::title_memory::kLow32End),
+                      static_cast<unsigned long long>(leonida::title_memory::kWindowStart),
+                      static_cast<unsigned long long>(leonida::title_memory::kWindowEnd),
+                      in_spec ? "host memory binds within the Vulkan spec"
+                              : "host memory is bound OUTSIDE the Vulkan spec (VUID-VkSparseMemoryBind-memory-01096)",
+                      window_types_, host_types_);
+        return text;
+    }
+
+    // ---- What xmem reports (title_memory_visible and the rest) -----------------------------------------------------
+
+    void visible(std::uint64_t start, std::uint64_t size) {
+        std::lock_guard lock(mutex_);
+        import_ordinary_locked(start, size);
+    }
+
+    // Physical pages: [va, va + size) shows the pool bytes at `backing`.
+    void mapped(std::uint64_t va, std::uint64_t size, const void* backing) {
+        std::lock_guard lock(mutex_);
+        const auto host = reinterpret_cast<std::uintptr_t>(backing);
+        if ((va | size | host) & (kPage - 1)) {
+            log_count(odd_, "physical pages not on 64 KiB lines", va, size);
+            return;
+        }
+        auto pool = pools_.upper_bound(host);
+        if (pool == pools_.begin() || host - std::prev(pool)->first >= std::prev(pool)->second.size ||
+            size > std::prev(pool)->second.size - (host - std::prev(pool)->first)) {
+            log_count(odd_, "physical pages of no known pool", va, size);
+            return;
+        }
+        --pool;
+        if (!window_of(va, size)) {
+            log_count(outside_, "title memory outside the GPU address windows", va, size);
+            return;
+        }
+        for (std::uint64_t at = 0; at < size; at += kPage) {
+            const std::uint64_t offset = host - pool->first + at;
+            const VkDeviceMemory memory = pool_piece_locked(pool->first, pool->second, std::size_t(offset / kPoolPiece));
+            set_page(va + at, {memory, memory ? offset % kPoolPiece : 0});
+        }
+    }
+
+    // A physical-page pool comes (`alive`) or goes; when it goes, nothing of it is mapped any more (xmem.h).
+    void pool(const void* backing, std::uint64_t size, bool alive) {
+        std::lock_guard lock(mutex_);
+        const auto base = reinterpret_cast<std::uintptr_t>(backing);
+        if (alive) {
+            Pool& pool = pools_[base];
+            pool.size = size;
+            const std::size_t pieces = std::size_t((size + kPoolPiece - 1) / kPoolPiece);
+            pool.pieces.assign(pieces, VK_NULL_HANDLE);
+            pool.refused.assign(pieces, false);
+            return;
+        }
+        const auto it = pools_.find(base);
+        if (it == pools_.end()) return;
+        std::set<VkDeviceMemory> memories;
+        for (VkDeviceMemory memory : it->second.pieces)
+            if (memory) memories.insert(memory);
+        // A page still bound to the pool (xmem unmaps them first) goes too.
+        for (auto page = bound_.begin(); page != bound_.end() && !memories.empty();) {
+            if (memories.count(page->second.memory)) {
+                pending_[page->first] = {};
+                page = bound_.erase(page);
+            } else {
+                ++page;
+            }
+        }
+        for (VkDeviceMemory memory : memories) {
+            release_.push_back(memory);
+            --imports_live_;
+        }
+        import_bytes_ -= it->second.imported;
+        pools_.erase(it);
+        if (pending_.empty()) free_released_locked();
+    }
+
+    // The title is about to free, decommit, unmap or remap [start, start + size): the pages there are unbound, an
+    // ordinary import there is released, and its parts outside the range (whole pages) are imported again.
+    void gone(std::uint64_t start, std::uint64_t size) {
+        if (!size) return;
+        std::lock_guard lock(mutex_);
+        const std::uint64_t end = start + size;
+        const std::uint64_t a = start & ~(kPage - 1), b = (end + kPage - 1) & ~(kPage - 1);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
+        for (auto it = first_range(a); it != ranges_.end() && it->first < b;) {
+            const std::uint64_t ra = it->first, rb = ra + it->second.size;
+            if (rb <= a) {
+                ++it;
+                continue;
+            }
+            for (std::uint64_t page = ra; page < rb; page += kPage) set_page(page, {});
+            release_.push_back(it->second.memory);
+            --imports_live_;
+            import_bytes_ -= it->second.size;
+            ++released_;
+            if (ra < a) keep.emplace_back(ra, a - ra);
+            if (rb > b) keep.emplace_back(b, rb - b);
+            it = ranges_.erase(it);
+        }
+        for (auto page = bound_.lower_bound(a); page != bound_.end() && page->first < b;) {
+            pending_[page->first] = {};
+            page = bound_.erase(page);
+        }
+        for (const auto& [ka, kn] : keep) import_ordinary_locked(ka, kn);
+        if (pending_.empty()) free_released_locked();
+    }
+
+    // [va, va + bytes) bound, importing the title's committed private memory there that is not yet (memory the
+    // layer reaches by address that xmem did not report: a view, a copy, an immediate write). False when part of it
+    // is not bound: not committed, a physical-page window with no page mapped, or write-combined.
+    bool ensure(std::uint64_t va, std::uint64_t bytes) {
+        if (!bytes || !window_of(va, bytes)) return false;
+        std::lock_guard lock(mutex_);
+        if (all_bound_locked(va, bytes)) return true;
+        // Each committed region clipped to the 64 MiB lines around the part needed, as the import path does it.
+        constexpr std::uint64_t kLine = std::uint64_t(64) << 20;
+        const std::uint64_t end = va + bytes;
+        for (std::uint64_t at = va & ~(kPage - 1); at < end;) {
+            Region region{};
+            if (!query(at, region)) break;
+            if (region.importable) {
+                const std::uint64_t a = std::max(region.start, at & ~(kLine - 1));
+                const std::uint64_t b = std::min(region.end, (std::min(end, region.end) + kLine - 1) & ~(kLine - 1));
+                import_ordinary_locked(a, b - a);
+            }
+            at = region.end;
+        }
+        return all_bound_locked(va, bytes);
+    }
+
+    // The window that holds all of [va, va + bytes), and the title address of its first byte. No lock: the windows do
+    // not change after start().
+    bool window(std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, std::uint64_t& window_va) const {
+        const Window* w = window_of(va, bytes ? bytes : 1);
+        if (!w || !w->resource) return false;
+        buffer = w->buffer;
+        window_va = w->va;
+        return true;
+    }
+    bool holds(std::uint64_t va) const { return window_of(va, 1) != nullptr; }
+
+    // Every page of [va, va + bytes) bound: the CPU reads the same bytes at that address (VulkanContext host_at).
+    bool host(std::uint64_t va, std::uint64_t bytes) {
+        std::lock_guard lock(mutex_);
+        return all_bound_locked(va, bytes);
+    }
+
+    // The binds queued since the last call, on the GPU (VulkanContext::set_title_windows).
+    std::uint64_t flush() {
+        std::lock_guard lock(mutex_);
+        return flush_locked();
+    }
+
+    void stats(TitleMemoryStats& out) {
+        std::lock_guard lock(mutex_);
+        out.enabled = true;
+        out.sparse = true;
+        out.heap_base = device_.arena.address;
+        out.imports = imports_live_;
+        out.bytes = import_bytes_;
+        out.failed = failed_;
+        out.binds = binds_;
+    }
+
+private:
+    struct Window {
+        std::uint64_t va = 0;
+        std::uint64_t size = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        Resource* resource = nullptr;  // owns `buffer` once made (start)
+    };
+    struct Target {  // what a page is bound to: nothing, or `memory` at `offset`
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+    };
+    struct Range {  // an import of the title's ordinary memory, bound at its own address
+        std::uint64_t size = 0;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    struct Pool {  // a physical-page allocation's own view, imported piece by piece
+        std::uint64_t size = 0;
+        std::uint64_t imported = 0;
+        std::vector<VkDeviceMemory> pieces;
+        std::vector<bool> refused;
+    };
+    struct Region {  // VirtualQuery's answer for one region
+        std::uint64_t start = 0, end = 0;
+        bool importable = false;  // committed private memory, neither write-combined nor uncached
+    };
+
+    static bool fail(std::string& why, const char* text) {
+        why = text;
+        return false;
+    }
+
+    // LEONIDA_TITLE_MEMORY_LOG=1: a line per import and release.
+    static bool verbose() {
+        static const bool on = [] {
+#ifdef _WIN32
+            char text[4] = {};
+            size_t length = 0;
+            return getenv_s(&length, text, "LEONIDA_TITLE_MEMORY_LOG") == 0 && length > 1 && text[0] != '0';
+#else
+            const char* text = std::getenv("LEONIDA_TITLE_MEMORY_LOG");
+            return text && *text && *text != '0';
+#endif
+        }();
+        return on;
+    }
+
+    void log_count(std::uint64_t& count, const char* what, std::uint64_t va, std::uint64_t size) {
+        const std::uint64_t n = ++count;
+        if (n <= 4 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: title memory (sparse): %s at 0x%llx (0x%llx bytes): not bound (%llu so "
+                                 "far)\n",
+                         what, static_cast<unsigned long long>(va), static_cast<unsigned long long>(size),
+                         static_cast<unsigned long long>(n));
+    }
+
+    // ---- The host (Win32 here; another host answers as if every page were committed and private) -----------------
+
+    static bool query(std::uint64_t at, Region& out) {
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region, sizeof(region)))
+            return false;
+        out.start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+        out.end = out.start + region.RegionSize;
+        out.importable = region.State == MEM_COMMIT && region.Type == MEM_PRIVATE &&
+                         !(region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD | PAGE_NOACCESS));
+        return true;
+#else
+        out.start = at & ~(kPage - 1);
+        out.end = out.start + kPage;
+        out.importable = true;
+        return true;
+#endif
+    }
+    static bool committed(std::uint64_t start, std::uint64_t size) {
+        for (std::uint64_t at = start; at < start + size;) {
+            Region region{};
+            if (!query(at, region) || !region.importable) return false;
+            at = region.end;
+        }
+        return true;
+    }
+    // A pool's view is reserved (SEC_RESERVE): its pages are committed before they are imported.
+    static bool commit_view(std::uint64_t host, std::uint64_t bytes) {
+#ifdef _WIN32
+        return VirtualAlloc(reinterpret_cast<void*>(static_cast<std::uintptr_t>(host)), static_cast<SIZE_T>(bytes),
+                            MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#else
+        (void)host;
+        (void)bytes;
+        return true;
+#endif
+    }
+    static void* host_page_alloc(std::uint64_t bytes) {
+#ifdef _WIN32
+        return VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        return std::aligned_alloc(static_cast<std::size_t>(kPage), static_cast<std::size_t>(bytes));
+#endif
+    }
+    static void host_page_free(void* page) {
+#ifdef _WIN32
+        if (page) VirtualFree(page, 0, MEM_RELEASE);
+#else
+        std::free(page);
+#endif
+    }
+
+    // ---- Windows, imports, binds ------------------------------------------------------------------------------------
+
+    // A sparse buffer at heap_base + [va, va + size), for host-allocation memory.
+    bool make_window(std::uint64_t va, std::uint64_t size, std::string& why) {
+        auto& vk = device_.context->vk;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferOpaqueCaptureAddressCreateInfo opaque{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO,
+                                                      &external};
+        opaque.opaqueCaptureAddress = device_.arena.address + va;
+        VkBufferCreateInfo info = device_.sparse_buffer_info(size);
+        if (!device_.info.features.sparseResidencyAliased)
+            info.flags &= ~VkBufferCreateFlags(VK_BUFFER_CREATE_SPARSE_ALIASED_BIT);  // a page at two VAs aliases
+        info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        info.pNext = &opaque;
+        char text[200];
+        VkBuffer buffer = VK_NULL_HANDLE;
+        const VkResult made = vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer);
+        if (made != VK_SUCCESS) {
+            std::snprintf(text, sizeof(text), "a sparse buffer at heap base + 0x%llx (0x%llx bytes) was refused (%d)",
+                          static_cast<unsigned long long>(va), static_cast<unsigned long long>(size), int(made));
+            why = text;
+            return false;
+        }
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = buffer;
+        const VkDeviceAddress got = vk.vkGetBufferDeviceAddress(device_.info.device, &address);
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer, &requirements);
+        if (got != device_.arena.address + va || requirements.alignment > kPage) {
+            vk.vkDestroyBuffer(device_.info.device, buffer, nullptr);
+            std::snprintf(text, sizeof(text),
+                          "the sparse buffer at heap base + 0x%llx got the device address 0x%llx and pages of 0x%llx",
+                          static_cast<unsigned long long>(va), static_cast<unsigned long long>(got),
+                          static_cast<unsigned long long>(requirements.alignment));
+            why = text;
+            return false;
+        }
+        window_types_ |= requirements.memoryTypeBits;
+        windows_.push_back({va, size, buffer, nullptr});
+        return true;
+    }
+
+    // The window that holds [va, va + bytes), or null.
+    const Window* window_of(std::uint64_t va, std::uint64_t bytes) const {
+        for (const Window& window : windows_)
+            if (va >= window.va && va - window.va < window.size && bytes <= window.size - (va - window.va))
+                return &window;
+        return nullptr;
+    }
+
+    // Host memory imported with VK_EXT_external_memory_host, without a device address of its own (it is reached
+    // through the windows only). A memory type the windows list first, where there is one (within the spec).
+    VkDeviceMemory import_host(std::uint64_t host, std::uint64_t bytes) {
+        auto& vk = device_.context->vk;
+        void* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(host));
+        VkMemoryHostPointerPropertiesEXT properties{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (device_.get_host_pointer_properties(device_.info.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                pointer, &properties) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        host_types_ |= properties.memoryTypeBits;
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = pointer;
+        const VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const std::uint32_t in_spec = properties.memoryTypeBits & window_types_;
+        const struct {
+            std::uint32_t types;
+            VkMemoryPropertyFlags want;
+        } passes[] = {{in_spec, coherent}, {in_spec, 0}, {properties.memoryTypeBits, coherent},
+                      {properties.memoryTypeBits, 0}};
+        for (const auto& pass : passes) {
+            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
+                if (!(pass.types >> i & 1) || (device_.memory.memoryTypes[i].propertyFlags & pass.want) != pass.want)
+                    continue;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+                allocate.allocationSize = bytes;
+                allocate.memoryTypeIndex = i;
+                VkDeviceMemory memory = VK_NULL_HANDLE;
+                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory) == VK_SUCCESS) {
+                    ++imports_live_;
+                    ++imports_made_;
+                    import_bytes_ += bytes;
+                    return memory;
+                }
+            }
+        }
+        return VK_NULL_HANDLE;
+    }
+
+    // Piece `index` of a pool, imported when it is first needed. Null when the host or the driver refused it.
+    VkDeviceMemory pool_piece_locked(std::uintptr_t base, Pool& pool, std::size_t index) {
+        if (index >= pool.pieces.size()) return VK_NULL_HANDLE;
+        if (pool.pieces[index] || pool.refused[index]) return pool.pieces[index];
+        const std::uint64_t at = base + std::uint64_t(index) * kPoolPiece;
+        const std::uint64_t bytes = std::min<std::uint64_t>(kPoolPiece, pool.size - std::uint64_t(index) * kPoolPiece);
+        VkDeviceMemory memory = commit_view(at, bytes) ? import_host(at, bytes) : VK_NULL_HANDLE;
+        if (!memory) {
+            pool.refused[index] = true;
+            log_count(failed_, "a physical-page pool's piece could not be imported", at, bytes);
+            return VK_NULL_HANDLE;
+        }
+        pool.imported += bytes;
+        if (verbose())
+            std::fprintf(stderr, "[rt] d3d12: title memory (sparse): import pool 0x%llx piece %zu (0x%llx bytes)\n",
+                         static_cast<unsigned long long>(base), index, static_cast<unsigned long long>(bytes));
+        return pool.pieces[index] = memory;
+    }
+
+    // The first ordinary import that can overlap a range starting at `start`.
+    std::map<std::uint64_t, Range>::iterator first_range(std::uint64_t start) {
+        auto it = ranges_.upper_bound(start);
+        if (it != ranges_.begin() && std::prev(it)->first + std::prev(it)->second.size > start) --it;
+        return it;
+    }
+
+    // The title's ordinary memory [start, start + size) imported and bound where no import is yet: whole 64 KiB pages
+    // (a page the range holds in part, when the rest of it is committed too), in pieces of at most kMaxImport inside
+    // one window.
+    void import_ordinary_locked(std::uint64_t start, std::uint64_t size) {
+        if (!size) return;
+        if (!window_of(start, size)) {
+            log_count(outside_, "title memory outside the GPU address windows", start, size);
+            return;
+        }
+        const std::uint64_t end = start + size;
+        std::uint64_t a = start & ~(kPage - 1), b = (end + kPage - 1) & ~(kPage - 1);
+        if (a < start && !committed(a, start - a)) a += kPage;
+        if (b > end && !committed(end, b - end)) b -= kPage;
+        if (b <= a) {
+            log_count(odd_, "title memory smaller than a sparse page", start, size);
+            return;
+        }
+        auto it = first_range(a);
+        for (std::uint64_t at = a; at < b;) {
+            while (it != ranges_.end() && it->first + it->second.size <= at) ++it;
+            if (it != ranges_.end() && it->first <= at) {
+                at = it->first + it->second.size;
+                continue;
+            }
+            const std::uint64_t gap_end = it != ranges_.end() ? std::min(b, it->first) : b;
+            const Window* window = window_of(at, 1);
+            for (std::uint64_t piece = at; piece < gap_end;) {
+                std::uint64_t piece_end = std::min(gap_end, piece + leonida::title_memory::kMaxImport);
+                if (window) piece_end = std::min(piece_end, window->va + window->size);
+                import_range_locked(piece, piece_end - piece);
+                piece = piece_end;
+            }
+            at = gap_end;
+            it = first_range(at);
+        }
+    }
+
+    void import_range_locked(std::uint64_t va, std::uint64_t bytes) {
+        const VkDeviceMemory memory = import_host(va, bytes);
+        if (verbose())
+            std::fprintf(stderr, "[rt] d3d12: title memory (sparse): import 0x%llx + 0x%llx: %s\n",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes),
+                         memory ? "ok" : "refused");
+        if (!memory) {
+            log_count(failed_, "title memory the driver would not import", va, bytes);
+            return;
+        }
+        ranges_.emplace(va, Range{bytes, memory});
+        for (std::uint64_t at = 0; at < bytes; at += kPage) set_page(va + at, {memory, at});
+    }
+
+    void set_page(std::uint64_t va, Target target) {
+        if (target.memory)
+            bound_[va] = target;
+        else
+            bound_.erase(va);
+        pending_[va] = target;
+    }
+
+    bool all_bound_locked(std::uint64_t va, std::uint64_t bytes) const {
+        const std::uint64_t first = va & ~(kPage - 1), end = va + (bytes ? bytes : 1);
+        auto it = bound_.lower_bound(first);
+        for (std::uint64_t page = first; page < end; page += kPage, ++it)
+            if (it == bound_.end() || it->first != page) return false;
+        return true;
+    }
+
+    void free_released_locked() {
+        for (VkDeviceMemory memory : release_)
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory);
+        release_.clear();
+    }
+
+    std::uint64_t flush_locked() {
+        if (pending_.empty()) {
+            free_released_locked();
+            return issued_;
+        }
+        auto& vk = device_.context->vk;
+        if (device_.context->is_device_lost()) {
+            pending_.clear();
+            return issued_;
+        }
+        // One bind list per window, runs of pages merged.
+        std::vector<std::vector<VkSparseMemoryBind>> binds(windows_.size());
+        std::size_t w = 0;
+        for (const auto& [va, target] : pending_) {
+            if (va < windows_[w].va || va - windows_[w].va >= windows_[w].size) {
+                const Window* window = window_of(va, kPage);
+                if (!window) continue;
+                w = std::size_t(window - windows_.data());
+            }
+            const VkDeviceSize at = va - windows_[w].va;
+            auto& list = binds[w];
+            if (!list.empty()) {
+                VkSparseMemoryBind& last = list.back();
+                if (last.resourceOffset + last.size == at && last.memory == target.memory &&
+                    (!target.memory || last.memoryOffset + last.size == target.offset)) {
+                    last.size += kPage;
+                    continue;
+                }
+            }
+            list.push_back({at, kPage, target.memory, target.memory ? target.offset : 0, 0});
+        }
+        std::vector<VkSparseBufferMemoryBindInfo> infos;
+        for (std::size_t i = 0; i < binds.size(); ++i)
+            if (!binds[i].empty())
+                infos.push_back({windows_[i].buffer, std::uint32_t(binds[i].size()), binds[i].data()});
+        const std::uint64_t wait = issued_, signal = issued_ + 1;
+        VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        values.waitSemaphoreValueCount = wait ? 1 : 0;
+        values.pWaitSemaphoreValues = &wait;
+        values.signalSemaphoreValueCount = 1;
+        values.pSignalSemaphoreValues = &signal;
+        VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &values};
+        info.waitSemaphoreCount = wait ? 1 : 0;
+        info.pWaitSemaphores = &timeline_;
+        info.bufferBindCount = std::uint32_t(infos.size());
+        info.pBufferBinds = infos.data();
+        info.signalSemaphoreCount = 1;
+        info.pSignalSemaphores = &timeline_;
+        VkResult result;
+        {
+            std::lock_guard submit(device_.context->submit_mutex());
+            result = vk.vkQueueBindSparse(device_.info.queue, 1, &info, VK_NULL_HANDLE);
+            if (result == VK_SUCCESS) device_.context->record_submit_locked(timeline_, signal);
+        }
+        const std::uint64_t pages = pending_.size();
+        pending_.clear();
+        if (result != VK_SUCCESS) {
+            if (result == VK_ERROR_DEVICE_LOST) device_.context->mark_device_lost();
+            const std::uint64_t n = ++bind_failures_;
+            if (n <= 4 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: title memory (sparse): vkQueueBindSparse of %llu pages failed (%d); "
+                                     "the GPU keeps the pages it had (%llu so far)\n",
+                             static_cast<unsigned long long>(pages), int(result), static_cast<unsigned long long>(n));
+            return issued_;  // the memory given up stays allocated: it may still be bound
+        }
+        issued_ = signal;
+        binds_ += pages;
+        ++flushes_;
+        free_released_locked();
+        note_rate_locked();
+        return issued_;
+    }
+
+    // Every 10 s of binding, a line with the rates since the last one.
+    void note_rate_locked() {
+        const auto now = std::chrono::steady_clock::now();
+        if (rate_since_ == std::chrono::steady_clock::time_point{}) {
+            rate_since_ = now;
+            rate_binds_ = binds_;
+            rate_flushes_ = flushes_;
+            rate_imports_ = imports_made_;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - rate_since_).count();
+        if (seconds < 10.0) return;
+        std::fprintf(stderr,
+                     "[rt] d3d12: title memory (sparse): %.0f pages bound or unbound/s in %.1f flushes/s, %.1f "
+                     "imports/s over %.1f s; %llu imports live (%.1f MiB), %zu pools, %zu pages bound\n",
+                     double(binds_ - rate_binds_) / seconds, double(flushes_ - rate_flushes_) / seconds,
+                     double(imports_made_ - rate_imports_) / seconds, seconds,
+                     static_cast<unsigned long long>(imports_live_), double(import_bytes_) / double(1 << 20),
+                     pools_.size(), bound_.size());
+        rate_since_ = now;
+        rate_binds_ = binds_;
+        rate_flushes_ = flushes_;
+        rate_imports_ = imports_made_;
+    }
+
+    // Before anything uses the windows: a host page imported and bound at the last page of the 32-bit window, read and
+    // written there by the GPU, then unbound and read as zero. The bind is the one the title's pages get, so a driver
+    // that does not do it right is found here instead of in a frame.
+    bool self_test(std::string& why) {
+        auto& vk = device_.context->vk;
+        const VkDevice device = device_.info.device;
+        void* const page = host_page_alloc(kPage);
+        if (!page) return fail(why, "self-test: no host page");
+        auto* const words = static_cast<std::uint32_t*>(page);
+        for (std::uint32_t i = 0; i < 8; ++i) words[i] = 0x7E570000u + i;
+        const char* failed = nullptr;
+        VkDeviceMemory memory = import_host(reinterpret_cast<std::uintptr_t>(page), kPage);
+        VkBuffer readback = VK_NULL_HANDLE;
+        VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer command = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        const Window& window = windows_.front();
+        const std::uint64_t va = window.va + window.size - kPage;
+        const VkDeviceSize at = va - window.va;
+        // Copies 16 bytes of the page to readback[slot], optionally writing word 4 of the page; waits for it.
+        const auto run = [&](std::uint32_t slot, bool write) -> bool {
+            vk.vkResetCommandBuffer(command, 0);
+            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            if (vk.vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) return false;
+            const VkBufferCopy copy{at, VkDeviceSize(slot) * 16, 16};
+            vk.vkCmdCopyBuffer(command, window.buffer, readback, 1, &copy);
+            if (write) vk.vkCmdFillBuffer(command, window.buffer, at + 16, 4, 0xC0FFEE11u);
+            VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vk.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
+                                    nullptr, 0, nullptr);
+            if (vk.vkEndCommandBuffer(command) != VK_SUCCESS) return false;
+            std::uint64_t wait = 0, signal = 0;
+            {
+                std::lock_guard lock(mutex_);
+                wait = issued_;
+                signal = ++issued_;
+            }
+            VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            values.waitSemaphoreValueCount = wait ? 1 : 0;
+            values.pWaitSemaphoreValues = &wait;
+            values.signalSemaphoreValueCount = 1;
+            values.pSignalSemaphoreValues = &signal;
+            const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &values};
+            submit.waitSemaphoreCount = wait ? 1 : 0;
+            submit.pWaitSemaphores = &timeline_;
+            submit.pWaitDstStageMask = &stage;
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &command;
+            submit.signalSemaphoreCount = 1;
+            submit.pSignalSemaphores = &timeline_;
+            {
+                std::lock_guard lock(device_.context->submit_mutex());
+                if (vk.vkQueueSubmit(device_.info.queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+            }
+            VkSemaphoreWaitInfo wait_info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wait_info.semaphoreCount = 1;
+            wait_info.pSemaphores = &timeline_;
+            wait_info.pValues = &signal;
+            return vk.vkWaitSemaphores(device, &wait_info, std::uint64_t(5) * 1000 * 1000 * 1000) == VK_SUCCESS;
+        };
+        do {
+            if (!memory) {
+                failed = "self-test: a host page could not be imported";
+                break;
+            }
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size = 64;
+            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vk.vkCreateBuffer(device, &info, nullptr, &readback) != VK_SUCCESS) {
+                readback = VK_NULL_HANDLE;
+                failed = "self-test: no readback buffer";
+                break;
+            }
+            VkMemoryRequirements requirements{};
+            vk.vkGetBufferMemoryRequirements(device, readback, &requirements);
+            readback_memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+            if (!readback_memory || vk.vkBindBufferMemory(device, readback, readback_memory, 0) != VK_SUCCESS ||
+                vk.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+                failed = "self-test: no readback memory";
+                break;
+            }
+            std::memset(mapped, 0xEE, 64);
+            VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            pool_info.queueFamilyIndex = device_.info.queue_family;
+            VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocate.commandBufferCount = 1;
+            if (vk.vkCreateCommandPool(device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+                pool = VK_NULL_HANDLE;
+                failed = "self-test: no command pool";
+                break;
+            }
+            allocate.commandPool = pool;
+            if (vk.vkAllocateCommandBuffers(device, &allocate, &command) != VK_SUCCESS) {
+                failed = "self-test: no command buffer";
+                break;
+            }
+            {
+                std::lock_guard lock(mutex_);
+                set_page(va, {memory, 0});
+                if (flush_locked() == 0) {
+                    failed = "self-test: vkQueueBindSparse refused the host page";
+                    break;
+                }
+            }
+            if (!run(0, true)) {
+                failed = "self-test: the copy through the bound page did not run";
+                break;
+            }
+            const auto* got = static_cast<const std::uint32_t*>(mapped);
+            if (got[0] != words[0] || got[1] != words[1] || got[2] != words[2] || got[3] != words[3]) {
+                failed = "self-test: the GPU read other bytes than the host page's through the sparse buffer";
+                break;
+            }
+            if (words[4] != 0xC0FFEE11u) {
+                failed = "self-test: the GPU's write through the sparse buffer did not reach the host page";
+                break;
+            }
+            {
+                std::lock_guard lock(mutex_);
+                set_page(va, {});
+                flush_locked();
+            }
+            if (!run(1, false)) {
+                failed = "self-test: the copy through the unbound page did not run";
+                break;
+            }
+            if (got[4] || got[5] || got[6] || got[7]) {
+                failed = "self-test: an unbound page did not read zero";
+                break;
+            }
+        } while (false);
+        // The GPU has finished (every submission above was waited for, or none ran).
+        if (failed) vk.vkDeviceWaitIdle(device);
+        if (pool) vk.vkDestroyCommandPool(device, pool, nullptr);
+        if (readback) vk.vkDestroyBuffer(device, readback, nullptr);
+        if (readback_memory) vk.vkFreeMemory(device, readback_memory, nullptr);
+        {
+            std::lock_guard lock(mutex_);
+            if (!failed) pending_.clear();  // the unbind is done
+            bound_.erase(va);
+        }
+        if (memory) {
+            vk.vkFreeMemory(device, memory, nullptr);
+            --imports_live_;
+            import_bytes_ -= kPage;
+        }
+        host_page_free(page);
+        if (failed) return fail(why, failed);
+        return true;
+    }
+
+    DeviceState& device_;
+    std::mutex mutex_;  // everything below but the windows, which do not change after start()
+    std::vector<Window> windows_;
+    bool registered_ = false;
+    VkSemaphore timeline_ = VK_NULL_HANDLE;
+    std::uint64_t issued_ = 0;              // the timeline value the last bind (or self-test copy) signals
+    std::uint32_t window_types_ = 0;        // memory types the windows take (memoryTypeBits)
+    std::uint32_t host_types_ = 0;          // memory types host imports had
+    std::map<std::uint64_t, Range> ranges_;     // ordinary imports, by first VA
+    std::map<std::uintptr_t, Pool> pools_;      // physical-page pools, by their view's address
+    std::map<std::uint64_t, Target> bound_;     // what every bound page is bound to now, by VA
+    std::map<std::uint64_t, Target> pending_;   // the changes not yet on the GPU, by VA
+    std::vector<VkDeviceMemory> release_;       // given up: freed once their unbinds are on the GPU
+    std::uint64_t imports_live_ = 0, imports_made_ = 0, import_bytes_ = 0, released_ = 0;
+    std::uint64_t binds_ = 0, flushes_ = 0, bind_failures_ = 0, failed_ = 0, outside_ = 0, odd_ = 0;
+    std::chrono::steady_clock::time_point rate_since_{};
+    std::uint64_t rate_binds_ = 0, rate_flushes_ = 0, rate_imports_ = 0;
 };
 
 // ---- Title memory (src/title_memory.h) ------------------------------------------------------------------------------
@@ -2900,8 +3820,48 @@ public:
             device_.context->vk.vkDestroyBuffer(device_.info.device, hold.second, nullptr);
     }
 
+    // Sparse title memory (SparseTitleMemory) instead of imports, when the device can and its self-test passes. False,
+    // with the reason in `why`, when it cannot: nothing of it is left, and the imports path goes on (hold_window).
+    bool start_sparse(std::string& why) {
+        auto sparse = std::make_unique<SparseTitleMemory>(device_);
+        if (!sparse->start(why)) return false;
+        sparse_ = std::move(sparse);
+        return true;
+    }
+    bool sparse() const { return sparse_ != nullptr; }
+    std::string describe_sparse() const { return sparse_ ? sparse_->describe() : std::string(); }
+
+    // Physical pages (title_memory_mapped): bound with sparse title memory, imported as any visible range otherwise.
+    void mapped(std::uint64_t start, std::uint64_t size, const void* backing) {
+        if (sparse_) {
+            sparse_->mapped(start, size, backing);
+            return;
+        }
+        visible(start, size);
+    }
+    void pool(const void* backing, std::uint64_t size, bool alive) {
+        if (sparse_) sparse_->pool(backing, size, alive);
+    }
+
+    // Sparse title memory: the window that holds [va, va + bytes), its committed memory imported first where it is
+    // not yet. Its pages need not all be bound: the GPU sees what is mapped there, as on the console.
+    bool span(std::uint64_t va, std::uint64_t bytes, VkBuffer& window, std::uint64_t& window_va) {
+        if (!sparse_ || !bytes) return false;
+        sparse_->ensure(va, bytes);
+        return sparse_->window(va, bytes, window, window_va);
+    }
+
+    // The device address the GPU reaches `va` at (heap_base + va), or 0 where no import holds it (sparse title memory:
+    // where no page is bound).
+    std::uint64_t device_address(std::uint64_t va) {
+        if (sparse_) return sparse_->host(va, 1) ? device_.arena.address + va : 0;
+        Resource* import = at(va);
+        return import ? import->device_address() + (va - import->va()) : 0;
+    }
+
     // The title window's device addresses, held (see holds_) from the start: before anything is imported.
     void hold_window() {
+        if (sparse_) return;  // the sparse windows hold them
         std::lock_guard lock(mutex_);
         const VkPhysicalDeviceFeatures& f = device_.info.features;
         if (!f.sparseBinding || !f.sparseResidencyBuffer) {
@@ -2928,6 +3888,10 @@ public:
 
     // xmem's ranges (title_memory_visible): imported now, around what is imported already.
     void visible(std::uint64_t start, std::uint64_t size) {
+        if (sparse_) {
+            sparse_->visible(start, size);
+            return;
+        }
         std::lock_guard lock(mutex_);
         if (verbose() && !maps_) {
             ++maps_;
@@ -2940,6 +3904,10 @@ public:
     // first (a Resource's destructor waits for the work submitted so far), and the parts of them outside the range,
     // still the title's, are imported again.
     void gone(std::uint64_t start, std::uint64_t size) {
+        if (sparse_) {
+            sparse_->gone(start, size);
+            return;
+        }
         std::lock_guard lock(mutex_);
         const std::uint64_t end = start + size;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
@@ -2977,6 +3945,7 @@ public:
     // (outside the window, not committed, write-combined) and was not imported.
     bool ensure(std::uint64_t va, std::uint64_t bytes) {
         if (!bytes || !leonida::title_memory::addressable(va, bytes)) return false;
+        if (sparse_) return sparse_->ensure(va, bytes);
         std::lock_guard lock(mutex_);
         return ensure_locked(va, bytes);
     }
@@ -2985,7 +3954,7 @@ public:
     // that hold parts of it (released first, so the GPU waits), when the whole span is committed and no other buffer
     // is on those imports. Null otherwise.
     Resource* cover(std::uint64_t va, std::uint64_t bytes) {
-        if (!bytes || !leonida::title_memory::addressable(va, bytes)) return nullptr;
+        if (sparse_ || !bytes || !leonida::title_memory::addressable(va, bytes)) return nullptr;
         std::lock_guard lock(mutex_);
         std::uint64_t first = va & ~std::uint64_t(0xfff), last = va + bytes;
         std::vector<std::map<std::uint64_t, Resource*>::iterator> parts;
@@ -3019,6 +3988,7 @@ public:
 
     // The import that holds `va` and where in it, or null.
     Resource* at(std::uint64_t va) {
+        if (sparse_) return nullptr;
         std::lock_guard lock(mutex_);
         auto it = imports_.upper_bound(va);
         if (it == imports_.begin()) return nullptr;
@@ -3027,8 +3997,12 @@ public:
     }
 
     TitleMemoryStats stats() {
-        std::lock_guard lock(mutex_);
         TitleMemoryStats out;
+        if (sparse_) {
+            sparse_->stats(out);
+            return out;
+        }
+        std::lock_guard lock(mutex_);
         out.enabled = true;
         out.heap_base = device_.arena.address;
         out.imports = imports_.size();
@@ -3336,17 +4310,30 @@ private:
     std::uint64_t failed_ = 0;
     std::uint64_t released_ = 0;
     std::uint64_t merged_ = 0;
+    std::unique_ptr<SparseTitleMemory> sparse_;  // LEONIDA_TITLE_MEMORY=sparse, when it took (start_sparse)
 };
 
 Resource* Resource::title_import_cover(std::uint64_t va, std::uint64_t bytes) {
     return device_.titles ? device_.titles->cover(va, bytes) : nullptr;
 }
 
+bool Resource::title_window_span(std::uint64_t va, std::uint64_t bytes, VkBuffer& window, std::uint64_t& window_va) {
+    return device_.titles && device_.titles->span(va, bytes, window, window_va);
+}
+
+bool Resource::title_window_span_kept() const { return device_.titles && device_.titles->sparse(); }
+
 // Every live device's title memory, and what xmem says is visible, so a device made later imports it too
 // (title_memory_visible). The lock is taken before a device's own.
 struct TitleRanges {
     std::mutex mutex;
     std::map<std::uint64_t, std::uint64_t> visible;  // start -> size, non-overlapping
+    struct Mapped {
+        std::uint64_t size;
+        std::uintptr_t backing;  // the pool bytes the first page shows
+    };
+    std::map<std::uint64_t, Mapped> mapped;  // physical pages (title_memory_mapped): start -> run, non-overlapping
+    std::map<const void*, std::uint64_t> pools;  // live physical-page pools (title_memory_pool)
     std::vector<TitleMemory*> devices;
 };
 TitleRanges& title_ranges() {
@@ -8475,15 +9462,42 @@ public:
 
     // After the arena: the device keeps title memory when the arena got heap_base = kHeapBase, and imports what is
     // visible already (title_memory_visible).
+    //
+    // LEONIDA_TITLE_MEMORY picks how (one line at startup says which, and why): unset or "imports", the imports of
+    // TitleMemory; "sparse", sparse buffers over the title's GPU address windows with its pages bound into them
+    // (SparseTitleMemory), when the device has what that needs and its self-test passes, else imports; "0", none.
     void start_title_memory() {
-        if (!state_.title_memory) return;
+        char mode[16] = {};
+        size_t mode_length = 0;
+        if (getenv_s(&mode_length, mode, "LEONIDA_TITLE_MEMORY") != 0) mode_length = 0;
+        const bool want_sparse = mode_length > 1 && std::strcmp(mode, "sparse") == 0;
+        if (!state_.title_memory) {
+            if (want_sparse)
+                std::fprintf(stderr, "[rt] d3d12: title memory: LEONIDA_TITLE_MEMORY=sparse asked for, but the device "
+                                     "keeps no title memory (see the line about heap base above)\n");
+            return;
+        }
         titles_ = std::make_unique<TitleMemory>(state_);
+        std::string why;
+        if (want_sparse && titles_->start_sparse(why))
+            std::fprintf(stderr, "[rt] d3d12: title memory: sparse (LEONIDA_TITLE_MEMORY=sparse): %s\n",
+                         titles_->describe_sparse().c_str());
+        else if (want_sparse)
+            std::fprintf(stderr, "[rt] d3d12: title memory: imports (LEONIDA_TITLE_MEMORY=sparse asked for, but %s)\n",
+                         why.c_str());
+        else
+            std::fprintf(stderr, "[rt] d3d12: title memory: imports (%s; LEONIDA_TITLE_MEMORY=sparse binds the title's "
+                                 "pages into sparse buffers instead)\n",
+                         mode_length > 1 ? "LEONIDA_TITLE_MEMORY set" : "the default");
         titles_->hold_window();
         state_.titles = titles_.get();
         auto& ranges = title_ranges();
         std::lock_guard lock(ranges.mutex);
         ranges.devices.push_back(titles_.get());
+        for (const auto& [backing, size] : ranges.pools) titles_->pool(backing, size, true);
         for (const auto& [start, size] : ranges.visible) titles_->visible(start, size);
+        for (const auto& [start, run] : ranges.mapped)
+            titles_->mapped(start, run.size, reinterpret_cast<const void*>(run.backing));
     }
 
     // Xbox device slots 70 and 71 (V device.rs:443-444, descriptor.rs:795-818): a view of memory the title placed
@@ -8916,6 +9930,25 @@ public:
         heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         // With title memory the pages are imported already (or now, merged into one import that holds the buffer):
         // the buffer is bound to that import's memory, so it has the device address heap_base + `address` too.
+        // With sparse title memory the buffer is the part of the window at `address`: its device address is
+        // heap_base + `address`, and the GPU sees the pages the title maps there whenever it maps them.
+        if (state_.titles && state_.titles->sparse()) {
+            const auto va = reinterpret_cast<std::uintptr_t>(address);
+            VkBuffer window = VK_NULL_HANDLE;
+            std::uint64_t window_va = 0;
+            if (state_.titles->span(va, desc.Width, window, window_va)) {
+                auto* span = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
+                span->attach_device(identity());
+                const HRESULT made = span->create_title_span(window, window_va, va);
+                if (SUCCEEDED(made)) return d3d12_trace::result(method, hand_out(span, riid, out));
+                span->Release();
+            }
+            log_once("a title-placed buffer lies outside the sparse title memory's windows; width in KiB",
+                     int(std::min<UINT64>(desc.Width >> 10, INT_MAX)));
+            const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
+            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
+        }
         if (state_.titles) {
             const auto va = reinterpret_cast<std::uintptr_t>(address);
             if (Resource* import = state_.titles->cover(va, desc.Width)) {
@@ -10809,6 +11842,24 @@ void cut_range(std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t sta
     }
 }
 
+// The same for runs of mapped physical pages, whose backing moves with their start.
+void cut_mapped(std::map<std::uint64_t, TitleRanges::Mapped>& ranges, std::uint64_t start, std::uint64_t size) {
+    const std::uint64_t end = start + size;
+    auto it = ranges.upper_bound(start);
+    if (it != ranges.begin()) --it;
+    while (it != ranges.end() && it->first < end) {
+        const std::uint64_t a = it->first, b = it->first + it->second.size;
+        const std::uintptr_t backing = it->second.backing;
+        if (b <= start) {
+            ++it;
+            continue;
+        }
+        it = ranges.erase(it);
+        if (a < start) ranges.emplace(a, TitleRanges::Mapped{start - a, backing});
+        if (b > end) ranges.emplace(end, TitleRanges::Mapped{b - end, backing + (end - a)});
+    }
+}
+
 bool list_copy_memory(ID3D12Device* device, ID3D12GraphicsCommandList* list, std::uint64_t dst, std::uint64_t src,
                       std::uint64_t size) {
     Device* d = vulkan_device_of(device);
@@ -10882,7 +11933,28 @@ void title_memory_gone(std::uint64_t start, std::uint64_t size) {
     auto& ranges = title_ranges();
     std::lock_guard lock(ranges.mutex);
     cut_range(ranges.visible, start, size);
+    cut_mapped(ranges.mapped, start, size);
     for (TitleMemory* titles : ranges.devices) titles->gone(start, size);
+}
+
+void title_memory_mapped(std::uint64_t start, std::uint64_t size, const void* backing) {
+    if (!size) return;
+    auto& ranges = title_ranges();
+    std::lock_guard lock(ranges.mutex);
+    cut_mapped(ranges.mapped, start, size);
+    ranges.mapped.emplace(start, TitleRanges::Mapped{size, reinterpret_cast<std::uintptr_t>(backing)});
+    for (TitleMemory* titles : ranges.devices) titles->mapped(start, size, backing);
+}
+
+void title_memory_pool(const void* backing, std::uint64_t size, bool alive) {
+    if (!backing || !size) return;
+    auto& ranges = title_ranges();
+    std::lock_guard lock(ranges.mutex);
+    if (alive)
+        ranges.pools[backing] = size;
+    else
+        ranges.pools.erase(backing);
+    for (TitleMemory* titles : ranges.devices) titles->pool(backing, size, alive);
 }
 
 ID3D12Resource* title_placed_texture(ID3D12Device* device, std::uint64_t address, const void* resource_desc) {
@@ -10900,8 +11972,7 @@ TitleMemoryStats title_memory_stats(ID3D12Device* device) {
 std::uint64_t title_memory_device_address(ID3D12Device* device, std::uint64_t va) {
     Device* d = vulkan_device_of(device);
     if (!d || !d->titles()) return 0;
-    Resource* import = d->titles()->at(va);
-    return import ? import->device_address() + (va - import->va()) : 0;
+    return d->titles()->device_address(va);
 }
 
 bool device_supports_ray_tracing(ID3D12Device* device) {

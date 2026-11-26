@@ -988,7 +988,16 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            if (!buffer_vas_.find(va, hit, size)) {  // prefers an aliasing buffer that holds all of it
+                TitleWindowHit window{};
+                if (!title_window_at(va, window)) return false;
+                const ResourceBinding* w = resolve(window.id);
+                if (!w || !w->buffer) return false;
+                buffer = w->buffer;
+                offset = w->buffer_offset + (va - window.start);
+                size = std::min<std::uint64_t>(size, window.size - (va - window.start));
+                return true;
+            }
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -1001,7 +1010,15 @@ public:
         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
         replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return HostReadStatus::absent;
+            if (!buffer_vas_.find(va, hit)) {
+                // Title memory a window holds: the title's own pages at that address, when all of them are there.
+                TitleWindowHit window{};
+                if (!title_window_at(va, window)) return HostReadStatus::absent;
+                if (bytes > window.size - (va - window.start)) return HostReadStatus::absent;
+                if (!title_window_.host || !title_window_.host(va, bytes ? bytes : 1)) return HostReadStatus::absent;
+                host = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va));
+                return HostReadStatus::ok;
+            }
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return HostReadStatus::absent;
             if (!b->host) return HostReadStatus::not_cpu_written;
@@ -1260,13 +1277,44 @@ public:
     bool resource_at(std::uint64_t va, std::uint64_t& bytes, ResourceId& id, std::uint64_t& offset) {
         std::shared_lock lock(resource_mutex_);
         BufferVaIndex<ResourceId>::Hit hit{};
-        if (!buffer_vas_.find(va, hit, bytes)) return false;
+        if (!buffer_vas_.find(va, hit, bytes)) {
+            TitleWindowHit window{};
+            if (!title_window_at(va, window)) return false;
+            id = window.id;
+            offset = va - window.start;
+            bytes = std::min<std::uint64_t>(bytes, window.size - offset);
+            return true;
+        }
         const ResourceBinding* b = resolve(hit.id);
         if (!b || va - b->va >= b->size) return false;
         id = hit.id;
         offset = va - b->va;
         bytes = std::min<std::uint64_t>(bytes, b->size - offset);
         return true;
+    }
+
+    // Title memory as sparse buffers (the D3D12 layer's sparse title memory, src/title_memory.h): buffers that each hold
+    // a window of title VAs, registered as resources but not in the VA index (one of 64 GiB would make every miss walk
+    // all of it). A VA that no indexed buffer holds is looked up in these few windows, sorted by start. `host`, when
+    // set, says whether every page of [va, va + bytes) is title memory the CPU can read at that address now (host_at).
+    // `flush` submits the title-memory binds queued since the last call (vkQueueBindSparse; it takes submit_mutex()
+    // itself) and returns the value `timeline` reaches when they are done, 0 before the first bind: every queue's next
+    // submission waits for it, so work submitted after a page was mapped or unmapped sees that. Set once, before any
+    // queue submits.
+    struct TitleWindow {
+        std::uint64_t start = 0;
+        std::uint64_t size = 0;
+        ResourceId id = 0;
+    };
+    struct TitleWindows {
+        std::vector<TitleWindow> windows;
+        std::function<bool(std::uint64_t va, std::uint64_t bytes)> host;
+        std::function<std::uint64_t()> flush;
+        VkSemaphore timeline = VK_NULL_HANDLE;
+    };
+    void set_title_windows(TitleWindows windows) {
+        std::unique_lock lock(resource_mutex_);
+        title_window_ = std::move(windows);
     }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
@@ -1654,6 +1702,23 @@ private:
     // buffer_at finds a buffer by VA: one with no image, a VkBuffer, a VA and bytes (what the linear search it replaced
     // accepted). Both are called with resource_mutex_ held uniquely.
     static bool addressable(const ResourceBinding& b) { return !b.image && b.buffer && b.va && b.size; }
+    // The title window that holds `va` (set_title_windows), with resource_mutex_ held.
+    struct TitleWindowHit {
+        ResourceId id = 0;
+        std::uint64_t start = 0;
+        std::uint64_t size = 0;
+    };
+    bool title_window_at(std::uint64_t va, TitleWindowHit& out) const {
+        const auto& windows = title_window_.windows;
+        auto it = std::upper_bound(windows.begin(), windows.end(), va,
+                                   [](std::uint64_t v, const TitleWindow& w) { return v < w.start; });
+        if (it == windows.begin()) return false;
+        --it;
+        if (va - it->start >= it->size) return false;
+        out = {it->id, it->start, it->size};
+        return true;
+    }
+    TitleWindows title_window_;
     void unindex_buffer(ResourceId id, const ResourceBinding& b) {
         if (addressable(b)) buffer_vas_.erase(b.va, id);
     }
@@ -2831,6 +2896,16 @@ private:
             waits_.push_back(progress_);
             wait_values_.push_back(submitted_);
         }
+        // Title memory mapped or unmapped since the last submission is bound first, and this work waits for the binds
+        // (set_title_windows).
+        if (ended && context_.title_window_.flush) {
+            const std::uint64_t bound = context_.title_window_.flush();
+            if (bound > title_binds_seen_) {
+                waits_.push_back(context_.title_window_.timeline);
+                wait_values_.push_back(bound);
+                title_binds_seen_ = bound;
+            }
+        }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             // not initialized after all: try again with the next submission
@@ -3463,6 +3538,7 @@ private:
     std::vector<VkEvent> free_events_;  // unsignaled, for order_timestamp_copy
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
+    std::uint64_t title_binds_seen_ = 0;   // the title-memory bind value this queue's submissions wait for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;

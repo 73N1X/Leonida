@@ -1585,6 +1585,35 @@ pointers above) and the rest in [64 GiB, 448 GiB); imports are released before t
 pages. Device slots 70/71 (views of title memory) and the list methods on title addresses (62, 71-74, 148) work on
 these imports. Without capture replay the title's memory is not imported at its addresses (logged).
 
+**Sparse title memory (`LEONIDA_TITLE_MEMORY=sparse`, opt-in).** The imports above pin the physical pages a range had
+when it was imported, and the title maps its physical pages one 64 KiB page at a time, so the import path re-imports
+ranges of hundreds of MiB again and again (8,766 imports in the first 25 s of the retail title, which then lost the
+device). The sparse path keeps the console's model instead: a GPU VA maps to a physical page, and a VA with no page
+reads zero. A few sparse buffers ("windows") cover the title's two address windows at the capture-replay device
+address heap_base + VA (one for [1 GiB, 4 GiB), pieces of at most 64 GiB for [64 GiB, 448 GiB)), made before anything
+is imported. xmem tells physical pages apart for this path (`rt::xmem::GraphicsListener`'s `pool` and `mapped`): each
+`XMemAllocatePhysicalPages` allocation's own view of its section is imported once, in 256 MiB pieces when a page of
+the piece is first mapped, and mapping, remapping or unmapping a page is a sparse bind of the title VA page to that
+import, or to nothing. The title's other GPU memory is imported once per range and bound at its own address. Binds are
+queued and go to the GPU in one `vkQueueBindSparse` on the device's graphics queue when any queue next submits; they
+signal a timeline semaphore that submission and every later one waits for (`VulkanContext::set_title_windows`).
+`buffer_at`, `resource_at` and `host_at` fall back to the windows for a VA no other buffer holds, and slot 133 and
+committed buffers on title memory are parts of a window. Shaders and V#/T# descriptors are unchanged: the device
+address of every title VA is still heap_base + VA. At device creation a self-test binds a host page into a window,
+reads and writes it from the GPU, unbinds it and reads zero; only when it passes does the device use this path, and one
+line on stderr says which path is active and why. Without the variable, or when the self-test fails, the import path
+above runs as before.
+
+**This is not valid Vulkan usage on NVIDIA.** On the RTX 4060 Ti (driver 616.64) every sparse buffer lists memory type
+1 alone (`memoryTypeBits`), with or without residency, capture replay or `VkExternalMemoryBufferCreateInfo`, while host
+pointers import as types 2 and 3; `vkGetPhysicalDeviceExternalBufferProperties` does call host allocations importable
+for a sparse buffer. Binding the imports anyway breaks `VUID-VkSparseMemoryBind-memory-01096`, and the validation layer
+says so for every bind: "memory has a type index (2) that is not among the allowed types mask (0x2) for this
+resource". The driver binds them correctly all the same (`runtime/test/vk_sparse_title_memory_test.cpp --force-bind`,
+and `d3d12_title_memory_sparse`), which a driver update may change; the self-test is there to catch that. The AMD
+iGPU's driver (2026.04.17) lists host memory types for sparse buffers, so there it would be valid, but it has no
+`bufferDeviceAddressCaptureReplay`.
+
 ### 3.4 Descriptor heaps and the bindless model
 
 The game can use D3D12 descriptors in three ways, and the layer must handle all of them:

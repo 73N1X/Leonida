@@ -2870,6 +2870,11 @@ if(TARGET Vulkan::Headers)
       target_link_options(d3d12_title_memory_test PRIVATE /OPT:NOREF)
       add_test(NAME d3d12_title_memory COMMAND d3d12_title_memory_test)
       set_tests_properties(d3d12_title_memory PROPERTIES SKIP_RETURN_CODE 77)
+      # The same on sparse title memory (SparseTitleMemory: sparse buffers over the title windows, pages bound into
+      # them); 77 where its self-test does not pass.
+      add_test(NAME d3d12_title_memory_sparse COMMAND d3d12_title_memory_test)
+      set_tests_properties(d3d12_title_memory_sparse PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_TITLE_MEMORY=sparse")
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
       add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
