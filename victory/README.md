@@ -1,6 +1,22 @@
-# Leonida
+# Leonida (AMD)
 
-Leonida's runtime is DexNom's community fork of Marvisak's VIctory for Windows x64, merged into Leonida. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
+Leonida's runtime is DexNom's community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. This is our most complete tested build so far and the source for the FSR Quality 4K baseline. Game files, executables, saves and generated shader caches stay on your own computer.
+
+AMD Radeon is the primary target and the best-tested GPU path for this build. NVIDIA users can try the launcher with `--no-rt` and the game's display path. The NVIDIA configuration is untested. The current performance priorities are reducing VRAM use and improving FPS and frame-time stability.
+
+The Radeon FSR Quality 4K build is our most stable tested baseline for shaders and texture streaming. See [Things to Be Done](#things-to-be-done) for open work and how to measure a contribution.
+
+## Tested PC
+
+| Component | Test system |
+| --- | --- |
+| GPU | AMD Radeon RX 7900 XTX, 24 GB GDDR6 |
+| CPU | Intel Core Ultra 9 285K, 24 cores |
+| System memory | 64 GB DDR5 |
+| OS | Windows 11 Pro x64, build 26200 |
+| Render profile | Series X, ray tracing on, 2560×1440 render, FSR 4.1.2 Quality, 3840×2160 output |
+
+[AMD Radeon RX 7900 XTX specifications](https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xtx.html)
 
 ## Run it on your PC
 
@@ -12,24 +28,38 @@ Leonida's runtime is DexNom's community fork of Marvisak's VIctory for Windows x
 To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** again. It reuses the saved game path and the same save directory. To select a different installation, pass its executable path to Setup from PowerShell:
 
 ```powershell
-.\Setup.cmd -GamePath "D:\My Games\Series X\game_scarlett_master.exe"
+.\Setup.cmd -GamePath "D:\My Games\Series X\game.exe"
 ```
 
 To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 
-## Try experimental ray tracing on Radeon
+## FSR Quality 4K baseline
 
-After running **Setup.cmd**, open **Leonida (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **Leonida** for the usual renderer.
+Open **Leonida (FSR Quality 4K)** to use the tested Series X profile. It renders at 2560×1440 and presents at 3840×2160 with ray tracing enabled. FSR 4.1.2 takes the place of the game's TAA upscaler in this profile.
 
-To start the same RT configuration from PowerShell:
+The baseline was tested with a PC FidelityFX 4.1.2 provider. Put the provider and its dependencies in the installed runtime's `fidelityfx` subfolder or set `VICTORY_FIDELITYFX_DIR` to the folder containing `amd_fidelityfx_upscaler_dx12.dll`. The provider is supplied separately.
+
+For a manual launch, use the same flags as the Quality shortcut.
 
 ```powershell
-& "$env:LOCALAPPDATA\Leonida\victory-play.exe" --rt
+& "$env:LOCALAPPDATA\Leonida\victory-play.exe" --rt --console series-x --local-gpu-memory --fsr-quality --sparse-textures --no-upload-ahead --capture-readbacks --rt-write-stats
 ```
 
+The **Leonida (Experimental RT)** shortcut enables ray tracing with the game's display path. The shortcuts share your local saves.
+
 Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XTX. The game builds and traverses its acceleration structures through translated Direct3D 12 compute shaders. Frame times can still reach several seconds. Interior lighting, shadows and performance vary by scene. [Ray-tracing implementation](docs/fork-ray-tracing.md) · [City testing](BENCHMARK.md)
+
+## Things to Be Done
+
+A fresh public download reached the City waterfront on an RX 7900 XTX with FSR 4.1.2 and ray tracing enabled. The first in-game frames took longer while pipelines compiled. Warm samples reached about 1.1–1.3 FPS with zero dropped draws. Some materials still rendered black.
+
+- **Reduce buffer copy-back.** Track which pages the GPU actually writes and read back the ranges needed by CPU consumers. Start with the ray-tracing header builder, which declares much broader write ranges than it uses. Check fence ordering, CPU writes, aliases, and remaps when narrowing synchronization. [Submission and readback](crates/victory-gpu/src/host.rs) · [Buffer snapshots](crates/victory-gpu/src/shadow.rs) · [Guest memory directory](crates/victory-gpu/src/memory.rs)
+- **Reduce VRAM use and stabilize texture streaming.** Measure local VRAM and GPU-shared system memory separately. Look for duplicate resident resources, oversized staging allocations, and repeated mip uploads. Keep a valid resident mip available until its replacement has finished uploading. For black materials, trace the draw's base color back to the bound texture and mip. [Texture residency](crates/victory-gpu/src/texture.rs) · [Texture descriptors](crates/victory-gpu/src/descriptor/host.rs)
+- **Improve frame-time stability.** Measure cold pipeline compilation and warm gameplay separately. Look for CPU waits on buffer publication, repeated uploads, and pipeline work that can be prepared before the first draw. Compare pipeline counts and the rendered scene to check for regressions. [Shader translation](crates/victory-shader/src/emit) · [Pipeline creation](crates/victory-gpu/src/pipeline.rs)
+
+For a before-and-after test, use the same scene, camera, and driver with ray tracing on and FSR Quality at 1440p → 4K. Report median and 95th-percentile frame times, dedicated and shared GPU memory, upload and copy-back time and bytes, and dropped draws or pending pipelines. Include the commit, hardware, and relevant log lines. [Benchmark notes](BENCHMARK.md)
 
 ## Changes in this snapshot
 
@@ -58,12 +88,15 @@ $env:VICTORY_PARALLEL_PRELUDES = '1'
 & "$env:LOCALAPPDATA\Leonida\victory-play.exe"
 ```
 
-## Credits and licensing
+## Credits
 
-- Marvisak and the VIctory contributors created the original runtime. [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
-- ZSlayerHQ and the contributors to the victory-world line provided the rendering baseline used here, including the Radeon work from triippywhale and asdaasdsaddf. [victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime) · [Integrated revision](https://github.com/ZSlayerHQ/victory-world-runtime/commit/99f8834aa16b98d7f3943b8de262a8d4857bda7b)
-- The XCL contributors published an independent Xbox Series compatibility layer. Their work informed our investigation of shader translation, CPU/GPU memory synchronization and performance. [xcl-dev/xcl](https://github.com/xcl-dev/xcl)
+- **Marvisak and the VIctory contributors** created the original Windows compatibility runtime that this fork builds on. [VIctory](https://github.com/Marvisak/VIctory)
+- **ZSlayerHQ and the victory-world contributors**, including **triippywhale** and **asdaasdsaddf**, supplied the Radeon rendering work used as the basis for this fork. [victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime) · [Integrated revision](https://github.com/ZSlayerHQ/victory-world-runtime/commit/99f8834aa16b98d7f3943b8de262a8d4857bda7b)
+- **The XCL contributors** published an independent Xbox Series compatibility layer that informed our work on shader translation and CPU/GPU memory synchronization. [XCL](https://github.com/xcl-dev/xcl)
+- **AMD** supplies the FSR 4.1.2 upscaler used by the Quality 4K profile. [AMD FSR SDK](https://gpuopen.com/amd-fsr-sdk/)
 
 The upstream README preserves the original credits and historical test results. [Upstream README](README.upstream.md)
+
+## Licensing
 
 VIctory source is licensed under GPL-3.0-or-later. The upstream project identifies the required BCPack format tables as separately supplied data outside that license. This source archive omits that file. The setup script verifies a local or upstream copy before use. [License](LICENSE) · [Upstream asset policy and table notice](docs/asset-policy.md)

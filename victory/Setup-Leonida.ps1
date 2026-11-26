@@ -86,6 +86,7 @@ $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(
     @{ Name = 'Leonida'; Arguments = '' }
     @{ Name = 'Leonida (Experimental RT)'; Arguments = '--rt' }
+    @{ Name = 'Leonida (FSR Quality 4K)'; Arguments = '--rt --console series-x --local-gpu-memory --fsr-quality --sparse-textures --no-upload-ahead --capture-readbacks --rt-write-stats' }
 )) {
     $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
     $shortcut.TargetPath = $launcher
@@ -93,4 +94,4 @@ foreach ($entry in @(
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.Save()
 }
-Write-Host "Open Leonida from $ShortcutDirectory to play, or select Leonida (Experimental RT) to try ray tracing."
+Write-Host "Open Leonida from $ShortcutDirectory. The FSR Quality 4K shortcut uses the tested ray-tracing profile."
