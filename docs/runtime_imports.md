@@ -194,6 +194,30 @@ functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo
 host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
 which opens none.
 
+### The title's window and its display mode
+
+The executable imports `CreateWindowExA`, `RegisterClassExA` and `DefWindowProcA` from
+`ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll`, `ShowWindow` from `ext-ms-win-rtcore-ntuser-window-l1-1-0.dll`
+and a `PeekMessageA`/`TranslateMessage`/`DispatchMessageA` loop from the `ext-ms-win-rtcore-ntuser-message-*` sets:
+it makes and pumps a Win32 window of its own. `CreateWindowExA` (and `CreateWindowExW`) are served by
+`runtime/shims/title_window.cpp`, ported from VIctory's `victory-hle/src/modules/lifecycle.rs`: the title asks for a
+3840x2160 window (measured under `gta6rt --run`, before any DXGI call), which is shrunk to the primary monitor's
+work area and centred, and closing the window ends the run. The other window imports bind to the host. `PresentX`
+shows the frames in that window ([runtime/README.md](../runtime/README.md#the-titles-window-presentx-and-screenshots)).
+
+Just before its first `SetFrameIntervalX` the title asks the device for its DXGI output (`IDXGIDevice1::GetAdapter`,
+adapter slot 7 `EnumOutputs(0)`) and calls the output's console slot 21 twice, `(format 0, flags 0, &count, null)` and
+then with room for one mode. That slot lists the display modes (VIctory's `dxgi.rs` `modes`); a PC `IDXGIOutput1` has
+`GetDisplaySurfaceData1` there, which failed. `runtime/shims/xbox_display.cpp` now answers it with one mode,
+`LEONIDA_DISPLAY_MODE=WxH` (default 3840x2160, as in VIctory). Measured on the 1.0.2.1 executable: with 1920x1080,
+1920x1080 at 120 Hz, a mode format of 87 instead of 0, or `LEONIDA_DEVICE_TYPE=6`, the title still creates its two
+`ALLOW_DISPLAY` back buffers at 3840x2160 (device slot 127), so the reported mode is not what sizes them; the window's
+3840x2160, asked for earlier, says the size is decided before the output is read. It is the executable's Series X SDR
+mode: with VIctory's native 1440p profile applied to the mapped image (`runtime/src/display_profile.h`, from VIctory
+upstream `native_1440p.rs`: the SDR mode, the scanout reservation, the temporal scene scale and the Settings viewport
+load), `LEONIDA_DISPLAY_MODE=2560x1440` gives a 2560x1440 window and 2560x1440 back buffers. With the SDR mode set to
+1920x1080 instead the title still made 2560x1440 ones, so only 2560x1440 is applied.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.

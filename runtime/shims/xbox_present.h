@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -166,6 +167,28 @@ public:
     // Peak of HDR10 content in nits, the white point of the tone map onto an SDR output (default 1000; no metadata is read).
     void set_hdr_peak_nits(float nits) { hdr_peak_nits_ = nits > 0.0f ? nits : 1000.0f; }
 
+    // The title's frame calls are answered by the device's frame clock, not by this object: the device proxy's slots
+    // 78-81 (d3d12_xs_device.cpp), VIctory's clock (victory/crates/victory-gpu/src/frame.rs, GPL-3.0-or-later, Marvisak
+    // and contributors, DexNom fork), whose waits pace the title and whose tokens count frames. `tokens_issued` says how
+    // many tokens that clock has handed out (d3d12_xs::device_frames_begun). From then on PresentX:
+    //   - takes its tokens from that clock: one above `tokens_issued()` is logged once and presented anyway (the clock
+    //     never refuses a present, as VIctory's queue.rs:757-841 does not); null, repeated and stale tokens are logged
+    //     once per kind and presented, as before;
+    //   - does not pace: the clock already holds the title to the frame interval, so a present is queued without
+    //     waiting for a vblank (MAILBOX, else IMMEDIATE), as VIctory's host.rs presents with Present(0, 0). Waiting for
+    //     a vblank as well would pace the title by two clocks that share no phase (the timer's ticks and the
+    //     display's refresh), so a frame could wait out both; ImmediateThresholdPercent has nothing to tear then and
+    //     is ignored.
+    // This object's own frame calls (FramePacer) stay for the tests that drive it directly; the title never reaches them.
+    void use_device_frame_clock(std::function<std::uint64_t()> tokens_issued) {
+        std::lock_guard serialise(present_mutex_);
+        device_tokens_ = std::move(tokens_issued);
+    }
+    bool uses_device_frame_clock() {
+        std::lock_guard serialise(present_mutex_);
+        return static_cast<bool>(device_tokens_);
+    }
+
     leonida::FramePacer& pacer() { return pacer_; }
     WindowPresenter& presenter() { return *presenter_; }
     std::uint64_t presents() const { return presents_; }
@@ -196,6 +219,10 @@ private:
     bool worker_stop_ = false;
     std::thread display_white_thread_;
     bool logged_null_token_ = false, logged_stale_token_ = false, logged_repeated_token_ = false;
+    // use_device_frame_clock: the clock's token count, and the newest token presented with it (under present_mutex_).
+    std::function<std::uint64_t()> device_tokens_;
+    std::uint64_t device_last_presented_ = 0;
+    bool logged_unissued_token_ = false;
 };
 
 inline constexpr UINT xbox_frame_event_origin = leonida::frame_event_origin;

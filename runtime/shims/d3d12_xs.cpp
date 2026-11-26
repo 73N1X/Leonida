@@ -17,6 +17,8 @@
 
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"
+#include "xbox_display.h"
+#include "xbox_window.h"
 #endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -179,6 +181,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             return result(method, vhr);
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
+        // A title (its device created as ID3D12Device11, the console layouts): the console's DXGI adapter and output,
+        // whose display mode it reads (xbox_display.h), and PresentX in a window (xbox_window.h).
+        if (rt::d3d12_xs::device_proxy_console_layout(*out)) {
+            rt::d3d12_xs::set_device_adapter_provider(*out, &rt::d3d12::console_adapter_provider);
+            rt::d3d12::attach_title_presentation(*out);
+        }
         if (!tracing)
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
                          static_cast<void*>(vulkan));

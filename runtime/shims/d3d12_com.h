@@ -30,6 +30,7 @@
 
 namespace leonida {
 class VulkanPresenter;
+class PresentSnapshot;
 struct PresentPlanes;
 }
 
@@ -392,6 +393,10 @@ public:
     std::uint64_t tear_presents() const;
     // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
     bool enable_capture();
+    // Screenshots on request (VulkanPresenter::enable_snapshots / request_snapshot): only the requested frame is
+    // copied, and the copy goes to `sink` once that frame has finished on the GPU.
+    bool enable_snapshots();
+    void request_snapshot(std::function<void(leonida::PresentSnapshot)> sink);
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
     void set_abort(std::function<bool()> abort);
     // See VulkanPresenter::read_back: false after a present skipped while the window is minimised, too.
@@ -409,7 +414,14 @@ private:
 bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+// `queue` (optional; a command queue of `device`, or its Xbox-ABI proxy) is the queue whose VkQueue the presents are
+// submitted on, so they follow the work the title executed on it; without it, the device's first graphics VkQueue.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window,
+                                                         ID3D12CommandQueue* queue = nullptr);
+
+// The VkQueue and queue family a command queue from create_command_queue (or its Xbox-ABI proxy) submits to. False
+// for any other queue.
+bool command_queue_vulkan(ID3D12CommandQueue* queue, VkQueue* vk_queue, std::uint32_t* family);
 
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it

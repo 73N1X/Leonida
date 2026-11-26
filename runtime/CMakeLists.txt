@@ -563,6 +563,11 @@ if(BUILD_TESTING)
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
+  # The title window's pieces that need no window (src/png_write.h, src/frame_meter.h, src/display_mode.h): the PNG
+  # writer against leonida::zlib_inflate, the caption's figures on made-up times, LEONIDA_DISPLAY_MODE's parser.
+  add_executable(present_window_parts_test test/present_window_parts_test.cpp)
+  add_test(NAME present_window_parts COMMAND present_window_parts_test)
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 
@@ -1740,7 +1745,8 @@ if(TARGET Vulkan::Headers)
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
-                shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/dxgi_com.cpp shims/xbox_display.cpp shims/xbox_window.cpp
+                ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -3173,6 +3179,8 @@ if(TARGET Vulkan::Headers)
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
+      # The title's CreateWindowExA/W (fitted to the screen, Close ends the run; PresentX shows its frames there).
+      target_sources(gta6rt PRIVATE shims/title_window.cpp)
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
       # device it gets, mapped and run by `gta6rt --run` with LEONIDA_D3D12=vulkan: the loader, the game thread, the
@@ -3205,6 +3213,37 @@ if(TARGET Vulkan::Headers)
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --queue-test-settings
                  ${_trace_runner})
         set_tests_properties(run_tiny_frame_queue_test_settings PROPERTIES SKIP_RETURN_CODE 77)
+      endif()
+
+      # A stand-in title that presents as a GDKX title does (shims/xbox_window.h): the console output's display mode
+      # (LEONIDA_DISPLAY_MODE), a back buffer of that size, the device's frame clock and PresentX through the console
+      # queue, into a window, with one frame saved by LEONIDA_CAPTURE_DIR's request file. check_tiny_present.py checks
+      # the screenshot's pixels. A window shows on the desktop for a few seconds; with --title-window the guest makes it
+      # itself, through the API set a title imports CreateWindowExA from (a stub here, the shim at run time).
+      add_library(ntuser_window_stub SHARED test/fixtures/ntuser_window_stub.cpp test/fixtures/ntuser_window_stub.def)
+      set_target_properties(ntuser_window_stub PROPERTIES
+        OUTPUT_NAME ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+      )
+      add_executable(tiny_present test/fixtures/tiny_present.cpp)
+      # The stub's import library before the default user32.lib: CreateWindowExA comes from the title's API set.
+      target_link_libraries(tiny_present PRIVATE d3d12_xs_stub ntuser_window_stub)
+      target_compile_definitions(tiny_present PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(tiny_present PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(tiny_present PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      )
+      if(Python3_FOUND)
+        add_test(NAME run_tiny_present COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_present.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_present>" "--probe=$<TARGET_FILE:d3d12_com_test>")
+        add_test(NAME run_tiny_present_title_window COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_present.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_present>" "--probe=$<TARGET_FILE:d3d12_com_test>" --title-window)
+        set_tests_properties(run_tiny_present run_tiny_present_title_window PROPERTIES SKIP_RETURN_CODE 77
+                             RUN_SERIAL TRUE)
       endif()
     endif()
 

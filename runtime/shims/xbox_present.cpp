@@ -4,6 +4,7 @@
 
 #include "../src/vulkan_present.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -131,17 +132,19 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     std::lock_guard serialise(present_mutex_);
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);
+    // The device's frame clock paces the title (use_device_frame_clock): nothing to tear, no vblank to wait for.
+    const bool device_clock = static_cast<bool>(device_tokens_);
     // A zero, negative or NaN threshold never tears; an uncapped frame is never late for anything either.
     const float threshold = params ? params->ImmediateThresholdPercent : 0.0f;
-    const bool wants_tear = threshold > 0.0f && !pacer_.uncapped();
+    const bool wants_tear = threshold > 0.0f && !pacer_.uncapped() && !device_clock;
     if (wants_tear && !presenter_->tear_supported())
         log_once(logged_threshold_,
                  "ImmediateThresholdPercent has no effect on this swapchain (tearing disabled by LEONIDA_PRESENT_NO_TEAR, "
                  "no VK_KHR/EXT_swapchain_maintenance1, or no IMMEDIATE/FIFO_RELAXED mode the surface can switch to): "
                  "a late frame waits for the next vblank");
 
-    // Unpaced (no interval registered, or uncapped): do not hold the queue for vblanks.
-    const UINT sync_interval = pacer_.registered() && !pacer_.uncapped() ? 1 : 0;
+    // Unpaced (no interval registered, uncapped, or the device's clock paces): do not hold the queue for vblanks.
+    const UINT sync_interval = pacer_.registered() && !pacer_.uncapped() && !device_clock ? 1 : 0;
 
     if (plane_count == 0) {
         const HRESULT result = presenter_->present_blank(sync_interval);
@@ -168,9 +171,18 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     }
     // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
     // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
+    // With the device's clock its tokens are the ones to check, and none is refused (use_device_frame_clock).
     FramePacer::TokenIssue issue{};
-    if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok)
+    if (device_clock) {
+        if (token > device_tokens_())
+            log_once(logged_unissued_token_, "PresentX with a token the device's frame clock has not handed out: "
+                                             "presented anyway");
+        if (token == 0) issue = FramePacer::TokenIssue::null_token;
+        else if (token == device_last_presented_) issue = FramePacer::TokenIssue::repeated;
+        else if (token < device_last_presented_) issue = FramePacer::TokenIssue::stale;
+    } else if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok) {
         return from_pacer(checked);
+    }
     switch (issue) {
     case FramePacer::TokenIssue::null_token:
         log_once(logged_null_token_, "PresentX with the null token: presented anyway (real behaviour unmeasured)");
@@ -264,9 +276,12 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         }
         const HRESULT result = presenter_->present_planes(composed, sync_interval, tear);
         if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
-        pacer_.commit_present_token(token, plane_count,
-                                    tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
-                                                                            : leonida::PresentSync::vblank);
+        if (device_clock)
+            device_last_presented_ = std::max(device_last_presented_, token);
+        else
+            pacer_.commit_present_token(token, plane_count,
+                                        tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
+                                                                                : leonida::PresentSync::vblank);
         ++presents_;
         return S_OK;
     }
@@ -295,9 +310,12 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     }
     const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
     if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
-    pacer_.commit_present_token(token, plane_count,
-                                tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
-                                                                        : leonida::PresentSync::vblank);
+    if (device_clock)
+        device_last_presented_ = std::max(device_last_presented_, token);
+    else
+        pacer_.commit_present_token(token, plane_count,
+                                    tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
+                                                                            : leonida::PresentSync::vblank);
     ++presents_;
     return S_OK;
 }

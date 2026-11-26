@@ -2964,8 +2964,8 @@ methods of `rt::d3d12::XboxPresentation` (`runtime/shims/xbox_present.h`), on to
 `leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The plane and present-parameter
 layouts and the 64-bit token are confirmed on x64 by the public code cited above; the constant values and HRESULTs
 are **our own provisional definitions**, because the samples give call shapes and field names only and the enum
-values are still unmeasured. The class is the surface the proxy will forward to. The queue-side calls ignore which
-queue they came on (one `VkQueue` behind all of them).
+values are still unmeasured. The class is what the title's `PresentX` reaches (see *Wiring* below). Its presenter
+submits on one `VkQueue`: the device's first graphics queue, or the one behind the queue the title presents on.
 
 - *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
@@ -3192,10 +3192,21 @@ queue they came on (one `VkQueue` behind all of them).
   second (GameDVR) output, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
   alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), a host-vblank clock (the timer drifts from the
   display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
-  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. The
-  public slots are the device's `SetFrameIntervalX`/`ScheduleFrameEventX`/`WaitFrameEventX`/`GetFrameStatisticsX`
-  at 78-81 and `PresentX` at queue 30 (older runtime layout) or 32 (newer); `SuspendX`/`ResumeX` have no public
-  slot. Nothing here is wired to those slots yet, and the game's own runtime is not observed.
+  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and `SuspendX`/`ResumeX`
+  (queue slots 23/24 in VIctory's newer layout, still refused by the proxy).
+- *Wiring (the title)*: the slot tables (`d3d12_xs_slots.h`, VIctory's) route the device's 78-81 to VIctory's frame
+  clock in the proxy and the queue's 32 to the device's present handler. On the Vulkan device a console-layout device
+  gets `runtime/shims/xbox_window.cpp` as that handler: at the first `PresentX` it takes the title's own window (the
+  title makes one with `CreateWindowExA`; `title_window.cpp` fits it to the screen) or opens one, makes the presenter on
+  the VkQueue of the queue the title presents on (`create_window_presenter(device, hwnd, queue)`, so the blit follows
+  the title's work there), and forwards to an `XboxPresentation` that takes its tokens from the proxy's clock and does
+  not pace (`use_device_frame_clock`): the clock holds the title to its interval, the present goes out unsynced
+  (MAILBOX, else IMMEDIATE), and `ImmediateThresholdPercent` is ignored. `FramePacer` and this class's own frame calls
+  stay for the tests that drive them; the title never reaches them. The window's caption shows the frame rate
+  (`src/frame_meter.h`), and `LEONIDA_CAPTURE_DIR` saves requested frames as PNGs: `VulkanPresenter::request_snapshot`
+  copies the next presented frame in its own command buffer into a buffer handed off once the frame's fence has
+  signalled, and a thread of the runtime encodes it (`src/png_write.h`). `run_tiny_present` and
+  `run_tiny_present_title_window` check the whole path through `gta6rt --run` on the GPU (see runtime/README.md).
 - *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
   statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
   swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, plane composition
@@ -3501,7 +3512,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Binning | The GDK topic index names Xbox binning modes (NDA content) | Should be a no-op if the game uses it only as an optimisation: it changes how a render pass uses on-chip memory, not the result. Log and ignore for the first boot; revisit for performance. **Open** whether the game relies on binning for correctness. |
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
-| Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
+| Device slots 48/73/78/79/80/81 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation); VIctory's `device.rs` table on the title | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79), `WaitFrameEventX` (80) and `GetFrameStatisticsX` (81) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame calls are VIctory's frame clock (`frame.rs`): a tick per interval from the first `SetFrameIntervalX` (60 Hz until then), blocking waits that end on ticks (`S_FALSE` on a time-out, a token on a time-out only with flag 2), tokens that count frames, no statistics; `PresentX` takes its tokens from it (section 4.5, *Wiring*). The six indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT`, `LEONIDA_XS_WAIT_EVENT_SLOT` and `LEONIDA_XS_FRAME_STATISTICS_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |

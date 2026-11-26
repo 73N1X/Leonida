@@ -10272,6 +10272,10 @@ float WindowPresenter::display_sdr_white_nits() const {
 }
 
 bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
+bool WindowPresenter::enable_snapshots() { return presenter_->enable_snapshots(); }
+void WindowPresenter::request_snapshot(std::function<void(leonida::PresentSnapshot)> sink) {
+    presenter_->request_snapshot(std::move(sink));
+}
 
 void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
 
@@ -10288,7 +10292,8 @@ bool device_has_swapchain_colorspace(ID3D12Device* device) {
     return d && d->state().info.swapchain_colorspace;
 }
 
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window,
+                                                         ID3D12CommandQueue* present_queue) {
     // A title holds the Xbox-ABI proxy, not the layer's device: look behind it, as the helpers above do.
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     Device* d = Device::from<Device>(real ? real : device);
@@ -10321,9 +10326,17 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
             std::free(value);
         }
     }
+    // Presents go on the VkQueue of the queue the title presents on, behind the work it executed there (PresentX), when
+    // that queue is in the graphics family (the blit needs it); otherwise on the device's first graphics VkQueue.
+    VkQueue vk_queue = info.queue;
+    std::uint32_t vk_family = info.queue_family;
+    if (present_queue && (!command_queue_vulkan(present_queue, &vk_queue, &vk_family) || vk_family != info.queue_family)) {
+        vk_queue = info.queue;
+        vk_family = info.queue_family;
+    }
     auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
-                                                                info.instance, info.physical, info.queue,
-                                                                info.queue_family, surface,  // owns the surface
+                                                                info.instance, info.physical, vk_queue,
+                                                                vk_family, surface,  // owns the surface
                                                                 info.swapchain_maintenance1 && tear_allowed,
                                                                 [window]() -> VkExtent2D {
                                                                     RECT r{};

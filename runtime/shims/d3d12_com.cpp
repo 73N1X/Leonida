@@ -1768,6 +1768,8 @@ public:
     }
 
     bool uses_calibrated_timestamps() const { return clock_.calibrated != nullptr; }
+    VkQueue vulkan_queue() const { return vk_queue_; }
+    std::uint32_t vulkan_family() const { return family_; }
 
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
@@ -2040,6 +2042,15 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q && q->uses_calibrated_timestamps();
+}
+
+bool command_queue_vulkan(ID3D12CommandQueue* queue, VkQueue* vk_queue, std::uint32_t* family) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
+    const CommandQueue* q = queue ? CommandQueue::from(queue) : nullptr;
+    if (!q) return false;
+    if (vk_queue) *vk_queue = q->vulkan_queue();
+    if (family) *family = q->vulkan_family();
+    return true;
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
