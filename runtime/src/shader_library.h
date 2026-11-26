@@ -855,7 +855,7 @@ public:
         }
         // fspx-captured: FSPX programs the title passed at slot 67 that no translation had, saved by the runtime to
         // <work>/shaders/captured and translated by make_game.py's shaders stage (docs/fspx.md, "Captured programs").
-        for (const char* sub_folder : {"fspx", "bvh", "fspx-captured"}) {
+        for (const char* sub_folder : {"fspx", "bvh", "fspx-captured", "fssm-captured"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;

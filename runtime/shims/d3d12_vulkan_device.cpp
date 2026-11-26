@@ -5597,6 +5597,9 @@ public:
             });
             if (!stage.entry) {
                 note_refusal((std::string("no translated shader for stage ") + stage.name).c_str(), 0);
+                capture_shader(*library,
+                               {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength},
+                               hash, stage.name);
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
@@ -6255,6 +6258,23 @@ public:
     // the translated shaders' folder; "0" turns it off. It stays in the player's work folder.
     static void capture_program(const leonida::ShaderLibrary& library, std::span<const std::uint8_t> payload,
                                 const leonida::ComputeProgram& program) {
+        capture_bytes(library, payload,
+                      leonida::sha256_hex(program.bytes) + "-" + leonida::sha256_hex(program.state) + ".fspx",
+                      "FSPX programs");
+    }
+
+    // A graphics stage's shader container the title passed that no translation has (a vertex shader that is not in
+    // the package's shader archives: it comes from elsewhere in the game's data, as the slot-67 programs do): saved
+    // once as <fssm sha256>-<stage>.dxbc beside the captured FSPX programs, for the build to translate like the
+    // containers it extracts from XboxBvhBuilder.dll (docs/embedded_shaders.md).
+    static void capture_shader(const leonida::ShaderLibrary& library, std::span<const std::uint8_t> container,
+                               const std::string& fssm_sha256, const char* stage) {
+        capture_bytes(library, container, fssm_sha256 + "-" + stage + ".dxbc", "shader containers");
+    }
+
+    // `payload` saved once as `name` in the capture folder (capture_program), written to a .part file first.
+    static void capture_bytes(const leonida::ShaderLibrary& library, std::span<const std::uint8_t> payload,
+                              const std::string& name, const char* what) {
         try {
             static const std::filesystem::path folder = [&] {
                 const char* named = std::getenv("LEONIDA_CAPTURE_PROGRAMS");
@@ -6266,8 +6286,6 @@ public:
             if (folder.empty() || payload.empty()) return;
             std::error_code ec;
             std::filesystem::create_directories(folder, ec);
-            const std::string name =
-                leonida::sha256_hex(program.bytes) + "-" + leonida::sha256_hex(program.state) + ".fspx";
             const std::filesystem::path file = folder / name;
             if (std::filesystem::exists(file, ec)) return;
             const std::filesystem::path partial = folder / (name + ".part");
@@ -6280,7 +6298,7 @@ public:
             static std::atomic<unsigned> saved{0};
             const unsigned n = saved.fetch_add(1, std::memory_order_relaxed) + 1;
             if (n == 1 || (n & (n - 1)) == 0)
-                std::fprintf(stderr, "[rt] d3d12: %u untranslated FSPX programs saved to %s for the next build\n", n,
+                std::fprintf(stderr, "[rt] d3d12: %u untranslated %s saved to %s for the next build\n", n, what,
                              folder.string().c_str());
         } catch (...) {
         }

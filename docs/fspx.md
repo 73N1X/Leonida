@@ -236,6 +236,8 @@ files in name order and leaves `.part` files out) into `<work>/shaders/fspx-capt
 shader library loads `fspx-captured/index.json` beside `fspx/` and `bvh/`, so a program translated this way is found by
 its keys on the next run.
 
+Graphics stages work the same way: a shader container whose FSSM program has no translation (one vertex shader in the first 20 s of a boot, used by 20 pipelines) is saved as `<fssm_sha256>-<stage>.dxbc` in the same folder. The `shaders` stage unpacks, disassembles and translates those as it does XboxBvhBuilder.dll's containers, into `<work>/shaders/spirv/fssm-captured`, which the library loads by `fssm_sha256`.
+
 ## Translation status
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the

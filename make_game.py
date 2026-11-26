@@ -1318,6 +1318,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     captured_fspx_shaders(work, signature, emulate=emulate, fallbacks=fallbacks)
+    captured_fssm_shaders(work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
@@ -1437,6 +1438,56 @@ def captured_fspx_shaders(work: str, mc_signature: str, emulate: bool = False,
     if fspx_key_clash(spirv):
         drop(translated)
         fail("shaders: two captured FSPX programs with the same keys translated differently")
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+def captured_fssm_shaders(work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                          fallbacks: tuple[str, ...] = ()) -> None:
+    """Graphics shader containers the title passed that no translation had (a vertex shader outside the package's
+    shader archives): the runtime saves each to <work>/shaders/captured as <fssm sha256>-<stage>.dxbc. They are
+    unpacked, disassembled and translated as the containers of XboxBvhBuilder.dll are (bvh_shaders), into
+    <work>/shaders/fssm-captured and <work>/shaders/spirv/fssm-captured, which the runtime's shader library loads by
+    fssm_sha256. Redone whole when the captured set or the tools change; nothing captured, nothing done."""
+    captured = os.path.join(work, "shaders", "captured")
+    names = sorted(n for n in os.listdir(captured) if n.endswith(".dxbc")) if os.path.isdir(captured) else []
+    if not names:
+        return
+    unpacked = os.path.join(work, "shaders", "fssm-captured")
+    spirv = os.path.join(work, "shaders", "spirv", "fssm-captured")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "captured_build.json")
+    digest = hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+    settings = json.dumps({"captured": digest, "count": len(names), "tools": mc_signature, "emulate": emulate,
+                           "fallbacks": list(fallbacks)}, sort_keys=True)
+    if read_shader_setting(settings_file) == settings and os.path.isfile(translated):
+        return
+    log(f"shaders: unpacking and translating {len(names)} captured shader containers")
+    drop(translated, settings_file)
+    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
+                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    os.makedirs(unpacked, exist_ok=True)
+    index = []
+    for file_name in names:
+        sha, stage = os.path.splitext(file_name)[0].rsplit("-", 1)
+        name = f"cap_{sha[:16]}_{stage}"
+        shutil.copyfile(os.path.join(captured, file_name), os.path.join(unpacked, name + ".dxbc"))
+        index.append({"name": name, "file": name + ".dxbc", "stage": stage})
+    extracted = os.path.join(unpacked, "index.json")
+    with open(extracted, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(index, f, indent=1)
+        f.write("\n")
+    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
+    disasm = os.path.join(unpacked, "disasm")
+    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", os.path.join(unpacked, "fssm_index.json"),
+       "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", *extra)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 
