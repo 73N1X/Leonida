@@ -329,6 +329,20 @@ int check_texture_layouts() {
         CHECK(!lin.detile(t, 0, 0, row, std::numeric_limits<std::size_t>::max(), 0));
         CHECK(!lin.tile(t, 0, 0, row, std::numeric_limits<std::size_t>::max(), 0));
     }
+    // The layout word and the library's suggestion (VIctory xg.rs): 0x100 | mode, 1 linear, 0 the suggestion.
+    {
+        std::uint32_t mode = 99;
+        CHECK(g::suggested_swizzle(g::Dimension::tex2d, false, false) == sw::sw_4kb_s);
+        CHECK(g::suggested_swizzle(g::Dimension::tex3d, false, true) == sw::sw_64kb_r_x);
+        CHECK(g::suggested_swizzle(g::Dimension::tex2d, true, true) == sw::sw_64kb_z_x);
+        CHECK(g::suggested_swizzle(g::Dimension::tex1d, true, true) == sw::linear);
+        CHECK(g::swizzle_from_layout_word(0x10a, g::Dimension::tex2d, false, false, mode) && mode == sw::sw_64kb_d);
+        CHECK(g::swizzle_from_layout_word(0x101, g::Dimension::tex2d, false, false, mode) && mode == sw::sw_256b_s);
+        CHECK(g::swizzle_from_layout_word(1, g::Dimension::tex2d, false, false, mode) && mode == sw::linear);
+        CHECK(g::swizzle_from_layout_word(0, g::Dimension::tex2d, false, true, mode) && mode == sw::sw_64kb_r_x);
+        mode = 99;
+        CHECK(!g::swizzle_from_layout_word(0x205, g::Dimension::tex2d, false, false, mode) && mode == 99);
+    }
     std::puts("gfx10_tiling: whole-texture layouts (mips, tails, slices, 3D, planes, SW_64KB_R_X) as VIctory's tests "
               "give them");
     return 0;

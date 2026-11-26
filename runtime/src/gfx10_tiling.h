@@ -749,4 +749,28 @@ struct ConsoleTexture {
     }
 };
 
+// The mode the console's layout library (xg_xs.dll XGSuggestSwizzleMode) picks for a texture: linear for 1D, the XOR
+// depth and render modes for depth and render targets, else SW_4KB_S (.ttpf textures without a mode of their own use
+// it). VIctory victory-hle xg.rs suggested(), which marks it a shortcut: the rule of the library's older optimal-mode
+// function (any size, 2D, 3D and cubes alike); XGSuggestSwizzleMode itself is newer than every copy VIctory could
+// check, so revisit if streamed textures come out scrambled. The layer reads layout word 0 with the same rule.
+constexpr std::uint32_t suggested_swizzle(Dimension dimension, bool depth_stencil, bool render_target) {
+    return dimension == Dimension::tex1d ? swizzle::linear
+           : depth_stencil              ? swizzle::sw_64kb_z_x
+           : render_target              ? swizzle::sw_64kb_r_x
+                                        : swizzle::sw_4kb_s;
+}
+
+// The swizzle mode a console D3D12_RESOURCE_DESC::Layout word names (VIctory xg.rs texture(), victory-gpu
+// resource.rs texture_layout): 0x100 | the mode, 1 row major (linear), 0 the library's pick (suggested_swizzle). False
+// for any other word.
+constexpr bool swizzle_from_layout_word(std::uint32_t word, Dimension dimension, bool depth_stencil,
+                                        bool render_target, std::uint32_t& mode) {
+    if (word == 0) mode = suggested_swizzle(dimension, depth_stencil, render_target);
+    else if (word == 1) mode = swizzle::linear;
+    else if ((word & ~0xffu) == 0x100) mode = word & 0xff;
+    else return false;
+    return true;
+}
+
 }  // namespace leonida::gfx10
