@@ -692,7 +692,8 @@ OpStore %f32_control %control
                                   "%res = OpLoad %uint %q\n"), 0xFFFFFFF0)
 
     def test_unsupported_constructs_are_rejected(self):
-        for body in ("%res = OpUDiv %uint %c2 %c1\n",                                     # opcode not modelled
+        for body in ("%res = OpSDiv %uint %c2 %c1\n",                                     # opcode not modelled
+                     "%res = OpUDiv %uint %c2 %c0\n",                                     # division by zero
                      "%res = OpExtInst %uint %glsl Ldexp %c2 %c1\n",                     # ext inst not modelled
                      "%res = OpBitFieldUExtract %uint %cFF %c32 %c1\n",                  # undefined per spec
                      "%res = OpShiftLeftLogical %uint %cFF %c32\n",                     # undefined per spec
@@ -706,6 +707,12 @@ OpStore %f32_control %control
             with self.subTest(body=body.splitlines()[0]):
                 with self.assertRaises(si.UnsupportedConstruct):
                     run_word(body)
+
+    def test_unsigned_division(self):
+        # OpUDiv / OpUMod (SPIR-V 3.32.13): unsigned quotient and remainder; the relabelled thread index of a
+        # wave64 compute shader run in halves splits into x, y, z with them (rdna2spirv.relabel_index)
+        self.assertEqual(run_word("%res = OpUDiv %uint %cFF %c32\n"), 0xFFFFFFFF // 32)
+        self.assertEqual(run_word("%res = OpUMod %uint %cFF %c32\n"), 0xFFFFFFFF % 32)
 
     def test_store_to_push_constant_is_rejected(self):
         text = HEADER + "%p = OpAccessChain %_ptr_PC_uint %pc %c0\nOpStore %p %c1\n" + FOOTER

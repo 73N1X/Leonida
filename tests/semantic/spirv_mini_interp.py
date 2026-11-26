@@ -107,7 +107,7 @@ UNDEF = _Undef()
 # Operations whose result is undefined when an operand is (they have no side effect and no control).
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
-    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUDiv", "OpUMod", "OpUConvert", "OpBitCount", "OpIEqual",
     "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
     "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
@@ -381,7 +381,8 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=()):
+                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=(),
+                  subgroup_order=None):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
@@ -414,6 +415,11 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     lane with no covered sample, so a shuffle from it is undefined. The caller's `inputs_for` gives each
     invocation the %sg_lane that matches. `resources` binds descriptor-set variables (see _invocation).
 
+    `subgroup_order` (a list of subgroup numbers) drops the lockstep across subgroups: between two OpControlBarriers
+    the subgroups run one after another in that order (the others after them), each in lockstep within itself, so a
+    program that leaves two subgroups' accesses to Workgroup or buffer memory unordered shows it (the lanes of one
+    hardware wave64 split over two 32-wide subgroups, SHADER-10).
+
     `helpers` names invocations that run the shader but take no part in subgroup operations, as helper lanes a
     driver leaves out: their ballot bit is never set, they count for no vote or reduction, and a shuffle from their
     lane is undefined. They still receive each operation's result over the others. Quad operations do include them:
@@ -443,67 +449,103 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
 
     for i in range(invocations):
         advance(i, None)
-    while True:
+    def result_of(i):
+        """The result of the subgroup operation (or barrier) invocation i waits at, over the running lanes of
+        its subgroup."""
+        kind, _, _value, ident = pending[i]
+        sub = slots[i] // subgroup_size
+        group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
+                 if slots[j] // subgroup_size == sub and j not in helpers}
+        if kind == "OpGroupNonUniformBallot":
+            # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
+            bits = sum(1 << l for l, req in group.items() if req[2])
+            return tuple((bits >> (32 * w)) & MASK for w in range(4))
+        elif kind == "OpGroupNonUniformAny":
+            return any(req[2] for req in group.values())
+        elif kind == "OpGroupNonUniformAll":
+            return all(req[2] for req in group.values())
+        elif kind == "OpGroupNonUniformBitwiseOr":
+            acc = 0
+            for req in group.values():
+                acc |= req[2]
+            return acc
+        elif kind == "OpControlBarrier":
+            return None           # everyone is here: the "same point" check is the barrier
+        elif kind == "OpGroupNonUniformBroadcastFirst":
+            return group[min(group)][2] if group else UNDEF   # the lowest running lane's value
+        elif kind == "OpGroupNonUniformShuffle":
+            if not 0 <= ident < subgroup_size:
+                if out_of_range == "raise":
+                    raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
+                                          f"{subgroup_size}-wide subgroup")
+                ident %= subgroup_size
+            return group[ident][2] if ident in group else UNDEF
+        elif kind in ("OpGroupNonUniformQuadBroadcast", "OpGroupNonUniformQuadSwap"):
+            # Helpers take part: Vulkan keeps a helper active for quad operations.
+            quad = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
+                    if slots[j] // subgroup_size == sub}
+            lane = slots[i] % subgroup_size
+            if kind == "OpGroupNonUniformQuadBroadcast":
+                if not 0 <= ident < 4:
+                    raise UnsupportedConstruct(f"OpGroupNonUniformQuadBroadcast index {ident}")
+                partner = (lane & ~3) | ident
+            else:
+                if ident not in (0, 1, 2):
+                    raise UnsupportedConstruct(f"OpGroupNonUniformQuadSwap direction {ident}")
+                partner = lane ^ (ident + 1)
+            return quad[partner][2] if partner in quad else UNDEF
+        else:
+            raise UnsupportedConstruct(kind)
+
+    def tick(members):
         # One instruction per invocation per round, in invocation order: invocations at the same instruction
         # execute it one after the other before any goes on, as the lanes of a SIMD wave do, so a load that
         # follows a store in program order sees every lane's store and none from a later instruction.
-        while any(req is not None and req[0] == "tick" for req in pending):
-            for i in range(invocations):
+        while any(pending[i] is not None and pending[i][0] == "tick" for i in members):
+            for i in members:
                 if pending[i] is not None and pending[i][0] == "tick":
                     advance(i, None)
+
+    if subgroup_order is None:
+        while True:
+            tick(range(invocations))
+            live = [i for i in range(invocations) if pending[i] is not None]
+            if not live:
+                break
+            if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
+                raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
+            results = [result_of(i) for i in range(invocations)]
+            for i in range(invocations):
+                advance(i, results[i])
+        return (memory, invocation_outputs) if return_outputs else memory
+    # One subgroup at a time: each runs, in lockstep within itself, until all its invocations wait at an
+    # OpControlBarrier or have returned; then the next. Only the barrier orders the subgroups (no lockstep across
+    # them), the weakest order Vulkan gives, to show what a program leaves unordered between its subgroups.
+    subs = sorted({s // subgroup_size for s in slots})
+    order = [s for s in subgroup_order if s in subs] + [s for s in subs if s not in subgroup_order]
+    members_of = {s: [i for i in range(invocations) if slots[i] // subgroup_size == s] for s in subs}
+    while True:
+        for s in order:
+            members = members_of[s]
+            while True:
+                tick(members)
+                live = [i for i in members if pending[i] is not None]
+                if not live or all(pending[i][0] == "OpControlBarrier" for i in live):
+                    break
+                if len(live) != len(members) or len({pending[i][1] for i in live}) != 1 or any(
+                        pending[i][0] == "OpControlBarrier" for i in live):
+                    raise UnsupportedConstruct("subgroup operation not reached by every invocation of the subgroup "
+                                               "at the same point")
+                results = [result_of(i) for i in members]
+                for i, r in zip(members, results):
+                    advance(i, r)
         live = [i for i in range(invocations) if pending[i] is not None]
         if not live:
             break
         if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
-            raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
-        results = []
-        for i in range(invocations):
-            kind, _, _value, ident = pending[i]
-            sub = slots[i] // subgroup_size
-            group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
-                     if slots[j] // subgroup_size == sub and j not in helpers}
-            if kind == "OpGroupNonUniformBallot":
-                # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
-                bits = sum(1 << l for l, req in group.items() if req[2])
-                results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
-            elif kind == "OpGroupNonUniformAny":
-                results.append(any(req[2] for req in group.values()))
-            elif kind == "OpGroupNonUniformAll":
-                results.append(all(req[2] for req in group.values()))
-            elif kind == "OpGroupNonUniformBitwiseOr":
-                acc = 0
-                for req in group.values():
-                    acc |= req[2]
-                results.append(acc)
-            elif kind == "OpControlBarrier":
-                results.append(None)           # everyone is here: the "same point" check above is the barrier
-            elif kind == "OpGroupNonUniformBroadcastFirst":
-                results.append(group[min(group)][2] if group else UNDEF)   # the lowest running lane's value
-            elif kind == "OpGroupNonUniformShuffle":
-                if not 0 <= ident < subgroup_size:
-                    if out_of_range == "raise":
-                        raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
-                                              f"{subgroup_size}-wide subgroup")
-                    ident %= subgroup_size
-                results.append(group[ident][2] if ident in group else UNDEF)
-            elif kind in ("OpGroupNonUniformQuadBroadcast", "OpGroupNonUniformQuadSwap"):
-                # Helpers take part: Vulkan keeps a helper active for quad operations.
-                quad = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
-                        if slots[j] // subgroup_size == sub}
-                lane = slots[i] % subgroup_size
-                if kind == "OpGroupNonUniformQuadBroadcast":
-                    if not 0 <= ident < 4:
-                        raise UnsupportedConstruct(f"OpGroupNonUniformQuadBroadcast index {ident}")
-                    partner = (lane & ~3) | ident
-                else:
-                    if ident not in (0, 1, 2):
-                        raise UnsupportedConstruct(f"OpGroupNonUniformQuadSwap direction {ident}")
-                    partner = lane ^ (ident + 1)
-                results.append(quad[partner][2] if partner in quad else UNDEF)
-            else:
-                raise UnsupportedConstruct(kind)
-        for i in range(invocations):
-            advance(i, results[i])
+            raise UnsupportedConstruct("OpControlBarrier not reached by every invocation at the same point")
+        for i in live:
+            advance(i, None)
     return (memory, invocation_outputs) if return_outputs else memory
 
 
@@ -989,6 +1031,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = (val(a[1]) - val(a[2])) & wmask(a[0])
         elif op == "OpIMul":
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
+        elif op in ("OpUDiv", "OpUMod"):
+            # SPIR-V leaves division by zero undefined: refuse it instead of inventing a value
+            d = val(a[2])
+            if d == 0:
+                raise UnsupportedConstruct(f"{op} by zero")
+            values[res] = (val(a[1]) // d if op == "OpUDiv" else val(a[1]) % d) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
         elif op == "OpSConvert":

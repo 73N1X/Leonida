@@ -1,13 +1,15 @@
-"""Wave64 vertex, pixel and geometry shaders on 32-wide subgroups: is the program partition invariant? (SHADER-10)
+"""Wave64 programs on 32-wide subgroups: is the program partition invariant? (SHADER-10)
 
 A wave64 program is exact on 32-lane subgroups when what it observes (exports, memory) does not change if its
 wave is cut into two 32-lane halves, each run as a wave of its own. The host forms the subgroups of a VS/PS/GS, so
-there is no partner half to exchange values with (compute and mesh shaders have workgroup memory and
---wave64-emulate). This module decides that property from the code, conservatively, for the translator
-(rdna2spirv.py, shader index key `wave64_graphics`) and for the corpus census (`--census`):
+there is no partner half to exchange values with. A compute or mesh shader has workgroup memory and
+--wave64-emulate, which the translator now keeps for tier C only (rdna2spirv.compute_halves): tiers A and B run
+natively with one half per subgroup. This module decides that property from the code, conservatively, for the
+translator (rdna2spirv.py, shader index keys `wave64_graphics` and `wave64_compute`) and for the corpus census
+(`--census`):
 
-    analyse(blocks, succ, masks, stage) -> {"tier": "A" | "B" | "C", "reasons": [...], "idioms": [...],
-                                            "uniform_readlane": {id(ins), ...}}
+    analyse(blocks, succ, masks, stage, group=None, lin=()) -> {"tier": "A" | "B" | "C", "reasons": [...],
+        "idioms": [...], "uniform_readlane": {id(ins), ...}, "sync": {id(ins), ...}, "drop_barriers": bool}
 
     A  nothing wave-wide is consumed except votes that only skip lane-masked work, votes on a wave-uniform compare
        (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does),
@@ -20,6 +22,13 @@ there is no partner half to exchange values with (compute and mesh shaders have 
        a store's data or a branch, readlane / writelane of varying data, a 32-bit access to half of a lane mask,
        scalar state defined behind a wave-wide vote and read where the vote did not run, ... Each reason is a
        short code (REASONS).
+
+Compute and mesh (stage "cs" / "ms", see docs/design.md "Wave64 compute and mesh: partition invariance"): lanes keep
+their wave numbers there (the translator relabels the thread index from the subgroup), so a lane id is exact; the
+first lane's D + lane keeps its bits from 6 up; a one-half EXEC (thread 0) marks the region only that half runs;
+and compute_checks adds what two subgroups must agree on besides values: s_barrier (left out when nothing is
+written, else not where a vote decides), LDS and scalar-load order inside the wave (a workgroup barrier in front of
+an access that follows a conflicting one, `sync`, only where every invocation runs), the group size.
 
 How: a forward dataflow over the basic blocks gives every register a set of taint bits (what partition-dependent
 quantity its value derives from) and, for the few idioms that are exact, a tag naming the proof object (the exec
@@ -57,14 +66,19 @@ CTRL = 128      # scalar defined behind a wave-wide vote and read where the def 
 MASKD = 256     # a lane mask used as data
 WFS = 512       # scalar read from the first lane of a waterfall loop
 ACT_RFL = 1024  # scalar from v_readfirstlane of active-EXEC-only uniform VGPR (valid only inside that EXEC mask)
-TAG_BITS = RNK | ELECT | WFS | ACT_RFL
+LINF = 2048     # compute/mesh: v_readfirstlane of a lane-linear VGPR (D + lane, D a multiple of 64 the same in the
+                # whole wave): D + an offset below 64 that depends on the half, so only bits 6 and up are invariant
+TAG_BITS = RNK | ELECT | WFS | ACT_RFL | LINF
 
 NAMES = {CNT: "lane-count", RNK: "lane-rank", FF1: "first-lane", BASE: "allocation-order", ELECT: "elected-lane",
          LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar",
-         ACT_RFL: "cross-lane"}
+         ACT_RFL: "cross-lane", LINF: "first-lane"}
+# compute and mesh only (see the Compute section of the docstring): vote-barrier, lds-in-wave, mem-in-wave,
+# nested-barrier, group-size, tainted-message
 REASONS = sorted(set(NAMES.values()) | {"tainted-branch", "unsafe-vote-branch", "mask-half", "elected-side-effect",
                                         "tainted-exec", "mask-compare", "unmodelled-op", "unsafe-execz-branch",
-                                        "analysis-error"})
+                                        "analysis-error", "vote-barrier", "lds-in-wave", "mem-in-wave",
+                                        "nested-barrier", "group-size", "tainted-message"})
 
 BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
             "s_cbranch_execz", "s_cbranch_execnz"}
@@ -255,14 +269,22 @@ def operands(ins):
         uses.append("scc")
     if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
         uses.append("vcc")
-    if op in MOVREL_OPS:
+    if op in MOVREL_OPS or op.startswith("s_sendmsg"):
         uses.append("m0")
     return dests, srcs, defs, uses
 
 
 class Analysis:
-    def __init__(self, blocks, succ, masks, stage):
+    def __init__(self, blocks, succ, masks, stage, group=None, lin=()):
         self.blocks, self.succ, self.masks, self.stage = blocks, succ, masks or {}, stage
+        # compute and mesh: each 32-lane half runs as its own subgroup, but lanes keep their wave numbers 0..63 (the
+        # translator takes the lane from the relabelled thread index), so a lane id is exact there
+        self.compute = stage in ("cs", "ms")
+        self.group = group                          # invocations per workgroup (compute and mesh)
+        self.lin_entry = frozenset(lin)             # VGPRs that hold D + lane at entry (D a multiple of 64)
+        self.oh_region = frozenset()                # blocks only the half holding a one-half EXEC runs (compute)
+        self.nonempty = {}                          # exec token -> blocks where no running half has it empty
+        self.wide = {("e",)}                        # exec tokens that hold every launch lane (the entry EXEC, its WQM)
         self.n = len(blocks)
         self.vgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
                              for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"})
@@ -367,6 +389,69 @@ class Analysis:
             return min(32, ks[0] + (src[1]["v"] & 31), ks[2])
         return None
 
+    def linear_first_use(self, st, ins, op, srcs):
+        """Compute/mesh: whether an op whose only partition-dependent source is the first-lane read of D + lane (tag
+        "linf": D a multiple of 64 the same in the whole wave, plus an offset below 64) keeps only D: a copy (the tag
+        goes on), a right shift by 6 or more, an AND with a constant whose low 6 bits are clear, a bit-field extract
+        from bit 6 up. Such a value is the wave base: mesh shaders take their group index as the first lane's v5 >> 7
+        (v5 = group * 128 + thread), compute shaders a wave index as their first lane's thread id >> 6."""
+        mods = ins.get("mods") or []
+        if ins["op"].endswith(("_sdwa", "_dpp")) or any(m == "clamp" or m.startswith(("op_sel", "omod")) for m in mods):
+            return False
+
+        def linf(x):
+            return x.get("k") in ("sgpr", "vgpr") and not x.get("neg") and not x.get("abs") and len(_regs(x)) == 1 \
+                and st["g"].get(_regs(x)[0]) == ("linf",) and st["t"].get(_regs(x)[0], 0) == LINF \
+                and (id(ins), _regs(x)[0]) not in self.stale
+
+        def imm(x):
+            return x.get("v") & 0xFFFFFFFF if x.get("k") == "imm" else None
+        if op in ("s_mov_b32", "v_mov_b32") and len(srcs) == 1:
+            return linf(srcs[0])
+        if len(srcs) != 2:
+            return False
+        if op == "s_lshr_b32":
+            return linf(srcs[0]) and imm(srcs[1]) is not None and imm(srcs[1]) & 31 >= 6
+        if op == "v_lshrrev_b32":
+            return linf(srcs[1]) and imm(srcs[0]) is not None and imm(srcs[0]) & 31 >= 6
+        if op in ("s_and_b32", "v_and_b32"):
+            return any(linf(x) and imm(y) is not None and imm(y) & 63 == 0 for x, y in (srcs, srcs[::-1]))
+        if op in ("s_bfe_u32",):
+            return linf(srcs[0]) and imm(srcs[1]) is not None and imm(srcs[1]) & 31 >= 6
+        return False
+
+    def linear_result(self, st, ins, op, a):
+        """Compute/mesh: whether a VALU result is again D + lane with D a multiple of 64 the same in the whole wave
+        (tag "lin"), from one lane-linear source: a copy, (wave-uniform value << 6 or more) + it or | it, it + or | a
+        constant whose low 6 bits are clear. The mesh entry forms its thread index so: v_lshl_add_u32 v0, s1, 6, v0
+        with s1 the wave id and v0 the lane id."""
+        mods = ins.get("mods") or []
+        if ins["op"].endswith(("_sdwa", "_dpp")) or any(
+                m == "clamp" or m.startswith(("op_sel", "dst_unused", "omod")) or "_sel:" in m for m in mods):
+            return False
+        src = a[1:]
+
+        def lin(x):
+            return x.get("k") == "vgpr" and x.get("n", 1) == 1 and not x.get("neg") and not x.get("abs") \
+                and st["g"].get(("v", x["r"])) == ("lin",) and not self.rd(st, ins, x)
+
+        def same(x):    # a value that is the same in every lane of the wave and partition invariant
+            if x.get("k") == "imm":
+                return True
+            if self.is_mask(ins, x) or x.get("neg") or x.get("abs") or self.rd(st, ins, x):
+                return False
+            return x.get("k") == "sgpr" or (x.get("k") == "vgpr" and all(r[1] in st["u"] for r in _regs(x)))
+
+        def k64(x):
+            return x.get("k") == "imm" and x["v"] & 63 == 0
+        if op == "v_mov_b32" and len(src) == 1:
+            return lin(src[0])
+        if op in ("v_lshl_add_u32", "v_lshl_or_b32") and len(src) == 3:
+            return same(src[0]) and src[1].get("k") == "imm" and src[1]["v"] & 31 >= 6 and lin(src[2])
+        if op in ("v_add_nc_u32", "v_add_u32", "v_or_b32") and len(src) == 2:
+            return any(lin(x) and k64(y) for x, y in (src, src[::-1]))
+        return False
+
     def join(self, a, b, blk=0):
         t = dict(a["t"])
         for k, v in b["t"].items():
@@ -388,8 +473,8 @@ class Analysis:
         return {k: a.get(k, frozenset()) | b.get(k, frozenset()) for k in set(a) | set(b)}
 
     def entry(self):
-        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "ua": frozenset(), "l": {},
-                "r": {}, "b": {}}
+        return {"t": {}, "g": {("v", r): ("lin",) for r in self.lin_entry}, "x": ("e",), "xg": None, "f": True,
+                "u": frozenset(), "ua": frozenset(), "l": {}, "r": {}, "b": {}}
 
     # ---- the transfer function ----
     def block(self, n, st, ev):
@@ -524,8 +609,8 @@ class Analysis:
         """LANE when a MUBUF/MTBUF access (vdata, vaddr, V#, ...) has no idxen and its V# word3 is a literal with
         ADD_TID_ENABLE (bit 23) set: the effective index is then the wave lane (idxen ignores the bit), so the
         result or the address is the lane id. A run-time V# cannot be judged here: tiers A and B assume the bit is
-        0 there (docs/design.md, SHADER-10)."""
-        if "idxen" in mods or len(a) < 3:
+        0 there (docs/design.md, SHADER-10). Compute and mesh: the translator's lane is the wave lane, exact."""
+        if self.compute or "idxen" in mods or len(a) < 3:
             return 0
         rsrc = a[2]
         if rsrc.get("k") == "sgpr" and rsrc.get("n") == 4:
@@ -743,6 +828,18 @@ class Analysis:
         if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32") and len(a) == 3:
             m, acc = a[1], a[2]
             tacc = self.rd(st, ins, acc)
+            if self.compute and not self.is_mask(ins, m):
+                # compute and mesh: the translator counts below the wave lane (the relabelled thread index mod 64),
+                # which a half keeps, so a lane id, or a count of the bits of a number, is what the wave computes
+                tag = None
+                if m.get("k") == "imm" and m["v"] in (-1, 0xFFFFFFFF):
+                    if op == "v_mbcnt_lo_u32_b32" and acc.get("k") == "imm" and acc["v"] == 0:
+                        tag = ("lane_lo",)
+                    elif op == "v_mbcnt_hi_u32_b32" and not tacc and _regs(acc) and \
+                            st["g"].get(_regs(acc)[0]) == ("lane_lo",):
+                        tag = ("lin",)
+                put(a[0], t_src, tag)
+                return
             if m.get("k") == "imm" and m["v"] in (-1, 0xFFFFFFFF):
                 # v_mbcnt_lo(-1, 0) then v_mbcnt_hi(-1, that) is the lane id: 0..63 in the wave, 0..31 in a half,
                 # so the two differ by a multiple of 32 (tag ("lmod", 5)); the low count alone does not (lanes 32..63
@@ -772,8 +869,8 @@ class Analysis:
             return
         if op == "s_bfm_b64" and dests:
             # rdna2spirv.py compares per-half wave_lane (0..31) against offset..offset+size, so the upper half
-            # produces bits for lanes 0..31 instead of 32..63.
-            put(dests[0], t_src | LANE)
+            # produces bits for lanes 0..31 instead of 32..63. Compute and mesh keep the wave lane: exact.
+            put(dests[0], t_src | (0 if self.compute else LANE))
             return
 
         # --- cross-lane reads and writes
@@ -793,6 +890,10 @@ class Analysis:
                 idiom("aggregated-atomic")
                 put(a[0], (tv & ~ELECT) | BASE)
                 self.new_base = st["g"][_regs(a[1])[0]][1]
+            elif self.compute and tv == 0 and vr is not None and st["g"].get(("v", vr)) == ("lin",):
+                # D + lane read at the first lane: D + an offset below 64 in the wave and in either half (lane 0 of
+                # its half when none is on). Only bits 6 and up are D (linear_first_use clears them)
+                put(a[0], LINF, ("linf",))
             elif tv == 0 and vr is not None:
                 put(a[0], WFS, ("wfs", vr))
             else:
@@ -858,6 +959,10 @@ class Analysis:
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
             if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
                 tag = UVOTE
+            elif tag is None and self.uniform_cmp(st, ins, srcs, uses, tj, active=True):
+                # the same compare under a narrowed EXEC: every active lane or none (exact where EXEC is not empty
+                # in any half that runs the vote, see nonempty_exec)
+                tag = ("uvote_a", st["x"])
             put(d, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
@@ -900,13 +1005,20 @@ class Analysis:
                 r = _regs(srcs[0])
                 if srcs[0].get("k") == "special" and srcs[0].get("t") == "exec":
                     tag = ("mask", st["x"])
-                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
+                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote", "uvote_a"):
                     tag = st["g"][r[0]]
-            elif op == "s_and_b64" and not t_src and all(
+            elif op in ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_nand_b64", "s_nor_b64",
+                        "s_xnor_b64", "s_not_b64", "s_cselect_b64") and not t_src and all(
                     (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                    or (x.get("k") == "imm" and x["v"] in (0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF))
                     for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
-                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
+                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..]);
+                # also EXEC or 0 picked by a clean SCC (s_cselect_b64 s[0:1], exec, 0) and any bitwise mix of such
+                # all-or-none masks: each is every launch lane or none, in the wave and in each half alike
                 tag = UVOTE
+            elif not t_src and self.active_all_or_none(st, op, srcs):
+                # every active lane or none (see active_all_or_none)
+                tag = ("uvote_a", st["x"])
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
@@ -991,6 +1103,22 @@ class Analysis:
                 T[("v", dst_base)] = T.get(("v", dst_base), 0) | wt
             return
 
+        # --- compute/mesh: the wave base of a first-lane read of D + lane (bits 6 and up)
+        if self.compute and t_src & LINF and dests and self.linear_first_use(st, ins, op, srcs):
+            for d in dests:
+                put(d, t_src & ~LINF, ("linf",) if op in ("s_mov_b32", "v_mov_b32") else None)
+            if "scc" in defs:
+                T["scc"] = t_src & ~LINF
+                st["g"].pop("scc", None)
+            if op not in ("s_mov_b32", "v_mov_b32"):
+                idiom("readfirstlane-wave-base")
+            return
+        if op.startswith("s_sendmsg") and self.compute:
+            # the message's M0 operand (a mesh shader's vertex and primitive counts) must be the wave's
+            if T.get("m0", 0) or (id(ins), "m0") in self.stale:
+                violation("tainted-message")
+            return
+
         # --- everything else: results depend on the sources
         def scaled_cnt_token():
             """Linear scaling of a lane count by a clean uniform 32-bit stride preserves wave-aggregated atomic
@@ -1039,6 +1167,19 @@ class Analysis:
                 uniform_active = not (st["xg"] and st["xg"][0] == "elect") and all(
                     x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
                     (x.get("k") == "vgpr" and all(r[1] in st["ua"] for r in _regs(x))) for x in srcs) and not uses
+            if op == "v_cndmask_b32" and dests and len(srcs) in (2, 3) and not ins["op"].endswith(("_sdwa", "_dpp")):
+                # a select by a wave-uniform lane mask (every launch lane or none, UVOTE: a uniform compare, or EXEC or
+                # 0 picked by a clean SCC) between values that are the same in every lane gives every lane one value
+                mregs = _regs(srcs[2]) if len(srcs) == 3 else ["vcc"]
+
+                def alike(x, s):
+                    return x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or \
+                        (x.get("k") == "vgpr" and all(r[1] in s for r in _regs(x)))
+                if mregs and all(st["g"].get(r) == UVOTE and not T.get(r, 0) for r in mregs) and \
+                        not (st["xg"] and st["xg"][0] == "elect"):
+                    uniform = st["f"] and all(alike(x, st["u"]) for x in srcs[:2])
+                    uniform_active = all(alike(x, st["ua"]) for x in srcs[:2])
+            if op.startswith("v_") and dests:
                 # a write of part of the VGPR (SDWA byte/word with UNUSED_PRESERVE, a 16-bit result) keeps the rest
                 # of it: uniform only if the whole register already was
                 if partial_write(ins, op):
@@ -1080,6 +1221,8 @@ class Analysis:
                 k = self.lmod_result(st, ins, op, a)
                 if k is not None:
                     tag = ("lmod", k)
+            if tag is None and self.compute and not tj and len(dests) == 1 and self.linear_result(st, ins, op, a):
+                tag = ("lin",)
             if st["xg"] and st["xg"][0] == "elect" and dests:
                 tj |= ELECT
                 tag = ("elect", st["xg"][1], ctok)
@@ -1089,12 +1232,36 @@ class Analysis:
             return
         # scalar ALU, loads, anything unnamed
         tag = None
+        own = False
+        if op.startswith(("buffer_load", "tbuffer_load", "global_load")) and dests and not t_src and not any(
+                m in ("tfe", "lds") for m in mods) and "_d16" not in op and not (st["xg"] and st["xg"][0] == "elect") \
+                and not self.after_store(ins):
+            # VIctory's uniform data (lower.rs lane_uniform): a load from an address made of values that are the same in
+            # every lane (constants, scalars that are no lane mask, uniform VGPRs) gives every lane one value, when no
+            # store can have run before it (a store of the other half could land between the two halves' loads)
+            def alike(x, s):
+                return x.get("k") in ("imm", "fimm", "off") or (x.get("k") == "special" and x.get("t") in (
+                    "off", "null")) or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or \
+                    (x.get("k") == "vgpr" and all(r[1] in s for r in _regs(x)))
+            if all(alike(x, st["u"]) for x in srcs):
+                for d in dests:
+                    put(d, 0, uniform=st["f"] and d.get("k") == "vgpr", uniform_active=d.get("k") == "vgpr")
+                return
+            if all(alike(x, st["ua"]) for x in srcs):
+                for d in dests:
+                    put(d, 0, uniform_active=d.get("k") == "vgpr")
+                return
         if t_src & WFS and t_src & ACT_RFL:
             t_src |= X
         elif t_src & WFS:
             gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & WFS}
             if len(gs) == 1 and None not in gs:
                 tag = next(iter(gs))
+                if st["xg"] and st["xg"][0] == "wf" and tag == ("wfs", st["xg"][1]) and op.startswith(
+                        ("buffer_load", "tbuffer_load", "global_load", "image_load", "image_sample", "image_gather")):
+                    # a load in the waterfall body through what the waterfall scalar selects (its descriptor): each
+                    # lane runs it in the pass whose value is its own, so the lane's result is the wave's
+                    own = True
             else:
                 t_src |= X
         elif t_src & ACT_RFL:
@@ -1115,7 +1282,10 @@ class Analysis:
             if ctok is not None:
                 tag = ("cnt", ctok)
         for d in dests:
-            put(d, t_src, tag)
+            if own and d.get("k") in ("vgpr", "vlist"):
+                put(d, t_src & ~WFS)
+            else:
+                put(d, t_src, tag)
         if "scc" in defs:
             T["scc"] = t_src
             st["g"].pop("scc", None)
@@ -1130,20 +1300,49 @@ class Analysis:
             return g[2]
         return None
 
-    def uniform_cmp(self, st, ins, srcs, uses, tj):
+    def active_all_or_none(self, st, op, srcs):
+        """Whether a 64-bit mask op gives every lane of the current EXEC or none, from the lanes' own bits of clean
+        all-or-none values: EXEC AND (or AND NOT) a mask that is all or none of an EXEC this one is inside (UVOTE, or
+        uvote_a of an ancestor token); EXEC or 0 picked by a clean SCC (s_cselect_b64 s[0:1], exec, 0); AND / OR of
+        two such masks of the current EXEC."""
+        def kind(x):
+            if _regs(x) == ["exec"] and not _half(x):
+                return "exec"
+            if x.get("k") == "imm" and x["v"] == 0:
+                return "zero"
+            g = st["g"].get(_regs(x)[0]) if _regs(x) else None
+            if g == UVOTE or (g and g[0] == "uvote_a" and self.ancestor(g[1], st["x"])):
+                return "sub" if not (g and g[0] == "uvote_a" and g[1] == st["x"]) else "same"
+            return None
+        ks = [kind(x) for x in srcs]
+        if None in ks or len(srcs) != 2:
+            return False
+        if op == "s_cselect_b64":
+            return set(ks) <= {"exec", "zero"}
+        if op in ("s_and_b64", "s_or_b64") and set(ks) <= {"same", "zero"}:
+            return True
+        if op == "s_and_b64":
+            return {"exec"} <= set(ks) and set(ks) - {"exec"} <= {"sub", "same"} and ks != ["exec", "exec"]
+        if op == "s_andn2_b64":
+            return ks[0] in ("exec", "same") and ks[1] in ("sub", "same")
+        return False
+
+    def uniform_cmp(self, st, ins, srcs, uses, tj, active=False):
         """Whether a v_cmp writes a wave-uniform lane mask: EXEC is the launch mask and every source is the same in
         every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
         and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
-        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
-        if tj or uses or not st["f"] or not srcs:
+        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one. `active`: the
+        same under any EXEC, with VGPRs the same in every active lane (st["ua"]): every active lane or none."""
+        if tj or uses or not (st["f"] or active) or not srcs:
             return False
+        same = st["ua"] if active else st["u"]
         for x in srcs:
             k = x.get("k")
             if k in ("imm", "fimm"):
                 continue
             if self.rd(st, ins, x) or self.is_mask(ins, x):
                 return False
-            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in same for r in _regs(x))):
                 continue
             return False
         return True
@@ -1163,6 +1362,18 @@ class Analysis:
                     idiom("waterfall")
                 elif g and g[0] == "rank" and sc.get("k") == "vgpr" and vv.get("k") == "imm" and vv["v"] == 0 and                         (T.get(r[0], 0) & ~TAG_BITS) == 0:
                     tag, tj = ("elect", g[1]), ELECT
+            if tag is None and self.compute and not t_src and "_eq_" in op and len(srcs) == 2 and \
+                    op.startswith(("v_cmp_eq_u32", "v_cmp_eq_i32", "v_cmpx_eq_u32", "v_cmpx_eq_i32")):
+                # compute/mesh: D + lane equal to a wave-uniform value holds in one lane of a wave at most (a mesh
+                # shader's v_cmpx_eq_u32 0, v0 picks thread 0): the mask is inside one half
+                for lv, other in ((srcs[0], srcs[1]), (srcs[1], srcs[0])):
+                    if lv.get("k") == "vgpr" and lv.get("n", 1) == 1 and not lv.get("neg") and not lv.get("abs") \
+                            and st["g"].get(("v", lv["r"])) == ("lin",) and not self.is_mask(ins, other) \
+                            and not other.get("neg") and not other.get("abs") and (
+                                other.get("k") in ("imm", "sgpr") or (other.get("k") == "vgpr" and all(
+                                    r[1] in st["u"] for r in _regs(other)))):
+                        tag = ("onehalf",)
+                        break
         return tag, tj
 
     def exec_write(self, n, i, ins, op, a, dests, srcs, st, ev, violation, idiom, t_src):
@@ -1200,6 +1411,13 @@ class Analysis:
                 mt = 0
                 for x in srcregs:
                     mt |= self.rd(st, ins, x)
+            if self.compute and op == "s_mov_b64" and len(a) == 2 and a[1].get("k") == "imm" and \
+                    a[1]["v"] in (-1, 0xFFFFFFFFFFFFFFFF) and self.group and self.group % 64 == 0:
+                # compute/mesh with whole waves: every lane of the wave is a launched invocation, so EXEC = -1 is the
+                # launch mask again (a mesh entry starts with it)
+                st["x"], st["xg"], st["f"] = ("e",), None, True
+                st["ua"] = st["u"]
+                return
             if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))) \
                     and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
@@ -1216,6 +1434,9 @@ class Analysis:
             elif op == "s_andn2_b64" and len(srcs) == 2 and _regs(srcs[0]) == ["exec"]:
                 self.new_exec(site, old, st, True, None, mt, violation, idiom)
             else:
+                if old in self.wide and op in ("s_wqm_b64", "s_or_b64") and any(
+                        _regs(x) == ["exec"] and not _half(x) for x in srcs):
+                    self.wide.add(site)     # whole quads of, or more than, an EXEC that holds the launch lanes
                 st["x"] = site
                 self.tok[site] = (None, None, False)
                 st["xg"], st["f"] = None, False
@@ -1264,6 +1485,8 @@ class Analysis:
             idiom("elected-lane")
         elif mg and mg[0] == "wfmask" and narrowing:
             xg = ("wf", mg[1])
+        elif mg and mg[0] == "onehalf" and narrowing:
+            xg = ("onehalf",)       # EXEC inside one half of the wave (compute/mesh, see oh_regions)
         else:
             bad = mt & ~0
             if bad:
@@ -1288,6 +1511,10 @@ class Analysis:
                 self.bad_branch(ev, ins, op, t)
                 return
             if g and g[0] == "vote":
+                if g[1] != "exec" and (st["g"].get(g[1]) == UVOTE and not T.get(g[1], 0) and (id(ins), g[1]) not in
+                                       self.stale or self.nonempty_vote(n, st["g"].get(g[1]), T.get(g[1], 0),
+                                                                        (id(ins), g[1]) in self.stale)):
+                    return      # SCC of an all-or-none mask: the same in the wave and in each half, no lane vote
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
                 self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None)
             return
@@ -1319,6 +1546,13 @@ class Analysis:
         # another value (a later v_cmp writes no SCC)
         if reg == "vcc" and st is not None and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \
                 and (id(ins), "vcc") not in self.stale:
+            return
+        if reg == "vcc" and st is not None and self.nonempty_vote(n, st["g"].get("vcc"), st["t"].get("vcc", 0),
+                                                                  (id(ins), "vcc") in self.stale):
+            return
+        if n in self.oh_region and self.within_exec(n, reg):
+            # compute/mesh: only the half that holds the one-half EXEC runs this block, on a mask inside EXEC: its
+            # vote is the wave's (oh_regions)
             return
         self.voted[n] = reg
         if n + 1 > self.n:
@@ -1541,43 +1775,135 @@ class Analysis:
             return False
         return False
 
-    # ---- fixpoint ----
-    def run(self, stale):
-        self.stale = stale
-        self.voted = {}
-        entry = [None] * self.n
-        if self.n:
-            entry[0] = self.entry()
-        work = [0] if self.n else []
-        while work:
-            n = work.pop()
-            out = self.block(n, entry[n], None)
-            for s in self.succ[n]:
-                new = out if entry[s] is None else self.join(entry[s], out, s)
-                if entry[s] is None or new != entry[s]:
-                    entry[s] = new
-                    work.append(s)
-        ev = {"viol": [], "idioms": set(), "uniform_readlane": set(), "scalar_spills": set()}
-        self.voted = {}
-        for n in range(self.n):
-            if entry[n] is not None:
-                self.block(n, entry[n], ev)
-        return ev
+    def within_exec(self, n, reg):
+        """Whether the mask a branch ending block `n` votes on is inside EXEC: EXEC itself, or written in block `n` by
+        a compare (VOPC clears the bits of the lanes that are off) or an AND with EXEC, and not written again."""
+        if reg == "exec":
+            return True
+        key = reg if reg == "vcc" else reg
+        for ins in reversed(self.blocks[n][:-1]):
+            op, a = base_op(ins["op"]), ins["args"]
+            dests, srcs, defs, _ = operands(ins)
+            written = [r for d in dests for r in _regs(d)] + [r for r in defs if r != "scc"]
+            if key not in written:
+                continue
+            if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
+                return True
+            if op == "s_and_b64" and any(_regs(x) == ["exec"] and not _half(x) for x in srcs):
+                return True
+            if op == "s_andn2_b64" and srcs and _regs(srcs[0]) == ["exec"] and not _half(srcs[0]):
+                return True
+            return False
+        return False
 
-    # ---- control dependence on wave-wide votes ----
-    def stale_uses(self):
+    def oh_regions(self, entry):
+        """Compute/mesh: the blocks only one half of a wave runs. When EXEC is inside one half (a lane-linear id
+        compared equal to a wave-uniform value: at most one lane per wave) and an s_cbranch_execz skips the region
+        that follows, the other half, whose EXEC is zero, skips it, and the wave (whose active lanes are all in the
+        half that runs it) does the same work in it. The region is what the fall-through reaches before the jump's
+        target, entered only from the branch and left only to that target, and EXEC stays inside the half there."""
+        out = set()
+        if not self.compute:
+            return frozenset()
+        preds = [[] for _ in range(self.n)]
+        for b, ss in enumerate(self.succ):
+            for s_ in ss:
+                preds[s_].append(b)
+        for n in range(self.n):
+            blk = self.blocks[n]
+            if not blk or entry[n] is None or base_op(blk[-1]["op"]) != "s_cbranch_execz" or len(self.succ[n]) != 2:
+                continue
+            if self.block(n, entry[n], None)["xg"] != ("onehalf",):
+                continue
+            skip, first = self.succ[n]
+            region, work = set(), [first]
+            while work:
+                b = work.pop()
+                if b in region or b == skip:
+                    continue
+                if b == n:
+                    region = None
+                    break
+                region.add(b)
+                work.extend(self.succ[b])
+            if not region or preds[first] != [n] or any(p not in region for b in region - {first} for p in preds[b]):
+                continue
+            if any(entry[b] is None or not self.stays_onehalf(b, entry[b]) for b in region):
+                continue
+            out |= region
+        return frozenset(out)
+
+    def nonempty_exec(self, entry):
+        """{exec token: blocks where every half that runs them has an active lane in that EXEC}: the blocks the
+        fall-through of an s_cbranch_execz on it dominates, when that fall-through has no other way in. A half whose
+        EXEC is empty takes the jump. A compare of uniform values made under such an EXEC (or one it is inside) is
+        every active lane or none, so a vote on it is the wave's in every half that gets there."""
+        out = {}
+        preds = [[] for _ in range(self.n)]
+        for b, ss in enumerate(self.succ):
+            for s_ in ss:
+                preds[s_].append(b)
+        dom = None
+        for n in range(self.n):
+            blk = self.blocks[n]
+            if not blk or entry[n] is None or base_op(blk[-1]["op"]) != "s_cbranch_execz" or len(self.succ[n]) != 2:
+                continue
+            first = self.succ[n][1]
+            if preds[first] != [n]:
+                continue
+            if dom is None:
+                dom = self.dominators(preds)
+            tok = self.block(n, entry[n], None)["x"]
+            out.setdefault(tok, set()).update(b for b in range(self.n) if dom[b] >> first & 1)
+        return out
+
+    def dominators(self, preds):
+        full = (1 << self.n) - 1
+        dom = [full] * self.n
+        if self.n:
+            dom[0] = 1
+        changed = True
+        while changed:
+            changed = False
+            for b in range(1, self.n):
+                new = full
+                for p in preds[b]:
+                    new &= dom[p]
+                new = (new if preds[b] else 0) | 1 << b
+                if new != dom[b]:
+                    dom[b], changed = new, True
+        return dom
+
+    def nonempty_vote(self, n, tag, taint, stale):
+        """Whether a vote in block `n` on a mask tagged `tag` is the wave's in every half: a compare of uniform values
+        under an EXEC that is not empty in any half there (uvote_a, nonempty_exec)."""
+        if not tag or tag[0] != "uvote_a" or taint or stale:
+            return False
+        if tag[1] in self.wide:
+            return True             # an EXEC holding every launch lane: not empty in any half that exists
+        return any(n in blocks and self.ancestor(tag[1], tok) for tok, blocks in self.nonempty.items())
+
+    def stays_onehalf(self, b, st):
+        """Whether EXEC is inside one half at the entry of block `b` and after every EXEC write in it."""
+        if st["xg"] != ("onehalf",):
+            return False
+        st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "u": st["u"],
+              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
+        for i, ins in enumerate(self.blocks[b]):
+            self.step(b, i, ins, st, None)
+            if st["xg"] != ("onehalf",):
+                return False
+        return True
+
+    def control(self):
+        """(cd, ctrl): cd[b] = the branch blocks block `b` is control dependent on (post-dominance on the CFG with one
+        exit node), ctrl[b] = whether `b` depends, directly or through other branches, on a wave-wide vote."""
         n = self.n
-        if not n or not self.voted:
-            return set()
         exit_ = n
         succ = [list(s) for s in self.succ] + [[]]
         for b in range(n):
             if not succ[b]:
                 succ[b] = [exit_]
-        pred = [[] for _ in range(n + 1)]
-        for b in range(n + 1):
-            for s in succ[b]:
-                pred[s].append(b)
         full = (1 << (n + 1)) - 1
         pdom = [full] * (n + 1)
         pdom[exit_] = 1 << exit_
@@ -1600,6 +1926,7 @@ class Analysis:
             return None
         ip = {b: ipdom(b) for b in range(n)}
         cd = {b: set() for b in range(n)}           # b -> branch blocks it is control dependent on
+        cd_edge = {b: set() for b in range(n)}      # b -> (branch block, successor) edges it is control dependent on
         for p in range(n):
             if len(succ[p]) < 2:
                 continue
@@ -1607,6 +1934,7 @@ class Analysis:
                 y = s
                 while y is not None and y != ip[p] and y != exit_:
                     cd[y].add(p)
+                    cd_edge[y].add((p, s))
                     y = ip[y]
         ctrl = {b: False for b in range(n)}
         changed = True
@@ -1615,6 +1943,255 @@ class Analysis:
             for b in range(n):
                 if not ctrl[b] and any(p in self.voted or ctrl[p] for p in cd[b]):
                     ctrl[b], changed = True, True
+        # the vote edges (vote block, the successor it takes) each block depends on, directly or through branches
+        self.votes_of = {b: frozenset() for b in range(n)}
+        changed = True
+        while changed:
+            changed = False
+            for b in range(n):
+                new = frozenset(e for e in cd_edge[b] if e[0] in self.voted).union(
+                    *(self.votes_of[p] for p in cd[b]))
+                if new != self.votes_of[b]:
+                    self.votes_of[b], changed = new, True
+        return cd, ctrl
+
+    @staticmethod
+    def mem_access(ins):
+        """(domain, reads, writes, scalar) of a memory instruction: domain "lds" (LDS data, not the cross-lane
+        ds_swizzle / ds_(b)permute) or "mem" (buffer, global, flat and image memory, scalar loads); None otherwise.
+        Scratch is the lane's own and not counted."""
+        op = base_op(ins["op"])
+        if op.startswith("ds_"):
+            if op.startswith(("ds_swizzle", "ds_bpermute", "ds_permute", "ds_nop")):
+                return None
+            if op.startswith(("ds_read", "ds_load")):
+                return ("lds", True, False, False)
+            if op.startswith(("ds_write", "ds_store")):
+                return ("lds", False, True, False)
+            return ("lds", True, True, False)              # atomics, cmpst, wrxchg, mskor, append/consume
+        if op.startswith(("s_load", "s_buffer_load")):
+            return ("mem", True, False, True)
+        if op.startswith(("s_store", "s_buffer_store", "s_atomic", "s_buffer_atomic")):
+            return ("mem", False, True, True)
+        if op.startswith(("buffer_load", "tbuffer_load", "global_load", "flat_load", "image_load", "image_sample",
+                          "image_gather", "image_get", "image_bvh")):
+            return ("mem", True, False, False)
+        if op.startswith(("buffer_store", "tbuffer_store", "global_store", "flat_store", "image_store")):
+            return ("mem", False, True, False)
+        if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic")):
+            return ("mem", True, True, False)
+        return None
+
+    def after_store(self, ins):
+        """Whether a memory write (vector or scalar store or atomic, not LDS or scratch) can run before `ins` with no
+        s_barrier in between (compute and mesh; there is none in the other stages)."""
+        if not hasattr(self, "_after_store"):
+            self._after_store = set()
+            entry = [None] * self.n
+            if self.n:
+                entry[0] = False
+            work = [0] if self.n else []
+
+            def through(b, dirty, record):
+                for x in self.blocks[b]:
+                    if record and dirty:
+                        self._after_store.add(id(x))
+                    if base_op(x["op"]) == "s_barrier" and self.compute:
+                        dirty = False
+                        continue
+                    m = self.mem_access(x)
+                    if m and m[0] == "mem" and m[2]:
+                        dirty = True
+                return dirty
+            while work:
+                b = work.pop()
+                out = through(b, entry[b], False)
+                for s in self.succ[b]:
+                    new = out if entry[s] is None else (entry[s] or out)
+                    if new != entry[s]:
+                        entry[s] = new
+                        work.append(s)
+            for b in range(self.n):
+                if entry[b] is not None:
+                    through(b, entry[b], True)
+        return id(ins) in self._after_store
+
+    def compute_checks(self, ev):
+        """Compute and mesh: what the two halves of a wave, run as two subgroups, must also agree on besides their
+        values (docs/design.md, "Wave64 compute and mesh: partition invariance").
+
+        * Barriers. With no memory write in the program (a mesh shader's exports are not memory) an s_barrier
+          orders nothing the program can observe, and natively it is left out (`drop_barriers`). Otherwise both
+          halves must reach the same s_barriers: none may be in a block a vote decides (vote-barrier; a half whose
+          lanes all voted no skips it, the wave does not), and a mesh shader, which has no barrier rounds, keeps
+          them where every invocation runs (nested-barrier).
+        * Memory order inside the wave. The lanes of a wave run each instruction together, so an LDS write is seen
+          by every later LDS read of the wave without a barrier (the compiler leaves them out in a one-wave group).
+          Two subgroups give no such order: an LDS access after a conflicting one (RAW, WAR, WAW) on a path with no
+          s_barrier between them needs a workgroup barrier right before it (`sync`). That is only possible in a
+          block every invocation runs once (not control dependent on any branch), else lds-in-wave. The same for a
+          scalar load after a vector store (mem-in-wave): every lane reads the one value, whichever lane wrote it.
+          Vector accesses with per-lane addresses, and a store after a scalar load, are taken to touch no word
+          another lane of the wave reads or writes without a barrier between (an assumption, as for ADD_TID_ENABLE;
+          VIctory orders LDS only).
+        * The group size: a group over 32 invocations whose size is not a multiple of 32 could have a partial
+          subgroup in the middle, which breaks the relabelling (group-size)."""
+        viol = ev["viol"]
+        cd, ctrl = self.control()
+        writes = any(m and m[2] for blk in self.blocks for m in map(self.mem_access, blk))
+        group = self.group
+        if group is not None and group > 32 and group % 32:
+            viol.append(("group-size", None, "group"))
+        ev["drop_barriers"] = not writes
+        if writes:
+            for b, blk in enumerate(self.blocks):
+                for ins in blk:
+                    if base_op(ins["op"]) != "s_barrier":
+                        continue
+                    if ctrl[b]:
+                        viol.append(("vote-barrier", ins.get("pc"), "s_barrier"))
+                    elif self.stage == "ms" and cd[b]:
+                        viol.append(("nested-barrier", ins.get("pc"), "s_barrier"))
+        if group is not None and group <= 32:
+            return                                      # one subgroup holds the whole wave: lockstep as on hardware
+        # barrier-free reachability of earlier accesses, per domain; a sync point acts as a barrier for later ones
+        sync = set()
+        for _ in range(4 * self.n + 8):
+            new = self.order_hazards(sync)
+            if new <= sync:
+                break
+            sync |= new
+        for b, blk in enumerate(self.blocks):
+            for ins in blk:
+                if id(ins) in sync and cd[b]:
+                    m = self.mem_access(ins)
+                    viol.append(("lds-in-wave" if m and m[0] == "lds" else "mem-in-wave", ins.get("pc"),
+                                 base_op(ins["op"])))
+        ev["sync"] = sync
+
+    def order_hazards(self, sync):
+        """The accesses (id(ins)) that follow a conflicting access of the other half on a path with no barrier: in
+        LDS any two of which one writes, in memory a scalar load after a write (and anything around a scalar store).
+        `sync` holds accesses a barrier is already put in front of."""
+        empty = frozenset()
+        entry = [None] * self.n
+        if self.n:
+            entry[0] = empty
+        work = [0] if self.n else []
+        hazards = set()
+
+        def through(b, pend, record):
+            for ins in self.blocks[b]:
+                if base_op(ins["op"]) == "s_barrier":
+                    pend = empty
+                    continue
+                m = self.mem_access(ins)
+                if not m:
+                    continue
+                dom, rd, wr, sc = m
+                if dom == "lds":
+                    clash = any(p[0] == "lds" and (wr or p[2]) for p in pend)
+                else:
+                    # a scalar load after a write: every lane reads the one word, whichever lane wrote it; scalar
+                    # stores order against everything
+                    clash = any(p[0] == "mem" and ((sc and rd and p[2]) or (sc and wr) or (p[3] and p[2]))
+                                for p in pend)
+                if id(ins) in sync or clash:
+                    if record and clash:
+                        hazards.add(id(ins))
+                    pend = empty                        # the barrier put in front of it orders LDS and memory
+                pend = pend | {m}
+            return pend
+        while work:
+            b = work.pop()
+            out = through(b, entry[b], False)
+            for s in self.succ[b]:
+                new = out if entry[s] is None else entry[s] | out
+                if new != entry[s]:
+                    entry[s] = new
+                    work.append(s)
+        for b in range(self.n):
+            if entry[b] is not None:
+                through(b, entry[b], True)
+        return hazards
+
+    # ---- fixpoint ----
+    def run(self, stale):
+        self.stale = stale
+        self.voted = {}
+        entry = [None] * self.n
+        if self.n:
+            entry[0] = self.entry()
+        work = [0] if self.n else []
+        while work:
+            n = work.pop()
+            out = self.block(n, entry[n], None)
+            for s in self.succ[n]:
+                new = out if entry[s] is None else self.join(entry[s], out, s)
+                if entry[s] is None or new != entry[s]:
+                    entry[s] = new
+                    work.append(s)
+        self.oh_region = self.oh_regions(entry)
+        self.nonempty = self.nonempty_exec(entry)
+        ev = {"viol": [], "idioms": set(), "uniform_readlane": set(), "scalar_spills": set(), "sync": set(),
+              "drop_barriers": False}
+        self.voted = {}
+        for n in range(self.n):
+            if entry[n] is not None:
+                self.block(n, entry[n], ev)
+        return ev
+
+    def waterfall_remaining(self):
+        """{id(ins): registers} of the waterfall form that keeps the lanes still to do in a mask register: a loop
+        block that starts with v_readfirstlane_b32 s, v and v_cmpx_eq (s, v) (or v_cmp_eq into VCC and
+        s_and_saveexec_b64 of it) and ends with s_andn2_wrexec_b64 m, m and s_cbranch_execnz back to itself, m set to
+        EXEC before it (s_mov_b64 m, exec, or a saveexec's destination). The loop removes each lane once, when the
+        value read is its own, so a lane's bit of m is the same in the wave and in a half at every pass that lane
+        sees; the read of m by the wrexec is not a stale scalar, though m is redefined in the loop a vote closes."""
+        out = {}
+        for b, blk in enumerate(self.blocks):
+            body = [x for x in blk if base_op(x["op"]) not in ("s_nop", "s_waitcnt")]
+            if len(body) < 4 or base_op(body[-1]["op"]) != "s_cbranch_execnz" or self.succ[b][:1] != [b]:
+                continue
+            w, rfl = body[-2], body[0]
+            wa, ra = w["args"], rfl["args"]
+            if base_op(w["op"]) != "s_andn2_wrexec_b64" or len(wa) != 2 or not (_mask64(wa[0]) and wa[0] == wa[1]):
+                continue
+            if base_op(rfl["op"]) != "v_readfirstlane_b32" or len(ra) != 2 or ra[1].get("k") != "vgpr":
+                continue
+            sreg, vreg = _regs(ra[0]), _regs(ra[1])
+            c = body[1]
+            co, ca = base_op(c["op"]), c["args"]
+            pair = lambda xs: {tuple(_regs(x)) for x in xs} == {tuple(sreg), tuple(vreg)}   # noqa: E731
+            if co.startswith("v_cmpx_eq_") and len(ca) == 2 and pair(ca):
+                pass
+            elif co.startswith("v_cmp_eq_") and len(ca) == 3 and pair(ca[1:]) and base_op(body[2]["op"]) == \
+                    "s_and_saveexec_b64" and _regs(body[2]["args"][1]) == _regs(ca[0]):
+                pass
+            else:
+                continue
+            m = tuple(_regs(wa[0]))
+            if any(set(m) & {r for d in operands(x)[0] for r in _regs(d)} for x in body[:-2]):
+                continue                            # m is the wrexec's alone in the loop
+            preds = [p for p in range(self.n) if b in self.succ[p] and p != b]
+            ok = bool(preds)
+            for p in preds:
+                last = next((x for x in reversed(self.blocks[p]) if set(m) & {r for d in operands(x)[0]
+                                                                             for r in _regs(d)}), None)
+                lo, la = (base_op(last["op"]), last["args"]) if last else (None, [])
+                if not (last and ((lo == "s_mov_b64" and len(la) == 2 and _regs(la[1]) == ["exec"]) or
+                                  lo.startswith(SAVEEXEC))):
+                    ok = False
+            if ok:
+                out[id(w)] = set(m)
+        return out
+
+    # ---- control dependence on wave-wide votes ----
+    def stale_uses(self):
+        n = self.n
+        if not n or not self.voted:
+            return set()
+        _, ctrl = self.control()
         if not any(ctrl.values()):
             return set()
         # reaching definitions of the scalar registers
@@ -1665,6 +2242,18 @@ class Analysis:
                         entry[s] = merged
                         work.append(s)
         stale = set()
+        carried = self.waterfall_remaining()
+        loops = frozenset(v for v in self.voted if any(self.reaches(s_, v, -1) for s_ in self.succ[v]))
+        preds = [[] for _ in range(n)]
+        for p_, ss in enumerate(self.succ):
+            for s_ in ss:
+                preds[s_].append(p_)
+        dom = self.dominators(preds)
+
+        def behind(e, b):
+            """Whether every way to block b takes vote edge e = (vote block, successor), a vote that closes no loop."""
+            v, s_ = e
+            return v not in loops and preds[s_] == [v] and dom[b] >> s_ & 1
         for b in range(n):
             if entry[b] is None:
                 continue
@@ -1672,6 +2261,8 @@ class Analysis:
             for i, ins in enumerate(self.blocks[b]):
                 dests, srcs, d2, uses = operands(ins)
                 read = {r for x in srcs for r in sregs(x)} | {r for r in uses if r != "exec"}
+                if id(ins) in carried:
+                    read -= carried[id(ins)]
                 if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic")) or dests and False:
                     read |= {r for x in ins["args"] for r in sregs(x)}
                 if base_op(ins["op"]) == "v_readlane_b32" and len(ins["args"]) == 3 \
@@ -1680,7 +2271,11 @@ class Analysis:
                     read.add(("spill", ins["args"][1]["r"], ins["args"][2]["v"] & 63))
                 for r in read:
                     rd = st.get(r, frozenset({(-1, 0)}))
-                    if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
+                    # stale: a def behind a vote edge the read does not depend on may not have run in one half
+                    # (where a vote that closes no loop went one way for both, every half that reads ran that side's
+                    # code as the wave did; in a loop a vote closes, the halves run different numbers of passes)
+                    if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] and
+                                           not all(behind(e, b) for e in self.votes_of[d[0]]) for d in rd):
                         stale.add((id(ins), r))
                 if base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64") and any(
                         isinstance(r, tuple) and r[0] == "s" and len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd)
@@ -1691,9 +2286,12 @@ class Analysis:
         return stale
 
 
-def analyse(blocks, succ, masks, stage):
-    """Tier of one wave64 VS/PS/GS program (see the module docstring)."""
-    an = Analysis(blocks, succ, masks, stage)
+def analyse(blocks, succ, masks, stage, group=None, lin=()):
+    """Tier of one wave64 program (see the module docstring). VS/PS/GS: `stage` alone. CS/MS also take `group`, the
+    invocations per workgroup, and `lin`, the VGPRs that hold D + lane at entry with D a multiple of 64 (a mesh
+    shader's v5, a compute shader's v0 when the group's x size is a multiple of 64); the result then also has `sync`
+    (id(ins) of the accesses a workgroup barrier goes in front of) and `drop_barriers`."""
+    an = Analysis(blocks, succ, masks, stage, group, lin)
     stale = set()
     ev = an.run(stale)
     for _ in range(3):
@@ -1702,36 +2300,43 @@ def analyse(blocks, succ, masks, stage):
             break
         stale = new
         ev = an.run(stale)
+    if an.compute:
+        an.compute_checks(ev)
     reasons = sorted({c for c, _, _ in ev["viol"]})
     idioms = sorted(ev["idioms"])
-    if any(an.voted):
-        pass
+    if ev["sync"]:
+        idioms = sorted(set(idioms) | {"wave-memory-order"})
     tier = "C" if reasons else ("B" if idioms else "A")
     return {"tier": tier, "reasons": reasons, "idioms": idioms, "uniform_readlane": ev["uniform_readlane"],
-            "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8]}
+            "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8], "sync": ev["sync"],
+            "drop_barriers": ev["drop_barriers"]}
 
 
 # ---- census over a shader index ----
 def census(index):
-    """Counts only: {stage: {tier: n}} and the reason / idiom counts of the wave64 VS/PS/GS entries of an index.json."""
+    """Counts only: {stage: {tier: n}} and the reason / idiom counts of the wave64 entries of an index.json: VS/PS/GS
+    from `wave64_graphics`, CS/MS from `wave64_compute` (written under --wave64-emulate only: a CS/MS without it is
+    left out, not counted as no_analysis)."""
     tiers, reasons, idioms, unmarked = {}, Counter(), Counter(), 0
     for name, m in index.items():
-        if not isinstance(m, dict) or not m.get("wave64") or m.get("stage") not in ("vs", "ps", "gs"):
+        if not isinstance(m, dict) or not m.get("wave64") or m.get("stage") not in ("vs", "ps", "gs", "cs", "ms"):
             continue
-        t = m.get("wave64_graphics")
+        key = "wave64_compute" if m["stage"] in ("cs", "ms") else "wave64_graphics"
+        t = m.get(key)
         if t is None:
-            unmarked += 1
+            unmarked += m["stage"] not in ("cs", "ms")
             continue
         tiers.setdefault(m["stage"], Counter())[t] += 1
-        reasons.update(m.get("wave64_graphics_reasons", []))
-        idioms.update(m.get("wave64_graphics_idioms", []))
+        reasons.update(m.get(key + "_reasons", []))
+        idioms.update(m.get(key + "_idioms", []))
     return {"tiers": {s: dict(sorted(c.items())) for s, c in sorted(tiers.items())},
             "reasons": dict(reasons.most_common()), "idioms": dict(idioms.most_common()), "no_analysis": unmarked}
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Tier census of the wave64 VS/PS/GS shaders of a translator index.json "
-                                             "(counts only, no shader names)")
+    ap = argparse.ArgumentParser(description="Tier census of the wave64 VS/PS/GS (and, translated with "
+                                             "--wave64-emulate, CS/MS) shaders of a translator index.json (counts "
+                                             "only, no shader names)")
     ap.add_argument("--census", required=True, metavar="INDEX_JSON", help="<spirv>/index.json from rdna2spirv.py")
     args = ap.parse_args(argv)
     # One line per bad input, as everywhere else in tools/: an unreadable path, a folder, a file that is not JSON and a
