@@ -70,6 +70,8 @@ inline constexpr std::uint32_t indirect_clamp_max_vertex_instances = 1u << 26;
 // (indirect_clamp_dispatch_limit), which on NVIDIA, for one, is far above Vulkan's guaranteed 65 535 in x.
 inline constexpr std::uint32_t indirect_clamp_max_group_dimension = 65535u;
 inline constexpr std::uint32_t indirect_clamp_max_groups = 1u << 20;
+// The x a dispatch record was cut at before the device's limit applied, which the dispatch counters compare with.
+inline constexpr std::uint32_t indirect_clamp_narrow_groups = 65535u;
 inline constexpr std::uint32_t indirect_clamp_budget = 1u << 27;
 
 // What the pass lets a dispatch record ask for in x, y and z: the device's own maxComputeWorkGroupCount. A fixed
@@ -182,6 +184,12 @@ public:
         std::uint64_t mesh_yz_records = 0;
         std::uint32_t mesh_max_y = 0;
         std::uint32_t mesh_max_z = 0;
+        // Dispatch records after the clamp: all of them, those that run wider than 65 535 groups in x (the old cut),
+        // the widest x that runs, and those cut at the device's own limits.
+        std::uint64_t dispatch_records = 0;
+        std::uint64_t dispatch_wide = 0;
+        std::uint32_t dispatch_widest = 0;
+        std::uint64_t dispatch_cut = 0;
     };
 
     // One submission's clamp state: the counter slots its calls claimed, read and released together once that
@@ -247,7 +255,7 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::uint8_t* host = nullptr;
         std::uint32_t slots = 0;
-        static constexpr std::uint32_t slot_bytes = 64;  // 48 bytes of counters (words 4-7 unused), 16 of padding
+        static constexpr std::uint32_t slot_bytes = 64;  // 16 words of counters (words 4-7 unused)
     };
     static constexpr std::uint32_t slots_per_area = 64;
     // 4,096 slots (128 KiB of host memory): enough for a submission's ExecuteIndirect calls after the load, and the
@@ -280,6 +288,7 @@ private:
     Counters counters_{};
     std::uint64_t next_report_frame_ = 0;
     std::chrono::steady_clock::time_point next_mesh_report_{};
+    std::chrono::steady_clock::time_point next_dispatch_report_{};
 };
 
 namespace detail {
@@ -470,6 +479,10 @@ inline void IndirectArgumentClamp::release(std::vector<Slot>& slots, bool read) 
                 delta.mesh_yz_records += words[9];
                 delta.mesh_max_y = std::max(delta.mesh_max_y, words[10]);
                 delta.mesh_max_z = std::max(delta.mesh_max_z, words[11]);
+                delta.dispatch_wide += words[12];
+                delta.dispatch_widest = std::max(delta.dispatch_widest, words[13]);
+                delta.dispatch_cut += words[14];
+                delta.dispatch_records += words[15];
                 // Clear after reading so a later aborted batch that reuses this slot without submitting never
                 // double-counts a previous submission's counters.
                 std::memset(words, 0, HostArea::slot_bytes);
@@ -484,6 +497,10 @@ inline void IndirectArgumentClamp::release(std::vector<Slot>& slots, bool read) 
         counters_.mesh_yz_records += delta.mesh_yz_records;
         counters_.mesh_max_y = std::max(counters_.mesh_max_y, delta.mesh_max_y);
         counters_.mesh_max_z = std::max(counters_.mesh_max_z, delta.mesh_max_z);
+        counters_.dispatch_records += delta.dispatch_records;
+        counters_.dispatch_wide += delta.dispatch_wide;
+        counters_.dispatch_widest = std::max(counters_.dispatch_widest, delta.dispatch_widest);
+        counters_.dispatch_cut += delta.dispatch_cut;
         // One line every 10 s while mesh records are clamped: does the console's mesh dispatch use y or z?
         const auto now = std::chrono::steady_clock::now();
         if (read && counters_.mesh_records && now >= next_mesh_report_) {
@@ -493,6 +510,18 @@ inline void IndirectArgumentClamp::release(std::vector<Slot>& slots, bool read) 
                          static_cast<unsigned long long>(counters_.mesh_records),
                          static_cast<unsigned long long>(counters_.mesh_yz_records), counters_.mesh_max_y,
                          counters_.mesh_max_z);
+        }
+        // One line every 10 s while dispatch records are clamped: how wide the title's dispatches are, and whether
+        // the device's limits cut any (a device whose x limit is 65 535 still cuts a wider record).
+        if (read && counters_.dispatch_records && now >= next_dispatch_report_) {
+            next_dispatch_report_ = now + std::chrono::seconds(10);
+            std::fprintf(stderr, "[rt] indirect clamp dispatch: %llu records, %llu wider than %u groups in x, widest x %u, "
+                                 "%llu cut at the device's limits (%u x %u x %u)\n",
+                         static_cast<unsigned long long>(counters_.dispatch_records),
+                         static_cast<unsigned long long>(counters_.dispatch_wide), indirect_clamp_narrow_groups,
+                         counters_.dispatch_widest, static_cast<unsigned long long>(counters_.dispatch_cut),
+                         indirect_clamp_dispatch_limit(limits_, 0), indirect_clamp_dispatch_limit(limits_, 1),
+                         indirect_clamp_dispatch_limit(limits_, 2));
         }
         const auto frame = submit_phases::totals().present_serial.load(std::memory_order_relaxed);
         if (read && calls && frame >= next_report_frame_) {
@@ -606,7 +635,8 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
     // The counters start at zero: the budget's compare-and-swap and the record counts accumulate into them. A
     // transfer write, ordered to the compute stage by the barrier below, like the arguments' own writes.
     fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.stats_scratch_offset, job.list_budget == job.stats + 16 ? 20 : 16, 0);
-    fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.stats_scratch_offset + 32, 16, 0);  // mesh words 8-11
+    // Words 8-15: the mesh and dispatch counters.
+    fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.stats_scratch_offset + 32, 32, 0);
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;  // every earlier write: the compute that wrote these arguments
     before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -649,7 +679,7 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
         after_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after_copy, 0, nullptr,
                 0, nullptr);
-        VkBufferCopy copy{job.stats_scratch_offset, job.stats_offset, 12 * sizeof(std::uint32_t)};
+        VkBufferCopy copy{job.stats_scratch_offset, job.stats_offset, 16 * sizeof(std::uint32_t)};
         fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(cb, job.buffer, job.stats_buffer, 1, &copy);
     }
     // The indirect command reads the records, and nothing else may read them while it does.

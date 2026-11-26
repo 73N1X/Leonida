@@ -57,6 +57,7 @@ const uint unfilled_draw = 1u << 23u;         // vertices or indices an instance
 const uint max_vertex_instances = 1u << 26u;  // vertex (or index) count times instance count
 const uint max_mesh_dimension = 65535u;       // groups in a mesh dispatch's x (dispatches: p.max_x, y, z)
 const uint max_groups = 1u << 20u;            // groups in one dispatch or mesh dispatch
+const uint narrow_groups = 65535u;            // the x a dispatch record was cut at before, for the counters
 const uint budget = 1u << 27u;                // work in the whole command list: vertices, indices, or groups * 64
 
 // Charges `cost` units to the batch's budget. Saturating: a record that no longer fits runs empty, so the batch never
@@ -148,6 +149,8 @@ void main() {
         uint y = min(asked_y, limit.y);
         uint z = min(asked_z, limit.z);
         if (p.kind == 3u) { y = 1u; z = 1u; }
+        // A dispatch past the device's limit in some dimension, cut there (stats word 14).
+        const bool past_device = p.kind != 3u && (x != asked_x || y != asked_y || z != asked_z);
         const uint groups = p.flags >> 1u;
         if (groups != 0u && x != 0u && y != 0u && z != 0u) {
             x = min(x, groups);
@@ -158,6 +161,14 @@ void main() {
             x = 0u;
             y = 0u;
             z = 0u;
+        }
+        if (p.kind != 3u) {
+            // Dispatch records (stats words 12-15): those that run wider than 65 535 groups in x, the widest x that
+            // runs, those cut at the device's limits (and still run), and all of them.
+            atomicAdd(p.stats.data[15], 1u);
+            if (x > narrow_groups) atomicAdd(p.stats.data[12], 1u);
+            atomicMax(p.stats.data[13], x);
+            if (past_device && x != 0u) atomicAdd(p.stats.data[14], 1u);
         }
         clamped = x != asked_x || y != asked_y || z != asked_z ? 1u : 0u;
         cost = x * y * z * (p.kind == 3u ? 128u : 64u);
