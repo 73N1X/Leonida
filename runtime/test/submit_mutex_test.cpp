@@ -205,9 +205,11 @@ int gate_wait_limit() {
         std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): wait limit not checked\n");
         return 0;
     }
-    // The default with neither LEONIDA_COMPILE_GATE_WAIT_MS nor the watchdog kick set.
-    if (!std::getenv("LEONIDA_COMPILE_GATE_WAIT_MS") && !std::getenv("LEONIDA_TITLE_WATCHDOG_KICK"))
-        EXPECT(SubmitMutex::default_gate_wait_limit_ms() == SubmitMutex::kDefaultGateWaitMs);
+    // The default with LEONIDA_COMPILE_GATE_WAIT_MS unset, whatever the title watchdog variables say: none with
+    // LEONIDA_COMPILE_GATE=1.
+    const bool always = SubmitMutex::compile_gate_mode() == SubmitMutex::GateMode::always;
+    if (!std::getenv("LEONIDA_COMPILE_GATE_WAIT_MS"))
+        EXPECT(SubmitMutex::default_gate_wait_limit_ms() == (always ? 0 : SubmitMutex::kDefaultGateWaitMs));
     SubmitMutex m;
     m.set_gate_adaptive(false);  // as LEONIDA_COMPILE_GATE=1: it never turns off
     m.set_gate_wait_limit_ms(150);
@@ -293,6 +295,7 @@ int gate_adapts() {
         SubmitMutex m;
         m.set_gate_adaptive(true);
         m.set_gate_wait_limit_ms(100);
+        m.set_gate_probe_budget_ms(0);  // probes at the limit only: gate_probe_budget checks the budget
         std::atomic<bool> in{false}, release{false};
         std::thread create([&] {
             const SubmitMutex::CompileTurn turn(m);
@@ -340,6 +343,7 @@ int gate_adapts() {
         SubmitMutex m;
         m.set_gate_adaptive(true);
         m.set_gate_wait_limit_ms(100);
+        m.set_gate_probe_budget_ms(0);  // probes at the limit only: gate_probe_budget checks the budget
         std::atomic<bool> in{false}, release{false};
         std::thread create([&] {
             const SubmitMutex::CompileTurn turn(m);
@@ -383,12 +387,118 @@ int gate_adapts() {
     return 0;
 }
 
+int gate_probe_budget() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): probe budget not checked\n");
+        return 0;
+    }
+    using Verdict = SubmitMutex::GateVerdict;
+    // The default budget, 0 when the limit is.
+    if (!std::getenv("LEONIDA_COMPILE_GATE_PROBE_MS"))
+        EXPECT(SubmitMutex::default_gate_probe_budget_ms() ==
+               (SubmitMutex::default_gate_wait_limit_ms() ? SubmitMutex::kDefaultProbeBudgetMs : 0));
+    // Short waits add up: with no per-wait limit, a submission goes ahead once the waits of the window reach the budget.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(0);
+        m.set_gate_probe_budget_ms(300);
+        EXPECT(m.gate_probe_budget_ms() == 300);
+        std::atomic<bool> a_in{false};
+        std::thread a([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            a_in = true;
+            std::this_thread::sleep_for(200ms);
+        });
+        const bool a_entered = eventually([&] { return a_in.load(); });
+        std::int64_t first_waited = 0;
+        bool first_ahead = true;
+        {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m);  // waits the create out: under the budget
+            first_waited = now_ms() - start;
+            first_ahead = turn.went_ahead();
+        }
+        a.join();
+        std::atomic<bool> b_in{false}, release{false};
+        std::thread b([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            b_in = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        const bool b_entered = eventually([&] { return b_in.load(); });
+        std::int64_t second_waited = 0;
+        bool second_ahead = false;
+        {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m);  // goes ahead once both waits add up to 300 ms
+            second_waited = now_ms() - start;
+            second_ahead = turn.went_ahead();
+        }
+        const Verdict after_one = m.gate_verdict();
+        release = true;
+        b.join();
+        EXPECT(a_entered && b_entered);
+        EXPECT(!first_ahead && first_waited >= 100);
+        EXPECT(second_ahead && first_waited + second_waited >= 250 && second_waited < 300);
+        EXPECT(after_one == Verdict::pending);  // one quick probe is not enough
+        std::printf("compile gate: waits of %lld and %lld ms reached the 300 ms probe budget, the second went ahead\n",
+                    static_cast<long long>(first_waited), static_cast<long long>(second_waited));
+    }
+    // After a held verdict the budget no longer applies: a submission waits a create out again.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(0);
+        m.set_gate_probe_budget_ms(100);
+        std::atomic<bool> in{false}, release{false};
+        std::thread create([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            in = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        const bool entered = eventually([&] { return in.load(); });
+        bool ahead = false;
+        {
+            const SubmitMutex::SubmitTurn turn(m);  // goes ahead at the budget, then is held 2.1 s
+            ahead = turn.went_ahead();
+            std::this_thread::sleep_for(2100ms);
+        }
+        const Verdict held = m.gate_verdict();
+        std::atomic<bool> short_in{false};
+        std::atomic<std::int64_t> short_left_at{0};
+        std::thread short_create([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            short_in = true;
+            std::this_thread::sleep_for(400ms);
+            short_left_at = now_ms();
+        });
+        const bool short_entered = eventually([&] { return short_in.load(); });
+        std::int64_t entered_at = 0;
+        bool later_ahead = true;
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            entered_at = now_ms();
+            later_ahead = turn.went_ahead();
+        }
+        release = true;
+        create.join();
+        short_create.join();
+        EXPECT(entered && short_entered && ahead);
+        EXPECT(held == Verdict::driver_holds);
+        EXPECT(!later_ahead && entered_at >= short_left_at.load());
+    }
+    std::printf("compile gate: after a held probe a 400 ms create is waited out past the 100 ms budget\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
-        compile_gate() || gate_wait_limit() || gate_adapts())
+        compile_gate() || gate_wait_limit() || gate_adapts() ||
+        gate_probe_budget())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;
