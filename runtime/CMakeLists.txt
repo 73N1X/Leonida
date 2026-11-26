@@ -537,13 +537,22 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       target_link_libraries(${_gi} PRIVATE SDL3::SDL3-static)
     endforeach()
   else()
+    # Without SDL3, the shim ported from VIctory (XInput, a wired DualSense, the keyboard and a keyboard pad) serves
+    # GameInputCreate instead; LEONIDA_GAMEINPUT=host binds the host's GameInput.dll as before.
+    target_sources(gta6rt PRIVATE shims/gameinput_xinput.cpp)
     if(LEONIDA_SDL3)
-      message(STATUS "GameInput shim not built: no installed SDL3 found. Set SDL3_DIR, or pass -DLEONIDA_SDL3_FETCH=ON "
-                     "to download the pinned SDL3 release (see docs/gameinput.md)")
+      message(STATUS "GameInput SDL3 shim not built: no installed SDL3 found, using the XInput shim. Set SDL3_DIR, or "
+                     "pass -DLEONIDA_SDL3_FETCH=ON to download the pinned SDL3 release (see docs/gameinput.md)")
     else()
-      message(STATUS "GameInput shim not built (LEONIDA_SDL3=OFF)")
+      message(STATUS "GameInput SDL3 shim not built (LEONIDA_SDL3=OFF), using the XInput shim")
     endif()
   endif()
+  # The XInput shim over a fake host, built either way: no controller, no game data.
+  add_executable(gameinput_xinput_test test/gameinput_xinput_test.cpp shims/gameinput_xinput.cpp shims/registry.cpp)
+  target_include_directories(gameinput_xinput_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(gameinput_xinput_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gameinput_xinput_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(gameinput_xinput_test PRIVATE /OPT:NOREF)
 
 elseif(NOT WIN32)
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
@@ -1336,6 +1345,9 @@ if(BUILD_TESTING)
     # Built without SDL3: listed as "Not Run (Disabled)" so it is visible that the shim was not tested.
     add_test(NAME gameinput COMMAND ${CMAKE_COMMAND} -E echo "built without SDL3")
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
+  endif()
+  if(WIN32 AND TARGET gameinput_xinput_test)
+    add_test(NAME gameinput_xinput COMMAND gameinput_xinput_test)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
     if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
