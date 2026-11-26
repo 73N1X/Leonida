@@ -1398,6 +1398,76 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
 namespace {
 using namespace rt::fs;
 
+// GetDiskFreeSpace(Ex) and SetCurrentDirectory on a console path (ported from VIctory victory-hle
+// src/modules/files.rs, GPL-3.0-or-later, which binds every path import): the folder behind the path is asked, so
+// "G:\" reports the game folder's volume and "T:\" the overlay's, rather than the host failing on a drive it does not
+// have (or answering for a host drive that happens to have the letter). A null path is the current directory's, the
+// host's answer.
+std::wstring as_directory(const std::filesystem::path& path) {
+    std::wstring dir = path.wstring();
+    if (!dir.empty() && dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+    return dir;
+}
+
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR name, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER total_free) {
+    if (!name) return ::GetDiskFreeSpaceExW(name, available, total, total_free);
+    const Target t = read_target(name);
+    if (t.error) {
+        SetLastError(t.error);
+        return FALSE;
+    }
+    return ::GetDiskFreeSpaceExW(as_directory(t.path).c_str(), available, total, total_free);
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR name, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER total_free) {
+    if (!name) return ::GetDiskFreeSpaceExA(name, available, total, total_free);
+    const std::wstring wide = widen_ansi(name);
+    return get_disk_free_space_ex_w(wide.c_str(), available, total, total_free);
+}
+
+BOOL WINAPI get_disk_free_space_w(LPCWSTR name, LPDWORD sectors_per_cluster, LPDWORD bytes_per_sector,
+                                  LPDWORD free_clusters, LPDWORD clusters) {
+    if (!name) return ::GetDiskFreeSpaceW(name, sectors_per_cluster, bytes_per_sector, free_clusters, clusters);
+    const Target t = read_target(name);
+    if (t.error) {
+        SetLastError(t.error);
+        return FALSE;
+    }
+    return ::GetDiskFreeSpaceW(as_directory(t.path).c_str(), sectors_per_cluster, bytes_per_sector, free_clusters,
+                               clusters);
+}
+
+BOOL WINAPI get_disk_free_space_a(LPCSTR name, LPDWORD sectors_per_cluster, LPDWORD bytes_per_sector,
+                                  LPDWORD free_clusters, LPDWORD clusters) {
+    if (!name) return ::GetDiskFreeSpaceA(name, sectors_per_cluster, bytes_per_sector, free_clusters, clusters);
+    const std::wstring wide = widen_ansi(name);
+    return get_disk_free_space_w(wide.c_str(), sectors_per_cluster, bytes_per_sector, free_clusters, clusters);
+}
+
+BOOL WINAPI set_current_directory_w(LPCWSTR name) {
+    if (!name) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const Target t = read_target(name);
+    if (t.error) {
+        SetLastError(t.error);
+        return FALSE;
+    }
+    return ::SetCurrentDirectoryW(t.path.c_str());
+}
+
+BOOL WINAPI set_current_directory_a(LPCSTR name) {
+    if (!name) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const std::wstring wide = widen_ansi(name);
+    return set_current_directory_w(wide.c_str());
+}
+
 // CreateFile, the FindFirstFile family, the attribute queries and DeleteFile arrive through kernel32/kernelbase
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
 // file-l1-2-0 and file-l2-1-0 for CreateFile).
@@ -1434,7 +1504,15 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "GetDiskFreeSpaceA", reinterpret_cast<void*>(&get_disk_free_space_a)},                     \
+        {dll, "GetDiskFreeSpaceW", reinterpret_cast<void*>(&get_disk_free_space_w)},                     \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)}
+// SetCurrentDirectory is in processenvironment, not the file api sets.
+#define CURRENT_DIRECTORY_API(dll)                                                                       \
+    {dll, "SetCurrentDirectoryA", reinterpret_cast<void*>(&set_current_directory_a)},                    \
+        {dll, "SetCurrentDirectoryW", reinterpret_cast<void*>(&set_current_directory_w)}
 }  // namespace
 
 SHIM_TABLE(file_system,
@@ -1443,4 +1521,8 @@ SHIM_TABLE(file_system,
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
     FILE_API("api-ms-win-core-file-l1-2-0.dll"),
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
+    CURRENT_DIRECTORY_API("kernel32.dll"),
+    CURRENT_DIRECTORY_API("kernelbase.dll"),
+    CURRENT_DIRECTORY_API("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    CURRENT_DIRECTORY_API("api-ms-win-core-processenvironment-l1-2-0.dll"),
 );
