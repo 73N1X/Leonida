@@ -17,7 +17,14 @@
 //   - the buffer's own opaque capture address reads 0: the address comes with the memory;
 //   - imported host memory cannot be bound into a sparse buffer there (a sparse buffer takes memory type 1, the device
 //     heap, only; host pointers import as types 2 and 3), so one sparse 2^40 mirror buffer (docs/port_plan.md, Frame
-//     time) is not possible on this driver;
+//     time) is not possible on this driver. test/vk_sparse_title_memory_test.cpp asks again (2026-11-25): every sparse
+//     buffer, with or without residency, capture replay or VkExternalMemoryBufferCreateInfo for host allocations,
+//     lists type 1 alone, although vkGetPhysicalDeviceExternalBufferProperties calls host allocations importable for a
+//     sparse buffer (features 0x6). Bound anyway (--force-bind, invalid usage: the validation layer reports the memory
+//     type), the pages work: reads, GPU writes the CPU sees, CPU writes the GPU sees, one frame at two VAs, rebinds,
+//     and unbound pages read zero. One vkQueueBindSparse of 16,384 64 KiB pages took 70 ms to idle, 16,384 calls of one
+//     page 1.7 s; a sparse buffer at a capture-replay address may be up to 64 GiB (128 GiB was refused). The AMD
+//     driver (2026.04.17) lists host memory types for sparse buffers but has no bufferDeviceAddressCaptureReplay;
 //   - an import pins its pages (256 MiB never touched: 17.9 ms and +256 MiB of working set) but does not stop the CPU
 //     from decommitting or protecting them: the import keeps the old physical pages, so a range the title frees has to
 //     leave the GPU first (xmem tells the layer, rt::xmem::set_graphics_listener).
@@ -29,6 +36,17 @@
 //   - device addresses go to imports 2 MiB at a time: an import that ends inside a 2 MiB block takes the rest of it,
 //     one that starts inside a block another holds is refused, and from 64 MiB on one must start on a 2 MiB line. The
 //     retail title's 32-bit windows lie side by side on 1 MiB lines, so imports that share a block are merged.
+//
+// Sparse title memory (LEONIDA_TITLE_MEMORY=sparse, opt-in; SparseTitleMemory in shims/d3d12_vulkan_device.cpp,
+// docs/d3d12_vulkan.md section 3.3): sparse buffers over both windows at heap_base + VA, xmem's physical-page pools
+// imported once each (in 256 MiB pieces) and every mapped page a sparse bind of its VA to its pool's import, every
+// unmapped page bound to nothing (it reads zero), the title's other GPU memory imported once per range and bound at its
+// own address. ON NVIDIA THAT BIND IS OUTSIDE THE VULKAN SPEC: the host imports' memory types (2, 3) are not in the
+// sparse buffers' memoryTypeBits (1), which breaks VUID-VkSparseMemoryBind-memory-01096 (the validation layer:
+// "memory has a type index (2) that is not among the allowed types mask (0x2) for this resource"). The driver does it
+// correctly (measured above), so the path runs only after a self-test on the device passes; otherwise the imports
+// below run.
+//
 // So heap_base is fixed at 512 GiB and the arena lies at [heap_base, heap_base + arena size). xmem places the title's
 // 32-bit graphics memory (VIctory xmem.rs:69-88, attribute bit 2) in [1 GiB, 4 GiB), where the descriptor-table
 // pointers the shaders truncate to 32 bits need it (docs/d3d12_vulkan.md, "Descriptor-table high-dword truncation"),

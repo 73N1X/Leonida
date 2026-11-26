@@ -361,9 +361,22 @@ int waits_hold(void* device, std::uint64_t A) {
     return 0;
 }
 
+// As gta6rt connects it (src/main.cpp): with LEONIDA_TITLE_MEMORY=sparse xmem also reports physical pages as such.
 const rt::xmem::GraphicsListener kListener{
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
     [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); }};
+const rt::xmem::GraphicsListener kSparseListener{
+    [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_visible(start, size); },
+    [](std::uintptr_t start, std::size_t size) { rt::d3d12::title_memory_gone(start, size); },
+    [](std::uintptr_t start, std::size_t size, const void* backing) {
+        rt::d3d12::title_memory_mapped(start, size, backing);
+    },
+    [](const void* backing, std::size_t size, bool alive) { rt::d3d12::title_memory_pool(backing, size, alive); }};
+bool sparse_wanted() {
+    char mode[16] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY", mode, sizeof(mode));
+    return n && n < sizeof(mode) && std::strcmp(mode, "sparse") == 0;
+}
 
 int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& container) {
     const auto virtual_alloc = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
@@ -1020,7 +1033,14 @@ int main() {
         return 1;
     }
     rt::d3d12::set_device_outer(inner, static_cast<IUnknown*>(device));
-    rt::xmem::set_graphics_listener(&kListener);
+    // LEONIDA_TITLE_MEMORY=sparse (the ctest entry d3d12_title_memory_sparse): the same checks on sparse title memory,
+    // which must have taken (its self-test passed), or the run is skipped where the driver cannot.
+    if (sparse_wanted() && !rt::d3d12::title_memory_stats(inner).sparse) {
+        std::printf("SKIP: LEONIDA_TITLE_MEMORY=sparse did not take on this GPU (see the title memory line above)\n");
+        static_cast<IUnknown*>(device)->Release();
+        return 77;
+    }
+    rt::xmem::set_graphics_listener(sparse_wanted() ? &kSparseListener : &kListener);
     int failures = run(inner, device, container);
     if (!failures) failures = run_title_allocator(inner, device);
     rt::xmem::set_graphics_listener(nullptr);

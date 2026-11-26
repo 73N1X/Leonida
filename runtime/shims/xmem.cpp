@@ -114,6 +114,45 @@ void make_visible(uintptr_t start, size_t size) {
     if (g_listener && g_listener->visible) g_listener->visible(start, size);
 }
 
+// Physical pages mapped at [start, start + size), whose bytes are [backing, backing + size) of their allocation's own
+// view: visible from now on, announced as mapped when the listener tells physical pages apart (xmem.h), else as visible.
+void make_mapped(uintptr_t start, size_t size, const uint8_t* backing) {
+    if (!size) return;
+    const std::lock_guard lock(g_graphics_mutex);
+    if (!g_listener || !g_listener->mapped) {
+        make_visible(start, size);
+        return;
+    }
+    // Only the parts no visible range holds yet (a remap announces gone first, so normally all of it).
+    uintptr_t at = start;
+    const uintptr_t end = start + size;
+    auto it = g_visible.upper_bound(start);
+    if (it != g_visible.begin() && std::prev(it)->first + std::prev(it)->second > start) --it;
+    std::vector<std::pair<uintptr_t, size_t>> gaps;
+    for (; it != g_visible.end() && it->first < end; ++it) {
+        if (it->first > at) gaps.emplace_back(at, it->first - at);
+        at = (std::max)(at, it->first + it->second);
+    }
+    if (at < end) gaps.emplace_back(at, end - at);
+    for (const auto& [a, n] : gaps) {
+        g_visible.emplace(a, n);
+        g_listener->mapped(a, n, backing + (a - start));
+    }
+}
+
+// The live physical-page allocations: each one's own view of its section and its bytes (xmem.h, `pool`).
+std::map<const void*, size_t> g_pools;
+
+void note_pool(const void* backing, size_t size, bool alive) {
+    if (!backing || !size) return;
+    const std::lock_guard lock(g_graphics_mutex);
+    if (alive)
+        g_pools[backing] = size;
+    else
+        g_pools.erase(backing);
+    if (g_listener && g_listener->pool) g_listener->pool(backing, size, alive);
+}
+
 // The committed run of [start, start + size): what a commit of it left committed (all of it, normally).
 void make_committed_visible(uintptr_t start, size_t size) {
     uintptr_t at = start;
@@ -498,10 +537,15 @@ struct Window {
 struct Section {
     HANDLE handle;
     void* scratch;
-    explicit Section(HANDLE h) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)) {}
+    size_t bytes;
+    Section(HANDLE h, size_t size) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)), bytes(size) {
+        note_pool(scratch, bytes, true);
+    }
     Section(const Section&) = delete;
     Section& operator=(const Section&) = delete;
     ~Section() {
+        // The listener lets go of the view first: it may have imported it (xmem.h, `pool`).
+        note_pool(scratch, bytes, false);
         if (scratch) UnmapViewOfFile(scratch);
         CloseHandle(handle);
     }
@@ -915,7 +959,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         *page_count = 0;
         return FALSE;
     }
-    const auto section = std::make_shared<Section>(handle);
+    const auto section = std::make_shared<Section>(handle, static_cast<size_t>(bytes));
     if (!section->scratch) {
         *page_count = 0;
         return FALSE;
@@ -968,13 +1012,17 @@ public:
     PageRuns& operator=(const PageRuns&) = delete;
     ~PageRuns() { flush(); }
     void add(uintptr_t page) {
-        if (size_ && page == start_ + size_) {
+        const uint8_t* backing = nullptr;
+        if (const auto it = g_mapped.find(page); it != g_mapped.end() && it->second.section->scratch)
+            backing = static_cast<const uint8_t*>(it->second.section->scratch) + it->second.offset;
+        if (size_ && page == start_ + size_ && (backing_ ? backing == backing_ + size_ : !backing)) {
             size_ += kPhysicalPageSize;
             return;
         }
         flush();
         start_ = page;
         size_ = kPhysicalPageSize;
+        backing_ = backing;
     }
     void flush() {
         if (!size_) return;
@@ -994,13 +1042,19 @@ public:
                 if (commit_mapped_page(at, at, protect) == PageCommit::failed) committed = false;
             }
         }
-        if (committed) make_visible(start_, size_);
+        if (committed) {
+            if (backing_)
+                make_mapped(start_, size_, backing_);
+            else
+                make_visible(start_, size_);
+        }
         size_ = 0;
     }
 
 private:
     uintptr_t start_ = 0;
     size_t size_ = 0;
+    const uint8_t* backing_ = nullptr;  // the first page's bytes in its allocation's own view
 };
 
 // PVOID XMemMapPhysicalPages(PVOID address, UINT64 pageCount, UINT64* pageArray). Measured at twelve call sites: RCX
@@ -1284,10 +1338,25 @@ bool map_alias(std::uint64_t to, std::uint64_t from, std::uint64_t len) {
 }
 
 void set_graphics_listener(const GraphicsListener* listener) {
+    const std::lock_guard phys(g_phys_mutex);  // the map calls' order: g_phys_mutex, then g_graphics_mutex
     const std::lock_guard lock(g_graphics_mutex);
     g_listener = listener;
-    if (listener && listener->visible)
-        for (const auto& [start, size] : g_visible) listener->visible(start, size);
+    if (!listener) return;
+    if (listener->pool)
+        for (const auto& [backing, size] : g_pools) listener->pool(backing, size, true);
+    for (const auto& [start, size] : g_visible) {
+        // A listener that tells physical pages apart gets those as mapped, page by page; the rest as visible.
+        uintptr_t run = start;
+        for (uintptr_t at = start; at < start + size; at += kPhysicalPageSize) {
+            const auto it = listener->mapped ? g_mapped.find(at) : g_mapped.end();
+            if (it == g_mapped.end() || !it->second.section->scratch) continue;
+            if (run < at && listener->visible) listener->visible(run, at - run);
+            listener->mapped(at, kPhysicalPageSize,
+                             static_cast<const uint8_t*>(it->second.section->scratch) + it->second.offset);
+            run = at + kPhysicalPageSize;
+        }
+        if (run < start + size && listener->visible) listener->visible(run, start + size - run);
+    }
 }
 
 std::size_t graphics_visible_bytes(std::size_t* ranges) {

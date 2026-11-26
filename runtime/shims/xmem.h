@@ -27,10 +27,19 @@ bool commit_physical_pages(const std::uint64_t* page_array, std::size_t count);
 // into windows (committed when mapped). The listener, the D3D12 layer, imports each range as it becomes visible and
 // releases it from the GPU before the title frees, decommits, unmaps or remaps it: `gone` is called first, the pages
 // change after it returns. Both run under xmem's own lock, so a listener must not call back into xmem. Setting a
-// listener replays every visible range to it; null detaches.
+// listener replays every visible range, live pool and mapped page to it; null detaches.
+//
+// Physical pages can be told apart, for a listener that maps GPU addresses to physical pages itself (the D3D12 layer's
+// sparse title memory): with `pool` set, every XMemAllocatePhysicalPages allocation is announced with the CPU view of
+// all its pages, `backing` (one section, mapped once, that holds every page of the allocation), and again with `alive`
+// false just before that view goes (when the last of its pages is freed and unmapped). With `mapped` set, physical
+// pages mapped into a window come as mapped(start, size, backing) instead of visible: [start, start + size) now shows
+// the pool bytes [backing, backing + size). `gone` comes first for an unmap or remap, as for any visible range.
 struct GraphicsListener {
     void (*visible)(std::uintptr_t start, std::size_t size);
     void (*gone)(std::uintptr_t start, std::size_t size);
+    void (*mapped)(std::uintptr_t start, std::size_t size, const void* backing) = nullptr;
+    void (*pool)(const void* backing, std::size_t size, bool alive) = nullptr;
 };
 void set_graphics_listener(const GraphicsListener* listener);
 

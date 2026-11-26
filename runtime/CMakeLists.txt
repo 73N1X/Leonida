@@ -1603,6 +1603,30 @@ if(TARGET Vulkan::Headers)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    # Sparse title memory (src/title_memory.h): imported host pages bound into a sparse buffer at heap_base + VA,
+    # read, written, rebound and unbound from a compute shader. 77 where the driver cannot bind host memory sparsely.
+    set(LEONIDA_TEST_CS_SPARSE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_sparse_title_memory.spv)
+    add_custom_command(
+      OUTPUT ${LEONIDA_TEST_CS_SPARSE}
+      COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SPARSE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sparse_title_memory.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sparse_title_memory.comp
+      COMMENT "Compiling cs_sparse_title_memory.comp"
+      VERBATIM)
+    add_executable(vk_sparse_title_memory_test test/vk_sparse_title_memory_test.cpp ${LEONIDA_TEST_CS_SPARSE})
+    target_link_libraries(vk_sparse_title_memory_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(vk_sparse_title_memory_test PRIVATE
+                               LEONIDA_TEST_CS_SPARSE_SPV="${LEONIDA_TEST_CS_SPARSE}")
+    if(WIN32)
+      target_compile_definitions(vk_sparse_title_memory_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+      if(MSVC)
+        target_compile_options(vk_sparse_title_memory_test PRIVATE /W4 /permissive- /utf-8)
+      endif()
+    endif()
+    if(BUILD_TESTING)
+      add_test(NAME vk_sparse_title_memory COMMAND vk_sparse_title_memory_test)
+      set_tests_properties(vk_sparse_title_memory PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
     target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
@@ -2863,6 +2887,11 @@ if(TARGET Vulkan::Headers)
       target_link_options(d3d12_title_memory_test PRIVATE /OPT:NOREF)
       add_test(NAME d3d12_title_memory COMMAND d3d12_title_memory_test)
       set_tests_properties(d3d12_title_memory PROPERTIES SKIP_RETURN_CODE 77)
+      # The same on sparse title memory (SparseTitleMemory: sparse buffers over the title windows, pages bound into
+      # them); 77 where its self-test does not pass.
+      add_test(NAME d3d12_title_memory_sparse COMMAND d3d12_title_memory_test)
+      set_tests_properties(d3d12_title_memory_sparse PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_TITLE_MEMORY=sparse")
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
       add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
