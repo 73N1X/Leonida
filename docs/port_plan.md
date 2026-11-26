@@ -49,19 +49,23 @@ Boot, in order:
 | 5 | Device 78-81 frame clock (`frame.rs:1-130`) | VIctory's clock per device (S_FALSE time-outs, token on time-out, flips on consecutive ticks); `XboxPresentation` takes its tokens and does not pace (`use_device_frame_clock`) |
 | 5a | Display mode (`dxgi.rs:222-279`, output slot 21; upstream `apps/victory/src/native_1440p.rs`) | `L\shims\xbox_display.cpp`: the console adapter and output report `LEONIDA_DISPLAY_MODE` (default 3840x2160), which the title reads but does not size by; `L\src\display_profile.h` patches the executable's SDR mode, scanout reservation, scene scale and Settings viewport for `2560x1440` (and `LEONIDA_RENDER_SCALE`): 2560x1440 window and back buffers, measured (`docs/runtime_imports.md`). VIctory's FSR 4K presets (`fsr_preset.rs`, `fidelityfx.rs`) are not ported |
 | 6 | Lists from device slot 12 get the console layout (`list.rs:566`) | console list proxies (also as the console's List5/List6 IIDs); device 25/26/108 take the return buffer first; device 48 takes the console queue description |
-| 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | 139 → PC Reset, 80 → Dispatch, 86 → CopyResource; on title memory (`L\src\title_memory.h`): 62 → copies between the imports, 71/72 → WriteBufferImmediate (MARKER_OUT; timestamps are the CPU clock at recording), 100 → DispatchMesh(x, 1, 1) (indirect dropped, as V does), 148 → the device's imported upload blocks, given back at reset; 73/74 recorded and waited for at ExecuteX up to `LEONIDA_VALUE_WAIT_MS` (100), not held as V holds them |
+| 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | 139 → PC Reset, 80 → Dispatch, 86 → CopyResource; on title memory (`L\src\title_memory.h`): 62 → copies between the imports, 71/72 → WriteBufferImmediate (MARKER_OUT; flag 1 a timestamp query the GPU writes when it gets there, flag 2 the performance counter once the submission has run), 100 → DispatchMesh(x, 1, 1) (indirect dropped, as V does), 148 → the device's imported upload blocks, given back at reset; 73/74 cut the list as V's `cut` does (`L\src\vulkan_backend.h`, `execute_parts`): the queue runs the parts in order and holds each at its wait until the value is in memory (a 250 µs poller while one is held; PresentX forces them; `LEONIDA_VALUE_HOLD_MS`, default 1000, bounds a hold) |
 | 8 | Queries at slots 28-30 (`list.rs:2114-2117,1330-1345`) | → PC 52-54; 59 is the console marker (ignored); 27, 31, 56-58 and 60 are named by no source and refused |
 | 9 | ~60,000 PSOs in the first 20 s; device 86 CreatePipelineState with streams (`pipeline.rs:6-11`) | every PSO compiled at creation (`d3d12_vulkan_device.cpp:3948,4061`), slot 86 E_NOTIMPL; the title's 30 s watchdog fires |
 
-Menus and movies: sampler stride 16, views 32 (`descriptor.rs:1-7`; Leonida
-uses 32 for all, `L\shims\d3d12_com.h:418`); device 61 CreateSamplerX; device
-70/71 views over title memory (`descriptor.rs:795-807`, `resource.rs:2383-2450`);
-textures the title writes, detiled from title memory (`texture.rs`); vertex,
+Menus and movies: sampler stride 16, views 32 (`descriptor.rs:1-7`; done:
+`L\shims\d3d12_com.h`, `descriptor_increment`); device 61 CreateSamplerX (done:
+the S# from the console description's hardware fields); device 70/71 views over
+title memory (`descriptor.rs:795-807`, `resource.rs:2383-2450`; done, every mip
+and slice detiled with the console's layout, `L\src\gfx10_tiling.h`
+`ConsoleTexture`, from `victory-formats` `texture.rs`); textures the title
+writes after the first view (open: a view keeps its first copy); vertex,
 index, constant and root views at title addresses outside any resource
 (`shadow.rs:230-247`); rectangle lists via a geometry shader (`primitive.rs`).
 
 World: page pools (device 74/75, queue 31 CopyPageMappingsBatchX,
-`resource.rs:2190-2230`, `queue.rs:897-948`); mesh draws (list 129/100,
+`resource.rs:2190-2230`, `queue.rs:897-948`; done: `rt::xmem::map_alias`,
+the imports follow the remap); mesh draws (list 129/100,
 indirect mesh dispatch, depth bounds); ExecuteIndirect with count buffers and
 argument clamps (`indirect.rs`); GPU memory placement between 4 GiB and 2^40
 (`VH\xmem.rs:73-87`).

@@ -186,6 +186,21 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   2560x1440 (`LEONIDA_RENDER_SCALE=0.75` renders 1080p into it). Other sizes
   are refused (1920x1080 still gave 2560x1440 buffers). Its frame-time effect
   is not measured yet: the title stops before its first frame.
+- Console D3D12 slots ported from VIctory on `port/d3d12-slots2` (Vulkan
+  device; tests `xs_proxy_mock_test`, `d3d12_sampler2_test`,
+  `gfx10_tiling_test` and `d3d12_title_memory_test` pass on the RTX 4060 Ti):
+  device 61 CreateSamplerX writes the S# from the console's sampler
+  description, and sampler heaps are 16 bytes a slot (views 32); list 73/74
+  WaitValue cut the list and the queue holds the rest until the value is in
+  memory (another queue's Write32/64, a fence's value word, or the CPU), a
+  present forcing what is held; queue 31 CopyPageMappingsBatchX maps
+  page-pool pages through xmem (`map_alias`), the title-memory imports
+  following the remap; queue 23/24 SuspendX/ResumeX are accepted; device
+  70/71 textures are detiled whole (mips, tails, slices, 3D; linear, S and D
+  modes, SW_64KB_R_X); Write64's GPU timestamp is a timestamp query the GPU
+  writes when it gets there, the system timestamp the performance counter
+  once the submission has run. The real title cannot exercise them yet: it
+  stops at its render-target pool check before its first frame.
 - The title asks the device for three interfaces it does not know
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them

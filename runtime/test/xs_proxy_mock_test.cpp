@@ -1859,10 +1859,34 @@ int check_value_waits() {
     EXPECT(g_wait_seen.calls == 1);
     xs::set_list_title_handlers(nullptr);
 
+    // Write64 with flag 2, the system timestamp (V queue.rs:697-731): QueryPerformanceCounter once the submission has
+    // run. The queue signals a fence of its own (made on the real device) behind the submission and stores the counter
+    // when it completes; a reset forgets the list's stamps.
+    EXPECT(hr_of(raw(list, 10, word(allocator), 0)) == S_OK);
+    volatile std::uint64_t stamp = 0, untouched = 0;
+    raw(list, 72, word(&stamp), 0, 0, 2);
+    LARGE_INTEGER qpc_before{};
+    QueryPerformanceCounter(&qpc_before);
+    const unsigned fences = mock->calls[36];
+    raw(queue, 35, 1, word(lists), 0, 0);
+    EXPECT(mock->calls[36] == fences + 1);  // the queue's own fence
+    const ULONGLONG until = GetTickCount64() + 5000;
+    while (!stamp && GetTickCount64() < until) Sleep(1);
+    LARGE_INTEGER qpc_after{};
+    QueryPerformanceCounter(&qpc_after);
+    EXPECT(stamp >= std::uint64_t(qpc_before.QuadPart) && stamp <= std::uint64_t(qpc_after.QuadPart));
+    EXPECT(hr_of(raw(list, 10, word(allocator), 0)) == S_OK);
+    raw(list, 72, word(&untouched), 0, 0, 2);
+    EXPECT(hr_of(raw(list, 10, word(allocator), 0)) == S_OK);
+    raw(queue, 35, 1, word(lists), 0, 0);
+    Sleep(20);
+    EXPECT(untouched == 0 && mock->calls[36] == fences + 1);  // reset: no stamps, and the fence is made once
+
     EXPECT(release(list) == 0 && release(allocator) == 0 && release(queue) == 0 && release(device) == 0 &&
            mock->refs == 0);
     std::printf("%s: list slots 73/74: a device that holds waits in the list gets them (ExecuteX does not stand at "
-                "them, PresentX forces them); without one ExecuteX checks them\n", g_label);
+                "them, PresentX forces them); without one ExecuteX checks them; slot 72 flag 2 stores the performance "
+                "counter once the submission has run\n", g_label);
     return 0;
 }
 

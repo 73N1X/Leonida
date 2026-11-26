@@ -7958,6 +7958,14 @@ public:
     // From the destructor, with the GPU idle: everything title memory holds, then the device leaves the registry.
     void release_title_memory() {
         {
+            std::lock_guard lock(stamp_mutex_);
+            for (QueryHeap*& heap : stamp_heaps_)
+                if (heap) {
+                    heap->Release();
+                    heap = nullptr;
+                }
+        }
+        {
             std::lock_guard lock(placed_mutex_);
             for (auto& [key, texture] : placed_textures_)
                 if (texture) texture->Release();
@@ -8211,9 +8219,12 @@ public:
     }
 
     // Xbox list slots 71/72, Write32/Write64 (V list.rs:1964-1983): the value at `address` once the list's earlier work
-    // has finished, as WriteBufferImmediate's MARKER_OUT mode writes it; 64 bits as two words. Flags 1 and 2 (the
-    // 64-bit form) ask for the GPU and the system timestamp: written here as the CPU's clock when the list is recorded,
-    // in the queue's timestamp ticks for 1 (VIctory writes both when the list has run).
+    // has finished, as WriteBufferImmediate's MARKER_OUT mode writes it; 64 bits as two words. Flag 1 (the 64-bit form)
+    // asks for the GPU timestamp, which the GPU writes when it gets there (VIctory writes it when the list has run,
+    // queue.rs:697-731): a timestamp query at the bottom of the pipe resolved into the address (write_gpu_timestamp),
+    // in the queue's timestamp ticks (GetTimestampFrequency, GetClockCalibration). Flag 2, the system timestamp, is the
+    // proxy's (rt::d3d12_xs: QueryPerformanceCounter once the submission has run). Where neither can be done (an
+    // address not 8-byte aligned, no timestamp queries) the CPU's clock at recording is written, logged.
     bool write_value(ID3D12GraphicsCommandList* list, std::uint64_t address, std::uint64_t value, unsigned bytes,
                      std::uint32_t flags) {
         if (address % 4) return false;
@@ -8222,6 +8233,7 @@ public:
         leonida::ResourceId id = 0;
         std::uint64_t offset = 0;
         if (!state_.context->resource_at(address, room, id, offset) || room < bytes) return false;
+        if (bytes == 8 && flags == 1 && offset % 8 == 0 && write_gpu_timestamp(list, id, offset)) return true;
         if (bytes == 8 && (flags == 1 || flags == 2)) {
             LARGE_INTEGER now{}, frequency{};
             QueryPerformanceCounter(&now);
@@ -8240,6 +8252,41 @@ public:
                                                     D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
         list2->WriteBufferImmediate(bytes == 8 ? 2 : 1, words, modes);
         list2->Release();
+        return true;
+    }
+
+    // A timestamp query of the device's own heap (one for copy lists, which take COPY_QUEUE_TIMESTAMP heaps, one for the
+    // others), ended where the list is and resolved into buffer `id` at `offset`: the GPU writes its clock there when
+    // it reaches it. The heap's queries are used in turn, so one is used again 65,536 timestamps later; the resolve
+    // that read it is taken to have run by then (a list kept unexecuted across that many timestamps would read the
+    // later one's value).
+    static constexpr UINT kStampQueries = 65536;
+    bool write_gpu_timestamp(ID3D12GraphicsCommandList* list, leonida::ResourceId id, std::uint64_t offset) {
+        const bool copy = list->GetType() == D3D12_COMMAND_LIST_TYPE_COPY;
+        QueryHeap* heap = nullptr;
+        {
+            std::lock_guard lock(stamp_mutex_);
+            QueryHeap*& made = stamp_heaps_[copy ? 1 : 0];
+            if (!made && !stamp_refused_[copy ? 1 : 0]) {
+                auto* fresh = new QueryHeap(state_);
+                const D3D12_QUERY_HEAP_DESC desc{copy ? D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+                                                      : D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                                                 kStampQueries, 0};
+                if (FAILED(fresh->create(desc))) {
+                    fresh->Release();
+                    stamp_refused_[copy ? 1 : 0] = true;
+                    log_once("Write64 GPU timestamps: no timestamp queries; the CPU clock at recording is written; copy",
+                             int(copy));
+                } else {
+                    made = fresh;  // the device holds it (no reference back to the device)
+                }
+            }
+            heap = made;
+        }
+        if (!heap) return false;
+        const UINT index = stamp_next_.fetch_add(1, std::memory_order_relaxed) % kStampQueries;
+        list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+        list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, index, 1, reinterpret_cast<ID3D12Resource*>(id), offset);
         return true;
     }
 
@@ -10043,6 +10090,11 @@ private:
     std::vector<UploadBlock> upload_free_;
     std::vector<std::pair<std::uint8_t*, std::uint64_t>> upload_blocks_;  // every block, for the destructor
     std::unique_ptr<MemoryWaitPoller> memory_poller_;  // start_memory_waits
+    // Write64's GPU timestamps (write_gpu_timestamp): direct/compute and copy heaps, released with the title memory.
+    std::mutex stamp_mutex_;
+    QueryHeap* stamp_heaps_[2] = {};
+    bool stamp_refused_[2] = {};
+    std::atomic<UINT> stamp_next_{0};
 };
 
 }  // namespace

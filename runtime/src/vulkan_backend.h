@@ -2086,6 +2086,10 @@ public:
             std::vector<MemoryWait> waits;  // stand before the lists
             std::vector<CommandList> lists;
         };
+        for (const CommandList* list : lists) {  // what prepare() refuses for the whole list, refused before it is cut
+            if (!list->closed()) return ReplayResult::list_open;
+            if (list->queries_open()) return ReplayResult::invalid_query;
+        }
         std::vector<Part> parts(1);
         for (const CommandList* list : lists) {
             const auto commands = list->commands();

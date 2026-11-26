@@ -712,6 +712,9 @@ struct ChildProxy {
     ChildProxy* word_prev;
     ChildProxy* word_next;
     bool word_listed;
+    // A console queue's own fence for Write64's system timestamps (queue_system_stamps), made on first use.
+    std::atomic<ID3D12Fence*> stamp_fence;
+    std::atomic<std::uint64_t> stamp_value;
 };
 
 template <ChildKind K>
@@ -916,6 +919,7 @@ void unlist_fence_word(ChildProxy* fence) {
 // Frees a proxy whose last reference is gone, with the real object and the device reference it held.
 void destroy_child(ChildProxy* self) {
     unlist_fence_word(self);
+    if (ID3D12Fence* stamps = self->stamp_fence.exchange(nullptr)) stamps->Release();
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     delete self;
@@ -1060,6 +1064,7 @@ struct ListProxy {
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
     std::vector<ValueWait> waits;       // slots 73/74 since the last reset, for the queue's ExecuteX
+    std::vector<std::uint64_t> system_stamps;  // slot 72 with flag 2 since the last reset: written after ExecuteX
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -1257,9 +1262,20 @@ std::uint64_t list_title_method(ListProxy* self, std::uint64_t a1, std::uint64_t
     } else if constexpr (M == ListMethod::write32 || M == ListMethod::write64) {
         // V list.rs:1964-1983: (address, value, flush, flags), done when the list has run.
         if (!a1) return 0;
+        const auto flags = M == ListMethod::write64 ? static_cast<std::uint32_t>(a4) : 0u;
+        if constexpr (M == ListMethod::write64) {
+            if (flags == 2) {
+                // V queue.rs:697-731 (Written::SystemTimestamp): the CPU's performance counter when the list has run;
+                // the queue writes it after the submission (queue_system_stamps).
+                try {
+                    self->system_stamps.push_back(a1);
+                } catch (const std::bad_alloc&) {
+                }
+                return 0;
+            }
+        }
         if (!h || !h->write_value) return not_done("no device handler");
         const std::uint64_t value = M == ListMethod::write32 ? (a2 & 0xffffffffu) : a2;
-        const auto flags = M == ListMethod::write64 ? static_cast<std::uint32_t>(a4) : 0u;
         if (!h->write_value(device, self->real, a1, value, M == ListMethod::write32 ? 4 : 8, flags))
             not_done("the address is not GPU memory");
         return 0;
@@ -1366,6 +1382,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 a1 = unwrap_object(a1);
                 self->pin_cursor_at_limit();
                 self->waits.clear();
+                self->system_stamps.clear();
                 release_list_uploads(self, self->device);
             } else if constexpr (entry.method == ListMethod::heaps) {  // SetDescriptorHeaps(count, heaps)
                 if (!heaps.fill(a2, a1)) return 0;
@@ -1651,6 +1668,95 @@ HRESULT queue_copy_page_mappings(std::uint64_t count_word, std::uint64_t batches
     return S_OK;
 }
 
+// Write64 with flag 2, the system timestamp (V queue.rs:697-731, Written::SystemTimestamp: QueryPerformanceCounter,
+// stored when the list has run). After an ExecuteX whose lists asked for some, the queue signals a fence of its own
+// behind the submission, and when the real fence gets there a thread-pool wait stores the counter at each address
+// (in place: title memory is host memory; an address that is not writable is skipped). Like VIctory's, the time is when
+// the whole submission has run, not when the GPU reached the write.
+struct StampJob {
+    std::vector<std::uint64_t> addresses;
+    HANDLE event = nullptr;
+    ID3D12Fence* fence = nullptr;
+};
+
+VOID CALLBACK system_stamps_due(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT wait, TP_WAIT_RESULT) {
+    std::unique_ptr<StampJob> job(static_cast<StampJob*>(context));
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    for (const std::uint64_t address : job->addresses)
+        WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), &now.QuadPart, sizeof(now.QuadPart),
+                           nullptr);
+    CloseHandle(job->event);
+    job->fence->Release();
+    CloseThreadpoolWait(wait);
+}
+
+void queue_system_stamps(ChildProxy* self, std::uint64_t lists, std::uint64_t count) {
+    if (!lists || !self->device) return;
+    std::vector<std::uint64_t> addresses;
+    const auto* objects = reinterpret_cast<void* const*>(lists);
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(count); ++i) {
+        void* const object = objects[i];
+        if (!object || *reinterpret_cast<void* const*>(object) != reinterpret_cast<void*>(get_list_vtable())) continue;
+        const auto& stamps = static_cast<const ListProxy*>(object)->system_stamps;
+        try {
+            addresses.insert(addresses.end(), stamps.begin(), stamps.end());
+        } catch (const std::bad_alloc&) {
+            return;
+        }
+    }
+    if (addresses.empty()) return;
+    const auto refuse = [](const char* why) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: Write64 system timestamps: %s; they are written now (logged once)\n",
+                         why);
+    };
+    const auto write_now = [&] {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        for (const std::uint64_t address : addresses)
+            WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), &now.QuadPart,
+                               sizeof(now.QuadPart), nullptr);
+    };
+    ID3D12Fence* fence = self->stamp_fence.load(std::memory_order_acquire);
+    if (!fence) {
+        ID3D12Fence* made = nullptr;
+        if (FAILED(self->device->real->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&made))) || !made) {
+            refuse("no fence for the queue");
+            return write_now();
+        }
+        ID3D12Fence* expected = nullptr;
+        if (self->stamp_fence.compare_exchange_strong(expected, made, std::memory_order_acq_rel)) {
+            fence = made;
+        } else {
+            made->Release();
+            fence = expected;
+        }
+    }
+    const std::uint64_t value = self->stamp_value.fetch_add(1, std::memory_order_relaxed) + 1;
+    using SignalFn = HRESULT(WINAPI*)(void*, ID3D12Fence*, UINT64);
+    std::unique_ptr<StampJob> job(new (std::nothrow) StampJob);  // nothing may throw out of a thunk
+    if (!job) {
+        refuse("out of memory");
+        return write_now();
+    }
+    job->addresses = std::move(addresses);
+    job->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    PTP_WAIT wait = job->event ? CreateThreadpoolWait(&system_stamps_due, job.get(), nullptr) : nullptr;
+    if (!wait || FAILED(reinterpret_cast<SignalFn>(self->real_vtable[kQueueSignal])(self->real, fence, value)) ||
+        FAILED(fence->SetEventOnCompletion(value, job->event))) {
+        if (wait) CloseThreadpoolWait(wait);
+        if (job->event) CloseHandle(job->event);
+        refuse("the queue's fence could not be signalled or waited for");
+        addresses = std::move(job->addresses);
+        return write_now();
+    }
+    fence->AddRef();
+    job->fence = fence;
+    SetThreadpoolWait(wait, job.release()->event, nullptr);
+}
+
 // GetDesc into `out`: the PC method (this, hidden return pointer), which returns the pointer.
 std::uint64_t queue_get_desc(ChildProxy* self, std::uint64_t out) {
     using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t);
@@ -1696,6 +1802,7 @@ std::uint64_t console_queue_call(ChildProxy* self, std::uint64_t a1, std::uint64
             using Fn = void(WINAPI*)(void*, UINT, std::uint64_t);
             reinterpret_cast<Fn>(self->real_vtable[entry.pc])(self->real, static_cast<UINT>(a1),
                                                               lists.data() ? lists.data() : a2);
+            queue_system_stamps(self, a2, a1);
             return 0;
         } else if constexpr (entry.method == QueueMethod::signal) {
             // Signal(fence, value) and Signal2X(fence, value, bottom, top): the sync settings are not used
@@ -1893,6 +2000,8 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     proxy->value_word.store(0, std::memory_order_relaxed);
     proxy->word_prev = proxy->word_next = nullptr;
     proxy->word_listed = false;
+    proxy->stamp_fence.store(nullptr, std::memory_order_relaxed);
+    proxy->stamp_value.store(0, std::memory_order_relaxed);
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
 
     const HRESULT hr = child_query_interface<K>(proxy, riid, out);

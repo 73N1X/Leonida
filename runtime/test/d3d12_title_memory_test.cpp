@@ -8,9 +8,15 @@
 //     reads the title's bytes through it and writes them into title memory through a root UAV at a title address,
 //     which the CPU reads back with no copy;
 //   - device slot 70 makes a texture from title memory, detiled from SW_64KB_D, whose image reads back as the
-//     linear texels;
+//     linear texels; and whole textures in the console's layout (a SW_4KB_S 2D array with a mip tail, a SW_64KB_D
+//     BC1 chain, a thick 3D chain), every subresource;
 //   - console list slots 62 (CopyMemoryToMemoryX), 71/72 (Write32/Write64), 73 (WaitValue32, recorded) and 148
 //     (AllocateUploadMemory) on title addresses;
+//   - list slots 73/74 hold the rest of their list until the value is in memory: a later submission's Write32 on
+//     another queue, a fence's value word after a Signal, or PresentX forcing it; Write64's GPU timestamp (written
+//     when the GPU gets there) and system timestamp (when the submission has run);
+//   - queue slot 31 (CopyPageMappingsBatchX) maps page-pool pages into another window, where the CPU and the GPU
+//     read them;
 //   - device slot 133 on mapped xmem physical pages: the buffer is bound to their import, at heap_base + its address;
 //   - the title's VirtualFree takes the imports off the GPU first.
 // 77 when the GPU has no bufferDeviceAddressCaptureReplay or VK_EXT_external_memory_host (title memory off). No game
@@ -267,12 +273,43 @@ int waits_hold(void* device, std::uint64_t A) {
     EXPECT(within(5000, [&] { return v[5] == 0x44 && completed(done) == 3; }));
     std::printf("title memory: a wait nothing met ran on at the next PresentX\n");
 
+    // 5. Write64 timestamps: flag 1 the GPU's clock when the GPU gets there (a timestamp query resolved into the
+    //    address), flag 2 QueryPerformanceCounter once the submission has run. Both are later than a calibration
+    //    taken after the list was recorded and before it was executed.
+    {
+        auto* const stamps = reinterpret_cast<volatile std::uint64_t*>(A + 0x3C0040);
+        stamps[0] = stamps[1] = 0;
+        call(graphics.list, 72, A + 0x3C0040, 0, 0, 1);  // GPU timestamp
+        call(graphics.list, 72, A + 0x3C0048, 0, 0, 2);  // system timestamp
+        call(graphics.list, 72, A + 0x3C0050, 0x1122334455667788ull, 0, 0);  // a plain value beside them
+        EXPECT(hr_from(call(graphics.list, 9)) == S_OK);
+        Sleep(30);
+        ID3D12CommandQueue* const real = rt::d3d12_xs::queue_proxy_real_queue(graphics.queue);
+        UINT64 gpu0 = 0, cpu0 = 0, gpu1 = 0, cpu1 = 0;
+        EXPECT(SUCCEEDED(real->GetClockCalibration(&gpu0, &cpu0)));
+        void* lists[] = {graphics.list};
+        call(graphics.queue, 35, 1, word(lists), 0, 0);
+        EXPECT(hr_from(call(graphics.list, 10, word(graphics.allocator), 0)) == S_OK);
+        EXPECT(call(graphics.queue, 16, word(done), 5) == S_OK);
+        EXPECT(within(5000, [&] { return completed(done) == 5 && stamps[1] != 0; }));
+        EXPECT(SUCCEEDED(real->GetClockCalibration(&gpu1, &cpu1)));
+        std::printf("title memory: GPU timestamp %llu in [%llu, %llu], system timestamp %llu in [%llu, %llu]\n",
+                    static_cast<unsigned long long>(stamps[0]), static_cast<unsigned long long>(gpu0),
+                    static_cast<unsigned long long>(gpu1), static_cast<unsigned long long>(stamps[1]),
+                    static_cast<unsigned long long>(cpu0), static_cast<unsigned long long>(cpu1));
+        EXPECT(stamps[0] >= gpu0 && stamps[0] <= gpu1);
+        EXPECT(stamps[1] >= cpu0 && stamps[1] <= cpu1);
+        EXPECT(stamps[2] == 0x1122334455667788ull);
+        std::printf("title memory: Write64 timestamps are written when the GPU gets there (flag 1) and when the "
+                    "submission has run (flag 2)\n");
+    }
+
     // 4. A wait whose value is there already holds nothing; one of a list without waits after it is not cut.
     call(compute.list, 73, A + 0x3C0004, 3, 0x11);
     call(compute.list, 71, A + 0x3C0018, 0x55, 0, 0);
     EXPECT(compute.execute());
-    EXPECT(call(compute.queue, 16, word(done), 4) == S_OK);
-    EXPECT(within(5000, [&] { return v[6] == 0x55 && completed(done) == 4; }));
+    EXPECT(call(compute.queue, 16, word(done), 6) == S_OK);
+    EXPECT(within(5000, [&] { return v[6] == 0x55 && completed(done) == 6; }));
     static_cast<IUnknown*>(gate)->Release();
     static_cast<IUnknown*>(done)->Release();
     return 0;
