@@ -146,6 +146,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/bcrypt_rng.cpp
     shims/registry_oem.cpp
     shims/dstorage_xs.cpp
+    shims/media_foundation.cpp
   )
   # leonida_bcpack_decode comes from gta6rt_bcpack (src/bcpack.cpp), linked below. Never add
   # src/bcpack_decode_stub.cpp here: an object file wins over the library, so the stub would silently replace the
@@ -547,6 +548,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       message(STATUS "GameInput SDL3 shim not built (LEONIDA_SDL3=OFF), using the XInput shim")
     endif()
   endif()
+  # mfplat.dll's source resolver proxy: the URL rule and a fake host resolver. No network, no Media Foundation.
+  add_executable(media_foundation_test test/media_foundation_test.cpp shims/media_foundation.cpp shims/registry.cpp
+    shims/file_system.cpp)
+  target_include_directories(media_foundation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(media_foundation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(media_foundation_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(media_foundation_test PRIVATE /OPT:NOREF)
+
   # The XInput shim over a fake host, built either way: no controller, no game data.
   add_executable(gameinput_xinput_test test/gameinput_xinput_test.cpp shims/gameinput_xinput.cpp shims/registry.cpp)
   target_include_directories(gameinput_xinput_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -1348,6 +1357,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET gameinput_xinput_test)
     add_test(NAME gameinput_xinput COMMAND gameinput_xinput_test)
+  endif()
+  if(WIN32 AND TARGET media_foundation_test)
+    add_test(NAME media_foundation COMMAND media_foundation_test)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
     if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
