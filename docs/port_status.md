@@ -345,10 +345,31 @@ Ti): a dark background, the selector arrows, a panel with the A-button glyph and
   `LEONIDA_FRAME_STATS` (d3d12_com.cpp, d3d12_vulkan_device.cpp).
 - Soft asserts are stepped over with `LEONIDA_SKIP_INT3=1` (game+0x4ffd879 after the first press).
 
+## The title's own pipelines, 2026-11-26
+
+The start screen now draws entirely through the title's console pipelines, with its text and button prompts, at 30
+fps, and no diagonal line. What it took (docs/fspx.md, "Graphics pipelines"):
+
+- Console device slot 57, refused until now (16k+ calls a boot), is the title's graphics pipeline deserializer:
+  decoded into a D3D12 description from its gfx10 register state (`ffe22b181`, `5f61a7ab8`), vertex or mesh stage,
+  formats taken from each draw's targets, rectangle lists through the generated stage.
+- The console vertex-buffer table in user SGPRs s0/s1 and the base vertex in s2 (`5f61a7ab8`): without them every
+  console vertex program fetched through address 0 and the frame was black.
+- Constant-buffer views are 16-byte-record V#s (`9ad7277af`, `port/ui-text`): the diagonal line and the missing
+  batched text were one bug.
+- The captured stages translate offline (`make_game.py`'s shaders stage): console stages end at their last
+  `s_endpgm`, and a listing `llvm-mc` cannot decode (SGPR tuples into VCC) comes from `tools/rdna2_decode.py`.
+- The placed-texture refresh moved off the present thread; a zlib stream longer than its DirectStorage destination
+  gives its first bytes.
+
+Still open from this: `FText` labels sample a glyph alpha of 0 (the batched text draws); culling is off for console
+pipelines until `LEONIDA_CONSOLE_CULL=1` is checked on screen; the world past the start screen.
+
 ## Open items, in order
 
-1. GPU device loss: sparse title memory (`port/sparse-title-memory`).
-2. Translate the captured FSPX programs (a title run, then the shaders stage).
+1. The world past the start screen: translate what each run captures (console stages, compute programs), then look
+   at what draws.
+2. GPU device loss: sparse title memory (`port/sparse-title-memory`).
 3. The 8,192+ slot-86 stream PSOs refused before the depth-bounds fix: recount by reason (`79df04da4`). Not
    tessellation: the corpus has no hull, domain or amplification shaders (tools/feature_scan.py, question 10).
 4. A8_UNORM render targets: done as R8 attachments with the alpha splatted (`src/spirv_output_splat.h`); check them

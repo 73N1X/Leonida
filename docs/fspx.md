@@ -307,12 +307,43 @@ draw binds (`leonida::GraphicsPipeline::formats_from_targets`). Each stage goes 
 `LEONIDA_CONSOLE_CULL=1`, until the +0x84 reading is confirmed on screen; `LEONIDA_CONSOLE_PIPELINES=0` refuses the
 calls as before.
 
+**Mesh pipelines.** Past the start screen most descriptions have no vertex stage: the pair at +0x68/+0x78 is a mesh
+stage, an NGG program in mesh mode (wave64, `MSG_GS_ALLOC_REQ`, `exp prim`, the group index read as `v5 >> 7` on lane
+0, as the game's own FSSM mesh shaders). Its kind 0 is 0x1d0 to 0x1e8 bytes and holds the same register block 0x54
+bytes further on (census of 300): `CB_BLEND0..7_CONTROL` at +0x124 (per target here, up to 3 targets),
+`DB_DEPTH_CONTROL` at +0x10c (reverse-Z `GEQUAL` mostly), `DB_STENCIL_CONTROL` +0x110, `DB_STENCILREFMASK` +0x114,
+the +0x84 word at +0xd8, `SPI_SHADER_COL_FORMAT` at +0x148 and `CB_TARGET_MASK` at +0x120 (`0x551` with `0x11f` for
+three targets; the vertex variant's +0xcc is 0 in 179 of 400 pipelines that export colour, read as "all"). The proxy
+creates these through the PC stream method with an MS subobject. `fspx_unpack.py` gives an `ms` stage a PSV0 of 128
+threads, 128 vertices and 128 primitives (triangles), what all 9,282 of the game's FSSM mesh shaders declare, and
+8 KiB of group-shared memory.
+
+**The driver's user SGPRs.** The console graphics root layout keeps root arguments from `s8`; `s0..s3` are the
+driver's. A console vertex program reads its vertex buffers through a table of 16-byte V#s whose address is in
+`s[0:1]` (`s_load_dwordx4 s[8:11], s[0:1]` after masking the high word to 8 bits) and adds the draw's base vertex
+from `s2` to the zero-based vertex id (`v_add_nc_u32 v0, s2, v0`). The command list builds that table from the bound
+vertex-buffer views in title memory it owns until reset (the memory of the Xbox list's `AllocateUploadMemory`) and
+passes `s2` = the base vertex (a non-indexed draw's start vertex) and `s3` = the first instance. Without it every
+console vertex program fetched through address 0, and the start screen was black.
+
+**Topology.** A console pipeline carries none. Its rectangle-list draws (topology 17; the start screen's final
+composite is one) take a variant with the generated rectangle stage (`src/rect_list_gs.h`), built beside the plain
+stages when the device has the geometry stage.
+
 **Captured stages.** A stage with no translation is saved once as `<kind-6 sha256>-<stage>.fspx` in the capture
 folder. `make_game.py`'s `shaders` stage unpacks those (`tools/fspx_unpack.py --only graphics`, which keeps kind 0
 as words and writes a container with the signatures the translator reads: empty for the vertex stage, the
-`SV_Position` components a pixel program reads for the pixel stage) into `<work>/shaders/console-captured` and
-translates them into `<work>/shaders/spirv/console-captured`, which the shader library loads. A trial on 40 of them
-translated 39, all passing `spirv-val`.
+`SV_Position` components a pixel program reads for the pixel stage, a PSV0 for the mesh stage) into
+`<work>/shaders/console-captured` and translates them into `<work>/shaders/spirv/console-captured`, which the shader
+library loads. A graphics or mesh listing runs to the program's last `s_endpgm`: these programs end early on some
+paths, and stopping at the first left 939 stages with "branch target outside code".
+
+**Decoding.** The title's programs, compute and graphics, load SGPR tuples that run past `s105` into VCC
+(`s_load_dwordx8 s[100:107]`, encoding `0xf40c190f`). The hardware does that; `llvm-mc` refuses the tuple as invalid
+and then decodes off the instruction boundaries, printing exports with invalid targets in compute code, so the
+translator stopped at "fall-through into undecodable words" (16 of the first 20 failed captured compute programs).
+`fspx_unpack.py --python-fallback`, which `make_game.py` passes for both captured sets, takes
+`tools/rdna2_decode.py`'s listing when `llvm-mc` reports invalid words and ours fewer (all 20 decode with none).
 
 ## Unknown
 
