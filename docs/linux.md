@@ -1,6 +1,6 @@
 # Leonida on Linux (D3D12 runtime)
 
-Leonida's D3D12 runtime is the VIctory build under `victory/` (since `bafb0e25b`, trustno1-coder/VIctory-NVIDIA). It is a
+Leonida's D3D12 runtime lives under `d3d12/`, grown from the VIctory runtime (since `bafb0e25b`, trustno1-coder/VIctory-NVIDIA). It is a
 Windows program, so on Linux it runs under Wine. Its Direct3D 12 comes from **VKD3D-Proton**, which translates D3D12
 to Vulkan. VKD3D-Proton ships inside the Linux package, so players download nothing else for D3D12.
 
@@ -14,7 +14,7 @@ to Vulkan. VKD3D-Proton ships inside the Linux package, so players download noth
 
 | Path | What |
 | --- | --- |
-| `leonida.exe` | The Windows build of `victory/` (Leonida's D3D12 runtime) (`cargo build --profile diag -p victory --features diagnostics`) |
+| `leonida.exe` | The Windows build of `d3d12/` (Leonida's D3D12 runtime) (`cargo build --profile diag -p leonida --features diagnostics`) |
 | `play-linux.sh` | `scripts/play-linux.sh`: the launcher |
 | `vkd3d-proton/d3d12.dll`, `d3d12core.dll` | VKD3D-Proton 3.1, 64-bit, unmodified |
 | `vkd3d-proton/LICENSE`, `COPYING`, `SOURCE.txt` | Its LGPL-2.1 text, notice, and where its source is |
@@ -38,9 +38,9 @@ It needs Python 3.14 or newer, for `compression.zstd`. `dist/` is not committed.
   on the first run. No other prefix is touched.
 - **D3D12:** it copies the bundled `d3d12.dll` and `d3d12core.dll` into that prefix's `system32` when they are
   missing or changed, and sets `WINEDLLOVERRIDES=d3d12,d3d12core=n` so Wine uses them.
-- **Game files:** it points `VICTORY_GAME_DIR` at the game's folder. Caches and saves go to
+- **Game files:** it points `LEONIDA_GAME_DIR` at the game's folder. Caches and saves go to
   `~/.local/share/leonida/{cache,data}`.
-- **Settings:** it uses the measured NVIDIA settings of `scripts/play-nvidia.ps1` as defaults; any `VICTORY_*` you set
+- **Settings:** it uses the measured NVIDIA settings of `scripts/play-nvidia.ps1` as defaults; any `LEONIDA_*` you set
   wins.
 - **Start:** it runs `wine leonida.exe run <exe> --execute --console series-s`, or `series-x` with `--series-x`.
 
