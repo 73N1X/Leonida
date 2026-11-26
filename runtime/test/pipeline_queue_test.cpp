@@ -120,6 +120,7 @@ int budget() {
     EXPECT(builder.wait(*slow) && slow->ready());  // no frame yet: as long as it takes
 
     begin_frame();
+    set_loading_allowance(0s);  // the frame budget alone
     set_wait_budget(60ms);
     builder.hold(true);
     const auto held = job(order, mutex, 7);
@@ -164,6 +165,14 @@ int budget_cap() {
     EXPECT(wait_budget_from_env(kMaxWaitMs) == kMaxWaitMs);
     EXPECT(wait_budget_from_env(600000) == kMaxWaitMs);
     EXPECT(kMaxWaitMs * 2 < 30000);
+    // The loading allowance (VIctory make.rs:213-219): a short frame budget grows to 4 s (graphics) or 12 s (compute)
+    // while the run's allowance lasts, and back to the budget once it is spent.
+    EXPECT(frame_budget(500ms, false, 120s, 0s) == 4s);
+    EXPECT(frame_budget(500ms, true, 120s, 0s) == 12s);
+    EXPECT(frame_budget(500ms, true, 120s, 115s) == 5s);
+    EXPECT(frame_budget(500ms, true, 120s, 120s) == 500ms);
+    EXPECT(frame_budget(12s, false, 120s, 0s) == 12s);
+    EXPECT(frame_budget(500ms, false, 0s, 0s) == 500ms);
     return 0;
 }
 

@@ -13,8 +13,8 @@
 //     compute), a window of waiting time the binding threads share (FrameWait), never for a pipeline the driver has
 //     held for long (held_too_long). A draw or dispatch whose pipeline is not made then is dropped and counted
 //     (pipeline.rs `note_drop`), and the counts are logged once a second.
-// Not ported: VIctory's loading allowance (make.rs:193-223, waits of up to 4 s / 12 s per frame while a world loads)
-// and its 12 s default; the budget here is VIctory's earlier 500 ms (LEONIDA_PIPELINE_WAIT_MS).
+// Also as there: its 12 s default budget per frame and kind (LEONIDA_PIPELINE_WAIT_MS) and its loading allowance
+// (make.rs:193-223, waits of up to 4 s / 12 s per frame while a world loads, LEONIDA_PIPELINE_GATE_S).
 // Leonida's own rule: on a device of no title (the PC interface, the tests) a bind waits for its pipeline however long
 // it takes until the console frame clock begins a frame (device slot 80, frame.rs:120-184), so nothing is dropped
 // there: D3D12 has a PSO usable once it is created. The title's device is bounded from its creation (title_running).
@@ -91,7 +91,16 @@ inline Sharing sharing_from(const char* value) {
     return Sharing::window;
 }
 
-inline constexpr std::int64_t kDefaultWaitMs = 500;
+// VIctory's default (make.rs:170-182, decision 0007): the picture before frame rate. A frame waits for pipelines still
+// being made rather than drop their draws and dispatches, up to 12 s for each kind, the threads together; both kinds'
+// windows one after the other stay under the title's 30 s hang watchdog (kMaxWaitMs). Until 2026-11-26 this was
+// 500 ms, and the world load dropped the passes the title dispatches once (VIctory: walls, floors and faces missing).
+inline constexpr std::int64_t kDefaultWaitMs = 12000;
+
+// While a world loads (make.rs:184-223): a frame whose budget is shorter may still wait up to 4 s for a graphics and
+// 12 s for a compute pipeline, until LEONIDA_PIPELINE_GATE_S (120) seconds of such waiting are spent for that kind.
+inline constexpr std::int64_t kLoadingFrameMs = 4000;
+inline constexpr std::int64_t kLoadingFrameComputeMs = 12000;
 
 inline long long env_number(const char* name, long long fallback) {
     char text[32] = {};
@@ -111,10 +120,11 @@ inline long long env_number(const char* name, long long fallback) {
 // The most LEONIDA_PIPELINE_WAIT_MS may ask for. The title's hang watchdog (a thread that wakes once a second) ends the
 // process when the main loop has not stamped its progress for 30 checks in a row: a deliberate write to address 0,
 // which the runtime's log shows as an access violation writing 0x0. Both waits of a frame (graphics and compute) and
-// the frame's own work must fit in that, so each stays under a third of it. Measured: a run with the budget at 600 s
+// the frame's own work must fit in that, so the two together stay under 24 s (VIctory's bound, make.rs:183-187). Measured: a run with the budget at 600 s
 // stopped drawing at 180 s (its frames waited on pipelines made on 4 threads, one of them 10.3 s) and the title wrote
 // to 0 at 211 s.
-inline constexpr std::int64_t kMaxWaitMs = 10000;
+inline constexpr std::int64_t kMaxWaitMs = 12000;
+static_assert(2 * kMaxWaitMs < 30000 && kLoadingFrameComputeMs <= kMaxWaitMs);
 
 // The budget the variable asks for, kept under kMaxWaitMs.
 inline std::int64_t wait_budget_from_env(std::int64_t asked) {
@@ -211,6 +221,27 @@ struct FrameWait {
 inline bool held_too_long(Clock::duration held, bool compute, Clock::duration base) {
     const Clock::duration most = std::chrono::seconds(compute ? 10 : 3);
     return base < most && held > most;
+}
+
+// LEONIDA_PIPELINE_GATE_S (120): the most a run waits past the frame budget for each kind while a world loads, all
+// frames together (make.rs:198-211); 0 waits as the budget alone.
+// Read once; set_loading_allowance overrides it (tests that measure the frame budget alone set 0).
+inline std::atomic<std::int64_t>& loading_allowance_s() {
+    static std::atomic<std::int64_t> seconds{env_number("LEONIDA_PIPELINE_GATE_S", 120)};
+    return seconds;
+}
+inline Clock::duration loading_allowance() {
+    return std::chrono::seconds(loading_allowance_s().load(std::memory_order_relaxed));
+}
+inline void set_loading_allowance(std::chrono::seconds total) { loading_allowance_s().store(total.count()); }
+
+// A frame's budget for a pipeline of one kind (make.rs:213-219): the frame budget, or while the run's allowance for
+// that kind lasts (`spent` of it gone) up to kLoadingFrameMs or kLoadingFrameComputeMs.
+inline Clock::duration frame_budget(Clock::duration base, bool compute, Clock::duration allowance,
+                                    Clock::duration spent) {
+    const Clock::duration loading = std::chrono::milliseconds(compute ? kLoadingFrameComputeMs : kLoadingFrameMs);
+    const Clock::duration rest = std::max(Clock::duration::zero(), allowance - spent);
+    return std::max(base, std::min(loading, rest));
 }
 
 // ---- A pipeline to make ----------------------------------------------------------------------------------------
@@ -550,11 +581,13 @@ public:
         const Clock::duration base = wait_budget();
         if (base <= Clock::duration::zero() || held_too_long(job.held(), job.compute(), base)) return job.ready();
         const Sharing sharing = shared_budget();
-        FrameWait& frame_wait = frames_[job.compute() ? 1 : 0];
+        const int kind = job.compute() ? 1 : 0;
+        FrameWait& frame_wait = frames_[kind];
         Clock::duration left;
         {
             std::lock_guard lock(frames_mutex_);
-            left = frame_wait.begin(sharing, frame, base, started);
+            const Clock::duration budget = frame_budget(base, kind == 1, loading_allowance(), loading_spent_[kind]);
+            left = frame_wait.begin(sharing, frame, budget, started);
         }
         if (left <= Clock::duration::zero()) return job.ready();
         {
@@ -572,6 +605,8 @@ public:
         {
             std::lock_guard lock(frames_mutex_);
             frame_wait.end(sharing, frame, left, waited, ended);
+            // What the frame budget alone would not have allowed counts against the loading allowance.
+            if (waited > base) loading_spent_[kind] += waited - base;
         }
         add_wait(waited);
         return job.ready();
@@ -708,6 +743,7 @@ private:
     std::atomic<std::uint64_t> made_{0}, refused_{0}, started_early_{0}, waited_us_{0};
     std::mutex frames_mutex_;
     FrameWait frames_[2];  // graphics, compute
+    Clock::duration loading_spent_[2]{};  // waiting past the frame budget, per kind (loading_allowance)
 };
 
 }  // namespace leonida::pipelines

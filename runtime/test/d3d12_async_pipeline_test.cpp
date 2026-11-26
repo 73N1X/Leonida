@@ -322,6 +322,7 @@ int main() {
     // 2. Frames run: many PSOs at once, all dropped while they are being made, all drawn once made.
     constexpr int kMany = 192;
     pipelines::begin_frame();
+    pipelines::set_loading_allowance(std::chrono::seconds(0));  // the frame budget alone
     pipelines::set_wait_budget(40ms);
     pipelines::Builder::get().hold(true);
     std::vector<Ref<ID3D12PipelineState>> many(kMany);

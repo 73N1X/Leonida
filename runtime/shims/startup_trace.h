@@ -21,7 +21,9 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <set>
+#include <vector>
 
 #include <atomic>
 #include <cerrno>
@@ -163,6 +165,56 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// Every other thread's stack, once: each thread is suspended only for as long as GetThreadContext takes (nothing is
+// allocated while one is held, so no lock a suspended thread holds is waited on), and the stacks are walked after
+// all are running again. For the title's hang watchdog (a deliberate write to address 0 when the main loop has not
+// stamped its progress for 30 s, docs/port_status.md): the thread that stalls is one of these, not the one that
+// faults. Written to the trace and to stderr.
+inline void dump_threads(const char* why) {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) return;
+    constexpr std::size_t kMax = 512;
+    std::vector<DWORD> ids;
+    ids.reserve(kMax);
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok && ids.size() < kMax; ok = Thread32Next(snap, &te))
+        if (te.th32OwnerProcessID == pid && te.th32ThreadID != self) ids.push_back(te.th32ThreadID);
+    CloseHandle(snap);
+    std::vector<CONTEXT> contexts(ids.size());
+    std::vector<bool> have(ids.size(), false);
+    std::vector<std::string> names(ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                                    FALSE, ids[i]);
+        if (!t) continue;
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(t, &description)) && description) {
+            names[i] = utf8_from_wide(description, static_cast<int>(wcslen(description)));
+            LocalFree(description);
+        }
+        contexts[i].ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (SuspendThread(t) != DWORD(-1)) {
+            have[i] = GetThreadContext(t, &contexts[i]) != 0;
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    std::fprintf(stderr, "[rt] threads at %s (%zu):\n", why, ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (!have[i]) continue;
+        const std::string stack = stack_from(contexts[i]);
+        event("thread_stack", "\"thread\":" + std::to_string(ids[i]) + ",\"name\":" + quote(names[i]) +
+                                  ",\"stack\":" + stack);
+        std::fprintf(stderr, "[rt]   thread %lu %s %s\n", static_cast<unsigned long>(ids[i]), names[i].c_str(),
+                     stack.c_str());
+    }
+    std::fflush(stderr);
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
@@ -198,6 +250,11 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
+            // A write to address 0: nothing in the runtime commits page 0, so this is a fatal (the title's watchdog
+            // ends a run this way); where every other thread stands says which one stalled.
+            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
+                r.ExceptionInformation[0] == 1 && r.ExceptionInformation[1] == 0)
+                dump_threads(where(reinterpret_cast<uint64_t>(r.ExceptionAddress)).c_str());
         }
     } catch (...) {
         // Out of memory while formatting: drop the event rather than disturb the process.
