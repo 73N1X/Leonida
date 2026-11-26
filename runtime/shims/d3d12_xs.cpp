@@ -19,6 +19,7 @@
 #include "d3d12_com.h"
 #include "xbox_display.h"
 #include "xbox_window.h"
+#include "../src/pipeline_queue.h"
 #endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -186,6 +187,10 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         if (rt::d3d12_xs::device_proxy_console_layout(*out)) {
             rt::d3d12_xs::set_device_adapter_provider(*out, &rt::d3d12::console_adapter_provider);
             rt::d3d12::attach_title_presentation(*out);
+            // Pipelines (src/pipeline_queue.h): a bind's wait is bounded from now on, before the frame clock's first
+            // frame too (VIctory's frame 0); the translator's index is read while the title sets up.
+            leonida::pipelines::title_running().store(true, std::memory_order_relaxed);
+            rt::d3d12::prefetch_shader_library(vulkan);
         }
         if (!tracing)
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,

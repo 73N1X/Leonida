@@ -59,6 +59,7 @@ enum class DeviceMethod : std::uint8_t {
     placed_resource_x,     // 133
     placed_view,           // 70, 71: a view of title memory (rt::d3d12_xs::set_placed_view_handler)
     sampler_x,             // 61: the console's sampler description (rt::d3d12_xs::set_sampler_x_handler)
+    stream_pso,            // 86 in the console layout: PC CreatePipelineState with the console's stream renumbered
 };
 
 struct DeviceSlot {
@@ -147,7 +148,8 @@ inline constexpr DeviceEntry kDeviceEntries[] = {
     {79, DeviceMethod::routed, DeviceMethod::routed, "Xbox ScheduleFrameEventX"},
     {80, DeviceMethod::routed, DeviceMethod::routed, "Xbox WaitFrameEventX"},
     {81, DeviceMethod::routed, DeviceMethod::routed, "Xbox GetFrameStatisticsX"},
-    {86, DeviceMethod::forward, DeviceMethod::open, "Xbox CreatePipelineState from streams (V pipeline.rs, open)"},
+    // V device.rs:454 (f[86] = pipeline::create_stream), pipeline.rs:671-758: (stream desc, riid, out).
+    {86, DeviceMethod::forward, DeviceMethod::stream_pso, "Xbox CreatePipelineState from streams -> PC CreatePipelineState"},
     // V resource.rs:840-849: ID3D12Device8's GetResourceAllocationInfo2 (PC slot 68), return buffer first.
     {108, DeviceMethod::struct_return, DeviceMethod::struct_return, "GetResourceAllocationInfo2 (return buffer first)"},
     {127, DeviceMethod::committed_resource3, DeviceMethod::committed_resource3, "Xbox CreateCommittedResource3"},

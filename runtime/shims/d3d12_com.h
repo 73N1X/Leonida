@@ -32,6 +32,9 @@ namespace leonida {
 class VulkanPresenter;
 class PresentSnapshot;
 struct PresentPlanes;
+namespace pipelines {
+class Job;  // src/pipeline_queue.h
+}
 }
 
 namespace rt::d3d12 {
@@ -325,6 +328,10 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 // the uniform-buffer fallback for the 16-byte tail (heap/code base).
 bool device_push_constants_need_fallback(ID3D12Device* device);
 
+// Starts reading the translator's index on a thread, so the device's first PSO does not read it all (the title's
+// device, from D3D12XboxCreateDevice). Nothing for a device of another implementation.
+void prefetch_shader_library(ID3D12Device* device);
+
 // True when `device` puts upload-heap buffers in DEVICE_LOCAL | HOST_VISIBLE memory: its GPU has Resizable BAR and
 // LEONIDA_UPLOAD_SYSMEM is not set (D3D-96).
 bool device_upload_in_vram(ID3D12Device* device);
@@ -466,7 +473,18 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+// Makes the pipeline first if it is not made yet.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+
+// A Vulkan device's PSO has its pipeline made by a worker (src/pipeline_queue.h). pipeline_bound is the bind site
+// (SetPipelineState): it notes the PSO for the next run's early list, starts the build and waits for it while the
+// frame's budget lasts; the list checks the job before each draw or dispatch it records, and drops one whose pipeline
+// is not made. Null for a PSO of another implementation.
+const leonida::pipelines::Job* pipeline_bound(ID3D12PipelineState* pipeline);
+// For tests: the job without binding, the key the early list knows the PSO by, and making it now on this thread.
+const leonida::pipelines::Job* pipeline_job(ID3D12PipelineState* pipeline);
+std::string pipeline_early_key(ID3D12PipelineState* pipeline);
+bool make_pipeline_now(ID3D12PipelineState* pipeline);
 
 // Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.

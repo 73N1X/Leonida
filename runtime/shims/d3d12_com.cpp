@@ -6,6 +6,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/pipeline_queue.h"
 
 #include <algorithm>
 #include <array>
@@ -491,6 +492,7 @@ public:
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        if (!pipeline_made(false)) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
@@ -861,6 +863,7 @@ public:
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
+            if (!pipeline_made(true)) return;
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
         }
@@ -1261,6 +1264,7 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
+    const leonida::pipelines::Job* pipeline_job_ = nullptr;  // the bound PSO's build (held with the PSO)
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
@@ -1327,6 +1331,19 @@ private:
         graphics_pipeline_ = graphics_pipeline_id(state);
         if (state && !compute_pipeline_ && !graphics_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
+        // The bind site: the pipeline is made by a worker, and waited for here within the frame's budget
+        // (src/pipeline_queue.h). A bundle's own state is not drawn with: its parent binds when the bundle runs.
+        pipeline_job_ = (compute_pipeline_ || graphics_pipeline_) && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE
+                            ? pipeline_bound(state)
+                            : nullptr;
+    }
+
+    // A draw or dispatch is recorded only with a made pipeline: one still being made (or that could not be made) is
+    // dropped and counted, as VIctory drops it (pipeline.rs note_drop); the list stays valid.
+    bool pipeline_made(bool dispatch) const {
+        if (!pipeline_job_ || pipeline_job_->ready()) return true;
+        leonida::pipelines::Drops::get().note(*pipeline_job_, dispatch, leonida::pipelines::Builder::get().waiting());
+        return false;
     }
 
     void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
@@ -1395,6 +1412,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        if (!pipeline_made(true)) return;
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
@@ -1419,6 +1437,7 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        if (!pipeline_made(false)) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};

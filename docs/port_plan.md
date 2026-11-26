@@ -51,7 +51,7 @@ Boot, in order:
 | 6 | Lists from device slot 12 get the console layout (`list.rs:566`) | console list proxies (also as the console's List5/List6 IIDs); device 25/26/108 take the return buffer first; device 48 takes the console queue description |
 | 7 | List 139 ResetX, 80 DispatchX, 71/72 Write32/64, 73/74 WaitValue, 62 CopyMemory, 86 CopyResourceX, 148 AllocateUploadMemory (`list.rs:2059-2149`) | 139 → PC Reset, 80 → Dispatch, 86 → CopyResource; on title memory (`L\src\title_memory.h`): 62 → copies between the imports, 71/72 → WriteBufferImmediate (MARKER_OUT; flag 1 a timestamp query the GPU writes when it gets there, flag 2 the performance counter once the submission has run), 100 → DispatchMesh(x, 1, 1) (indirect dropped, as V does), 148 → the device's imported upload blocks, given back at reset; 73/74 cut the list as V's `cut` does (`L\src\vulkan_backend.h`, `execute_parts`): the queue runs the parts in order and holds each at its wait until the value is in memory (a 250 µs poller while one is held; PresentX forces them; `LEONIDA_VALUE_HOLD_MS`, default 1000, bounds a hold) |
 | 8 | Queries at slots 28-30 (`list.rs:2114-2117,1330-1345`) | → PC 52-54; 59 is the console marker (ignored); 27, 31, 56-58 and 60 are named by no source and refused |
-| 9 | ~60,000 PSOs in the first 20 s; device 86 CreatePipelineState with streams (`pipeline.rs:6-11`) | every PSO compiled at creation (`d3d12_vulkan_device.cpp:3948,4061`), slot 86 E_NOTIMPL; the title's 30 s watchdog fires |
+| 9 | ~60,000 PSOs in the first 20 s; device 86 CreatePipelineState with streams (`pipeline.rs:6-11`) | creation checks the description and returns; the pipeline is made on worker threads (`L\src\pipeline_queue.h`, `make.rs`), started by the first bind or, for one an earlier run bound, at creation (`early-pipelines.txt`); a bind waits `LEONIDA_PIPELINE_WAIT_MS` (500) per frame and kind; draws and dispatches without a made pipeline are dropped and counted; 86 → PC CreatePipelineState with the console's AS/MS numbers (23/24) made the PC's |
 
 Menus and movies: sampler stride 16, views 32 (`descriptor.rs:1-7`; done:
 `L\shims\d3d12_com.h`, `descriptor_increment`); device 61 CreateSamplerX (done:
@@ -78,7 +78,12 @@ argument clamps (`indirect.rs`); GPU memory placement between 4 GiB and 2^40
    (`L\src\queue_holds.h`), ExecuteX/Signal2X, timestamps, release at PresentX.
 3. Pipelines built at first bind on worker threads with a per-frame wait
    budget; draws without a ready pipeline dropped; a list of pipelines earlier
-   runs used, started early.
+   runs used, started early. Done on `port/pipelines` (`L\src\pipeline_queue.h`,
+   docs/d3d12_vulkan.md "Pipelines made off the creating thread"); not yet
+   seen on the title, which stops before its first frame. Open: VIctory's
+   loading allowance (`make.rs:193-223`), and the attachment-format variants
+   replay still compiles where it records (`VK_EXT_dynamic_rendering_unused_attachments`
+   would remove them).
 4. Title memory: a GPU address is the title's CPU address. Import xmem graphics
    memory with `VK_EXT_external_memory_host` (Leonida's `create_host_buffer`,
    `d3d12_vulkan_device.cpp:1974-2075`) as the default; keep copies only for
