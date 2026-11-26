@@ -814,8 +814,77 @@ void check_run_time_load() {
               "slot 26 (XPackageCloseMountHandle) closes the handle");
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        check(reinterpret_cast<Stub>(slot(pk, 13))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 20))(pk) == E_NOTIMPL &&
+                  reinterpret_cast<Stub>(slot(pk, 41))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (13, 20, 41) are E_NOTIMPL");
+
+        // The chunk and installation-monitor slots (ported from VIctory xpackage.rs): this installation is
+        // complete, every chunk ready; any other identifier is E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER.
+        constexpr HRESULT no_package = static_cast<HRESULT>(0x89245208u);
+        char own[64] = {};
+        check(reinterpret_cast<Ident>(slot(pk, 3))(pk, sizeof(own), own) == S_OK, "the package identifier for the chunk slots");
+        using CreateMonitor = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*, uint32_t, void*, void**);
+        void* monitor = nullptr;
+        void* other_monitor = &monitor;
+        check(reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, own, 0, nullptr, 100, nullptr, &monitor) == S_OK && monitor &&
+                  reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, "dlc", 0, nullptr, 100, nullptr, &other_monitor) ==
+                      no_package && !other_monitor,
+              "slot 5 (XPackageCreateInstallationMonitor) watches this installation only");
+        using RegisterProgress = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*, void*, XTaskQueueRegistrationToken*);
+        XTaskQueueRegistrationToken progress_token{};
+        check(reinterpret_cast<RegisterProgress>(slot(pk, 9))(pk, monitor, nullptr, &progress_token, &progress_token) == S_OK &&
+                  progress_token.token != 0,
+              "slot 9 (XPackageRegisterInstallationProgressChanged) hands out a token");
+        using CloseMonitor = void(STDMETHODCALLTYPE*)(void*, void*);
+        reinterpret_cast<CloseMonitor>(slot(pk, 6))(pk, monitor);
+        using Find = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*, uint32_t*);
+        uint32_t availability = 9;
+        check(reinterpret_cast<Find>(slot(pk, 12))(pk, own, 0, nullptr, &availability) == S_OK && availability == 0 &&
+                  reinterpret_cast<Find>(slot(pk, 12))(pk, "dlc", 0, nullptr, &availability) == no_package,
+              "slot 12 (XPackageFindChunkAvailability): Ready for this installation, no other package");
+        using Order = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*);
+        check(reinterpret_cast<Order>(slot(pk, 14))(pk, own, 0, nullptr) == S_OK &&
+                  reinterpret_cast<Order>(slot(pk, 19))(pk, own, 0, nullptr) == S_OK &&
+                  reinterpret_cast<Order>(slot(pk, 19))(pk, "dlc", 0, nullptr) == no_package,
+              "slots 14 and 19 (change install order, uninstall chunks) accept this installation only");
+        using Estimate = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*, uint64_t*, bool*);
+        uint64_t download = 7;
+        bool confirm = true;
+        check(reinterpret_cast<Estimate>(slot(pk, 18))(pk, own, 0, nullptr, &download, &confirm) == S_OK && download == 0 &&
+                  !confirm,
+              "slot 18 (XPackageEstimateDownloadSize): nothing to download, no confirmation");
+        using InstallAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*, uint32_t, bool, XAsyncBlock*);
+        using InstallResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+        XAsyncBlock install{};
+        void* installed = nullptr;
+        check(reinterpret_cast<InstallAsync>(slot(pk, 16))(pk, own, 0, nullptr, 100, true, &install) == S_OK &&
+                  XAsyncGetStatus(&install, true) == S_OK &&
+                  reinterpret_cast<InstallResult>(slot(pk, 17))(pk, &install, &installed) == S_OK && installed == monitor,
+              "slots 16/17 (XPackageInstallChunksAsync/Result) complete at once with the installation's monitor");
+        XAsyncBlock install_other{};
+        check(reinterpret_cast<InstallAsync>(slot(pk, 16))(pk, "dlc", 0, nullptr, 100, true, &install_other) == S_OK &&
+                  XAsyncGetStatus(&install_other, true) == no_package,
+              "slot 16 completes with E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER for another package");
+        using MountUiAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, XAsyncBlock*);
+        using MountUiResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, XPackageMountHandle*);
+        XAsyncBlock mount_ui{};
+        XPackageMountHandle ui_mount{5};
+        check(reinterpret_cast<MountUiAsync>(slot(pk, 37))(pk, "not-installed", &mount_ui) == S_OK &&
+                  FAILED(XAsyncGetStatus(&mount_ui, true)) &&
+                  FAILED(reinterpret_cast<MountUiResult>(slot(pk, 38))(pk, &mount_ui, &ui_mount)) && ui_mount.handle == 0,
+              "slots 37/38 (XPackageMountWithUiAsync/Result) fail like XPackageMount for a package that is not installed");
+        using Enumerate = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, void*);
+        using RegisterInstalled = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*, void*, XTaskQueueRegistrationToken*);
+        XTaskQueueRegistrationToken installed_token{};
+        check(reinterpret_cast<Enumerate>(slot(pk, 39))(pk, 1, 0, nullptr, &installed_token) == S_OK &&
+                  reinterpret_cast<RegisterInstalled>(slot(pk, 40))(pk, nullptr, nullptr, &installed_token, &installed_token) ==
+                      S_OK && installed_token.token != 0,
+              "slots 39/40 (EnumeratePackages, RegisterPackageInstalled): no packages, a token");
+        void* pk4 = nullptr;
+        const GUID package4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
+        check(query(&package_cls, package4, &pk4) == S_OK && pk4 == pk,
+              "QueryApiImpl hands out XPackageImpl for IXPackageImpl4, the id the retail executable asks with");
+        if (pk4) release(pk4);
         struct Progress {
             uint64_t total, installed, launch;
             bool launchable, completed;
