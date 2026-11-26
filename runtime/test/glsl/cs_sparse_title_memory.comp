@@ -1,0 +1,45 @@
+#version 460
+// vk_sparse_title_memory_test: samples the pages of a sparse buffer through its device address (heap_base + VA, as a
+// translated shader computes it) and writes one word into one page.
+//   out[3 * i + 0..2] = page i's words 0, 1 and page_words - 1, for i < pages;
+//   page write_page's word 1 = write_value (write_page ~0u: no write). The samples are read before the write in the
+//   same invocation, and no other invocation reads word 1 of that page after it.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform Params {
+    uvec2 sparse;  // device address of page 0
+    uvec2 result;  // device address of the result words
+    uint page_words;
+    uint pages;
+    uint write_page;
+    uint write_value;
+} p;
+
+uvec2 add64(uvec2 a, uint bytes) {
+    uint carry;
+    const uint low = uaddCarry(a.x, bytes, carry);
+    return uvec2(low, a.y + carry);
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i < p.pages) {
+        Words page = Words(add64(p.sparse, i * p.page_words * 4u));
+        Words out_words = Words(p.result);
+        out_words.w[3u * i + 0u] = page.w[0];
+        out_words.w[3u * i + 1u] = page.w[1];
+        out_words.w[3u * i + 2u] = page.w[p.page_words - 1u];
+    }
+    barrier();
+    if (i == 0u && p.write_page != 0xffffffffu) {
+        Words page = Words(add64(p.sparse, p.write_page * p.page_words * 4u));
+        page.w[1] = p.write_value;
+    }
+}

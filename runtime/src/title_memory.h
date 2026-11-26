@@ -17,7 +17,14 @@
 //   - the buffer's own opaque capture address reads 0: the address comes with the memory;
 //   - imported host memory cannot be bound into a sparse buffer there (a sparse buffer takes memory type 1, the device
 //     heap, only; host pointers import as types 2 and 3), so one sparse 2^40 mirror buffer (docs/port_plan.md, Frame
-//     time) is not possible on this driver;
+//     time) is not possible on this driver. test/vk_sparse_title_memory_test.cpp asks again (2026-11-25): every sparse
+//     buffer, with or without residency, capture replay or VkExternalMemoryBufferCreateInfo for host allocations,
+//     lists type 1 alone, although vkGetPhysicalDeviceExternalBufferProperties calls host allocations importable for a
+//     sparse buffer (features 0x6). Bound anyway (--force-bind, invalid usage: the validation layer reports the memory
+//     type), the pages work: reads, GPU writes the CPU sees, CPU writes the GPU sees, one frame at two VAs, rebinds,
+//     and unbound pages read zero. One vkQueueBindSparse of 16,384 64 KiB pages took 70 ms to idle, 16,384 calls of one
+//     page 1.7 s; a sparse buffer at a capture-replay address may be up to 64 GiB (128 GiB was refused). The AMD
+//     driver (2026.04.17) lists host memory types for sparse buffers but has no bufferDeviceAddressCaptureReplay;
 //   - an import pins its pages (256 MiB never touched: 17.9 ms and +256 MiB of working set) but does not stop the CPU
 //     from decommitting or protecting them: the import keeps the old physical pages, so a range the title frees has to
 //     leave the GPU first (xmem tells the layer, rt::xmem::set_graphics_listener).
