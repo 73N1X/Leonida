@@ -126,6 +126,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/winsock_offline.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -165,7 +166,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # scripts/build_runtime.ps1.
   set(GTA6RT_STACK 8388608)
   target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
-  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue gta6rt_bcpack psapi)
+  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue gta6rt_bcpack psapi ws2_32)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -339,6 +340,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
+  # Winsock reaches loopback only (shims/winsock_offline.cpp). Opens loopback sockets only; nothing leaves the machine.
+  add_executable(winsock_offline_test
+    test/winsock_offline_test.cpp
+    shims/winsock_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(winsock_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(winsock_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(winsock_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(winsock_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(winsock_offline_test PRIVATE ws2_32)
+
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
     shims/winhttp_offline.cpp
@@ -1263,6 +1276,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+    add_test(NAME winsock_offline COMMAND winsock_offline_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
