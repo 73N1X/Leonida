@@ -2627,7 +2627,9 @@ HRESULT unregister_page_pool(DeviceProxy* self, std::uint64_t handle) {
 // CreateCommittedResource3 (PC slot 76). The description becomes a PC one (make_pc_desc); ALLOW_DISPLAY is cleared,
 // since the presentation here copies from the resource and the PC runtime keeps that flag for its own swapchains; the
 // protected session is not passed on (none is modelled). Without ID3D12Device10 the resource is made with
-// CreateCommittedResource in the common state, as VIctory makes it (layouts are not tracked there).
+// CreateCommittedResource in the common state, as VIctory makes it (layouts are not tracked there). On the Vulkan
+// device either call is the title's own, so the memory comes from the title's allocator when it exports one
+// (rt::d3d12::set_title_allocator): the title counts its back buffers against its render-target pool that way.
 HRESULT proxy_create_committed_resource3(DeviceProxy* self, std::uint64_t heap, std::uint64_t heap_flags,
                                          std::uint64_t desc1, std::uint64_t layout, std::uint64_t clear,
                                          std::uint64_t protected_session, std::uint64_t castable_count,

@@ -6,9 +6,11 @@
 //   XMemVirtualQuery(process, address, out64)
 //   XMemGetWorkingSetStatistics(kind, out)   (kind 0x20000001 at all seven FSR call sites)
 //
-// ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
-// site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
-// zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
+// XMemAlloc and XMemFree call the title's own routines when its exe exports __XMemAllocationHooks__ (VIctory's
+// xmem.rs; set_allocation_hooks). The default allocator behind them decodes the attribute word as VIctory does
+// (src/title_memory.h): CPU blocks are at least 64-byte aligned (cache lines and SIMD), more when the attributes ask,
+// and a size of zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can
+// release; GPU blocks are pages of their own in the GPU address window.
 //
 // The default allocators, the physical-page functions and XMemIsToolsMemAvailable follow argument shapes measured
 // locally at a title's call sites (each function says which). The page functions are built on the Windows placeholder
@@ -196,16 +198,136 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
-void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
+// ---- The default allocator (XMemAllocDefault, and XMemAlloc without the title's hooks) ----------------------------
+// Attribute words decoded as title_memory.h has them (VIctory xmem.rs:228-336, XMemAllocDefault/XMemFreeDefault). CPU
+// memory comes from the CRT's aligned heap at the attributes' alignment, 64 bytes at least. GPU memory (a graphics
+// memory type, or a 32-bit address) is whole pages of its own in the GPU address window, committed and announced
+// to the D3D12 layer like the title's own graphics memory (make_visible), so a committed resource the title's hook
+// places there (D3D12 layer, set_title_allocator) is imported at its address. A block is its page size (2 MiB or
+// 64 KiB) rounded and at least that aligned. VIctory keeps such blocks on its heap: its GPU side copies title memory.
+// shortcut: one reservation per GPU block, 64 KiB at least; sub-allocate if small GPU blocks turn up in numbers.
+constexpr size_t kGpuPage64k = 0x10000;
+constexpr size_t kGpuPage2m = 0x200000;
+std::mutex g_gpu_blocks_mutex;
+std::map<uintptr_t, size_t> g_gpu_blocks;  // start -> bytes, for the free
+
+size_t alloc_alignment(uint64_t attributes) {
+    return (std::max)(kAlign, size_t(1) << tm::alloc_alignment_log2(attributes));
+}
+
+void* allocate_gpu_block(size_t size, uint64_t attributes) {
+    const size_t page = tm::alloc_page_size(attributes) == 2 ? kGpuPage2m : kGpuPage64k;
+    const size_t alignment = (std::max)(page, alloc_alignment(attributes));
+    if (size > (std::numeric_limits<size_t>::max)() - (page - 1)) return nullptr;
+    const SIZE_T bytes = ((size ? size : 1) + page - 1) & ~(page - 1);
+    // The 32-bit window for a 32-bit address, else the main one (title_memory.h's placement of graphics attributes).
+    const tm::Range range = tm::placement(tm::alloc_32bit(attributes) ? 7 : 3);
+    void* block = allocate_in(range, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, alignment);
+    if (!block) {
+        note_unplaced(bytes, attributes);
+        static const auto va2 = reinterpret_cast<VirtualAlloc2Fn>(
+            GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = alignment > 0x10000 ? alignment : 0;
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        block = va2 ? va2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &parameter, 1)
+                    : nullptr;
+    }
+    if (!block) return nullptr;
+    {
+        const std::lock_guard lock(g_gpu_blocks_mutex);
+        g_gpu_blocks[reinterpret_cast<uintptr_t>(block)] = bytes;
+    }
+    // Fresh pages: a visible range that still overlaps them was freed where xmem did not see it (the host's own
+    // VirtualFree), so the listener drops what it holds there before it takes these.
+    make_gone(reinterpret_cast<uintptr_t>(block), bytes);
+    make_visible(reinterpret_cast<uintptr_t>(block), bytes);
+    return block;
+}
+
+void* default_alloc(size_t size, uint64_t attributes) {
+    if (tm::alloc_gpu_memory(attributes)) return allocate_gpu_block(size, attributes);
+    return _aligned_malloc(size ? size : 1, alloc_alignment(attributes));
+}
+
+// Either kind of block, found by its address (the attributes a caller passes back need not be the ones it allocated
+// with). A GPU block leaves the GPU first (make_gone), then its pages go.
+void default_free(void* p) {
+    if (!p) return;
+    size_t bytes = 0;
+    {
+        const std::lock_guard lock(g_gpu_blocks_mutex);
+        if (const auto it = g_gpu_blocks.find(reinterpret_cast<uintptr_t>(p)); it != g_gpu_blocks.end()) {
+            bytes = it->second;
+            g_gpu_blocks.erase(it);
+        }
+    }
+    if (bytes) {
+        make_gone(reinterpret_cast<uintptr_t>(p), bytes);
+        VirtualFree(p, 0, MEM_RELEASE);
+        return;
+    }
+    _aligned_free(p);
+}
+
+// ---- The title's allocation hooks (xmem.h, set_allocation_hooks) -----------------------------------------------
+// Ported from VIctory's xmem.rs:243-300 (hooks, XMemAlloc, XMemFree; GPL-3.0-or-later, Marvisak and contributors,
+// DexNom fork). The title's exe exports __XMemAllocationHooks__, two routine pointers: alloc(size, attributes) and
+// free(address, attributes). XMemAlloc and XMemFree call them, for the title's own calls, its middleware's and the
+// D3D12 layer's committed resources; XMemAllocDefault and XMemFreeDefault never do (the title's routines call those
+// themselves: the measured hook dispatches on the allocator id to handlers the title registers, and the handler every
+// id starts with is a tail jump to the XMemAllocDefault import). The pointers are read at each call, as VIctory reads
+// them: the table is in the title's .data, which it may rewrite.
+using AllocRoutine = void*(__stdcall*)(size_t, uint64_t);
+using FreeRoutine = void(__stdcall*)(void*, uint64_t);
+std::atomic<void* const*> g_hooks{nullptr};
+
+// How deep this thread is inside the title's routines. An XMemAlloc or XMemFree made from inside them (a handler that
+// calls the import instead of the Default one) goes to the default allocator, not round the hook again. No lock is
+// held across a hook call: the routines call back into xmem (XMemAllocDefault, which announces GPU blocks to the
+// D3D12 layer under xmem's own lock). Plain data, no destructor (AGENTS.md, Runtime traps).
+thread_local unsigned t_hook_depth = 0;
+
+struct HookDepth {
+    HookDepth() { ++t_hook_depth; }
+    ~HookDepth() { --t_hook_depth; }
+    HookDepth(const HookDepth&) = delete;
+    HookDepth& operator=(const HookDepth&) = delete;
+};
+
+void* hook_routine(unsigned index) {
+    if (t_hook_depth) return nullptr;
+    void* const* const table = g_hooks.load(std::memory_order_acquire);
+    return table ? table[index] : nullptr;
+}
+
+void* call_alloc(size_t size, uint64_t attributes) {
+    if (const auto hook = reinterpret_cast<AllocRoutine>(hook_routine(0))) {
+        const HookDepth depth;
+        return hook(size, attributes);
+    }
+    return default_alloc(size, attributes);
+}
+
+void call_free(void* p, uint64_t attributes) {
+    if (const auto hook = reinterpret_cast<FreeRoutine>(hook_routine(1))) {
+        const HookDepth depth;
+        hook(p, attributes);
+        return;
+    }
+    default_free(p);
+}
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    return call_alloc(size, attributes);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    call_free(p, attributes);
 }
 
 // XMemAllocDefault / XMemFreeDefault: the GDK's own allocator behind XMemAlloc and XMemFree, which a title that hooks
@@ -214,12 +336,12 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
 // released by either free.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
     note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    return default_alloc(size, attributes);
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
     note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    default_free(p);
 }
 
 // BOOL XMemIsToolsMemAvailable(void). The measured title calls it from one helper, which six out-of-memory paths reach
@@ -1087,6 +1209,25 @@ BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
 }  // namespace
 
 namespace rt::xmem {
+
+void set_allocation_hooks(const void* table) {
+    g_hooks.store(static_cast<void* const*>(table), std::memory_order_release);
+    if (table) {
+        const auto* routines = static_cast<void* const*>(table);
+        std::fprintf(stderr, "[rt] xmem: the title's allocation hooks (__XMemAllocationHooks__): alloc %s, free %s\n",
+                     rt::startup_trace::where(reinterpret_cast<uint64_t>(routines[0])).c_str(),
+                     rt::startup_trace::where(reinterpret_cast<uint64_t>(routines[1])).c_str());
+    }
+}
+
+bool has_allocation_hooks() {
+    void* const* const table = g_hooks.load(std::memory_order_acquire);
+    return table && table[0] && table[1];
+}
+
+void* title_alloc(std::size_t size, std::uint64_t attributes) { return call_alloc(size, attributes); }
+
+void title_free(void* address, std::uint64_t attributes) { call_free(address, attributes); }
 
 void set_graphics_listener(const GraphicsListener* listener) {
     const std::lock_guard lock(g_graphics_mutex);

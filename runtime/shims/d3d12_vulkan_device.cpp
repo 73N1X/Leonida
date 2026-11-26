@@ -1841,6 +1841,53 @@ public:
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
+        // The title's memory goes back to its allocator last, on the releasing thread, as the title's routine expects.
+        // A buffer on it waited above for the work submitted so far (title_import_); a texture's image and a buffer on
+        // the layer's own memory never had the GPU touch it.
+        if (title_memory_ && title_free_) title_free_(title_memory_, title_attributes_);
+    }
+
+    // The memory the title's allocator gave this committed resource (Device::create_committed): this resource owns it
+    // from now on and gives it back when it goes; a texture reports its address as its GPU virtual address.
+    void adopt_title_memory(void* address, std::uint64_t attributes, TitleFreeRoutine free) {
+        title_memory_ = address;
+        title_attributes_ = attributes;
+        title_free_ = free;
+    }
+    void* title_memory() const { return title_memory_; }
+
+    // A committed buffer on the title's memory (adopt_title_memory): bound to the title-memory import that holds it,
+    // as slot 133's buffers are, so its GPU virtual address is the title address and its device address heap_base +
+    // that address. Without that (a device that keeps no title memory, memory that is not one import, an acceleration
+    // structure, which the import's buffer usage leaves out), the buffer is the layer's own, as before, and the title's
+    // memory stays its allocation; `why` says which.
+    HRESULT create_title_buffer(D3D12_RESOURCE_STATES initial_state, const char*& why) {
+        why = nullptr;
+        const auto va = reinterpret_cast<std::uintptr_t>(title_memory_);
+        if (!title_memory_ || !device_.titles)
+            why = "the device keeps no title memory";
+        else if (initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
+            why = "an acceleration structure";
+        if (!why) {
+            Resource* import = title_import_cover(va, desc_.Width);
+            if (!import) {
+                why = "its memory is not one import of title memory";
+            } else {
+                const HRESULT made = create_title_alias(import, va);
+                import->Release();
+                if (SUCCEEDED(made)) return S_OK;
+                why = "it could not be bound to its import";
+                // Nothing of it reached the GPU: undone at once, then the layer's own buffer below.
+                if (buffer_) device_.context->vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+                buffer_ = VK_NULL_HANDLE;
+                if (title_import_) title_import_->Release();
+                title_import_ = nullptr;
+                mapped_ = nullptr;
+                va_ = buffer_va_ = gpu_va_ = 0;
+                memory_flags_ = 0;
+            }
+        }
+        return create_buffer(initial_state);
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -2177,19 +2224,25 @@ public:
         import->AddRef();
         title_import_ = import;
         memory_flags_ = import->memory_flags_;
-        mapped_ = reinterpret_cast<void*>(static_cast<std::uintptr_t>(va));
+        // The heap says what the CPU does with the pages, as for any buffer (create_buffer): slot 133's CUSTOM
+        // WRITE_BACK heap maps them and the CPU writes them; a committed default-heap buffer on title memory
+        // (create_title_buffer) is not mapped, and its bytes are the GPU's.
+        void* const pages = reinterpret_cast<void*>(static_cast<std::uintptr_t>(va));
+        mapped_ = cpu_visible() ? pages : nullptr;
         va_ = va;
         VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         bda.buffer = buffer_;
         buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
         gpu_va_ = buffer_va_;
         if (buffer_va_ != device_.arena.address + va) return E_NOTIMPL;
-        device_.log_va("title-placed buffer", va_, desc_.Width);
+        device_.log_va(title_memory_ ? "committed buffer on title memory" : "title-placed buffer", va_, desc_.Width);
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
         binding.size = desc_.Width;
-        binding.host = static_cast<const std::uint8_t*>(mapped_);
-        binding.host_readable = true;
+        binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(pages) : nullptr;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
@@ -2423,7 +2476,13 @@ public:
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    // A texture with memory from the title's allocator reports that memory's address, as on the console (VIctory
+    // resource.rs:2797-2800, gpu_address: every resource's data address).
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        if (accel_) return gpu_va_;
+        if (image_ && title_memory_) return reinterpret_cast<std::uintptr_t>(title_memory_);
+        return va_;
+    }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2732,6 +2791,12 @@ private:
     VkDeviceSize import_offset_ = 0;  // a host import: where va_ lies in memory_ (the import starts on a host page)
     // A buffer on title memory another import holds (create_title_alias): its memory, held through a reference.
     Resource* title_import_ = nullptr;
+    // Memory from the title's allocator (adopt_title_memory): its address, its attributes, and the routine that gives
+    // it back.
+    void* title_memory_ = nullptr;
+    std::uint64_t title_attributes_ = 0;
+    TitleFreeRoutine title_free_ = nullptr;
+    Resource* title_import_cover(std::uint64_t va, std::uint64_t bytes);  // TitleMemory::cover, after TitleMemory
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -3205,6 +3270,10 @@ private:
     std::uint64_t merged_ = 0;
 };
 
+Resource* Resource::title_import_cover(std::uint64_t va, std::uint64_t bytes) {
+    return device_.titles ? device_.titles->cover(va, bytes) : nullptr;
+}
+
 // Every live device's title memory, and what xmem says is visible, so a device made later imports it too
 // (title_memory_visible). The lock is taken before a device's own.
 struct TitleRanges {
@@ -3215,6 +3284,18 @@ struct TitleRanges {
 TitleRanges& title_ranges() {
     static TitleRanges* ranges = new TitleRanges;  // never destroyed: xmem may call after static destruction began
     return *ranges;
+}
+
+// The title's general allocator (set_title_allocator): both routines, or neither.
+struct TitleAllocator {
+    TitleAllocRoutine alloc = nullptr;
+    TitleFreeRoutine free = nullptr;
+};
+std::mutex g_title_allocator_mutex;
+TitleAllocator g_title_allocator;
+TitleAllocator title_allocator() {
+    std::lock_guard lock(g_title_allocator_mutex);
+    return g_title_allocator;
 }
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -9505,16 +9586,51 @@ private:
                      int(desc->Dimension));
             return finish(E_INVALIDARG);
         }
-        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out));
+        // The title's calls (a method named) take their memory from the title's allocator when it has one; the
+        // layer's own committed resources (slot 70/71 textures, reserved and slot 133 fallbacks) never do.
+        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out,
+                                       method != nullptr));
+    }
+
+    // Memory from the title's allocator for a committed resource the title makes (set_title_allocator; VIctory
+    // resource.rs:965-985, Memory::for_resource): GetResourceAllocationInfo's size and alignment, with VIctory's
+    // attributes (title_memory::resource_attributes), zeroed. Null with `refused` false when there is no allocator.
+    void* title_memory_for(const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& desc, std::uint64_t& attributes,
+                           TitleFreeRoutine& free, bool& refused) {
+        refused = false;
+        const TitleAllocator allocator = title_allocator();
+        if (!allocator.alloc || !allocator.free) return nullptr;
+        D3D12_RESOURCE_DESC checked = desc;
+        if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
+        const D3D12_RESOURCE_ALLOCATION_INFO info = allocation(checked);
+        if (info.SizeInBytes == UINT64_MAX || info.SizeInBytes > SIZE_MAX) return nullptr;  // refused before this
+        attributes = leonida::title_memory::resource_attributes(info.SizeInBytes, info.Alignment,
+                                                                heap.Type == D3D12_HEAP_TYPE_DEFAULT);
+        void* const memory = allocator.alloc(static_cast<std::size_t>(info.SizeInBytes), attributes);
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8 || d3d12_trace::enabled())
+            std::fprintf(stderr,
+                         "[rt] d3d12: committed resource (dimension %d, heap type %d) from the title's allocator: "
+                         "0x%llx bytes, attributes 0x%llx -> %p\n",
+                         int(desc.Dimension), int(heap.Type), static_cast<unsigned long long>(info.SizeInBytes),
+                         static_cast<unsigned long long>(attributes), memory);
+        if (!memory) {
+            refused = true;
+            return nullptr;
+        }
+        std::memset(memory, 0, static_cast<std::size_t>(info.SizeInBytes));  // committed resources start zeroed
+        free = allocator.free;
+        return memory;
     }
 
     // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
     // is only meaningful on textures; the layer reports RelaxedFormatCastingSupported, so each format is mapped and
     // handed to Vulkan as a VkImageFormatListCreateInfo. A nonzero count with a null list is no list, as on the PC
-    // runtime.
+    // runtime. `from_title`: the title's own call, whose memory comes from its allocator (title_memory_for).
     HRESULT create_committed(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
-                             UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                             UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out,
+                             bool from_title = false) {
         if (out) *out = nullptr;
         if (!heap || !desc) return E_INVALIDARG;
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -9523,11 +9639,32 @@ private:
         }
         auto* resource = new Resource(state_, *desc, *heap, heap_flags);
         resource->attach_device(identity());
+        if (from_title && out) {
+            std::uint64_t attributes = 0;
+            TitleFreeRoutine free = nullptr;
+            bool refused = false;
+            if (void* const memory = title_memory_for(*heap, *desc, attributes, free, refused))
+                resource->adopt_title_memory(memory, attributes, free);  // given back with the resource, failed or not
+            else if (refused) {
+                resource->Release();
+                return E_OUTOFMEMORY;
+            }
+        }
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            const char* why = nullptr;
             hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0
-                     ? resource->create_buffer(initial_state)
+                     ? (resource->title_memory() ? resource->create_title_buffer(initial_state, why)
+                                                 : resource->create_buffer(initial_state))
                      : E_INVALIDARG;
+            if (why) {
+                static std::atomic<unsigned> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || d3d12_trace::enabled())
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: a committed buffer of 0x%llx bytes at title address %p is not on its "
+                                 "title memory (%s); the layer's own memory backs it\n",
+                                 static_cast<unsigned long long>(desc->Width), resource->title_memory(), why);
+            }
         } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
@@ -9992,6 +10129,11 @@ void create_placed_view(ID3D12Device* device, bool uav, const void* resource_des
     if (!d || !resource_desc || !view_desc || !handle) return;
     d->create_placed_view(uav, static_cast<const std::uint32_t*>(resource_desc),
                           static_cast<const std::uint32_t*>(view_desc), handle);
+}
+
+void set_title_allocator(TitleAllocRoutine alloc, TitleFreeRoutine free) {
+    std::lock_guard lock(g_title_allocator_mutex);
+    g_title_allocator = alloc && free ? TitleAllocator{alloc, free} : TitleAllocator{};
 }
 
 void title_memory_visible(std::uint64_t start, std::uint64_t size) {
