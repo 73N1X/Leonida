@@ -190,8 +190,9 @@ What this does not show: `--run` has not been run, so the entry point has not be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
-functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
-host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`). `runtime/shims/winsock_offline.cpp`
+(ported from VIctory's `net.rs`) vets the ways out among them: connects and datagrams reach loopback only, and names
+other than `localhost` and IP literals do not resolve; the rest of `ws2_32.dll` is the host's. `winhttp.dll` is served by the offline shim,
 which opens none.
 
 ### The title's window and its display mode
