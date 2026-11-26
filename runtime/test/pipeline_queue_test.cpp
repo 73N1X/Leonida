@@ -157,6 +157,16 @@ int budget() {
 }
 
 // The early list: written as sorted lines, the keys of earlier runs kept, read back as the next run reads it.
+// LEONIDA_PIPELINE_WAIT_MS stays under the title's 30 s hang watchdog.
+int budget_cap() {
+    EXPECT(wait_budget_from_env(0) == 0);
+    EXPECT(wait_budget_from_env(kDefaultWaitMs) == kDefaultWaitMs);
+    EXPECT(wait_budget_from_env(kMaxWaitMs) == kMaxWaitMs);
+    EXPECT(wait_budget_from_env(600000) == kMaxWaitMs);
+    EXPECT(kMaxWaitMs * 2 < 30000);
+    return 0;
+}
+
 int early_list() {
     const testfiles::ScratchDir scratch("leonida_pipeline_queue_test");
     const std::filesystem::path file = scratch.path() / "early-pipelines.txt";
@@ -199,7 +209,7 @@ int early_list() {
 }  // namespace
 
 int main() {
-    if (frame_window() || queue_order() || budget() || early_list()) return 1;
+    if (frame_window() || queue_order() || budget() || budget_cap() || early_list()) return 1;
     std::printf("pipeline_queue_test: ok\n");
     return 0;
 }

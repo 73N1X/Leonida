@@ -108,10 +108,28 @@ inline long long env_number(const char* name, long long fallback) {
     return end == text || n < 0 ? fallback : n;
 }
 
-// LEONIDA_PIPELINE_WAIT_MS: the waiting a frame allows per kind of pipeline, over all threads (make.rs:154-179).
-// 0 waits for nothing once frames have begun. Read once; set_wait_budget overrides it (tests).
+// The most LEONIDA_PIPELINE_WAIT_MS may ask for. The title's hang watchdog (a thread that wakes once a second) ends the
+// process when the main loop has not stamped its progress for 30 checks in a row: a deliberate write to address 0,
+// which the runtime's log shows as an access violation writing 0x0. Both waits of a frame (graphics and compute) and
+// the frame's own work must fit in that, so each stays under a third of it. Measured: a run with the budget at 600 s
+// stopped drawing at 180 s (its frames waited on pipelines made on 4 threads, one of them 10.3 s) and the title wrote
+// to 0 at 211 s.
+inline constexpr std::int64_t kMaxWaitMs = 10000;
+
+// The budget the variable asks for, kept under kMaxWaitMs.
+inline std::int64_t wait_budget_from_env(std::int64_t asked) {
+    if (asked <= kMaxWaitMs) return asked;
+    std::fprintf(stderr,
+                 "[rt] d3d12: pipelines: LEONIDA_PIPELINE_WAIT_MS %lld is past the title's 30 s hang watchdog; "
+                 "%lld ms is used\n",
+                 static_cast<long long>(asked), static_cast<long long>(kMaxWaitMs));
+    return kMaxWaitMs;
+}
+
+// LEONIDA_PIPELINE_WAIT_MS: the waiting a frame allows per kind of pipeline, over all threads (make.rs:154-179), at
+// most kMaxWaitMs. 0 waits for nothing once frames have begun. Read once; set_wait_budget overrides it (tests).
 inline std::atomic<std::int64_t>& wait_budget_ms() {
-    static std::atomic<std::int64_t> ms{env_number("LEONIDA_PIPELINE_WAIT_MS", kDefaultWaitMs)};
+    static std::atomic<std::int64_t> ms{wait_budget_from_env(env_number("LEONIDA_PIPELINE_WAIT_MS", kDefaultWaitMs))};
     return ms;
 }
 inline Clock::duration wait_budget() { return std::chrono::milliseconds(wait_budget_ms().load(std::memory_order_relaxed)); }
