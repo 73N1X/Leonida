@@ -705,4 +705,21 @@ inline bool decode(const BufferWords& words, Buffer& out) {
     return true;
 }
 
+// The V# of a constant-buffer view: `size` bytes at `address` as records of one float4 (16 bytes), checked by index.
+// The title's console-compiled shaders index a constant buffer's float4 rows with `buffer_load_dwordx4 ... idxen`
+// and the row number as the index (a Scaleform batch vertex shader reads row 4 * batch + k of its constant buffer
+// that way), which only reaches row k with a 16-byte stride: a raw view (stride 0) gives every row the first one.
+// Scalar loads still see `size` bytes (s_buffer_load is bounded at NUM_RECORDS * STRIDE), offset loads (offen,
+// index 0) reach the whole buffer, and index loads stop at the last row (OOB_SELECT structured, index only). D3D12
+// sizes constant buffers in 256-byte units; a size that is not a multiple of 16 keeps its last partial row.
+inline Buffer constant_buffer_descriptor(std::uint64_t address, std::uint32_t size) {
+    Buffer buffer{};
+    buffer.address = address;
+    buffer.stride = 16;
+    buffer.num_records = size / 16 + (size % 16 ? 1 : 0);
+    buffer.format = 77;  // GFX10_FORMAT_32_32_32_32_FLOAT
+    buffer.oob_select = OobSelect::structured;
+    return buffer;
+}
+
 }  // namespace leonida::gfx10

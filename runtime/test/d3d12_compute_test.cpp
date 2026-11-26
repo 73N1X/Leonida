@@ -691,11 +691,12 @@ int main() {
                 leonida::gfx10::Buffer decoded{};
                 EXPECT(leonida::gfx10::decode(raw, decoded));
                 EXPECT(decoded.address == expected_va);
-                EXPECT(decoded.stride == 0);
-                EXPECT(decoded.num_records == 256);
-                EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
+                // 256 bytes as 16 float4 records, checked by index (gfx10::constant_buffer_descriptor).
+                EXPECT(decoded.stride == 16);
+                EXPECT(decoded.num_records == 16);
+                EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32G32B32A32_SFLOAT));
                 EXPECT(decoded.swizzle == leonida::gfx10::identity_swizzle);
-                EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
+                EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::structured);
                 EXPECT(std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(slot_idx).ptr) + 16, zeros, 16) == 0);
             }
 

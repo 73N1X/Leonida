@@ -413,6 +413,18 @@ int main() {
     CHECK(decode(v, read) && read == buffer);
     buffer = {.address = 0x1000, .num_records = 256, .format = format_from_vulkan(VK_FORMAT_R32_SFLOAT)};
     CHECK(decode(encode(buffer), read) && read == buffer && read.stride == 0);
+    // A constant-buffer view: float4 records, so `buffer_load_dwordx4 ... idxen` with a row number reaches that row
+    // (row k at address + 16 k, as tools/rdna2spirv.py buffer_address computes it), s_buffer_load is bounded at the
+    // view's bytes (NUM_RECORDS * STRIDE), and an index past the last row is out of range (OOB_SELECT 1).
+    const Buffer constants = constant_buffer_descriptor(0x4119b9c0, 1536);
+    CHECK(constants.address == 0x4119b9c0 && constants.stride == 16 && constants.num_records == 96);
+    CHECK(constants.format == format_from_vulkan(VK_FORMAT_R32G32B32A32_SFLOAT));
+    CHECK(constants.oob_select == OobSelect::structured && constants.swizzle == identity_swizzle);
+    const BufferWords cbv = encode(constants);
+    CHECK(get(cbv[1], 16, 14) == 16 && cbv[2] == 96 && get(cbv[3], 28, 2) == 1);
+    CHECK(std::uint64_t(cbv[2]) * get(cbv[1], 16, 14) == 1536);
+    CHECK(decode(cbv, read) && read == constants);
+    CHECK(constant_buffer_descriptor(0x1000, 20).num_records == 2);  // a partial last row is kept
     // TYPE (bits 31:30) is 0 for a buffer; the first four dwords of a T# are refused, and so is a reserved DST_SEL.
     const Buffer kept = read;
     BufferWords wrong = v;
