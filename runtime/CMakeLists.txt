@@ -144,6 +144,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
+    shims/registry_oem.cpp
     shims/dstorage_xs.cpp
   )
   # leonida_bcpack_decode comes from gta6rt_bcpack (src/bcpack.cpp), linked below. Never add
@@ -358,6 +359,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(com_shim_test PRIVATE /OPT:NOREF)
+
+  # The console model the title reads from HKLM\...\OEM\ConsoleMode (registry_oem.cpp).
+  add_executable(registry_oem_test
+    test/registry_oem_test.cpp
+    shims/registry_oem.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(registry_oem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(registry_oem_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_compile_options(registry_oem_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(registry_oem_test PRIVATE /OPT:NOREF)
+  target_link_libraries(registry_oem_test PRIVATE advapi32)
 
   # BCrypt RNG and algorithm provider shims.
   add_executable(bcrypt_rng_test
@@ -1225,6 +1238,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
+  endif()
+  if(WIN32 AND TARGET registry_oem_test)
+    add_test(NAME registry_oem COMMAND registry_oem_test)
   endif()
   if(WIN32 AND TARGET bcrypt_rng_test)
     add_test(NAME bcrypt_rng COMMAND bcrypt_rng_test)
