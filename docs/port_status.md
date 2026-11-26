@@ -131,9 +131,28 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   after device slot 70 (a placed SRV over title memory) returned E_NOTIMPL.
   Next: the title-memory model and the slots that need it (device 70/71, list
   62, 71-74, 100, 148).
-- The title renders to 3840x2160 because it is told it is on a 4K console
-  display; reporting a smaller display mode is a large frame-time lever for
-  later (VIctory has `VICTORY_DISPLAY_MODE`).
+- Presentation (`port/present`, from VIctory's `host.rs`, `queue.rs`, `frame.rs`,
+  `dxgi.rs`, `capture.rs` and `lifecycle.rs`): `PresentX` (queue slot 32) on the
+  Vulkan device goes to the title's own window (its `CreateWindowExA`, fitted
+  to the screen; closing it ends the run) or a window of the runtime's, through
+  a swapchain on the presenting queue; the caption shows `Leonida | <fps> fps
+  <ms> ms/frame`; the device's frame clock (slots 78-81) hands out the tokens
+  and paces, the present does not wait for a vblank; `LEONIDA_CAPTURE_DIR`
+  saves requested frames as PNGs off the present path. `run_tiny_present`
+  (stand-in title through `gta6rt --run`, screenshot pixels checked) passes on
+  the RTX 4060 Ti. The real title still stops before its first present.
+- The title makes its window at 3840x2160 and its `ALLOW_DISPLAY` back buffers
+  at 3840x2160. It reads the console output's display mode (output slot 21,
+  now answered with `LEONIDA_DISPLAY_MODE`, VIctory's `VICTORY_DISPLAY_MODE`)
+  just before its first `SetFrameIntervalX`, but 1920x1080 (also at 120 Hz,
+  also with `LEONIDA_DEVICE_TYPE=6`) leaves both at 3840x2160. The size is the
+  executable's Series X SDR mode: VIctory upstream's native 1440p profile
+  (`native_1440p.rs`), ported as `runtime/src/display_profile.h`, patches it
+  and three related places in the mapped image, and with
+  `LEONIDA_DISPLAY_MODE=2560x1440` the window and both back buffers are
+  2560x1440 (`LEONIDA_RENDER_SCALE=0.75` renders 1080p into it). Other sizes
+  are refused (1920x1080 still gave 2560x1440 buffers). Its frame-time effect
+  is not measured yet: the title stops before its first frame.
 - The title asks the device for three interfaces it does not know
   (`{5f6e592d-d895-44c2-8e4a-88ad4926d323}`, `{14eecffc-4df8-40f7-a118-5c816f45695e}`,
   `{5af5c532-4c91-4cd0-b541-15a405395fc5}`); VIctory has no answer for them
