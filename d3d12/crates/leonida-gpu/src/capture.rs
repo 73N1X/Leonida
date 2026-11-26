@@ -186,6 +186,11 @@ pub(crate) fn recording(n: u64) -> bool {
     static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
     static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let Some(folder) = folder() else { return false };
+    // `LEONIDA_CAPTURE_ALL=1`: every frame for as long as the title runs.
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var_os("LEONIDA_CAPTURE_ALL").is_some_and(|v| v == "1")) {
+        return true;
+    }
     if ASKED.swap(n, Relaxed) != n {
         ON.store(folder.join("rec").exists(), Relaxed);
     }

@@ -608,6 +608,25 @@ pub fn emit(
                 }
             }
         }
+        // Leonida, last of all (`LEONIDA_WAVE_LDS_LOOSE=0`: not tried): LDS read and
+        // written inside one lane-branch region, the host waves meeting only around it
+        // (`lower::with_lds_loose`, approximate). Refused, every dispatch is dropped.
+        if !strict && std::env::var_os("LEONIDA_WAVE_LDS_LOOSE").is_none_or(|v| v != "0") {
+            let loose = lower::with_lds_loose(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &loose);
+            if done(&loose) {
+                return loose.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let both = lower::with_lds_loose(|| {
+                    lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))
+                });
+                report("loose LDS and local waves (APPROXIMATE, any mask)", &both);
+                if done(&both) {
+                    return both.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the

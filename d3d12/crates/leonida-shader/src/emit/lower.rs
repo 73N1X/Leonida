@@ -994,7 +994,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if (0..n).any(|r| reads[r] && writes[r]) && !LDS_LOOSE.get() {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1070,6 +1070,26 @@ thread_local! {
 /// operations promise; a program that takes one wave to be its whole
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
+thread_local! {
+    /// [`with_lds_loose`] is running.
+    static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Leonida: runs `f` with a lane-branch region that both reads and writes
+/// LDS accepted on a 32-lane host ([`lds_meetings`]): the two host waves of
+/// a console wave meet where the region is entered and left, not inside it,
+/// so a value one half writes there and the other half reads there may be
+/// read as it was. APPROXIMATE; the last thing tried for a console wave64
+/// program before it is refused, which would drop every dispatch of it (the
+/// water's shading tiles: black and teal blocks on the sea, one frame in a
+/// few). The same finding as lepotane/VIctory-leonida b619f92 (GPL-3.0).
+pub(super) fn with_lds_loose<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_LOOSE.replace(true);
+    let r = f();
+    LDS_LOOSE.set(was);
+    r
+}
+
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_ANY.replace(true);
     let r = with_local_waves(f);

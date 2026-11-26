@@ -36,9 +36,12 @@ $settings = @{
     LEONIDA_TEXTURE_NO_WAIT = '1'; LEONIDA_RELAY = '2'; LEONIDA_CARD_STEPS = '2'
     LEONIDA_WIDE_BACK = '1'; LEONIDA_CARD_REHASH_RUNS = '1'
     LEONIDA_JOIN_COPIES = '1'; LEONIDA_INDIRECT_WINDOW = '1'; LEONIDA_RELAY_COPY = '1'
-    LEONIDA_INDIRECT_BATCH = '2'; LEONIDA_MAP_THREADS = '1'; LEONIDA_TITLE_PRIORITIES = '0'; LEONIDA_CARD_AWAKE = '1'
+    LEONIDA_INDIRECT_BATCH = '1'; LEONIDA_MAP_THREADS = '1'; LEONIDA_TITLE_PRIORITIES = '0'; LEONIDA_CARD_AWAKE = '1'
     LEONIDA_SHOW_AFTER = '1'; LEONIDA_AMBIENT = '0.8'; LEONIDA_D3D12_DRED = 'light'; LEONIDA_SKIP_PIPELINES = 'none'
     LEONIDA_THIN = '1'; LEONIDA_JOIN_PARTS = '8'; LEONIDA_UPLOAD_AHEAD = '1'
+    # Leonida: indirect batches end at every dispatch (INDIRECT_BATCH=1, not 2). With 2 a batch opened before the
+    # title's culling and tessellation dispatches clamped their arguments before they were written: the sea's surface
+    # and its tiled resolve went missing for a frame (sand or black blocks), 6 times in 271 frames; with 1, none in 441.
     # Cheap picture fixes, on in both sets:
     # - Overbright views: without rays the light probes keep the sky's light indoors. The fog is bounded by 1.5 times
     #   the light around, and what the title left by 2 times the estimate (was 4; ambient.rs).

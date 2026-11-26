@@ -100,6 +100,23 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Leonida: the program's own name in its container (`CS_WaterClip...`,
+/// `PS_...`), for logs: a refused or skipped hash says nothing by itself.
+pub(crate) fn program_name(container: &[u8]) -> Option<String> {
+    const STAGES: [&[u8]; 8] = [b"CS_", b"PS_", b"VS_", b"MS_", b"AS_", b"GS_", b"HS_", b"DS_"];
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for at in 0..container.len().saturating_sub(6) {
+        if (at > 0 && ident(container[at - 1])) || !STAGES.iter().any(|s| container[at..].starts_with(s)) {
+            continue;
+        }
+        let end = container[at..].iter().position(|&b| !ident(b)).map_or(container.len(), |n| at + n);
+        if end - at >= 6 {
+            return Some(String::from_utf8_lossy(&container[at..end]).into_owned());
+        }
+    }
+    None
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);

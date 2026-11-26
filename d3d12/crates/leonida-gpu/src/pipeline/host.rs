@@ -703,7 +703,11 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    {
+                    let names: Vec<_> =
+                        stages.iter().filter_map(|(s, _)| crate::pipeline::program_name(&s.container)).collect();
+                    tracing::warn!(error = %e, ?shaders, ?names, "host pipeline refused");
+                }
                     host.log_messages();
                     return None;
                 }
@@ -862,7 +866,11 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                {
+                    let names: Vec<_> =
+                        stages.iter().filter_map(|(s, _)| crate::pipeline::program_name(&s.container)).collect();
+                    tracing::warn!(error = %e, ?shaders, ?names, "host pipeline refused");
+                }
                 host.log_messages();
                 return None;
             }

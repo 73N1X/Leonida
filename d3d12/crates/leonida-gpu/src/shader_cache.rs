@@ -69,6 +69,8 @@ fn build() -> [u8; 32] {
             // LOCAL (fxceless #1216): constant buffer slots marked.
             "LEONIDA_CONSTANT_MARKS",
             "LEONIDA_WAVE_WIDE",
+            // Leonida: the loose-LDS last resort (emit/lower.rs with_lds_loose).
+            "LEONIDA_WAVE_LDS_LOOSE",
             "LEONIDA_WAVE_DEEP_SKIPS",
             "LEONIDA_WAVE_OWN_BITS",
             "LEONIDA_WAVE_LOCAL",
