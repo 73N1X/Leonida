@@ -291,6 +291,36 @@ ConsoleObject* make(Kind kind, IUnknown* inner, ConsoleObject* adapter) {
 
 }  // namespace
 
+double title_aspect_ratio() {
+    static const double ratio = [] {
+        char value[64] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_ASPECT", value, sizeof(value));
+        if (length == 0) return 0.0;
+        leonida::aspect::Request request;
+        if (length >= sizeof(value) || !leonida::aspect::parse_request(value, &request)) {
+            std::fprintf(stderr, "[rt] display: LEONIDA_ASPECT=%s is not W:H, a ratio in 1..4, auto or off; ignored\n",
+                         length < sizeof(value) ? value : "(too long)");
+            return 0.0;
+        }
+        // `auto`: the primary monitor's shape (its size in whatever DPI units this thread has; the ratio is the same).
+        std::uint32_t monitor_w = 0, monitor_h = 0;
+        MONITORINFO monitor{sizeof(monitor)};
+        if (request.kind == leonida::aspect::Kind::automatic &&
+            GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor)) {
+            monitor_w = std::uint32_t(monitor.rcMonitor.right - monitor.rcMonitor.left);
+            monitor_h = std::uint32_t(monitor.rcMonitor.bottom - monitor.rcMonitor.top);
+        }
+        const double r = leonida::aspect::resolve(request, monitor_w, monitor_h);
+        if (request.kind == leonida::aspect::Kind::automatic)
+            std::fprintf(stderr, "[rt] display: LEONIDA_ASPECT=auto: the primary monitor is %ux%u (%.3f:1)%s\n", monitor_w,
+                         monitor_h, r, r > 0.0 ? "" : ", not a ratio in 1..4; ignored");
+        else if (r > 0.0)
+            std::fprintf(stderr, "[rt] display: LEONIDA_ASPECT=%s (%.3f:1)\n", value, r);
+        return r;
+    }();
+    return ratio;
+}
+
 leonida::DisplayMode title_display_mode() {
     static const leonida::DisplayMode mode = [] {
         leonida::DisplayMode m;
@@ -306,6 +336,18 @@ leonida::DisplayMode title_display_mode() {
             std::fprintf(stderr, "[rt] display: LEONIDA_DISPLAY_MODE=%s is not WxH with W in 640..7680 and H in "
                                  "360..4320; the title is told %ux%u\n",
                          length < sizeof(value) ? value : "(too long)", m.width, m.height);
+        }
+        // LEONIDA_ASPECT (src/aspect_fit.h): the same height, wider. Only the answers here change; the size the title
+        // renders at is compiled into it (src/display_profile.h), so whether it follows is for a run to show.
+        if (const double ratio = title_aspect_ratio(); ratio > 0.0) {
+            const leonida::DisplayMode wide = leonida::aspect::widen_display_mode(m, ratio);
+            if (wide.width != m.width || wide.height != m.height)
+                std::fprintf(stderr, "[rt] display: the title is told its display is %ux%u instead (LEONIDA_ASPECT)\n",
+                             wide.width, wide.height);
+            else
+                std::fprintf(stderr, "[rt] display: LEONIDA_ASPECT is not wider than %ux%u; the mode is kept\n", m.width,
+                             m.height);
+            m = wide;
         }
         return m;
     }();

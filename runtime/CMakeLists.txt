@@ -638,6 +638,11 @@ if(BUILD_TESTING)
   add_executable(present_window_parts_test test/present_window_parts_test.cpp)
   add_test(NAME present_window_parts COMMAND present_window_parts_test)
 
+  # Ultrawide (src/aspect_fit.h, docs/ultrawide.md): LEONIDA_ASPECT's and LEONIDA_PRESENT_SCALE's parsers, the widened
+  # display mode and the pillarbox/letterbox box a frame is presented in. Pure stdlib.
+  add_executable(aspect_fit_test test/aspect_fit_test.cpp)
+  add_test(NAME aspect_fit COMMAND aspect_fit_test)
+
   # The title's time step patch (src/frame_step.h) on a stand-in image, and the step it gives at 1 to 1000 fps.
   add_executable(frame_step_test test/frame_step_test.cpp)
   add_test(NAME frame_step COMMAND frame_step_test)

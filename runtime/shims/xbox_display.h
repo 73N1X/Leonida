@@ -26,14 +26,19 @@
 #include <dxgi1_6.h>
 #include <d3d12.h>
 
+#include "../src/aspect_fit.h"
 #include "../src/display_mode.h"
 
 #include <cstdint>
 
 namespace rt::d3d12 {
 
-// The display mode reported to the title: LEONIDA_DISPLAY_MODE when it parses (read and logged once), else 3840x2160.
+// The display mode reported to the title: LEONIDA_DISPLAY_MODE when it parses (read and logged once), else 3840x2160;
+// then, with LEONIDA_ASPECT, widened to that aspect at the same height (src/aspect_fit.h, docs/ultrawide.md).
 leonida::DisplayMode title_display_mode();
+// LEONIDA_ASPECT as width over height (`auto`: the primary monitor's), read and logged once; 0 when it is unset, off or
+// not understood.
+double title_aspect_ratio();
 
 // `pc` (an IDXGIAdapter of any implementation; one reference is taken) in the console adapter layout described above.
 HRESULT create_console_adapter(IDXGIAdapter* pc, REFIID riid, void** out);

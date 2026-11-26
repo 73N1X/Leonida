@@ -6,6 +6,8 @@
 // PeekMessageA loop from the ext-ms-win-rtcore-ntuser-* sets) and sizes it to its render target: 3840x2160 on a
 // Series X, larger than most screens. CreateWindowExA/W here make the window the title asks for, with two changes for a
 // top-level one:
+//   - with LEONIDA_ASPECT (src/aspect_fit.h, docs/ultrawide.md) it is first widened to that aspect, keeping its height,
+//     so an ultrawide monitor gets an ultrawide window (a 16:9 frame is then pillarboxed in it, src/vulkan_present.h);
 //   - a size that does not fit the primary monitor's work area is shrunk to it, keeping its shape, and centred (what the
 //     window shows is scaled to it: the swapchain follows the client area);
 //   - a window procedure goes in front of the title's: Close (the close button, Alt+F4, the window menu) ends the run,
@@ -20,6 +22,7 @@
 #include <cstdio>
 
 #include "shims.h"
+#include "xbox_display.h"
 #include "xbox_window.h"
 
 namespace {
@@ -33,6 +36,14 @@ bool top_level(HWND parent, DWORD style) { return !parent && !(style & WS_CHILD)
 void fit(HWND parent, DWORD style, int& x, int& y, int& width, int& height, const void* caller) {
     if (!top_level(parent, style) || width <= 0 || height <= 0 || width == CW_USEDEFAULT || height == CW_USEDEFAULT)
         return;
+    if (const double ratio = rt::d3d12::title_aspect_ratio(); ratio > 0.0) {
+        const leonida::aspect::Size wide = leonida::aspect::widen({std::uint32_t(width), std::uint32_t(height)}, ratio);
+        if (int(wide.width) != width) {
+            std::fprintf(stderr, "[rt] window: the title's %dx%d window is widened to %ux%d (LEONIDA_ASPECT)\n", width,
+                         height, wide.width, height);
+            width = int(wide.width);
+        }
+    }
     RECT area{};
     if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0)) return;
     const int aw = area.right - area.left, ah = area.bottom - area.top;

@@ -10,6 +10,8 @@ param(
     [string]$Overlay = "",                            # folder for the title's writable files (default: <Work>\overlay)
     [string]$Saves = "",                              # save folder (default: <Work>\saves)
     [string]$DisplayMode = "2560x1440",
+    [string]$Aspect = "",                             # LEONIDA_ASPECT: 21:9, 32:9, 43:18, auto (docs/ultrawide.md)
+    [string]$PresentScale = "",                       # LEONIDA_PRESENT_SCALE: fit or stretch (fit with -Aspect)
     [string]$Build = "",                              # the runtime build folder (default: runtime\build-vk\RelWithDebInfo)
     [switch]$Trace                                    # write a startup trace beside the logs
 )
@@ -33,6 +35,8 @@ Set-Default "LEONIDA_D3D12" "vulkan"
 Set-Default "LEONIDA_SHADERS" (Join-Path $Work "shaders\spirv")
 Set-Default "LEONIDA_SAVE_DIR" $Saves
 Set-Default "LEONIDA_DISPLAY_MODE" $DisplayMode
+if ($Aspect) { Set-Default "LEONIDA_ASPECT" $Aspect }
+if ($PresentScale) { Set-Default "LEONIDA_PRESENT_SCALE" $PresentScale }
 Set-Default "LEONIDA_KEYBOARD_PAD" "1"          # keyboard and mouse as a pad while the window has focus
 # The title's soft asserts (an int3 the console build carries on from) are stepped over and logged; the one known
 # site is game+0x4ffd879 after the start screen (docs/port_status.md, open items).

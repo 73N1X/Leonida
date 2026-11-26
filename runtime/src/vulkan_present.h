@@ -31,7 +31,14 @@
 // that fence there anyway) or when it recreates the swapchain. Nothing is read or converted on the present path: the
 // sink owns the pixels and frees them on whatever thread it likes. Unlike the capture below, only a requested frame is
 // copied.
+//
+// Aspect (LEONIDA_PRESENT_SCALE, src/aspect_fit.h, docs/ultrawide.md): with Scaling::fit a frame whose shape is not
+// the window's keeps its aspect, centred with black bars (pillarbox or letterbox); a plain blit then clears the
+// swapchain image first and blits into that box, and a composed present maps the planes' placements into it (the pass
+// writes black outside plane 0). With Scaling::stretch (the default unless LEONIDA_ASPECT is set) the frame fills the
+// window as before. set_scaling() overrides the environment.
 
+#include "aspect_fit.h"
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
 
@@ -236,6 +243,7 @@ public:
                 vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS)
                 return;
         }
+        scaling_ = aspect::scaling_from(std::getenv("LEONIDA_PRESENT_SCALE"), std::getenv("LEONIDA_ASPECT"));
         // LEONIDA_CAPTURE=<dir>: besides presenting, copy the swapchain image to host memory and write it out as a
         // binary PPM, every LEONIDA_CAPTURE_EVERY presented frames (default 30), at most LEONIDA_CAPTURE_LIMIT of
         // them (default 24). Off unless the variable is set; a capture that cannot be made shows nothing and is
@@ -390,6 +398,10 @@ public:
     // Tests, on surfaces without HDR10: compose as if the output were HDR10 but write the PQ values into the (8-bit,
     // UNORM) swapchain, so the encoder can be checked on any GPU. Takes effect with the next present_planes().
     void force_hdr_encoding(bool on) { force_hdr_encoding_ = on; }
+    // How a frame of another shape than the window is put in it (aspect_fit.h); from LEONIDA_PRESENT_SCALE and
+    // LEONIDA_ASPECT when the presenter is made. Takes effect with the next present.
+    void set_scaling(aspect::Scaling scaling) { scaling_ = scaling; }
+    aspect::Scaling scaling() const { return scaling_; }
 
     // Polled while a present waits for a swapchain image (every 50 ms): when it returns true the present gives up with
     // VK_NOT_READY, so a caller that is being suspended is never held by a window that stopped taking frames.
@@ -864,13 +876,26 @@ private:
         const PresentRect whole{0, 0, std::int32_t(binding.width), std::int32_t(binding.height)};
         const PresentRect& src = source_rect ? *source_rect : whole;
         const std::int32_t sw = src.right - src.left, sh = src.bottom - src.top;
-        const std::int32_t dw = std::int32_t(extent_.width), dh = std::int32_t(extent_.height);
+        // Scaling::fit: the frame keeps its aspect inside the window, the rest of the image cleared to black first.
+        aspect::Box box{0, 0, std::int32_t(extent_.width), std::int32_t(extent_.height)};
+        if (scaling_ == aspect::Scaling::fit && vkCmdClearColorImage_)
+            box = aspect::fit_box(double(sw) / double(sh), extent_.width, extent_.height);
+        if (!aspect::is_whole(box, extent_.width, extent_.height)) {
+            const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+            vkCmdClearColorImage_(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+            detail::image_barrier(fn, commands, target, range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+        }
+        const std::int32_t dw = box.width(), dh = box.height();
         VkImageBlit blit{};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[0] = {src.left, src.top, 0};
         blit.srcOffsets[1] = {src.right, src.bottom, 1};
         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.dstOffsets[1] = {dw, dh, 1};
+        blit.dstOffsets[0] = {box.left, box.top, 0};
+        blit.dstOffsets[1] = {box.right, box.bottom, 1};
         vkCmdBlitImage_(commands, binding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                         sw == dw && sh == dh ? VK_FILTER_NEAREST : blit_filter(binding.format));
@@ -963,18 +988,25 @@ private:
                                       VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         }
 
-        // The pass: destinations in output pixels, sources in texels.
+        // The pass: destinations in output pixels, sources in texels. Scaling::fit: the output the title composed for
+        // (the shape plane 0 has undistorted in its placement) is a box of the window that keeps that shape, and every
+        // placement goes into it; the pass writes black outside plane 0.
         PresentComposePush push{};
-        const float out_w = float(extent_.width), out_h = float(extent_.height);
+        aspect::Box box{0, 0, std::int32_t(extent_.width), std::int32_t(extent_.height)};
+        if (scaling_ == aspect::Scaling::fit) {
+            const PresentPlane& first = planes.plane[0];
+            const double source_w = first.has_source_rect ? double(first.source_rect.right - first.source_rect.left)
+                                                          : double(current[0].width);
+            const double source_h = first.has_source_rect ? double(first.source_rect.bottom - first.source_rect.top)
+                                                          : double(current[0].height);
+            box = aspect::fit_box(aspect::content_aspect(source_w, source_h, first.dest), extent_.width, extent_.height);
+        }
         std::uint32_t* flags[2] = {&push.flags0, &push.flags1};
         float* dest[2] = {push.dest0, push.dest1};
         float* src[2] = {push.src0, push.src1};
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             const PresentPlane& plane = planes.plane[i];
-            dest[i][0] = plane.dest[0] * out_w;
-            dest[i][1] = plane.dest[1] * out_h;
-            dest[i][2] = plane.dest[2] * out_w;
-            dest[i][3] = plane.dest[3] * out_h;
+            aspect::place(plane.dest, box, dest[i]);
             const PresentRect whole{0, 0, std::int32_t(current[i].width), std::int32_t(current[i].height)};
             const PresentRect& r = plane.has_source_rect ? plane.source_rect : whole;
             src[i][0] = float(r.left);
@@ -1646,6 +1678,7 @@ private:
     bool hdr_active_ = false;
     std::atomic<std::uint64_t> composed_{0};
     std::atomic<bool> force_hdr_encoding_{false};
+    std::atomic<aspect::Scaling> scaling_{aspect::Scaling::stretch};  // set from the environment by the constructor
     bool warned_hdr_ = false;
     std::unique_ptr<PresentComposer> composer_;
     std::function<bool()> abort_;

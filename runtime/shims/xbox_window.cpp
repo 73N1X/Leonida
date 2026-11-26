@@ -503,6 +503,8 @@ private:
                 height = desc.Height;
             }
         }
+        // LEONIDA_ASPECT: a window the runtime makes is that wide too, as the title's own is (title_window.cpp).
+        if (const double ratio = title_aspect_ratio(); ratio > 0.0) width = leonida::aspect::widen({width, height}, ratio).width;
         const HWND title = title_window();
         window_ = title ? GameWindow::adopt(title) : GameWindow::create(width, height);
         if (!window_) {
