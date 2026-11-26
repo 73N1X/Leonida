@@ -1143,6 +1143,32 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
         check(attributes_w(L"G:\\data\\sub") != INVALID_FILE_ATTRIBUTES, "GetFileAttributesW stats a G: folder");
 
+        // GetDiskFreeSpace(Ex) and SetCurrentDirectory on a console path ask the folder behind it (VIctory files.rs).
+        using FreeExW = BOOL(WINAPI*)(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+        using FreeA = BOOL(WINAPI*)(LPCSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD);
+        using SetDirW = BOOL(WINAPI*)(LPCWSTR);
+        const auto free_ex_w = resolve<FreeExW>("kernel32.dll", "GetDiskFreeSpaceExW");
+        const auto free_a = resolve<FreeA>("kernelbase.dll", "GetDiskFreeSpaceA");
+        const auto set_dir_w = resolve<SetDirW>("api-ms-win-core-processenvironment-l1-1-0.dll", "SetCurrentDirectoryW");
+        ULARGE_INTEGER avail{}, total{}, total_free{}, host_total{};
+        ::GetDiskFreeSpaceExW((package.wstring() + L"\\").c_str(), nullptr, &host_total, nullptr);
+        check(free_ex_w && free_ex_w(L"G:\\", &avail, &total, &total_free) && total.QuadPart == host_total.QuadPart &&
+                  total.QuadPart > 0,
+              "GetDiskFreeSpaceExW(G:\\) answers for the game folder's volume");
+        DWORD spc = 0, bps = 0, fc = 0, tc = 0;
+        check(free_a && free_a("GAME:\\drives\\", &spc, &bps, &fc, &tc) && bps > 0 && tc > 0,
+              "GetDiskFreeSpaceA on a GAME: folder answers too");
+        SetLastError(0);
+        check(free_ex_w && !free_ex_w(L"G:\\..\\", &avail, nullptr, nullptr) && GetLastError() == ERROR_INVALID_NAME,
+              "a path that climbs out of the drive is refused");
+        wchar_t before[MAX_PATH] = {};
+        ::GetCurrentDirectoryW(MAX_PATH, before);
+        wchar_t now[MAX_PATH] = {};
+        check(set_dir_w && set_dir_w(L"G:\\drives\\sub") && ::GetCurrentDirectoryW(MAX_PATH, now) > 0 &&
+                  std::filesystem::equivalent(std::filesystem::path(now), package / "drives" / "sub"),
+              "SetCurrentDirectoryW(G:\\drives\\sub) enters the package folder");
+        ::SetCurrentDirectoryW(before);
+
         SetLastError(0);
         check(create_w(L"G:\\..\\x.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr) ==
                       INVALID_HANDLE_VALUE &&

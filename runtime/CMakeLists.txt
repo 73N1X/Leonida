@@ -87,6 +87,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   # Host CPU preflight of --init/--run (src/host_cpu.h): AVX, OSXSAVE and XCR0 YMM state. The test feeds synthetic
   # CPUID/XCR0 words.
+  # Console-only CPU instructions (src/console_insn.*): decoder, SSE4a fields and the emulation on a hand-made
+  # CONTEXT; nothing is executed, so AMD and Intel hosts mean the same. No game files.
+  add_executable(console_insn_test test/console_insn_test.cpp src/console_insn.cpp shims/registry.cpp)
+  target_include_directories(console_insn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(console_insn_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(console_insn_test PRIVATE /W4 /permissive- /utf-8)
   add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
   target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_options(host_cpu_test PRIVATE /W4 /permissive- /utf-8)
@@ -122,10 +128,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(gta6rt
     src/main.cpp
     src/host_cpu.cpp
+    src/console_insn.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/winsock_offline.cpp
+    shims/app_state.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -166,7 +175,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # scripts/build_runtime.ps1.
   set(GTA6RT_STACK 8388608)
   target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
-  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue gta6rt_bcpack psapi)
+  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue gta6rt_bcpack psapi ws2_32)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -353,6 +362,25 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
+  # The title's suspend routines (shims/app_state.cpp). No game files.
+  add_executable(app_state_test test/app_state_test.cpp shims/app_state.cpp shims/registry.cpp)
+  target_include_directories(app_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(app_state_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(app_state_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(app_state_test PRIVATE /OPT:NOREF)
+
+  # Winsock reaches loopback only (shims/winsock_offline.cpp). Opens loopback sockets only; nothing leaves the machine.
+  add_executable(winsock_offline_test
+    test/winsock_offline_test.cpp
+    shims/winsock_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(winsock_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(winsock_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(winsock_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(winsock_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(winsock_offline_test PRIVATE ws2_32)
+
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
     shims/winhttp_offline.cpp
@@ -431,6 +459,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xgameruntime_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
+
+  # GetModuleHandle(NULL) / GetModuleFileName in mapped code name the title's image (library_loader.cpp). No game files.
+  add_executable(module_identity_test
+    test/module_identity_test.cpp
+    shims/library_loader.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(module_identity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(module_identity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(module_identity_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(module_identity_test PRIVATE /OPT:NOREF)
 
   # XUserImpl (offline local user) through QueryApiImpl, slot by slot as xgameruntime.lib's thunks call it.
   add_executable(xgameruntime_user_test
@@ -1284,6 +1323,8 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+    add_test(NAME winsock_offline COMMAND winsock_offline_test)
+    add_test(NAME app_state COMMAND app_state_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
@@ -1343,6 +1384,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+    add_test(NAME module_identity COMMAND module_identity_test)
     add_test(NAME xgameruntime_user COMMAND xgameruntime_user_test)
     add_test(NAME xgameruntime_gamesave COMMAND xgameruntime_gamesave_test)
     add_test(NAME xgameruntime_store COMMAND xgameruntime_store_test)
@@ -1444,6 +1486,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET host_cpu_test)
     add_test(NAME host_cpu COMMAND host_cpu_test)
+    add_test(NAME console_insn COMMAND console_insn_test)
   endif()
   if(WIN32 AND TARGET root_signature_oracle_test)
     add_test(NAME root_signature_oracle COMMAND root_signature_oracle_test)

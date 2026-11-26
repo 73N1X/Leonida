@@ -480,6 +480,19 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
+bool bundled_module_path(void* module, std::wstring& path) {
+    if (!module) return false;
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->module_path && entry.ops->module_path(entry.ctx, module, path)) return true;
+    return false;
+}
+
+namespace {
+std::atomic<void*> g_main_image{nullptr};
+}
+void set_main_image(void* base) { g_main_image.store(base); }
+void* main_image() { return g_main_image.load(); }
+
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }
@@ -492,8 +505,10 @@ void* find(const std::string& dll_lower, const std::string& name) {
 bool owns_dll(const std::string& dll_lower) {
     // advapi32.dll: registry_oem.cpp answers four of its imports; LoadLibrary still gets the host module.
     // mfplat.dll: media_foundation.cpp answers MFCreateSourceResolver; the rest of Media Foundation is the host's.
+    // ws2_32.dll: winsock_offline.cpp vets the ways out of it and the rest is the host's.
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
-                                       "vulkan-1.dll", "ntdll.dll", "user32.dll", "advapi32.dll", "mfplat.dll"};
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll", "advapi32.dll", "mfplat.dll",
+                                       "ws2_32.dll"};
     if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
     for (const char* h : host)
         if (dll_lower == h) return false;

@@ -133,6 +133,8 @@ public:
     void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
+    // The file a mapped module was mapped from, by its handle (base); false for any other handle.
+    bool module_path(void* module_handle, std::wstring& path) const;
 
 private:
     void initialise(Module& m);
