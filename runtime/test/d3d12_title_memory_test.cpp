@@ -455,6 +455,128 @@ int run(ID3D12Device* inner, void* device, const std::vector<std::uint8_t>& cont
     std::printf("title memory: a slot-70 texture view of a 64x64 SW_64KB_D texture in title memory reads back as "
                 "its linear texels\n");
 
+    // ---- Slot 70, whole textures in the console's layout (gfx10::ConsoleTexture, VIctory texture.rs): a 2D array
+    // with a mip chain and tail in SW_4KB_S, a BC1 chain in SW_64KB_D and a 3D chain in thick SW_4KB_S, every
+    // subresource read back as its linear texels.
+    {
+        namespace g = leonida::gfx10;
+        struct Case {
+            D3D12_RESOURCE_DIMENSION dimension;
+            UINT width, height, depth_or_array, mips;
+            DXGI_FORMAT format;
+            std::uint32_t layout_word;
+            std::uint64_t at;
+        } const cases[] = {
+            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 32, 3, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 0x105, A + 0x110000},
+            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 1, 9, DXGI_FORMAT_BC1_UNORM, 0x10a, A + 0x140000},
+            {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 32, 16, 8, 3, DXGI_FORMAT_R8G8B8A8_UNORM, 0, A + 0x180000},
+        };
+        for (const Case& c : cases) {
+            g::ConsoleTextureDesc cd;
+            cd.dimension = c.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? g::Dimension::tex3d : g::Dimension::tex2d;
+            cd.width = c.width;
+            cd.height = c.height;
+            cd.depth_or_array = c.depth_or_array;
+            cd.mips = c.mips;
+            cd.format = c.format;
+            cd.swizzle = c.layout_word ? (c.layout_word & 0xff) : g::swizzle::sw_4kb_s;
+            g::ConsoleTexture console;
+            EXPECT(g::ConsoleTexture::make(cd, false, console) && console.planes.size() == 1);
+            const g::TextureLayout& layout = console.planes[0].layout;
+            EXPECT(layout.addressable() && c.at + layout.size() <= A + (2 << 20));
+            const bool three_d = cd.dimension == g::Dimension::tex3d;
+            const UINT slices = three_d ? 1 : c.depth_or_array;
+            const std::size_t n = layout.desc().element_bytes;
+            auto* const tiled = reinterpret_cast<std::byte*>(c.at);
+            std::memset(tiled, 0, std::size_t(layout.size()));
+            std::vector<std::vector<std::byte>> expected;  // per subresource, rows packed
+            for (UINT slice = 0; slice < slices; ++slice)
+                for (UINT mip = 0; mip < c.mips; ++mip) {
+                    const g::MipLayout& m = layout.mips()[mip];
+                    const std::size_t row = m.width * n, plane = row * m.height;
+                    std::vector<std::byte> rows(plane * m.depth);
+                    for (std::size_t i = 0; i < rows.size(); ++i)
+                        rows[i] = std::byte(i * 29 + (i >> 7) + mip * 61 + slice * 17 + 1);
+                    EXPECT(layout.tile(std::span<std::byte>(tiled, std::size_t(layout.size())), mip, slice, rows,
+                                       row, plane));
+                    expected.push_back(std::move(rows));
+                }
+            std::uint32_t words14[14] = {};
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = c.dimension;
+            td.Width = c.width;
+            td.Height = c.height;
+            td.DepthOrArraySize = UINT16(c.depth_or_array);
+            td.MipLevels = UINT16(c.mips);
+            td.Format = c.format;
+            td.SampleDesc.Count = 1;
+            std::memcpy(words14, &td, sizeof(td));
+            words14[11] = c.layout_word;
+            std::uint32_t view16[16] = {};
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = c.format;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (three_d) {
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+                srv.Texture3D.MipLevels = c.mips;
+            } else {
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                srv.Texture2DArray.MipLevels = c.mips;
+                srv.Texture2DArray.ArraySize = c.depth_or_array;
+            }
+            std::memcpy(view16, &srv, sizeof(srv));
+            view16[10] = static_cast<std::uint32_t>(c.at);
+            view16[11] = static_cast<std::uint32_t>(c.at >> 32);
+            EXPECT(call(device, 70, word(words14), word(view16), T + 128) == 0);
+            Ref<ID3D12Resource> made;
+            made.p = rt::d3d12::title_placed_texture(inner, c.at, words14);
+            EXPECT(made.p);
+            const UINT subresources = slices * c.mips;
+            std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresources);
+            std::vector<UINT> row_counts(subresources);
+            std::vector<UINT64> row_bytes(subresources);
+            UINT64 total = 0;
+            const D3D12_RESOURCE_DESC made_desc = made->GetDesc();
+            inner->GetCopyableFootprints(&made_desc, 0, subresources, 0, footprints.data(), row_counts.data(),
+                                         row_bytes.data(), &total);
+            const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+            const auto readback_desc = buffer_desc(total);
+            Ref<ID3D12Resource> readback;
+            EXPECT(SUCCEEDED(inner->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&readback.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            for (UINT s = 0; s < subresources; ++s) {
+                D3D12_TEXTURE_COPY_LOCATION src{made.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                src.SubresourceIndex = s;
+                D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                dst.PlacedFootprint = footprints[s];
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(SUCCEEDED(list->Close()));
+            EXPECT(runner.run(list.p));
+            void* mapped = nullptr;
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+            bool same = true;
+            for (UINT s = 0; s < subresources && same; ++s) {
+                const g::MipLayout& m = layout.mips()[s % c.mips];
+                const std::size_t row = m.width * n;
+                const auto& f = footprints[s];
+                for (UINT z = 0; z < m.depth && same; ++z)
+                    for (UINT y = 0; y < m.height && same; ++y)
+                        same = std::memcmp(static_cast<const std::byte*>(mapped) + f.Offset +
+                                               (std::size_t(z) * row_counts[s] + y) * f.Footprint.RowPitch,
+                                           expected[s].data() + (std::size_t(z) * m.height + y) * row, row) == 0;
+                if (!same) std::fprintf(stderr, "subresource %u of a %ux%u layout-0x%x texture differs\n", s, c.width,
+                                        c.height, c.layout_word);
+            }
+            readback->Unmap(0, nullptr);
+            EXPECT(same);
+        }
+    }
+    std::printf("title memory: slot-70 textures in the console's layout (a SW_4KB_S 2D array with a mip tail, a "
+                "SW_64KB_D BC1 chain, a thick 3D chain) read back as their linear texels, every subresource\n");
+
     // ---- Slot 71: a structured buffer UAV (a V# at the title address plus the first element) and a texture UAV.
     {
         std::uint32_t uav_resource[14] = {};

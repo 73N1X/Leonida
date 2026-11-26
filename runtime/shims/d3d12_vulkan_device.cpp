@@ -7998,8 +7998,9 @@ public:
     //     the title's CPU address, and the memory is imported where it is not yet (TitleMemory::ensure).
     //   - A texture view is a view of a texture this device makes for (address, description), the description's
     //     padding words zeroed (V resource.rs:2383-2448: two views that differ only in them are one texture). Its
-    //     contents are the title's at the first view, detiled (gfx10_tiling.h) where the layout is one 2D level in
-    //     SW_4KB_S or SW_64KB_D; other layouts start zeroed, logged once each. Later title writes do not reach it.
+    //     contents are the title's at the first view, every mip and slice detiled with the console's layout
+    //     (fill_from_title, gfx10_tiling.h); layouts it does not read start zeroed, logged once each. Later title
+    //     writes do not reach it.
     void create_placed_view(bool uav, const std::uint32_t* resource, const std::uint32_t* view, std::uint64_t handle) {
         constexpr auto method = "Xbox placed view (device slots 70/71)";
         d3d12_trace::record(method);
@@ -8085,54 +8086,102 @@ public:
         return it->second;
     }
 
-    // The title's bytes at `address` into the texture, detiled, where the layout is one this layer can read: one 2D
-    // level of one slice in SW_4KB_S (0x105, or 0: the layout library's pick for a texture that is neither a render
-    // target nor depth, V resource.rs:150-158) or SW_64KB_D (0x10a).
+    // The title's bytes at `address` into the texture, every mip of every array slice (or of the 3D volume), detiled
+    // with the console's own layout (leonida::gfx10::ConsoleTexture, VIctory's victory-formats texture.rs). The layout
+    // comes from the description's layout word as VIctory's texture_layout reads it (victory-gpu resource.rs:140-170):
+    // 0x100 | the swizzle mode, 1 linear, 0 the layout library's pick (linear for 1D, SW_64KB_Z_X for depth,
+    // SW_64KB_R_X for a render target, else SW_4KB_S). Laid out and read: linear, the S and D modes (256 B, 4 KiB,
+    // 64 KiB, thin and thick 3D), with their mip tails, and SW_64KB_R_X for one-mip 2D targets (the Series X pipe tables,
+    // Series S with LEONIDA_DEVICE_TYPE=6). Not read, logged once each, and the texture starts zeroed: other XOR modes,
+    // multisampled and depth/stencil textures, formats the console layout does not know, and a texture whose memory is
+    // not all there.
     void fill_from_title(Resource& texture, std::uint64_t address, const D3D12_RESOURCE_DESC& desc,
                          std::uint32_t xbox_layout) {
-        using leonida::gfx10::TileMode;
-        const bool target = desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-        TileMode mode{};
-        bool known = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.MipLevels == 1 &&
-                     desc.DepthOrArraySize == 1 && desc.SampleDesc.Count <= 1;
-        if (xbox_layout == 0x105 || (xbox_layout == 0 && !target))
-            mode = TileMode::sw_4kb_s;
-        else if (xbox_layout == 0x10a)
-            mode = TileMode::sw_64kb_d;
+        namespace g = leonida::gfx10;
+        const D3D12_RESOURCE_DESC& made = texture.desc();  // the mip count resolved
+        const bool depth = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        const bool target = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        g::ConsoleTextureDesc td;
+        bool known = true;
+        switch (desc.Dimension) {
+        case D3D12_RESOURCE_DIMENSION_TEXTURE1D: td.dimension = g::Dimension::tex1d; break;
+        case D3D12_RESOURCE_DIMENSION_TEXTURE2D: td.dimension = g::Dimension::tex2d; break;
+        case D3D12_RESOURCE_DIMENSION_TEXTURE3D: td.dimension = g::Dimension::tex3d; break;
+        default: known = false; break;
+        }
+        if (xbox_layout == 0)
+            td.swizzle = td.dimension == g::Dimension::tex1d ? g::swizzle::linear
+                         : depth                              ? g::swizzle::sw_64kb_z_x
+                         : target                             ? g::swizzle::sw_64kb_r_x
+                                                              : g::swizzle::sw_4kb_s;
+        else if (xbox_layout == 1)
+            td.swizzle = g::swizzle::linear;
+        else if ((xbox_layout & ~0xffu) == 0x100)
+            td.swizzle = xbox_layout & 0xff;
         else
             known = false;
-        const Format format = vulkan_format(desc.Format, false);
+        td.width = static_cast<std::uint32_t>(std::min<UINT64>(made.Width, UINT32_MAX));
+        td.height = made.Height;
+        td.depth_or_array = made.DepthOrArraySize;
+        td.mips = made.MipLevels;
+        td.format = static_cast<std::uint32_t>(desc.Format);
+        td.samples = std::max<UINT>(made.SampleDesc.Count, 1);
+        g::ConsoleTexture console;
+        const Format format = vulkan_format(made.Format, false);
         const leonida::BlockFormat block = footprint_block(format, VK_IMAGE_ASPECT_COLOR_BIT);
-        leonida::gfx10::TiledSurface2D surface;
-        const std::size_t blocks_w = block.block ? (std::size_t(desc.Width) + block.block - 1) / block.block : 0;
-        const std::size_t blocks_h = block.block ? (std::size_t(desc.Height) + block.block - 1) / block.block : 0;
-        if (!known || !block.bytes ||
-            !leonida::gfx10::TiledSurface2D::make(mode, block.bytes, blocks_w, blocks_h, surface)) {
+        known = known && !depth && td.samples == 1 && g::ConsoleTexture::make(td, series_s_tiling(), console) &&
+                console.planes.size() == 1 && console.planes[0].layout.addressable() &&
+                console.planes[0].layout.desc().element_bytes == block.bytes &&
+                console.planes[0].layout.desc().block == block.block;
+        if (!known) {
             static std::mutex mutex;
-            static std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
+            static std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> seen;
             std::lock_guard lock(mutex);
-            if (seen.insert({xbox_layout, (std::uint32_t(desc.Dimension) << 16) | desc.MipLevels}).second)
+            if (seen.insert({xbox_layout, std::uint32_t(desc.Dimension), std::uint32_t(desc.Format)}).second)
                 std::fprintf(stderr,
                              "[rt] d3d12: a texture the title placed has a layout this layer does not read (layout "
-                             "0x%x, dimension %d, %u mips, %u slices, format %d); it starts zeroed\n",
-                             xbox_layout, int(desc.Dimension), unsigned(desc.MipLevels),
-                             unsigned(desc.DepthOrArraySize), int(desc.Format));
+                             "0x%x, dimension %d, %u mips, %u slices, %u samples, format %d%s); it starts zeroed\n",
+                             xbox_layout, int(desc.Dimension), unsigned(made.MipLevels),
+                             unsigned(made.DepthOrArraySize), unsigned(td.samples), int(desc.Format),
+                             depth ? ", depth" : "");
             return;
         }
-        std::vector<std::byte> tiled(surface.tiled_size());
+        const g::TextureLayout& layout = console.planes[0].layout;
+        std::vector<std::byte> tiled(std::size_t(layout.size()));
         SIZE_T read = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
                                tiled.data(), tiled.size(), &read) ||
             read != tiled.size()) {
-            log_once("a texture the title placed lies in memory that is not there; it starts zeroed, bytes",
-                     int(std::min<std::size_t>(tiled.size(), INT_MAX)));
+            log_once("a texture the title placed lies in memory that is not all there; it starts zeroed, KiB",
+                     int(std::min<std::size_t>(tiled.size() >> 10, INT_MAX)));
             return;
         }
-        const std::size_t pitch = blocks_w * block.bytes;
-        std::vector<std::byte> linear(pitch * blocks_h);
-        if (!surface.detile(tiled, linear, pitch) ||
-            FAILED(texture.upload(0, linear.data(), UINT(pitch), UINT(linear.size()))))
-            log_once("a texture the title placed could not be filled; format", int(desc.Format));
+        const UINT mips = UINT(layout.mips().size());
+        const UINT slices = td.dimension == g::Dimension::tex3d ? 1 : made.DepthOrArraySize;
+        std::vector<std::byte> linear;
+        for (UINT slice = 0; slice < slices; ++slice)
+            for (UINT mip = 0; mip < mips; ++mip) {
+                const g::MipLayout& m = layout.mips()[mip];
+                const std::size_t row_pitch = std::size_t(m.width) * block.bytes;
+                const std::size_t depth_pitch = row_pitch * m.height;
+                linear.assign(depth_pitch * m.depth, std::byte{0});
+                if (!layout.detile(tiled, mip, slice, linear, row_pitch, depth_pitch) ||
+                    FAILED(texture.upload(mip + slice * mips, linear.data(), UINT(row_pitch), UINT(depth_pitch)))) {
+                    log_once("a texture the title placed could not be filled; format", int(desc.Format));
+                    return;
+                }
+            }
+    }
+
+    // The console model's pipe tables for SW_64KB_R_X (VIctory console.rs:41): Series S with LEONIDA_DEVICE_TYPE=6
+    // (XboxScarlettLockhart), as XSystemGetDeviceType and the registry's console model answer it.
+    static bool series_s_tiling() {
+        static const bool series_s = [] {
+            char text[8] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", text, sizeof(text));
+            return n && n < sizeof(text) && std::strtoul(text, nullptr, 10) == 6;
+        }();
+        return series_s;
     }
 
     // Xbox list slot 62, CopyMemoryToMemoryX (V list.rs:1294-1314): `size` bytes from title address `src` to `dst`,
