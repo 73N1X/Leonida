@@ -2583,6 +2583,69 @@ HRESULT refuse_unknown_pipeline(unsigned slot, std::uint64_t desc, std::uint64_t
     return E_NOTIMPL;
 }
 
+// Console device slot 86: CreatePipelineState(stream desc, riid, out), V device.rs:454 and pipeline.rs:671-758. The
+// console's stream is the PC's D3D12_PIPELINE_STATE_STREAM_DESC, its subobjects laid out the same way (a type, then
+// the description at its alignment, each subobject pointer-aligned), except that the console numbers the amplification
+// and mesh shaders 23 and 24 where the PC has 24 and 25 (V pipeline.rs:679-705, whose sizes are taken here). A copy of
+// the stream gets the PC numbers and goes to the PC ID3D12Device2::CreatePipelineState (PC slot 47), which on the
+// Vulkan device is the layer's stream PSO. A type past 24 is the console's own and of unknown size: the stream is cut
+// there, logged once, as VIctory ignores the rest.
+std::size_t console_subobject_size(std::uint32_t type) {
+    switch (type) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 23: case 24: case 12: case 19: return 24;
+    case 0: case 17: return 16;
+    case 7: case 15: return 40;
+    case 8: return 336;
+    case 10: return 48;
+    case 11: return 56;
+    case 21: return 64;
+    case 22: return 32;
+    case 9: case 13: case 14: case 16: case 18: case 20: return 8;
+    default: return 0;
+    }
+}
+
+HRESULT proxy_create_pipeline_state_stream(DeviceProxy* self, std::uint64_t desc_word, const IID* riid, void** out) {
+    note_slot(86);
+    if (out) *out = nullptr;
+    const auto* desc = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(desc_word);
+    if (!desc || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
+    if (!riid || !out) return E_POINTER;
+    constexpr unsigned kPcCreatePipelineState = 47;  // ID3D12Device2's first method
+    if (kPcCreatePipelineState >= self->slot_count) return refuse_beyond_device(86, self->slot_count);
+    const auto* in = static_cast<const std::uint8_t*>(desc->pPipelineStateSubobjectStream);
+    std::vector<std::uint8_t> stream(in, in + desc->SizeInBytes);
+    std::size_t at = 0, cut = stream.size();
+    unsigned shaders = 0;
+    while (at + 8 <= stream.size()) {
+        std::uint32_t type = 0;
+        std::memcpy(&type, stream.data() + at, sizeof(type));
+        const std::size_t size = console_subobject_size(type);
+        if (!size) {
+            static std::atomic<bool> logged{false};
+            if (first_call(logged))
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 86: pipeline subobject type %u at byte %zu has no known size; "
+                                     "the stream is cut there (V pipeline.rs:729-735)\n", type, at);
+            cut = at;
+            break;
+        }
+        if (type == 23 || type == 24) {
+            const std::uint32_t pc = type + 1;  // D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS / _MS
+            std::memcpy(stream.data() + at, &pc, sizeof(pc));
+        }
+        if ((type >= 1 && type <= 6) || type == 23 || type == 24) ++shaders;
+        at += size;
+    }
+    const D3D12_PIPELINE_STATE_STREAM_DESC pc_desc{cut, stream.data()};
+    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+    const HRESULT hr = reinterpret_cast<Fn>(self->real_vtable[kPcCreatePipelineState])(self->real, &pc_desc, riid, out);
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || trace_enabled() || FAILED(hr))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 86 CreatePipelineState: %llu bytes, %u shader subobjects -> 0x%08lx\n",
+                     static_cast<unsigned long long>(desc->SizeInBytes), shaders, static_cast<unsigned long>(hr));
+    return hr;
+}
+
 // Console device slots 74 and 75 (V resource.rs:2187-2223): page pools, 64 KiB pages the title maps into its tiled
 // resources by page index (through queue slot 31, CopyPageMappingsBatchX, which is still open). Kept per device: the
 // first address and the page count; a handle is an index plus one, and a removed pool keeps its index.
@@ -2757,6 +2820,9 @@ __forceinline std::uint64_t device_call(DeviceProxy* self, std::uint64_t a1, std
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
+    } else if constexpr (M == DeviceMethod::stream_pso) {
+        return hr_to_u64(proxy_create_pipeline_state_stream(self, a1, reinterpret_cast<const IID*>(a2),
+                                                            reinterpret_cast<void**>(a3)));
     } else if constexpr (M == DeviceMethod::native_compute_pso) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));

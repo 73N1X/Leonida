@@ -367,9 +367,20 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
 
 // PC ID3D12GraphicsCommandList slots 47 (ClearDepthStencilView) and 62 (OMSetDepthBounds) take floats in XMM registers:
 // typed entries, so the floats the list proxy hands on can be checked. (The table is every mock's; nothing else here
-// calls these slots on another kind of mock.)
-void WINAPI mock_clear_depth_stencil(Mock* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags, FLOAT depth,
-                                     UINT8 stencil, UINT count, const D3D12_RECT* rects) {
+// calls 62 on another kind of mock.) On a device, 47 is ID3D12Device2::CreatePipelineState(stream desc, riid, out): the
+// stream's size and its first and fourth words are kept (the output is not written; this signature does not read R9).
+std::uint64_t WINAPI mock_clear_depth_stencil(Mock* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
+                                              FLOAT depth, UINT8 stencil, UINT count, const D3D12_RECT* rects) {
+    if (self->kind == Kind::device) {
+        ++self->calls[47];
+        if (const auto* d = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(view.ptr)) {
+            self->array[47][0] = d->SizeInBytes;
+            const auto* w = static_cast<const std::uint64_t*>(d->pPipelineStateSubobjectStream);
+            self->array[47][1] = d->SizeInBytes >= 8 ? w[0] : 0;
+            self->array[47][2] = d->SizeInBytes >= 32 ? w[3] : 0;
+        }
+        return S_OK;
+    }
     ++self->calls[47];
     self->args[47][0] = view.ptr;
     self->args[47][1] = static_cast<std::uint64_t>(flags);
@@ -377,6 +388,7 @@ void WINAPI mock_clear_depth_stencil(Mock* self, D3D12_CPU_DESCRIPTOR_HANDLE vie
     self->args[47][3] = count;
     self->args[47][4] = reinterpret_cast<std::uint64_t>(rects);
     self->floats[0] = depth;
+    return 0;
 }
 
 void WINAPI mock_depth_bounds(Mock* self, FLOAT min, FLOAT max) {
@@ -1441,7 +1453,7 @@ int check_slot_tables() {
         {79, DeviceMethod::routed, DeviceMethod::routed},
         {80, DeviceMethod::routed, DeviceMethod::routed},
         {81, DeviceMethod::routed, DeviceMethod::routed},
-        {86, DeviceMethod::forward, DeviceMethod::open},
+        {86, DeviceMethod::forward, DeviceMethod::stream_pso},
         {108, DeviceMethod::struct_return, DeviceMethod::struct_return},
         {127, DeviceMethod::committed_resource3, DeviceMethod::committed_resource3},
         {133, DeviceMethod::placed_resource_x, DeviceMethod::placed_resource_x},
@@ -1959,7 +1971,25 @@ int check_console_device() {
     void* pipeline = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 57, 0x1234, word(&pipeline_iid), word(&pipeline))) == E_NOTIMPL && !pipeline &&
            mock->calls[57] == 0);
-    // From 44 on the console slots no source names, and the console methods not written yet (61, 70, 71, 86), are
+    // 86, CreatePipelineState from a stream (V pipeline.rs:671-758): the console's mesh (24) and amplification (23)
+    // subobjects reach the PC method as 25 and 24; a type of unknown size (here 40) cuts the stream there.
+    {
+        struct alignas(8) Stream {
+            std::uint32_t ms_type, pad0;
+            D3D12_SHADER_BYTECODE ms;
+            std::uint32_t as_type, pad1;
+            D3D12_SHADER_BYTECODE as;
+            std::uint32_t unknown_type, pad2;
+        } stream{24, 0, {}, 23, 0, {}, 40, 0};
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+        void* pso = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 86, word(&stream_desc), word(&pipeline_iid), word(&pso))) == S_OK && !pso &&
+               mock->calls[47] == 1 && mock->calls[86] == 0);
+        EXPECT(mock->array[47][0] == 48 && std::uint32_t(mock->array[47][1]) == 25 &&
+               std::uint32_t(mock->array[47][2]) == 24 && stream.ms_type == 24 && stream.as_type == 23);
+        EXPECT(hr_of(raw(device, 86, 0, word(&pipeline_iid), word(&pso))) == E_INVALIDARG && mock->calls[47] == 1);
+    }
+    // From 44 on the console slots no source names, and the console methods not written yet (61, 70, 71), are
     // refused: never the PC method at the same number (45/46/50 among them, PC ID3D12Device1/3 methods).
     for (unsigned slot = 44; slot < slots::kDeviceSlots; ++slot) {
         const slots::DeviceSlot entry = slots::device_slot(slot);
