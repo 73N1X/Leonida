@@ -5118,6 +5118,36 @@ class Gen:
                 self.dst(a[0], value)
             else:
                 self.emit(f"OpStore {ptr} {self.src_u(a[0])} Volatile")
+        elif op in ("ds_append", "ds_consume"):
+            # RDNA2 ISA: one atomic per wave on the LDS dword at M0[15:0] + offset, adding (append) or subtracting
+            # (consume) the number of active lanes; every active lane gets the value before it. Here the lowest active
+            # lane does the atomic and the others take its result (BroadcastFirst). Wave32 only: an emulated wave64
+            # runs as two 32-lane subgroups, which would allocate twice where the program's own lane prefix counts
+            # all 64 lanes. 28 of the title's captured compute programs use it.
+            if "gds" in mods or self.wave64 or len(a) != 1 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " form")
+            m0, base, ballot, count, lsb, first = (self.tmp() for _ in range(6))
+            self.emit(f"{m0} = OpLoad %uint %m0")
+            self.emit(f"{base} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+            word = self.wave32_ballot_word(ballot)
+            self.emit(f"{count} = OpBitCount %uint {word}")
+            self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
+            self.emit(f"{first} = OpIEqual %bool {self.wave_lane()} {lsb}")
+            l_do, l_end = self.tmp() + "_ap", self.tmp() + "_ape"
+            self.emit(f"OpSelectionMerge {l_end} None")
+            self.emit(f"OpBranchConditional {first} {l_do} {l_end}")
+            self.emit(f"{l_do} = OpLabel")
+            atomic = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
+            old = self.lds_atomic(base, off, f"{atomic} %uint {{p}} {sc} {sem} {count}")
+            self.dst(a[0], old)
+            self.emit(f"OpBranch {l_end}")
+            self.emit(f"{l_end} = OpLabel")
+            mine, shared = self.tmp(), self.tmp()
+            self.emit(f"{mine} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+            self.emit(f"{shared} = OpGroupNonUniformBroadcastFirst %uint {self.cu(3)} {mine}")
+            self.dst(a[0], shared)
+            self.uses_subgroup = self.uses_ballot = self.uses_bcast_first = True
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
