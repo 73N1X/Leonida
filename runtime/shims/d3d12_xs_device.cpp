@@ -2938,7 +2938,7 @@ void capture_slot57(std::uint64_t desc, unsigned call) {
         const DWORD n = GetEnvironmentVariableA("LEONIDA_CAPTURE_SLOT57", buf, sizeof buf);
         return n && n < sizeof buf ? std::string(buf) : std::string();
     }();
-    if (folder.empty() || call > 400 || !desc) return;
+    if (folder.empty() || (call > 400 && call <= 100000) || call > 100300 || !desc) return;  // 100001..: refused
     std::uint64_t d[33] = {};
     SIZE_T got = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(desc), d, sizeof d, &got) ||
@@ -3049,7 +3049,7 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::
     };
     struct Desc {
         ID3D12RootSignature* root_signature;
-        Pair state, semantics, ps, ps_records, vs, vs_records;
+        Pair state, semantics, ps, ps_records, vs, vs_records, ms, ms_records;
     };
     const auto* d = reinterpret_cast<const Desc*>(desc_word);
     const auto fail = [&](const char* why) {
@@ -3060,11 +3060,20 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::
         return E_INVALIDARG;
     };
     if (!d->root_signature) return fail("no root signature");
-    if (!d->vs.data || !d->vs.size) return fail("no vertex stage");
+    // A mesh pipeline: no vertex stage, the mesh stage's pair at +0x68/+0x78 (an NGG program in mesh mode: wave64,
+    // MSG_GS_ALLOC_REQ, exp prim, group index v5 >> 7 as the game's own mesh shaders). Its kind 0 is the same
+    // register block 0x54 bytes further on (measured over 300 mesh descriptions, docs/fspx.md).
+    const bool mesh = !(d->vs.data && d->vs.size) && d->ms.data && d->ms.size;
+    if (!mesh && !(d->vs.data && d->vs.size)) {
+        static std::atomic<unsigned> refused{0};
+        capture_slot57(desc_word, 100001 + refused.fetch_add(1, std::memory_order_relaxed));
+        return fail("no vertex or mesh stage");
+    }
     if (!d->state.data || d->state.size < 0xf0 || d->state.size > 0x1000) return fail("kind 0 is not the expected size");
     std::uint32_t w[0x1000 / 4] = {};
     std::memcpy(w, d->state.data, static_cast<std::size_t>(d->state.size) & ~std::size_t(3));
-    const auto reg = [&](std::uint32_t offset) { return w[offset / 4]; };
+    const std::uint32_t shift = mesh ? 0x54 : 0;
+    const auto reg = [&](std::uint32_t offset) { return w[(offset + shift) / 4]; };
 
     // Each stage goes to the device as one FSPX payload (kinds 0, 1, 6, 7), which its graphics path takes apart:
     // the kind-6 bytes are the key and the code base (d3d12_vulkan_device.cpp, create_graphics).
@@ -3075,7 +3084,7 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::
                                            {7, records.data, records.size}};
         return leonida::fspx_payload_from_parts(parts);
     };
-    const std::vector<std::uint8_t> vs = payload(d->vs, d->vs_records);
+    const std::vector<std::uint8_t> vs = mesh ? payload(d->ms, d->ms_records) : payload(d->vs, d->vs_records);
     const std::vector<std::uint8_t> ps = d->ps.data && d->ps.size ? payload(d->ps, d->ps_records)
                                                                   : std::vector<std::uint8_t>{};
     if (vs.empty() || (d->ps.data && d->ps.size && ps.empty())) return fail("a stage's parts are inconsistent");
@@ -3097,7 +3106,10 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::
         t.BlendOpAlpha = separate ? console_pso::blend_op((b >> 21) & 7) : t.BlendOp;
         t.DestBlendAlpha = separate ? console_pso::blend_factor((b >> 24) & 31) : t.DestBlend;
         t.LogicOp = D3D12_LOGIC_OP_NOOP;
-        t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        // CB_TARGET_MASK (+0xcc, 4 bits a target; 0 in 179 of 400 vertex pipelines that still export colour, so
+        // read as "all" there), measured against SPI_SHADER_COL_FORMAT at +0xf4.
+        const std::uint32_t targets = reg(0xcc);
+        t.RenderTargetWriteMask = targets ? static_cast<UINT8>((targets >> (4 * i)) & 15) : D3D12_COLOR_WRITE_ENABLE_ALL;
     }
     pc.SampleMask = UINT_MAX;
     // PA_SU_SC_MODE_CNTL: CULL_FRONT bit 0, CULL_BACK bit 1, FACE bit 2 (1: clockwise is front). Culling is off unless
@@ -3134,7 +3146,41 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, std::
     pc.DSVFormat = DXGI_FORMAT_UNKNOWN;
     pc.SampleDesc = {1, 0};
     pc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(console_pso::kFormatsFromTargets);
-    const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc, *riid, out);
+    HRESULT hr = E_FAIL;
+    if (!mesh) {
+        hr = self->real->CreateGraphicsPipelineState(&pc, *riid, out);
+    } else {
+        // A mesh pipeline goes through the PC stream method (ID3D12Device2::CreatePipelineState, PC slot 47) with an
+        // MS subobject, each subobject pointer-aligned as the device's parser reads it.
+        constexpr unsigned kPcCreatePipelineState = 47;
+        if (kPcCreatePipelineState >= self->slot_count) return refuse_beyond_device(57, self->slot_count);
+        std::vector<std::uint8_t> stream;
+        const auto add = [&](D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const auto& value) {
+            using T = std::remove_cv_t<std::remove_reference_t<decltype(value)>>;
+            const std::size_t at = (stream.size() + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+            const std::size_t payload_at = (at + sizeof(type) + alignof(T) - 1) & ~(alignof(T) - 1);
+            stream.resize((payload_at + sizeof(T) + sizeof(void*) - 1) & ~(sizeof(void*) - 1), 0);
+            std::memcpy(stream.data() + at, &type, sizeof(type));
+            std::memcpy(stream.data() + payload_at, &value, sizeof(T));
+        };
+        D3D12_RT_FORMAT_ARRAY formats{};
+        formats.NumRenderTargets = pc.NumRenderTargets;
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, pc.pRootSignature);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, pc.VS);
+        if (pc.PS.BytecodeLength) add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, pc.PS);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, pc.BlendState);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, pc.SampleMask);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, pc.RasterizerState);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, pc.DepthStencilState);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, pc.PrimitiveTopologyType);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, formats);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, pc.DSVFormat);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, pc.SampleDesc);
+        add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, pc.Flags);
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{stream.size(), stream.data()};
+        using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+        hr = reinterpret_cast<Fn>(self->real_vtable[kPcCreatePipelineState])(self->real, &stream_desc, riid, out);
+    }
     if (FAILED(hr)) {
         if (out) *out = nullptr;
         static std::atomic<unsigned> failures{0};

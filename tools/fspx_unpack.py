@@ -140,15 +140,41 @@ def decode_kind0(b: bytes) -> dict:
     }
 
 
-def code_range(code: bytes):
+def code_range(code: bytes, last: bool = False):
     """(start, end) of the instructions in a kind-6 program: after the 36-byte prologue when it is there, through
-    the first s_endpgm. end is None when the program has no s_endpgm."""
+    the first s_endpgm, or with `last` the last one. end is None when the program has no s_endpgm. The compute
+    programs hold one; a console graphics or mesh program can end early on some paths (an s_endpgm in the middle,
+    the rest of the code after it), so its listing runs to the last."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
     start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
+    found = None
     pos = code.find(ENDPGM, start)
-    while pos >= 0 and pos % 4:
+    while pos >= 0:
+        if pos % 4 == 0:
+            found = pos
+            if not last:
+                break
         pos = code.find(ENDPGM, pos + 1)
-    return start, (pos + 4 if pos >= 0 else None)
+    return start, (found + 4 if found is not None else None)
+
+
+def disasm_with_fallback(disasm, code: bytes, mcpu: str):
+    """llvm-mc's listing, or tools/rdna2_decode.py's (shader_disasm's "python" backend) when llvm-mc reports
+    undecodable words and ours reports fewer. The title's captured programs load SGPR tuples that run past s105
+    into VCC (`s_load_dwordx8 s[100:107]`, encoding 0xf40c190f), which the hardware does and llvm-mc refuses as an
+    invalid register tuple; from there llvm-mc resynchronises off the instruction boundaries and prints garbage
+    (`exp invalid_target_22` in compute code), so the translator stopped at "fall-through into undecodable words"
+    (16 of the first 20 failed captured compute programs; our decoder reads all 20 with none). Returns
+    (asm, invalid, err, decoder)."""
+    asm, invalid, err = disasm.disasm(code, mcpu)
+    if invalid and asm.strip():
+        try:
+            py_asm, py_invalid, py_err = disasm.disasm(code, mcpu, backend="python")
+        except Exception as error:  # the fallback must not cost the llvm-mc listing
+            return asm, invalid, err + f"\npython decoder: {error}", "llvm-mc"
+        if py_asm.strip() and py_invalid < invalid:
+            return py_asm, py_invalid, py_err, "python"
+    return asm, invalid, err, "llvm-mc"
 
 
 def psv_stage(container_parts: dict):
@@ -165,7 +191,7 @@ def unpack_payload(payload: bytes, graphics: bool = False):
     if status:
         return None, status
     blob = {k: payload[o:o + s] for k, (o, s) in entries.items()}
-    start, end = code_range(blob[6])
+    start, end = code_range(blob[6], last=graphics)
     meta = {
         "version": struct.unpack_from("<I", payload, 4)[0],
         "directory": {str(k): [o, s] for k, (o, s) in sorted(entries.items())},
@@ -181,11 +207,11 @@ def unpack_payload(payload: bytes, graphics: bool = False):
 
 
 # A payload the runtime saved from a console graphics pipeline (device slot 57) is named <kind-6 sha256>-<stage>.fspx.
-GRAPHICS_STAGES = ("vs", "ps")
+GRAPHICS_STAGES = ("vs", "ps", "ms")
 
 
 def graphics_stage(stem: str):
-    """'vs' or 'ps' for a captured console pipeline stage's file stem, else None."""
+    """'vs', 'ps' or 'ms' for a captured console pipeline stage's file stem, else None."""
     head, _, tail = stem.rpartition("-")
     return tail if head and tail in GRAPHICS_STAGES else None
 
@@ -241,6 +267,24 @@ def signature_part(elements) -> bytes:
     return head + table + names
 
 
+# A console mesh program's launch shape: what all 9,282 of the game's own FSSM mesh shaders declare (128 threads,
+# 128 vertices, 128 primitives, triangles), and group-shared memory above the 5,200 bytes the largest common ones
+# use (the translator grows it to cover every constant LDS offset too).
+MESH_THREADS, MESH_MAX_VERTICES, MESH_MAX_PRIMITIVES, MESH_SHARED_BYTES = 128, 128, 128, 8192
+
+
+def mesh_psv0() -> bytes:
+    """A PSV0 part for a console mesh program, in the layout rdna2spirv.mesh_psv reads: MSInfo (GroupSharedBytesUsed,
+    two words, u16 MaxOutputVertices, u16 MaxOutputPrimitives), the wave lane counts, then PSVRuntimeInfo1 (stage 13 =
+    mesh, UsesViewID, SigPrimVectors, MeshOutputTopology 2 = triangles) and NumThreads at 36."""
+    info = bytearray(52)
+    struct.pack_into("<I", info, 0, MESH_SHARED_BYTES)
+    struct.pack_into("<HH", info, 12, MESH_MAX_VERTICES, MESH_MAX_PRIMITIVES)
+    info[24], info[27] = 13, 2
+    struct.pack_into("<III", info, 36, MESH_THREADS, 1, 1)
+    return struct.pack("<I", len(info)) + bytes(info)
+
+
 def synthetic_container(stage: str, listing: str) -> bytes:
     """A DXBC container holding only the signatures the translator reads for a console program, which comes without
     one: a vertex program's are empty (it fetches its own vertices, and pos0 is SV_Position), a pixel program's input
@@ -252,6 +296,8 @@ def synthetic_container(stage: str, listing: str) -> bytes:
         if n > 0:
             inputs.append(("SV_Position", 0, 1, 0, 0xF, (1 << n) - 1))
     parts = [(b"ISG1", signature_part(inputs)), (b"OSG1", signature_part([]))]
+    if stage == "ms":
+        parts.append((b"PSV0", mesh_psv0()))
     offset = 32 + 4 * len(parts)
     offsets, body = [], b""
     for tag, payload in parts:
@@ -266,6 +312,9 @@ def main(argv=None) -> int:
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads, or a folder of .fspx payloads (the runtime's captured programs, docs/fspx.md)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
+    ap.add_argument("--python-fallback", action="store_true",
+                    help="with --disasm: a listing llvm-mc decodes with invalid words is taken from tools/rdna2_decode.py "
+                         "when that decodes fewer (the title's captured programs, docs/fspx.md)")
     ap.add_argument("--only", choices=("all", "compute", "graphics"), default="all",
                     help="for a folder: only its compute payloads, or only its console graphics stages "
                          "(<code>-vs.fspx / <code>-ps.fspx)")
@@ -360,7 +409,13 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                if a.python_fallback:
+                    asm, invalid, err, decoder = disasm_with_fallback(disasm, blob[6][start:end], a.mcpu)
+                else:
+                    asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                    decoder = "llvm-mc"
+                if decoder != "llvm-mc":
+                    entry["decoder"] = decoder
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

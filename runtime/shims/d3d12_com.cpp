@@ -380,6 +380,7 @@ public:
     ~GraphicsCommandList() override {
         stop_recording();
         release_held();
+        release_uploads();
     }
 
     // While open, the list holds a reference to the allocator it records into and marks it busy.
@@ -431,6 +432,7 @@ public:
         invalid_ = false;
         calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
+        release_uploads();  // its vertex tables: reused once the GPU is past what was submitted
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
         return d3d12_trace::result(method, S_OK);
@@ -1520,6 +1522,8 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
+    std::uint64_t vertex_table_ = 0;  // vertex_buffers_ as console V#s (vertex_table); 0: not built for these views
+    bool uploads_ = false;            // the device gave this list title memory since its last Reset
     leonida::IndexBufferView index_{};
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
@@ -1637,6 +1641,7 @@ private:
         sampler_base_ = 0;
         topology_ = 0;
         vertex_buffers_ = {};
+        vertex_table_ = 0;
         index_ = {};
         viewport_ = {};
         scissor_ = {};
@@ -1648,8 +1653,57 @@ private:
         set_pipeline(state);
     }
 
+    // Console vertex programs (device slot 57's, docs/fspx.md "Graphics pipelines") read their vertex buffers through
+    // a table of V#s whose address the console driver puts in user SGPRs s0/s1 (`s_load_dwordx4 s[8:11], s[0:1]`
+    // after masking the high word to 8 bits), and add the draw's base vertex from s2 to the zero-based vertex id
+    // (`v_add_nc_u32 v0, s2, v0`). The table is built here from the bound views, one 16-byte V# a slot up to the
+    // last bound one, in title memory the list owns until it is reset (rt::d3d12::allocate_list_upload): once per
+    // change of the views. 0 when the device cannot give the memory.
+    std::uint64_t vertex_table() {
+        if (vertex_table_) return vertex_table_;
+        std::size_t count = 1;
+        for (std::size_t i = 0; i < vertex_buffers_.size(); ++i)
+            if (vertex_buffers_[i].va) count = i + 1;
+        ID3D12Device* device = nullptr;
+        if (IUnknown* attached = attached_device())
+            attached->QueryInterface(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+        if (!device) return 0;
+        void* memory = rt::d3d12::allocate_list_upload(device, this, 16 * count, 16);
+        device->Release();
+        if (!memory) return 0;
+        uploads_ = true;
+        auto* words = static_cast<std::uint32_t*>(memory);
+        for (std::size_t i = 0; i < count; ++i) {
+            const leonida::VertexBufferView& v = vertex_buffers_[i];
+            leonida::gfx10::Buffer buffer{};
+            buffer.address = v.va;
+            buffer.stride = v.stride & 0x3fff;
+            buffer.num_records = v.stride ? v.size / v.stride : v.size;
+            buffer.format = 77;  // GFX10_FORMAT_32_32_32_32_FLOAT: an untyped load reads 0 through format 0
+            buffer.oob_select = v.stride ? leonida::gfx10::OobSelect::structured : leonida::gfx10::OobSelect::raw;
+            const leonida::gfx10::BufferWords encoded = leonida::gfx10::encode(buffer);
+            std::memcpy(words + 4 * i, encoded.data(), 16);
+        }
+        vertex_table_ = reinterpret_cast<std::uintptr_t>(memory);
+        return vertex_table_;
+    }
+
+    // The list's title memory (vertex_table) goes back to the device for reuse.
+    void release_uploads() {
+        vertex_table_ = 0;
+        if (!uploads_) return;
+        uploads_ = false;
+        ID3D12Device* device = nullptr;
+        if (IUnknown* attached = attached_device())
+            attached->QueryInterface(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+        if (!device) return;
+        rt::d3d12::release_list_uploads(device, this);
+        device->Release();
+    }
+
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
         if (count) draw_views_stale_ = true;
+        if (count) vertex_table_ = 0;
         for (UINT i = 0; i < count; ++i)
             vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
                                                                           views[i].StrideInBytes}
@@ -1690,7 +1744,18 @@ private:
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         if (!pipeline_made(false)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
+        // The console graphics layout keeps root arguments from s8; s0..s3 are the driver's: the vertex-buffer table,
+        // the base vertex (the start vertex of a non-indexed draw, as the zero-based vertex id leaves it out) and the
+        // first instance (vertex_table).
+        auto user_data = graphics_.data;
+        if (graphics_.layout && graphics_.layout->graphics_console && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            const std::uint64_t table = vertex_table();
+            user_data[0] = std::uint32_t(table);
+            user_data[1] = std::uint32_t(table >> 32);
+            user_data[2] = indexed ? std::uint32_t(base_vertex) : first;
+            user_data[3] = first_instance;
+        }
+        leonida::Draw draw{graphics_pipeline_, user_data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
         draw.depth_bounds_min = depth_bounds_min_;

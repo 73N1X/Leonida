@@ -565,6 +565,12 @@ void refresh_title_textures();
 // LEONIDA_PRESENT_DEBUG=2: the render target most draws went into lately, or 0 (presented instead of the title's image).
 leonida::ResourceId busiest_target();
 
+// Title memory a command list owns until it is reset (the Xbox list's AllocateUploadMemory, d3d12_vulkan_device.cpp):
+// `size` bytes at a title address the CPU writes and the GPU reads. Null when the device cannot give it.
+void* allocate_list_upload(ID3D12Device* device, const void* owner, std::uint64_t size, std::uint64_t alignment);
+// Everything allocate_list_upload gave `owner`, taken back for reuse once the GPU is past the work submitted so far.
+void release_list_uploads(ID3D12Device* device, const void* owner);
+
 // A private D3D12_PIPELINE_STATE_FLAGS bit, set only by the console proxy for device slot 57's pipelines: their
 // attachment formats and sample count are those of the targets each draw binds. A console pipeline carries none (the
 // hardware takes them from the bound targets' registers), so the Vulkan pipeline is built per format set at draw

@@ -1434,7 +1434,7 @@ def captured_fspx_shaders(work: str, mc_signature: str, emulate: bool = False,
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("fspx_unpack.py", captured, "--out", unpacked, "--disasm", "--only", "compute")
+    py("fspx_unpack.py", captured, "--out", unpacked, "--disasm", "--only", "compute", "--python-fallback")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
     if fspx_key_clash(spirv):
@@ -1445,8 +1445,8 @@ def captured_fspx_shaders(work: str, mc_signature: str, emulate: bool = False,
 
 
 def console_stage_name(name: str) -> bool:
-    """A captured console graphics stage (device slot 57): <kind-6 sha256>-vs.fspx or -ps.fspx (docs/fspx.md)."""
-    return name.endswith(("-vs.fspx", "-ps.fspx"))
+    """A captured console graphics stage (device slot 57): <kind-6 sha256>-vs.fspx, -ps.fspx or -ms.fspx (docs/fspx.md)."""
+    return name.endswith(("-vs.fspx", "-ps.fspx", "-ms.fspx"))
 
 
 def captured_console_shaders(work: str, mc_signature: str, emulate: bool = False,
@@ -1479,7 +1479,7 @@ def captured_console_shaders(work: str, mc_signature: str, emulate: bool = False
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("fspx_unpack.py", captured, "--out", unpacked, "--disasm", "--only", "graphics")
+    py("fspx_unpack.py", captured, "--out", unpacked, "--disasm", "--only", "graphics", "--python-fallback")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:

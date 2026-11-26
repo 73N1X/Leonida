@@ -832,8 +832,12 @@ struct TargetFormats {
     VkFormat depth = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
     std::uint32_t samples = 1;
+    // The draw is a rectangle list (D3D12.X topology 17): the pipeline with the generated stage that completes each
+    // rectangle (src/rect_list_gs.h). A console pipeline carries no topology, so its draws pick.
+    bool rects = false;
     bool operator<(const TargetFormats& o) const {
-        return std::tie(colors, depth, depth_aspects, samples) < std::tie(o.colors, o.depth, o.depth_aspects, o.samples);
+        return std::tie(colors, depth, depth_aspects, samples, rects) <
+               std::tie(o.colors, o.depth, o.depth_aspects, o.samples, o.rects);
     }
 };
 
@@ -2282,6 +2286,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             if (!take(p.depth.binding.samples)) return ReplayResult::invalid_subresource;
         }
         targets.samples = samples ? samples : 1;
+        targets.rects = draw.topology == 17;  // rect_list::kListTopology
         p.pipeline = pipeline->format_variant ? pipeline->format_variant(targets) : VK_NULL_HANDLE;
         if (!p.pipeline) return ReplayResult::unsupported;
         unbound = 0;

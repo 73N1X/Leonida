@@ -6256,6 +6256,10 @@ public:
         auto& required_sizes = recipe_.required_sizes;
         const bool depth24_planned = depth24_fragment_;
         std::vector<std::uint32_t> rect_vs;  // the VS's words for the rectangle-list stage (rects_)
+        // A console pipeline carries no topology: its rectangle-list draws take a variant with the stage
+        // (Recipe::rect_stages), built beside the plain stages when the device has the geometry stage.
+        const bool console_rects = graphics_.formats_from_targets && !rects_ && !recipe_.mesh &&
+                                   device_.info.features.geometryShader && planned_[0].entry && !planned_[1].entry;
         for (PlannedStage& stage : planned_) {
             if (!stage.entry) continue;
             // LEONIDA_DEBUG_SOLID_PS=1 (diagnostic): every pixel shader writes solid magenta (src/debug_magenta_spv.h).
@@ -6291,7 +6295,7 @@ public:
             if (solid_vs && !planned_[1].entry && stage.bit == VK_SHADER_STAGE_VERTEX_BIT)
                 stage.words.assign(std::begin(leonida::kFullscreenVertex), std::end(leonida::kFullscreenVertex));
             // The rectangle-list stage is made from the VS as it is built (after any debug substitution).
-            if (rects_ && stage.bit == VK_SHADER_STAGE_VERTEX_BIT) rect_vs = stage.words;
+            if ((rects_ || console_rects) && stage.bit == VK_SHADER_STAGE_VERTEX_BIT) rect_vs = stage.words;
             // A8_UNORM targets are R8 attachments: their output's alpha is stored in every component, so the one
             // channel holds it (src/spirv_output_splat.h). A module without that output keeps its words.
             if (a8_targets_ && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
@@ -6337,6 +6341,13 @@ public:
                                                         stage_infos)) {
             log_once("rectangle-list stage could not be made for the VS; its words", int(rect_vs.size()));
             return false;
+        }
+        if (console_rects) {
+            std::vector<VkPipelineShaderStageCreateInfo> with_rects = stage_infos;
+            if (leonida::rect_list::append_stage(vk.vkCreateShaderModule, dev, true, rect_vs, modules_, with_rects))
+                recipe_.rect_stages = std::move(with_rects);
+            else
+                log_once("rectangle-list stage could not be made for a console VS; its words", int(rect_vs.size()));
         }
         if (depth24_fragment_ && !planned_[2].entry) {  // no pixel shader: a built-in one writes the depth
             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias_);
@@ -6597,6 +6608,9 @@ private:
     struct Recipe {
         bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
         std::vector<VkPipelineShaderStageCreateInfo> stages;
+        // A formats_from_targets pipeline's stages with the rectangle-list stage appended, for its rectangle-list
+        // draws (TargetFormats::rects); empty when it has none (a mesh or geometry stage, or no geometryShader).
+        std::vector<VkPipelineShaderStageCreateInfo> rect_stages;
         // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
@@ -6691,8 +6705,9 @@ private:
         }
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
-        info.stageCount = std::uint32_t(r.stages.size());
-        info.pStages = r.stages.data();
+        const auto& stages = targets && targets->rects && !r.rect_stages.empty() ? r.rect_stages : r.stages;
+        info.stageCount = std::uint32_t(stages.size());
+        info.pStages = stages.data();
         info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
         info.pInputAssemblyState = r.mesh ? nullptr : &r.assembly;
         info.pViewportState = &viewport;
@@ -12713,6 +12728,12 @@ void list_force_waits(ID3D12Device* device) {
 }
 
 }  // namespace
+
+void* allocate_list_upload(ID3D12Device* device, const void* owner, std::uint64_t size, std::uint64_t alignment) {
+    return list_allocate_upload(device, owner, size, alignment);
+}
+
+void release_list_uploads(ID3D12Device* device, const void* owner) { list_release_uploads(device, owner); }
 
 const rt::d3d12_xs::ListTitleHandlers kListTitleHandlers{&list_copy_memory,     &list_write_value,
                                                          &list_allocate_upload, &list_release_uploads,
