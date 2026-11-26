@@ -63,23 +63,31 @@ const DEVICES: usize = MOUSE + 1;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+/// The keyboard's stand-in gamepad (virtual key, button), in Leonida's layout (the one its Vulkan runtime's
+/// gameinput shim has): the pad-named keys, and PC-style ones beside them: Space confirms/jumps (A), F interacts (Y),
+/// R goes back/reloads (B), Left Shift and C click the sticks. H stays a second right-stick click.
+/// Sticks: W/A/S/D left, I/J/K/L right (the mouse also turns the camera: the title reads it directly);
+/// triggers Z (left) and V (right).
+const FALLBACK_BUTTONS: [(u8, u32); 19] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
+    (b'R', B),
     (b'X', X),
     (b'Y', Y),
+    (b'F', Y),
     (0x26, UP), // arrows
     (0x28, DOWN),
     (0x25, LEFT),
     (0x27, RIGHT),
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
+    (0xA0, LEFT_STICK), // Left Shift
+    (b'C', RIGHT_STICK),
     (b'H', RIGHT_STICK),
+    (0xA2, LEFT_STICK), // Left Ctrl, a second left-stick click (crouch on some layouts)
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -165,7 +173,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
         left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        right_trigger: on(b'V'),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -1697,7 +1705,7 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'V')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
@@ -1724,6 +1732,16 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn leonida_keys_press_their_buttons() {
+        // Space A, F Y, R B, Left Shift and C the stick clicks, Z and V the triggers (Leonida's layout).
+        let pad = fallback(&[key(0x20), key(b'F'), key(b'R'), key(0xA0), key(b'C'), key(b'Z'), key(b'V')]);
+        assert_eq!(pad.buttons, A | Y | B | LEFT_STICK | RIGHT_STICK);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
+        // C no longer pulls a trigger.
+        assert_eq!(fallback(&[key(b'C')]).right_trigger, 0.0);
     }
 
     #[test]
