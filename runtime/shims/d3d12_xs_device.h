@@ -157,6 +157,9 @@ using DepthUnorderedHandler = bool (*)(ID3D12Device* real);
 void set_depth_unordered_handler(DepthUnorderedHandler handler);
 // True while this thread is in a resource call the proxy makes for a console description that keeps both flags.
 bool console_depth_unordered();
+// The console layout word of the description the proxy is making a resource for on this thread (slots 76, 127 and
+// 133), or 0 outside such a call: the device detiles the title's bytes of a texture on the title's memory with it.
+std::uint32_t console_texture_layout();
 
 // Console list methods that work on title addresses (V list.rs:1294-1314, 1409-1431, 1891-1983), done by the device
 // behind the list's device proxy, which registers them (the Vulkan layer). `real` is the PC list, `device` the PC

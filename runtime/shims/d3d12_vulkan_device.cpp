@@ -10227,7 +10227,7 @@ public:
 
     // Placed textures whose title bytes may still change (refresh_placed_textures), with what was last uploaded.
     struct PlacedFill {
-        Resource* texture = nullptr;  // held by placed_textures_
+        Resource* texture = nullptr;  // held by placed_textures_, or by the watch when `owned`
         std::uint64_t address = 0;
         D3D12_RESOURCE_DESC desc{};
         std::uint32_t layout = 0;
@@ -10235,7 +10235,27 @@ public:
         unsigned unchanged = 0;  // checks in a row that found the same bytes
         unsigned interval = 1;   // settled: passes between checks (refresh_pass)
         unsigned wait = 0;       // passes left before the next check
+        bool owned = false;      // the title's own texture (watch_title_texture): the watch holds a reference
     };
+
+    // A texture made on the title's memory (slots 76, 127, 133 with the title's allocator or pages): the title writes
+    // its texels there itself, through Map or the address (its font caches: menu labels sampled alpha 0), and the
+    // Vulkan image does not see them. Watched like a placed texture, with the console layout word the proxy passed
+    // (rt::d3d12_xs::console_texture_layout); the watch holds a reference and lets go once the title has released
+    // the texture. A texture in a layout fill_from_title does not read is left alone.
+    void watch_title_texture(Resource* texture, std::uint64_t address, const D3D12_RESOURCE_DESC& desc,
+                             std::uint32_t layout) {
+        if (!texture || !address || !layout || desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return;
+        PlacedFill fill{texture, address, desc, layout};
+        fill.owned = true;
+        if (!placed_bytes(fill)) {
+            log_once("a texture on the title's memory has a layout this layer does not read; layout", int(layout));
+            return;
+        }
+        texture->AddRef();
+        std::lock_guard lock(placed_mutex_);
+        pending_fills_.push_back(fill);
+    }
 
     // Placed textures whose title bytes changed since their last upload are uploaded again (fill_from_title), up to
     // kBudget bytes read per pass, round robin; one whose bytes stay the same for kSettled checks in a row is settled
@@ -10261,6 +10281,14 @@ public:
         }
         fill_cv_.notify_one();
         if (fill_worker_.joinable()) fill_worker_.join();
+        std::vector<Resource*> owned;  // the watch's references to the title's textures
+        {
+            std::lock_guard lock(placed_mutex_);
+            for (const PlacedFill& f : pending_fills_)
+                if (f.owned) owned.push_back(f.texture);
+            std::erase_if(pending_fills_, [](const PlacedFill& f) { return f.owned; });
+        }
+        for (Resource* texture : owned) texture->Release();
     }
 
     void fill_worker_loop() {
@@ -10330,6 +10358,20 @@ public:
                     return;
                 }
             };
+            // The title's own texture: a reference for this pass. Once only the watch's is left besides it, the title
+            // has released the texture, and the watch lets go too.
+            if (f.owned && f.texture->AddRef() <= 2) {
+                f.texture->Release();
+                update(nullptr);
+                f.texture->Release();
+                continue;
+            }
+            struct PassReference {
+                Resource* texture;
+                ~PassReference() {
+                    if (texture) texture->Release();
+                }
+            } pass_reference{f.owned ? f.texture : nullptr};
             if (f.wait) {  // settled: not read this pass
                 update([](PlacedFill& e) { --e.wait; });
                 continue;
@@ -10738,8 +10780,11 @@ public:
             // takes a texture's GPU address as its CPU pointer (game+0x4fd2940); a 0 there had it clear w*h*4 bytes
             // at null (game+0x5ebea33).
             if (SUCCEEDED(hr) && out && *out)
-                if (Resource* r = Resource::from<Resource>(static_cast<ID3D12Resource*>(*out)))
+                if (Resource* r = Resource::from<Resource>(static_cast<ID3D12Resource*>(*out))) {
                     r->adopt_title_memory(address, 0, nullptr);
+                    watch_title_texture(r, reinterpret_cast<std::uintptr_t>(address), desc,
+                                        rt::d3d12_xs::console_texture_layout());
+                }
             return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};
@@ -12245,6 +12290,9 @@ private:
             resource->Release();
             return S_FALSE;
         }
+        if (resource->image() && resource->title_memory())
+            watch_title_texture(resource, reinterpret_cast<std::uintptr_t>(resource->title_memory()), *desc,
+                                rt::d3d12_xs::console_texture_layout());
         return hand_out(resource, riid, out);
     }
 

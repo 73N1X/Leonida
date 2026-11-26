@@ -2674,6 +2674,24 @@ private:
     bool before_;
 };
 
+// The console layout word of the description the proxy is making a resource for (slots 76, 127 and 133), which the
+// PC description it passes on replaces: the device reads the title's bytes of a texture on the title's memory with
+// it (rt::d3d12_xs::console_texture_layout). Plain data: no thread-exit callback (AGENTS.md, runtime traps).
+thread_local std::uint32_t t_console_texture_layout = 0;
+
+class ConsoleLayoutScope {
+public:
+    explicit ConsoleLayoutScope(std::uint32_t layout) : before_(t_console_texture_layout) {
+        t_console_texture_layout = layout;
+    }
+    ~ConsoleLayoutScope() { t_console_texture_layout = before_; }
+    ConsoleLayoutScope(const ConsoleLayoutScope&) = delete;
+    ConsoleLayoutScope& operator=(const ConsoleLayoutScope&) = delete;
+
+private:
+    std::uint32_t before_;
+};
+
 // Whether the device behind `self` takes depth textures that allow unordered access.
 bool takes_depth_unordered(const DeviceProxy* self) {
     const DepthUnorderedHandler handler = g_depth_unordered.load(std::memory_order_acquire);
@@ -2717,6 +2735,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     const DepthUnorderedScope scope(depth_unordered_access(pc_desc, takes_depth_unordered(self)));
+    const ConsoleLayoutScope layout_scope(xbox_layout);
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -2762,6 +2781,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // flags where the device gives it colour twins, as slots 76 and 127 do; dropping the UAV flag left its
     // UNORDERED_ACCESS initial state refused, and the title went on without the texture.
     const DepthUnorderedScope scope(depth_unordered_access(pc_desc, takes_depth_unordered(self)));
+    const ConsoleLayoutScope layout_scope(static_cast<std::uint32_t>(xbox_desc->Layout));
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -3397,6 +3417,7 @@ HRESULT proxy_create_committed_resource3(DeviceProxy* self, std::uint64_t heap, 
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     const DepthUnorderedScope scope(make_pc_desc(pc_desc, takes_depth_unordered(self)));
+    const ConsoleLayoutScope layout_scope(xbox_layout);
     const auto xbox_heap_flags = static_cast<std::uint32_t>(heap_flags);
     const auto pc_heap_flags =
         static_cast<D3D12_HEAP_FLAGS>(xbox_heap_flags & ~static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY));
@@ -3829,6 +3850,7 @@ void set_depth_unordered_handler(DepthUnorderedHandler handler) {
 }
 
 bool console_depth_unordered() { return t_console_depth_unordered; }
+std::uint32_t console_texture_layout() { return t_console_texture_layout; }
 
 void set_sampler_x_handler(SamplerXHandler handler) {
     g_sampler_x.store(handler, std::memory_order_release);
