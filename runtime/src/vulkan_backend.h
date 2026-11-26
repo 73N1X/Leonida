@@ -108,6 +108,7 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT)                                    \
+    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV)                                                      \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -981,6 +982,7 @@ public:
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
         replay_.draw_mesh_tasks_indirect = vk.vkCmdDrawMeshTasksIndirectEXT;
         replay_.draw_mesh_tasks_indirect_count = vk.vkCmdDrawMeshTasksIndirectCountEXT;
+        replay_.set_checkpoint = vk.vkCmdSetCheckpointNV;  // null unless the device enabled the NV checkpoints
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -1586,7 +1588,42 @@ public:
     }
 #endif
 
+    // VK_NV_device_diagnostic_checkpoints: the queues work is submitted to, and the name of a pipeline id for the
+    // report (the device's debug names; none: ids only).
+    void add_checkpoint_queue(VkQueue queue) {
+        if (!vk.vkGetQueueCheckpointDataNV || !queue) return;
+        std::lock_guard lock(checkpoint_mutex_);
+        if (std::find(checkpoint_queues_.begin(), checkpoint_queues_.end(), queue) == checkpoint_queues_.end())
+            checkpoint_queues_.push_back(queue);
+    }
+    void set_checkpoint_names(std::function<std::string(std::uintptr_t)> name) { checkpoint_name_ = std::move(name); }
+
+    // After a device loss: the last markers each queue's work passed, by pipeline stage, so the draw or dispatch the
+    // GPU stopped in is named (a hang leaves no fault address for VK_EXT_device_fault).
+    void report_checkpoints() noexcept {
+        if (!vk.vkGetQueueCheckpointDataNV) return;
+        try {
+            std::lock_guard lock(checkpoint_mutex_);
+            for (const VkQueue queue : checkpoint_queues_) {
+                std::uint32_t count = 0;
+                vk.vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+                std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+                vk.vkGetQueueCheckpointDataNV(queue, &count, data.data());
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const auto id = reinterpret_cast<std::uintptr_t>(data[i].pCheckpointMarker);
+                    const std::string name = checkpoint_name_ && id ? checkpoint_name_(id & ~std::uintptr_t{1}) : "";
+                    std::fprintf(stderr, "[rt] vulkan: checkpoint: queue %p stage 0x%x %s pipeline 0x%llx %s\n",
+                                 static_cast<void*>(queue), unsigned(data[i].stage), (id & 1) ? "compute" : "graphics",
+                                 static_cast<unsigned long long>(id & ~std::uintptr_t{1}), name.c_str());
+                }
+            }
+            std::fflush(stderr);
+        } catch (...) {
+        }
+    }
+
     void report_device_fault() noexcept {
+        report_checkpoints();
 #ifdef VK_EXT_device_fault
         if (!fault_info_) {
             std::fprintf(stderr, "[rt] vulkan: device lost (no VK_EXT_device_fault to say where)\n");
@@ -1840,6 +1877,9 @@ private:
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+    std::mutex checkpoint_mutex_;
+    std::vector<VkQueue> checkpoint_queues_;
+    std::function<std::string(std::uintptr_t)> checkpoint_name_;
 #ifdef VK_EXT_device_fault
     PFN_vkGetDeviceFaultInfoEXT fault_info_ = nullptr;
 #endif
@@ -2011,6 +2051,7 @@ public:
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
         : context_(context), queue_(queue), kind_(kind), family_(family) {
+        context.add_checkpoint_queue(queue);
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

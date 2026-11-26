@@ -989,6 +989,9 @@ struct ReplayFunctions {
     // VK_EXT_mesh_shader: mesh draws from ExecuteIndirect (Draw::indirect_buffer). Null: those draws are unsupported.
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
     PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
+    // VK_NV_device_diagnostic_checkpoints (LEONIDA_GPU_CHECKPOINTS=1): a marker before each draw and dispatch, its
+    // pipeline id (bit 0 set for compute), read back from the queues when the device is lost. Null: none are set.
+    PFN_vkCmdSetCheckpointNV set_checkpoint = nullptr;
     // A DISPATCH-only ExecuteIndirect signature with a GPU count buffer needs a compute prepass to clamp
     // the number of commands. The resulting scratch buffer is owned by the queue's timeline-retained batch.
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
@@ -4557,6 +4560,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &set0, 0, nullptr);
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            if (vk.set_checkpoint)
+                vk.set_checkpoint(command_buffer, reinterpret_cast<const void*>(dispatch->pipeline | 1u));
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
@@ -4641,6 +4646,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
+            if (vk.set_checkpoint) vk.set_checkpoint(command_buffer, reinterpret_cast<const void*>(draw->pipeline));
             if (draw->mesh && d.indirect_buffer && d.indirect_count_buffer) {
                 vk.draw_mesh_tasks_indirect_count(command_buffer, d.indirect_buffer, d.indirect_offset,
                                                   d.indirect_count_buffer, d.indirect_count_offset, draw->indirect_max,

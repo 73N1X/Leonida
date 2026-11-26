@@ -7826,6 +7826,7 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_checkpoint_names([](std::uintptr_t id) { return graphics_pipeline_debug_name(id); });
 #ifdef VK_EXT_device_fault
         if (info.device_fault) state_.context->configure_device_fault(get_device);
 #endif
@@ -14088,6 +14089,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 #ifdef VK_EXT_device_fault
     if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 #endif
+    // LEONIDA_GPU_CHECKPOINTS=1 (diagnostic): NVIDIA's diagnostic checkpoints, a marker per draw and dispatch that a
+    // device loss reads back (VulkanContext::report_checkpoints), to name the pipeline a GPU hang stopped in.
+    if (const char* v = std::getenv("LEONIDA_GPU_CHECKPOINTS"); v && v[0] == '1' &&
+        has_device_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME))
+        device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
