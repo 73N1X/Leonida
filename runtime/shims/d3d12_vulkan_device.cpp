@@ -928,6 +928,16 @@ struct DeviceState {
         return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     }
 
+    // B4G4R4A4_UNORM (115) textures that are rendered to or written as unordered access, where the GPU can do neither
+    // with A4R4G4B4 (NVIDIA): 8-bit RGBA, the same four channels, stands in for the texture and for pipelines that
+    // target the format, as in VIctory (victory-gpu resource.rs: the console renders B5G5R5A1 and B4G4R4A4, a host that
+    // refuses either refused the whole texture). The title makes a 2560x1440 one and asserts at game+0x344196 when its
+    // size is refused.
+    bool b4g4r4a4_as_rgba8() const {
+        return !color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16) ||
+               !storage_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16);
+    }
+
     bool sampled_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
@@ -1136,6 +1146,12 @@ struct DeviceState {
                 backed.uint_backed = srgb;
                 return backed;
             }
+        }
+        if (desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM &&
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
+            b4g4r4a4_as_rgba8()) {
+            log_once("B4G4R4A4_UNORM render target or UAV texture made as R8G8B8A8_UNORM; flags", int(desc.Flags));
+            return {VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -5844,6 +5860,9 @@ public:
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
             // A8_UNORM: the R8 attachment of its R8 image (texture_storage_format); the alpha goes there at build.
             graphics_.color_formats[i] = texture_storage_format(desc.RTVFormats[i], false).format;
+            // B4G4R4A4 render targets are 8-bit RGBA where the GPU cannot render A4R4G4B4 (b4g4r4a4_as_rgba8).
+            if (desc.RTVFormats[i] == DXGI_FORMAT_B4G4R4A4_UNORM && device_.b4g4r4a4_as_rgba8())
+                graphics_.color_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -7088,6 +7107,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
         named = texture_storage_format(view.format, false).format;
+        // A B4G4R4A4 view of a texture made as 8-bit RGBA (b4g4r4a4_as_rgba8) is a view in the image's own format.
+        if (view.format == DXGI_FORMAT_B4G4R4A4_UNORM && resource.format() == VK_FORMAT_R8G8B8A8_UNORM)
+            named = resource.format();
         if (g::is_depth_stencil_format(named)) {
             log_once("depth-stencil view format on a colour texture:", int(view.format));
             return false;

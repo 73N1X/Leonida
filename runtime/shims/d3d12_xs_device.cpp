@@ -2709,7 +2709,10 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // for everything else, as slot 76 does.
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    depth_unordered_access(pc_desc, false);
+    // A depth texture with unordered access on the title's pages (a 768x768 R16_TYPELESS one, flags 0x6) keeps both
+    // flags where the device gives it colour twins, as slots 76 and 127 do; dropping the UAV flag left its
+    // UNORDERED_ACCESS initial state refused, and the title went on without the texture.
+    const DepthUnorderedScope scope(depth_unordered_access(pc_desc, takes_depth_unordered(self)));
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,

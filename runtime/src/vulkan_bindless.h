@@ -198,6 +198,11 @@ struct SetLayout {
 // What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
 // 3-6 MiB (93793 descriptors on an RTX 5070).
 inline constexpr std::uint32_t max_2d_images = 65536;
+// What the 2D-array, 3D and 1D image arrays grow to past their defaults (step 3): the title's 2D-array textures overran
+// the 1024 of the default in the first 15 s of a boot, and every one past the end had no descriptor.
+inline constexpr std::uint32_t max_2d_array_images = 16384;
+inline constexpr std::uint32_t max_3d_images = 2048;
+inline constexpr std::uint32_t max_1d_images = 2048;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -243,10 +248,17 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     auto& counts = features.counts;
     counts = default_counts();
     std::uint32_t images = 1, samplers = 1, storage = 1;
+    // The other image dimensions keep their default counts until step 3 grows them.
+    std::uint32_t arrays = bindings[sampled_binding(ImageDimension::dim_2d_array)].count;
+    std::uint32_t volumes = bindings[sampled_binding(ImageDimension::dim_3d)].count;
+    std::uint32_t lines = bindings[sampled_binding(ImageDimension::dim_1d)].count;
     // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
     // take descriptors away.
     const auto apply = [&](bool final) {
         counts[sampled_binding(ImageDimension::dim_2d)] = images;
+        counts[sampled_binding(ImageDimension::dim_2d_array)] = arrays;
+        counts[sampled_binding(ImageDimension::dim_3d)] = volumes;
+        counts[sampled_binding(ImageDimension::dim_1d)] = lines;
         counts[sampler_binding] = samplers;
         for (std::uint32_t d = 0; d < 4; ++d) {
             const auto dimension = ImageDimension(d);
@@ -304,6 +316,9 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
         limits.maxSamplerAllocationCount - std::min(limits.maxSamplerAllocationCount, reserved_samplers);
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
     grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
+    grow(arrays, std::max(arrays, max_2d_array_images), growth_headroom, set_limit);
+    grow(volumes, std::max(volumes, max_3d_images), growth_headroom, set_limit);
+    grow(lines, std::max(lines, max_1d_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
     apply(true);
     return full;
