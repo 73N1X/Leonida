@@ -4978,6 +4978,44 @@ public:
         return false;
     }
 
+    // An FSPX payload the title passed that no translation has (its compute PSOs at slot 67 come from the game's own
+    // data, not the FidelityFX DLL the build unpacks): saved once as <code sha256>-<state sha256>.fspx into the
+    // capture folder, which make_game.py's shaders stage unpacks and translates into <shaders>/fspx-captured
+    // (docs/fspx.md, "Captured programs"). The folder is LEONIDA_CAPTURE_PROGRAMS, else <shaders>/../captured beside
+    // the translated shaders' folder; "0" turns it off. It stays in the player's work folder.
+    static void capture_program(const leonida::ShaderLibrary& library, std::span<const std::uint8_t> payload,
+                                const leonida::ComputeProgram& program) {
+        try {
+            static const std::filesystem::path folder = [&] {
+                const char* named = std::getenv("LEONIDA_CAPTURE_PROGRAMS");
+                if (named && std::string_view(named) == "0") return std::filesystem::path();
+                if (named && *named) return std::filesystem::path(named);
+                const std::filesystem::path shaders = library.directory();
+                return shaders.empty() ? std::filesystem::path() : shaders.parent_path() / "captured";
+            }();
+            if (folder.empty() || payload.empty()) return;
+            std::error_code ec;
+            std::filesystem::create_directories(folder, ec);
+            const std::string name =
+                leonida::sha256_hex(program.bytes) + "-" + leonida::sha256_hex(program.state) + ".fspx";
+            const std::filesystem::path file = folder / name;
+            if (std::filesystem::exists(file, ec)) return;
+            const std::filesystem::path partial = folder / (name + ".part");
+            {
+                std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(payload.data()), std::streamsize(payload.size()));
+                if (!out) return;
+            }
+            std::filesystem::rename(partial, file, ec);
+            static std::atomic<unsigned> saved{0};
+            const unsigned n = saved.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: %u untranslated FSPX programs saved to %s for the next build\n", n,
+                             folder.string().c_str());
+        } catch (...) {
+        }
+    }
+
     // As create_graphics: the description and the translator's index are checked here, the pipeline is made on a worker.
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
@@ -5013,6 +5051,10 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
+            if (fspx && !program.state.empty())
+                capture_program(*library,
+                                {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength},
+                                program);
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose

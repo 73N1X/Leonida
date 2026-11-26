@@ -221,6 +221,21 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
+## Captured programs
+
+The title's own compute pipelines come through device slot 67 (DeserializeComputePipelineStateX) as FSPX payloads
+too, built from its data at run time: 2,680 distinct programs in the first 25 s of a 1.0.2.1 boot, none of them in the
+DLL the build unpacks. When the shader library has no translation for one, the runtime saves the payload it was
+given, once, as `<fspx_code_sha256>-<fspx_state_sha256>.fspx` in the capture folder: `LEONIDA_CAPTURE_PROGRAMS`, else
+`captured/` beside the translated shaders' folder (`<work>/shaders/captured`); `LEONIDA_CAPTURE_PROGRAMS=0` turns it
+off. The folder is the player's: it holds the game's programs and never goes into the repository.
+
+`make_game.py`'s `shaders` stage then runs `tools/fspx_unpack.py` on that folder (a folder argument takes its `.fspx`
+files in name order and leaves `.part` files out) into `<work>/shaders/fspx-captured` and `rdna2spirv.py` into
+`<work>/shaders/spirv/fspx-captured`, redone when the captured set or the tools change (`captured_build.json`). The
+shader library loads `fspx-captured/index.json` beside `fspx/` and `bvh/`, so a program translated this way is found by
+its keys on the next run.
+
 ## Translation status
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the

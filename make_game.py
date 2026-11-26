@@ -1317,6 +1317,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
+    captured_fspx_shaders(work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
@@ -1398,6 +1399,44 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
         fail(f"shaders: FSPX programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
              "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
              "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+def captured_fspx_shaders(work: str, mc_signature: str, emulate: bool = False,
+                          fallbacks: tuple[str, ...] = ()) -> None:
+    """FSPX programs the title passed at slot 67 that no translation had (docs/fspx.md, "Captured programs"): the
+    runtime saves each to <work>/shaders/captured as <code sha256>-<state sha256>.fspx; tools/fspx_unpack.py unpacks
+    and disassembles that folder into <work>/shaders/fspx-captured and rdna2spirv.py translates it into
+    <work>/shaders/spirv/fspx-captured, which the runtime's shader library loads beside fspx/. Redone whole when the
+    captured set or the tools change; nothing captured, nothing done."""
+    captured = os.path.join(work, "shaders", "captured")
+    names = sorted(n for n in os.listdir(captured) if n.endswith(".fspx")) if os.path.isdir(captured) else []
+    if not names:
+        return
+    unpacked = os.path.join(work, "shaders", "fspx-captured")
+    spirv = os.path.join(work, "shaders", "spirv", "fspx-captured")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "captured_build.json")
+    digest = hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+    settings = json.dumps({"captured": digest, "count": len(names), "tools": mc_signature, "emulate": emulate,
+                           "fallbacks": list(fallbacks)}, sort_keys=True)
+    if read_shader_setting(settings_file) == settings and os.path.isfile(translated):
+        return
+    log(f"shaders: unpacking and translating {len(names)} captured FSPX programs")
+    drop(translated, settings_file)
+    for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    py("fspx_unpack.py", captured, "--out", unpacked, "--disasm")
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
+    if fspx_key_clash(spirv):
+        drop(translated)
+        fail("shaders: two captured FSPX programs with the same keys translated differently")
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 

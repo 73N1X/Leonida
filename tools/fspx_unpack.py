@@ -177,7 +177,7 @@ def unpack_payload(payload: bytes):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
-    ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
+    ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads, or a folder of .fspx payloads (the runtime's captured programs, docs/fspx.md)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1030",
@@ -212,7 +212,17 @@ def main(argv=None) -> int:
             return 2
     index, bad = [], 0
     used_names = set()
+    inputs = []
     for path in a.files:
+        if os.path.isdir(path):
+            # A folder holds payloads the runtime saved (<code sha256>-<state sha256>.fspx); unfinished .part files
+            # are left out. Sorted, so the same folder gives the same names on every platform.
+            with os.scandir(path) as entries:
+                inputs.extend(sorted(e.path for e in entries
+                                     if e.name.endswith(".fspx") and e.is_file(follow_symlinks=False)))
+        else:
+            inputs.append(path)
+    for path in inputs:
         try:
             with open(path, "rb") as f:
                 data = f.read()

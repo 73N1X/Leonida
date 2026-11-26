@@ -194,6 +194,29 @@ class Cli(unittest.TestCase):
                                  src, "--out", out, "--disasm"], capture_output=True, text=True, env=env)
         return result, out
 
+    def test_folder_of_captured_payloads(self):
+        # The runtime's captured programs: a folder of <code>-<state>.fspx files, a .part file still being written and
+        # a stray file left out, the payloads unpacked in name order.
+        with tempfile.TemporaryDirectory() as t:
+            captured = os.path.join(t, "captured")
+            os.makedirs(captured)
+            for name, threads in (("b-2.fspx", (32, 1, 1)), ("a-1.fspx", (64, 1, 1))):
+                with open(os.path.join(captured, name), "wb") as f:
+                    f.write(make_fspx([(0, kind0(threads)), (6, program())]))
+            with open(os.path.join(captured, "c-3.fspx.part"), "wb") as f:
+                f.write(b"FSPX")
+            with open(os.path.join(captured, "notes.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("not a payload\n")
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(captured, "--out", out)
+            self.assertEqual(code, 0, err)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            names = sorted(index) if isinstance(index, dict) else sorted(e["file"] for e in index)
+            self.assertEqual(len(names), 2, names)
+            self.assertTrue(os.path.isfile(os.path.join(out, "fspx", "a-1.code")))
+            self.assertTrue(os.path.isfile(os.path.join(out, "fspx", "b-2.state")))
+
     def test_disassembly_error_writes_no_listing(self):
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
