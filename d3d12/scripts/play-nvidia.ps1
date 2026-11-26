@@ -8,8 +8,9 @@
 # -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
 #                  1080 on X). The play-S-*.ps1 and play-X-*.ps1 scripts next to this one call it with each.
-#                  'native' renders at the output size with neither title patch (no render scale, no forced own
-#                  upscaler): a pinned scale of 1 with the own upscaler forced stops the title in its init on Series S.
+#                  'native' renders at the output size with no render scale pinned, the title's own temporal
+#                  upscaler kept (a pinned scale of 1 with it stopped the title in its init on Series S; without
+#                  the own upscaler, FidelityFX's untranslated passes left dithering unresolved: grainy hair).
 # -Adapter         on a PC with more than one card, the one to use: part of its name (-Adapter 5060) or its index
 #                  (-Adapter '#1'). Default: Windows' default card (the one the main display is on).
 # -Build           target\diag (the default, the build all measurements are of) or target\release
@@ -79,8 +80,9 @@ if ($Quality) {
 $outHeight = if ($SeriesX) { 2160 } else { 1080 }
 $console = if ($SeriesX) { 'X' } else { 'S' }
 if ($Resolution -eq 'native') {
-    # Leonida: the title's own size and upscaler choice, untouched.
-    $settings.Remove('LEONIDA_RENDER_SCALE'); $settings.Remove('LEONIDA_OWN_UPSCALER')
+    # Leonida: the title's own size; its own temporal upscaler stays forced (it resolves dithering and
+    # history at 1:1 too).
+    $settings.Remove('LEONIDA_RENDER_SCALE')
 } elseif ($Resolution) {
     if ([int]$Resolution -gt $outHeight) {
         Write-Host "Series $console outputs ${outHeight}p: ${Resolution}p is above it."
@@ -106,7 +108,7 @@ if ($settings.ContainsKey('LEONIDA_RENDER_SCALE')) {
     $scale = [double]::Parse($settings.LEONIDA_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
     Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.LEONIDA_RENDER_SCALE))"
 } else {
-    Write-Host "Series $console, rendering at the title's own ${outHeight}p, no resolution patches"
+    Write-Host "Series $console, rendering at the title's own ${outHeight}p (no render scale pinned)"
 }
 
 $leonida = Join-Path $PSScriptRoot "..\target\$Build\leonida.exe"
