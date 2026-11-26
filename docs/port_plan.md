@@ -150,6 +150,16 @@ translate it.
   resources; candidates for Leonida's texture step.
 - `crates/victory-gpu/src/pipeline/ray_tracing.rs`: ray-tracing pipelines.
 
+## From VIctory `64bd58f5f`: NVIDIA settings
+
+VIctory's recommended NVIDIA run: `--no-rt` (no ray-tracing builder, traversal or
+lighting resolve), `VICTORY_AMBIENT_FALLBACK=1` (supported material shaders get a
+lightweight diffuse ambient fill from their base colour, so unlit areas are not
+black) and `VICTORY_FSR_4K=0`; `--rt-static-bvh` traces only the prebuilt world
+structure. The ambient fill is a cheap stand-in for the missing ray-traced light
+worth porting to Leonida until ray tracing runs (see
+`victory/crates/victory-gpu/src/pipeline/ray_tracing.rs`).
+
 ## Frame time: where Leonida can beat VIctory
 
 VIctory's world frames cost 240-970 ms, mostly host copies of title memory

@@ -58,7 +58,7 @@ NVIDIA gameplay is untested. Start with ray tracing off and the game's display p
 ```powershell
 $env:VICTORY_FSR_4K = '0'
 $env:VICTORY_AMBIENT_FALLBACK = '1'
-& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --no-rt --console series-x
+& "$env:LOCALAPPDATA\Leonida\victory-play.exe" --no-rt --console series-x
 ```
 
 `--no-rt` skips the ray-tracing builder, traversal, and lighting resolve. Supported material shaders use a lightweight diffuse ambient fill based on their base color. Some interiors can still look darker. [RT pass selection](crates/victory-gpu/src/pipeline/ray_tracing.rs) · [Ambient fill](crates/victory-shader/src/emit/mod.rs)
