@@ -680,11 +680,39 @@ constexpr char kLauncherName[] = "XLauncherImpl";
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
 
 // 3: HRESULT XLaunchUri(XUserHandle user, const char* uri): nothing is launched; E_FAIL.
-// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): none is handed out.
-// 5: XDisplayCloseTimeoutDeferralHandle(handle): no handle exists; E_FAIL, which a void caller ignores.
-HRESULT STDMETHODCALLTYPE launcher_acquire_deferral(void* self, void** handle) {
-    if (handle) *handle = nullptr;
-    return offline_failure<kLauncherName, 4>(self);
+// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): keeps the host display on, as a
+//    deferral keeps the console's (ported from VIctory, victory-hle display.rs:79-123, GPL-3.0-or-later): the handle
+//    is a power request asking for the display, set until it is closed. Without one (the request refused) the call
+//    fails with the host's error and writes a null handle.
+// 5: XDisplayCloseTimeoutDeferralHandle(handle): clears and closes that request; a null handle is ignored.
+HRESULT host_error() {
+    const DWORD error = GetLastError();
+    return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE launcher_acquire_deferral(void*, void** handle) {
+    if (!handle) return E_INVALIDARG;
+    *handle = nullptr;
+    wchar_t reason[] = L"Title display deferral";
+    REASON_CONTEXT context{};
+    context.Version = POWER_REQUEST_CONTEXT_VERSION;
+    context.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    context.Reason.SimpleReasonString = reason;
+    const HANDLE request = PowerCreateRequest(&context);
+    if (request == INVALID_HANDLE_VALUE) return host_error();
+    if (!PowerSetRequest(request, PowerRequestDisplayRequired)) {
+        const HRESULT hr = host_error();
+        CloseHandle(request);
+        return hr;
+    }
+    *handle = request;
+    return S_OK;
+}
+
+void STDMETHODCALLTYPE launcher_close_deferral(void*, void* handle) {
+    if (!handle) return;
+    PowerClearRequest(handle, PowerRequestDisplayRequired);
+    CloseHandle(handle);
 }
 
 HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out);
@@ -692,7 +720,7 @@ const void* const kLauncherVtable[] = {
     FN(launcher_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
     FN((offline_failure<kLauncherName, 3>)),   // 3 XLaunchUri
     FN(launcher_acquire_deferral),             // 4 XDisplayAcquireTimeoutDeferral
-    FN((offline_failure<kLauncherName, 5>)),   // 5 XDisplayCloseTimeoutDeferralHandle
+    FN(launcher_close_deferral),               // 5 XDisplayCloseTimeoutDeferralHandle
 };
 static_assert(std::size(kLauncherVtable) == 6, "IUnknown + IXLauncherImpl's 3 methods");
 ClassObject g_launcher_object{kLauncherVtable};

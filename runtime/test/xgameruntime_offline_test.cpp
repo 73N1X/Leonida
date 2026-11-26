@@ -320,9 +320,17 @@ int main() {
     void* deferral = reinterpret_cast<void*>(1);
     check(at<LaunchUri>(launcher, 3)(launcher, nullptr, "https://example.com") == E_FAIL,
           "XLaunchUri is not available offline");
-    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == E_FAIL && deferral == nullptr &&
-              at<NoArgs>(launcher, 5)(launcher) == E_FAIL,
-          "the display timeout deferral is not available offline");
+    // A deferral keeps the host display on through a power request (VIctory display.rs:79-123); closing it ends the
+    // request, and a null handle closes nothing.
+    using CloseDeferral = void(STDMETHODCALLTYPE*)(void*, void*);
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr &&
+              deferral != INVALID_HANDLE_VALUE,
+          "a display timeout deferral is a power request");
+    check(at<AcquireDeferral>(launcher, 4)(launcher, nullptr) == E_INVALIDARG, "a deferral needs somewhere to go");
+    DWORD handle_flags = 0;
+    check(GetHandleInformation(deferral, &handle_flags) != 0, "the deferral is an open handle");
+    at<CloseDeferral>(launcher, 5)(launcher, deferral);
+    at<CloseDeferral>(launcher, 5)(launcher, nullptr);
     GUID other = kLauncherClass;
     other.Data1 ^= 1;
     void* none = reinterpret_cast<void*>(1);
