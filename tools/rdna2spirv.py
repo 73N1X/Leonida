@@ -5082,12 +5082,44 @@ class Gen:
             return v
         return self.lds_access(addr, byte_off, f)
 
+    def ds_append_wave64(self, op, a, mods):
+        """ds_append / ds_consume in an emulated wave64 (24 of the title's captured compute programs): one round for
+        the wave's active lanes as two mask words, then every lane does the atomic, the first active lane (of 64)
+        with the count and the others with 0, which leaves the dword as it is; a second round hands the first
+        lane's old value to the wave, with that lane's bit as the mask (a value of one segment is not visible in the
+        next, so the lane is found again from it). Runs outside lds_op's guard on the active lanes, whose selection
+        a round would split; the result goes to the active lanes only."""
+        if "gds" in mods or len(a) != 1 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+            raise Unsupported(op + " form")
+        self.uses_lds = True
+        off = self.mod_int(mods, "offset", 0)
+        sc, sem = self.cu(2), self.cu(0)
+        atomic = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
+        lo_in, hi_in = self.lane_bits(self.active_b())
+        _, (lo, hi) = self.x_round(bits=(lo_in, hi_in))
+        m0, base, cl, ch, count, me, n = (self.tmp() for _ in range(7))
+        self.emit(f"{cl} = OpBitCount %uint {lo}")
+        self.emit(f"{ch} = OpBitCount %uint {hi}")
+        self.emit(f"{count} = OpIAdd %uint {cl} {ch}")
+        first = self.first_lane64(lo, hi)
+        self.emit(f"{me} = OpIEqual %bool {self.wave_lane()} {first}")
+        self.emit(f"{n} = OpSelect %uint {me} {count} {self.cu(0)}")
+        self.emit(f"{m0} = OpLoad %uint %m0")
+        self.emit(f"{base} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
+        old = self.lds_atomic(base, off, f"{atomic} %uint {{p}} {sc} {sem} {n}")
+        read, (flo, fhi) = self.x_round(data=old, bits=self.lane_bits(me))
+        value, keep, r = read(self.first_lane64(flo, fhi)), self.load_reg("vgpr", a[0]["r"]), self.tmp()
+        self.emit(f"{r} = OpSelect %uint {self.active_b()} {value} {keep}")
+        self.dst(a[0], r)
+
     def lds_op(self, op, a, mods):
         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
         data-size units (x64 for st64). Writes and atomics run only in active lanes; results land in VGPRs through
         dst (inactive lanes unchanged). Sub-dword writes use atomic and/or so neighbouring lanes don't race."""
         if self.stage not in ("cs", "ms"):
             raise Unsupported(op + " outside compute")
+        if op in ("ds_append", "ds_consume") and self.wave64 and self.emulate:
+            return self.ds_append_wave64(op, a, mods)
         self.uses_lds = True
         rtn = "_rtn_" in op
         name = op if op == "ds_wrxchg_rtn_b32" else op.replace("_rtn_", "_")
@@ -5124,8 +5156,11 @@ class Gen:
             # lane does the atomic and the others take its result (BroadcastFirst). Wave32 only: an emulated wave64
             # runs as two 32-lane subgroups, which would allocate twice where the program's own lane prefix counts
             # all 64 lanes. 28 of the title's captured compute programs use it.
-            if "gds" in mods or self.wave64 or len(a) != 1 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+            if "gds" in mods or len(a) != 1 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
                 raise Unsupported(op + " form")
+            atomic = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
+            if self.wave64:
+                raise Unsupported(op + " form")      # an emulated wave64 is ds_append_wave64, before the guard
             m0, base, ballot, count, lsb, first = (self.tmp() for _ in range(6))
             self.emit(f"{m0} = OpLoad %uint %m0")
             self.emit(f"{base} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
@@ -5138,7 +5173,6 @@ class Gen:
             self.emit(f"OpSelectionMerge {l_end} None")
             self.emit(f"OpBranchConditional {first} {l_do} {l_end}")
             self.emit(f"{l_do} = OpLabel")
-            atomic = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
             old = self.lds_atomic(base, off, f"{atomic} %uint {{p}} {sc} {sem} {count}")
             self.dst(a[0], old)
             self.emit(f"OpBranch {l_end}")
@@ -6557,6 +6591,18 @@ class Gen:
             self.emit(f"{nz} = OpBitwiseOr %uint {res[0]} {res[1]}")
         self.scc_nonzero(nz)
 
+    def first_lane64(self, lo, hi):
+        """The lowest lane (0-63) set in a 64-lane mask held as two words; 0 when none is."""
+        lz, hz, l, h, h32, fh, first = (self.tmp() for _ in range(7))
+        self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
+        self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
+        self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
+        self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
+        self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
+        self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(0)}")
+        self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
+        return first
+
     def lane_bits(self, b):
         """This lane's bool as its bit of a 64-lane mask: (lanes 0-31 word, lanes 32-63 word), one of them 0."""
         lane = self.wave_lane()
@@ -7769,6 +7815,16 @@ class Gen:
             d, x = a[0], a[1]
             wide_src = op == "s_quadmask_b64"
             wide_dst = op != "s_quadmask_b32"
+            if op == "s_bitreplicate_b64_b32" and x["k"] == "imm" and self.wave64:
+                # A constant source is a constant 64-bit result (D[2i+1] = D[2i] = S0[i]): the same as s_mov_b64 of
+                # it, also into EXEC or VCC (26 of the title's captured wave64 compute programs set EXEC this way
+                # in a lane-prefix scan, s_bitreplicate_b64_b32 exec, 0xff00ff00).
+                s, r = x["v"] & 0xFFFFFFFF, 0
+                for i in range(32):
+                    if s >> i & 1:
+                        r |= 3 << (2 * i)
+                self.mov64(d, {"k": "imm", "v": r})
+                return
             if self.is_mask_op(x) or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
                 raise Unsupported(op + " on a lane mask")
             if wide_src:
@@ -8524,11 +8580,12 @@ class Gen:
             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            # s_lshl_b64). A lane mask (18 of the title's captured compute programs: s_flbit_i32_b64 sN, exec, the
+            # wave's last lane as 63 - sN) is the whole wave's mask, as s_ff1_i32_b64 reads it (wave_mask).
             x = a[1]
             if self.holds_lane_mask(x):
-                raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.wave_mask(x)
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
