@@ -2110,6 +2110,109 @@ public:
         quiet_upload_ = false;
         return hr;
     }
+    // Many subresources at once (create_placed_view's texture: every mip and slice): one staging buffer, one list of
+    // copies, one submission and one wait, where upload() per subresource makes each of those every time. The title's
+    // world load fills thousands of placed textures on its main thread; a 12-mip texture was 12 GPU round trips and
+    // 12 copies of the device's layout tracker, which its 30 s hang watchdog ended. With host image copy, upload()
+    // goes on the host anyway: then it is used per subresource.
+    struct Upload {
+        UINT subresource;
+        const void* data;
+        UINT row_pitch;
+        UINT depth_pitch;
+    };
+    HRESULT upload_all(const std::vector<Upload>& uploads) {
+        if (!image_) return E_INVALIDARG;
+        if (host_transfer_ || uploads.size() == 1) {
+            for (const Upload& u : uploads)
+                if (FAILED(upload(u.subresource, u.data, u.row_pitch, u.depth_pitch))) return E_FAIL;
+            return S_OK;
+        }
+        struct Part {
+            Region r;
+            std::uint64_t pitch;
+            std::uint64_t offset;
+        };
+        std::vector<Part> parts;
+        parts.reserve(uploads.size());
+        std::uint64_t total = 0;
+        for (const Upload& u : uploads) {
+            Part p{};
+            if (!region(u.subresource, nullptr, p.r)) return E_INVALIDARG;
+            p.pitch = (p.r.row_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT *
+                      D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            total = (total + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) / D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT *
+                    D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+            p.offset = total;
+            total += p.pitch * p.r.rows * p.r.slices;
+            parts.push_back(p);
+        }
+        if (!total) return S_OK;
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        leonida::ResourceBinding staging{};
+        staging.size = total;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = staging.size;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        device_.share(info);
+        if (vk.vkCreateBuffer(dev, &info, nullptr, &staging.buffer) != VK_SUCCESS) return E_OUTOFMEMORY;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        const auto release = [&](HRESULT hr) {
+            if (memory) vk.vkFreeMemory(dev, memory, nullptr);
+            vk.vkDestroyBuffer(dev, staging.buffer, nullptr);
+            return hr;
+        };
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(dev, staging.buffer, &requirements);
+        memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+        if (!memory || vk.vkBindBufferMemory(dev, staging.buffer, memory, 0) != VK_SUCCESS ||
+            vk.vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+            return release(E_OUTOFMEMORY);
+        const auto staging_id = reinterpret_cast<leonida::ResourceId>(&staging);
+        leonida::CommandList list;
+        for (std::size_t i = 0; i < uploads.size(); ++i) {
+            const Part& p = parts[i];
+            const Upload& u = uploads[i];
+            if (!p.r.rows || !p.r.slices) continue;
+            auto* to = static_cast<std::byte*>(mapped) + p.offset;
+            const auto* from = static_cast<const std::byte*>(u.data);
+            for (std::uint32_t z = 0; z < p.r.slices; ++z)
+                for (std::uint32_t y = 0; y < p.r.rows; ++y)
+                    std::memcpy(to + (std::uint64_t(z) * p.r.rows + y) * p.pitch,
+                                from + std::uint64_t(z) * u.depth_pitch + std::uint64_t(y) * u.row_pitch, p.r.row_bytes);
+            const std::uint32_t k = p.r.block.block;
+            const leonida::CopyLocation texture{id(), false, u.subresource, 0, 0, 0, 0, 0};
+            const leonida::CopyLocation placed{staging_id, true, 0, p.offset,
+                                               std::uint32_t(p.r.row_bytes / p.r.block.bytes) * k, p.r.rows * k,
+                                               p.r.slices, std::uint32_t(p.pitch)};
+            const leonida::CopyTexture copy{texture, p.r.box.left, p.r.box.top, p.r.box.front, placed, false, {}};
+            if (!list.copy_texture(copy)) return release(E_INVALIDARG);
+        }
+        if (!list.close()) return release(E_INVALIDARG);
+        device_.context->add_resource(staging_id, staging);
+        leonida::ReplayResult result = leonida::ReplayResult::unsupported;
+        {
+            std::lock_guard lock(device_.staging_mutex);
+            if (!device_.staging_queue) {
+                device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
+                                                                               device_.info.queue_family);
+            }
+            if (device_.staging_queue->ok()) {
+                const leonida::CommandList* lists[] = {&list};
+                result = device_.staging_queue->execute(lists);
+                if (result == leonida::ReplayResult::success && !device_.staging_queue->idle())
+                    result = leonida::ReplayResult::unsupported;
+            }
+        }
+        device_.context->remove_resource(staging_id);
+        if (result != leonida::ReplayResult::success) {
+            log_once("a placed texture's batched upload failed; replay result", int(result));
+            return release(E_FAIL);
+        }
+        return release(S_OK);
+    }
     const DeviceState& device_state() const { return device_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
@@ -10560,19 +10663,25 @@ public:
         }
         const UINT mips = UINT(layout.mips().size());
         const UINT slices = td.dimension == g::Dimension::tex3d ? 1 : made.DepthOrArraySize;
-        std::vector<std::byte> linear;
+        // Every mip and slice detiled first, then uploaded together (Resource::upload_all).
+        std::vector<std::vector<std::byte>> linear(std::size_t(slices) * mips);
+        std::vector<Resource::Upload> uploads;
+        uploads.reserve(linear.size());
         for (UINT slice = 0; slice < slices; ++slice)
             for (UINT mip = 0; mip < mips; ++mip) {
                 const g::MipLayout& m = layout.mips()[mip];
                 const std::size_t row_pitch = std::size_t(m.width) * block.bytes;
                 const std::size_t depth_pitch = row_pitch * m.height;
-                linear.assign(depth_pitch * m.depth, std::byte{0});
-                if (!layout.detile(tiled, mip, slice, linear, row_pitch, depth_pitch) ||
-                    FAILED(texture.upload(mip + slice * mips, linear.data(), UINT(row_pitch), UINT(depth_pitch)))) {
+                std::vector<std::byte>& sub = linear[std::size_t(slice) * mips + mip];
+                sub.assign(depth_pitch * m.depth, std::byte{0});
+                if (!layout.detile(tiled, mip, slice, sub, row_pitch, depth_pitch)) {
                     log_once("a texture the title placed could not be filled; format", int(desc.Format));
                     return;
                 }
+                uploads.push_back({mip + slice * mips, sub.data(), UINT(row_pitch), UINT(depth_pitch)});
             }
+        if (FAILED(texture.upload_all(uploads)))
+            log_once("a texture the title placed could not be filled; format", int(desc.Format));
     }
 
     // The console model's pipe tables for SW_64KB_R_X (VIctory console.rs:41): Series S with LEONIDA_DEVICE_TYPE=6
