@@ -150,6 +150,20 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   (`budget - used + [0x1475E6FF0] <= 0x1FFFFF`, budget 0x5200000 or 0x4000000
   by a console-model test at 0x140075140) that slot 70 does not reach; slot 25
   answers 33,423,360 bytes for each 3840x2160 RGBA8 target.
+- Title memory merged from `port/title-memory`: title GPU memory imported into
+  Vulkan at its own addresses (capture-replay device addresses, arena at 512
+  GiB), device slots 70/71/133 and list slots 62/71/72/100/148 implemented.
+  The title then passes slot 70 but still stops at `+0x247af2d`. That
+  breakpoint is the title's render-target pool check: it opens a pool (budget
+  0x4000000 for Series X, 0x5200000 for Series S, picked by the console model
+  it reads from `HKLM\...\OEM\ConsoleMode`), creates its back buffers, and
+  requires budget - used + a global to be at most 0x1FFFFF. On the console
+  (and in VIctory) committed resources take their memory through the title's
+  `__XMemAllocationHooks__`, so the tracker counts them (2 x 33,423,360 bytes
+  fill the 64 MiB pool); in Leonida they did not, so `used` stayed 0. The
+  registry answer is merged (`runtime\shims\registry_oem.cpp`); routing
+  XMemAlloc and committed resources through the title's hooks is in progress
+  (`port/xmem-hooks`).
 - The title renders to 3840x2160 because it is told it is on a 4K console
   display; reporting a smaller display mode is a large frame-time lever for
   later (VIctory has `VICTORY_DISPLAY_MODE`).
