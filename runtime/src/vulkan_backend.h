@@ -1276,6 +1276,8 @@ public:
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
     void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
+    void set_barriers_outside_predication(bool on) { replay_.barriers_outside_predication = on; }
+    void set_avoid_msaa_clear_attachments(bool on) { replay_.avoid_msaa_clear_attachments = on; }
 
     // The buffer whose VA range holds `va`, as buffer_at finds it (one that holds all `bytes` first): its ID, where
     // `va` lies in it, and in `bytes` how many of the bytes asked for it holds from there. False when none holds `va`.

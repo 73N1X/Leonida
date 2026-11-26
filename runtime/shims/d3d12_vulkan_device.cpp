@@ -7921,6 +7921,14 @@ public:
                 VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
                 get_props2(info.physical, &props);
+                // NVIDIA's driver and barriers inside conditional rendering (ReplayFunctions::
+                // barriers_outside_predication); LEONIDA_BARRIERS_OUTSIDE_PREDICATION=0 or 1 overrides it.
+                bool outside = driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+                if (const char* v = std::getenv("LEONIDA_BARRIERS_OUTSIDE_PREDICATION"); v && (v[0] == '0' || v[0] == '1'))
+                    outside = v[0] == '1';
+                state_.context->set_barriers_outside_predication(outside);
+                // NVIDIA and vkCmdClearAttachments on multisampled views (ReplayFunctions::avoid_msaa_clear_attachments).
+                state_.context->set_avoid_msaa_clear_attachments(driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY);
                 if (driver.driverID == VK_DRIVER_ID_MOLTENVK) {
                     state_.context->set_order_timestamp_copies(true);
                     log_once("timestamp resolves wait for the timestamps before them (MoltenVK); driver",

@@ -919,6 +919,16 @@ struct ReplayFunctions {
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
     PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
+    // NVIDIA's proprietary driver does not handle a pipeline barrier recorded inside a conditional rendering scope
+    // (Eden/Yuzu's DriverBugs.md, "doesn't properly support conditional barriers"; Blueshell runs into it):
+    // with this set, emit ends the scope around each barrier and begins it again (detail::outside_predication).
+    // A barrier is never predicated in D3D12, so this changes nothing on a driver that handles them.
+    bool barriers_outside_predication = false;
+    // NVIDIA: vkCmdClearAttachments on a multisampled attachment can lock the GPU up (Eden/Yuzu's DriverBugs.md:
+    // partial rects or a clear load op on MSAA framebuffers, several clears in one command buffer). With this set,
+    // a rect clear of a multisampled view whose rects cover the whole mip and every layer, with no predicate open,
+    // is replayed as the image clear (same result); a partial one still uses vkCmdClearAttachments and is logged.
+    bool avoid_msaa_clear_attachments = false;
     PFN_vkCmdResetQueryPool reset_query_pool = nullptr;  // queries, with fill_buffer for unavailable results
     PFN_vkCmdBeginQuery begin_query = nullptr;
     PFN_vkCmdEndQuery end_query = nullptr;
@@ -1426,6 +1436,29 @@ inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkI
     return range;
 }
 
+// The conditional rendering scope emit has open on its command buffer, while it emits (plain data: AGENTS.md,
+// "Runtime traps"). Barrier helpers deep in the replay record through outside_predication without it passed down.
+struct ActivePredicate {
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    const VkConditionalRenderingBeginInfoEXT* info = nullptr;
+};
+inline thread_local const ActivePredicate* active_predicate = nullptr;
+
+// Records a barrier (`record`) outside the open conditional rendering scope where the driver needs that
+// (ReplayFunctions::barriers_outside_predication), else as it is.
+template <typename F>
+inline void outside_predication(const ReplayFunctions& vk, VkCommandBuffer command_buffer, F&& record) {
+    const ActivePredicate* open = active_predicate;
+    if (vk.barriers_outside_predication && open && open->command_buffer == command_buffer && open->info &&
+        open->info->buffer && vk.end_conditional_rendering && vk.begin_conditional_rendering) {
+        vk.end_conditional_rendering(command_buffer);
+        record();
+        vk.begin_conditional_rendering(command_buffer, open->info);
+        return;
+    }
+    record();
+}
+
 inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                           const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
                           VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
@@ -1442,7 +1475,9 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = resource.image;
     barrier.subresourceRange = layout_range(resource, range);
-    vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    outside_predication(vk, command_buffer, [&] {
+        vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    });
 }
 
 inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkAccessFlags src_access,
@@ -1453,7 +1488,9 @@ inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_bu
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
     barrier.dstAccessMask = dst_access;
-    vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    outside_predication(vk, command_buffer, [&] {
+        vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    });
 }
 
 // The current layouts of a range: from the tracker, or `assumed` for an untracked image.
@@ -3037,6 +3074,25 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.skip = true;
                 return ReplayResult::success;
             }
+            if (vk.avoid_msaa_clear_attachments && p.binding.samples > 1) {
+                const VkExtent2D extent = detail::mip_extent(p.binding, target.mip);
+                const bool whole = std::any_of(p.rects.begin(), p.rects.end(), [&](const VkClearRect& r) {
+                    return r.rect.offset.x <= 0 && r.rect.offset.y <= 0 &&
+                           std::int64_t(r.rect.offset.x) + r.rect.extent.width >= extent.width &&
+                           std::int64_t(r.rect.offset.y) + r.rect.extent.height >= extent.height &&
+                           r.baseArrayLayer == 0 && r.layerCount >= target.layer_count;
+                });
+                const bool same_format = p.clear_format == VK_FORMAT_UNDEFINED || p.clear_format == p.binding.format;
+                if (whole && !predicated && same_format && !p.binding.volume) {
+                    p.rects.clear();  // the image clear (emit: vkCmdClearColorImage / vkCmdClearDepthStencilImage)
+                    return ReplayResult::success;
+                }
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "[rt] vulkan: a partial clear of a multisampled view (%u samples, %zu rects%s) "
+                                         "uses vkCmdClearAttachments, which NVIDIA's driver can hang on (logged once)\n",
+                                 p.binding.samples, p.rects.size(), predicated ? ", predicated" : "");
+            }
             VkImageSubresourceRange range = p.range;
             range.aspectMask = view_aspects;
             if (p.binding.volume) {
@@ -3850,6 +3906,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     // The extension is enabled: barriers into and out of PREDICATION also cover conditional rendering's read.
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+    // The open scope, for the barrier helpers (detail::outside_predication); the caller's is restored on return.
+    const detail::ActivePredicate active{command_buffer, &predicate};
+    struct Publish {
+        const detail::ActivePredicate* saved;
+        explicit Publish(const detail::ActivePredicate* now) : saved(detail::active_predicate) {
+            detail::active_predicate = now;
+        }
+        ~Publish() { detail::active_predicate = saved; }
+    } publish(&active);
     std::size_t next_query = 0;
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
@@ -3966,7 +4031,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1;
             dependency.pMemoryBarriers = &barrier;
-            vk.pipeline_barrier2(command_buffer, &dependency);
+            detail::outside_predication(vk, command_buffer, [&] { vk.pipeline_barrier2(command_buffer, &dependency); });
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
@@ -4009,7 +4074,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.imageMemoryBarrierCount = barrier_count;
             dependency.pImageMemoryBarriers = barriers;
-            vk.pipeline_barrier2(command_buffer, &dependency);
+            detail::outside_predication(vk, command_buffer, [&] { vk.pipeline_barrier2(command_buffer, &dependency); });
             if (tracker) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
