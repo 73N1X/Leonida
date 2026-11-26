@@ -330,4 +330,21 @@ std::uint64_t heap_slot_hits(unsigned slot);
 bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();
 
+// ---- d3d12_xs.dll!D3D12ConfigureVirtualMemoryX (shims/d3d12_xs.cpp) ----------------------------------------------
+
+// What the title passes, 32 bytes (VIctory victory-gpu device.rs:184-196; L RT-5: the title zeroes it and sets +4).
+// The first three words are its policy, the last two the range graphics addresses fall in, written by the call.
+struct VirtualMemoryConfig {
+    std::uint32_t flags;
+    std::uint32_t page_table_pages;  // GPU page table size in 4 MiB pages
+    std::uint32_t preserved_bytes;   // memory kept across title processes for the frame buffer
+    std::uint64_t lowest;            // out
+    std::uint64_t highest;           // out
+};
+static_assert(sizeof(VirtualMemoryConfig) == 0x20 && offsetof(VirtualMemoryConfig, lowest) == 0x10,
+              "V device.rs:197");
+
+// The range D3D12ConfigureVirtualMemoryX reports: the process's user address space (GetSystemInfo).
+void user_address_range(std::uint64_t& lowest, std::uint64_t& highest);
+
 }  // namespace rt::d3d12_xs
