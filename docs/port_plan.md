@@ -120,7 +120,12 @@ tools or GPU):
 6. **Per-program wave64 emulation** for speed on 32-lane GPUs: run Leonida's
    partition-invariance tiers (`tools\wave64_halves.py`) on compute and mesh
    too, emulate only tier C, add VIctory's exact idioms (`lower.rs:483-533,
-   996-1017`, `VS\emit\own_bits.rs`).
+   996-1017`, `VS\emit\own_bits.rs`). Done on `port/wave64-tiers`: design.md
+   rows "Wave64 compute and mesh: partition invariance" and "Wave64 halves:
+   further exact forms". Not ported yet: the own-bits light loop (a wave
+   OR / min / max steering a loop over the lanes' own bits); it needs the
+   reduction's cross-half `v_readlane` rewritten to the half's own value and
+   VIctory's proof that a pass outside a lane's own bits leaves nothing.
 7. Compute implicit derivatives (both use LOD 0 today), cube `_d` LOD pin,
    waterfall collapse (measure first).
 

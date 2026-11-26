@@ -59,6 +59,10 @@ WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact o
 MAX_SHARED_BYTES = 65536
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
 W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
+W64C_COUNTS = Counter()   # --wave64-emulate: tiers of the wave64 CS/MS translated so far (tier C is emulated)
+# --wave64-emulate without --wave64-emulate-all: emulate a wave64 CS/MS only when wave64_halves puts it in tier C
+# (compute_halves). Off unless main() sets it, so code that sets WAVE64_EMULATE alone gets every shader emulated.
+WAVE64_TIERS = False
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
 # in the metadata as "bary_fallback_input") instead of BuiltIn BaryCoordKHR, for devices without
 # VK_KHR_fragment_shader_barycentric. Whatever feeds the stage before the PS (a pass-through geometry shader) writes
@@ -358,6 +362,10 @@ class Gen:
         self.cur_uniform_readlane = False
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
         self.w64_scalar_spills = set()  # (vgpr, lane) pure scalar spill slots lowered to self.parked (SHADER-10)
+        self.w64c = None           # wave64 CS/MS: wave64_halves.analyse() result, the tier that decides emulation
+        self.relabel = False       # wave64 CS/MS run natively in halves: thread index from the subgroup (relabel_index)
+        self.w64_sync = frozenset()  # relabel: id(ins) of the LDS/memory accesses a workgroup barrier goes before
+        self.drop_barriers = False   # relabel: no memory write in the program, so s_barrier orders nothing
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
@@ -5429,8 +5437,12 @@ class Gen:
 
     def local_index(self):
         """LocalInvocationIndex of a compute or mesh shader invocation (thread i of its workgroup): the mesh shader
-        loads the built-in; a compute shader flattens LocalInvocationId with the group size from its header."""
+        loads the built-in; a compute shader flattens LocalInvocationId with the group size from its header. With
+        `relabel` it is the relabelled index the entry block computes (%rl_t, see relabel_index)."""
         li = self.tmp()
+        if self.relabel:
+            self.emit(f"{li} = OpCopyObject %uint %rl_t")
+            return li
         if self.stage == "ms":
             self.emit(f"{li} = OpLoad %uint %local_index")
             return li
@@ -7218,6 +7230,11 @@ class Gen:
         under sext()) before the op and its neg/abs, and a VGPR result is placed at dst_sel with dst_unused
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
+        if self.w64_sync and id(ins) in self.w64_sync:
+            # SHADER-10, compute/mesh run in halves: this LDS or memory access follows a conflicting one that the
+            # other half of the wave may not have made yet; the wave's lockstep ordered them (wave64_halves
+            # compute_checks). Only in blocks every invocation runs (compute_halves checks), so this is uniform.
+            self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
         self.cur_ins = ins
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
@@ -8749,6 +8766,10 @@ class Gen:
             # Workgroup execution barrier; AMD orders LDS through s_waitcnt before it, so include workgroup memory.
             if self.stage not in ("cs", "ms"):
                 raise Unsupported("s_barrier outside compute")
+            if self.drop_barriers:
+                # SHADER-10: run in halves with no memory write at all (a mesh shader's exports are not memory), a
+                # barrier orders nothing the program observes; left out, it can't be reached by one half only
+                return
             if self.emulate_inline:
                 self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
                 self.x_dirty = set()
@@ -15362,6 +15383,20 @@ def dedupe_types(text):
     return pattern.sub(lambda m: alias[m.group(0)], "\n".join(out))
 
 
+def relabel_index(gen):
+    """SHADER-10, a wave64 CS/MS run natively in 32-lane halves (compute_halves): the invocation's thread index in
+    its group, %rl_t = SubgroupId * SubgroupSize + SubgroupLocalInvocationId, so each subgroup holds the threads
+    32k..32k+31, one half of the console wave k / 2, with its lanes in order. Vulkan does not promise that
+    LocalInvocationIndex order (VIctory found host waves that are not consecutive thread indices); the program then
+    sees these indices as its thread ids (v0..v2, a mesh shader's v5 and s3), its lane (wave_lane) and the slot it
+    exports to, a permutation of the group's invocations that changes no result. Needs whole subgroups but the
+    last (a group size that is a multiple of 32, or one subgroup), which compute_halves checks. Empty otherwise."""
+    if not gen.relabel:
+        return []
+    return ["%rl_sid = OpLoad %uint %sg_id", "%rl_ssz = OpLoad %uint %sg_size", "%rl_lane = OpLoad %uint %sg_lane",
+            "%rl_base = OpIMul %uint %rl_sid %rl_ssz", "%rl_t = OpIAdd %uint %rl_base %rl_lane"]
+
+
 def mesh_compute_epilogue(gen):
     """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
@@ -15373,7 +15408,7 @@ def mesh_compute_epilogue(gen):
          f"%msp0 = OpBitwiseAnd %uint %msp1 {c(0xFFF)}",
          f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
          f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
-         "%mli = OpLoad %uint %local_index",
+         "%mli = OpCopyObject %uint %rl_t" if gen.relabel else "%mli = OpLoad %uint %local_index",
          # Slot base = output address (push-constant dwords 36..37, or --pc-tail-ubo dwords 4..5) + linear
          # workgroup index * slot bytes.
          pc_tail_chain("%moa_lo_p", 5, c), pc_tail_chain("%moa_hi_p", 6, c),
@@ -15538,13 +15573,15 @@ def assemble(gen):
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
     tex = gen.uses_tex
-    sg = gen.uses_subgroup
+    sg = gen.uses_subgroup = gen.uses_subgroup or gen.relabel
     if tex:
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
                  (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
     if sg:
         iface += ["%sg_lane"]
+    if gen.relabel:
+        iface += ["%sg_id", "%sg_size"]
     if gen.writes_depth:
         iface += ["%out_depth"]
     if vs:
@@ -15811,6 +15848,8 @@ def assemble(gen):
     if sg:
         types += ["%_ptr_Input_uint = OpTypePointer Input %uint"]
         dec += ["OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId"]
+        if gen.relabel:
+            dec += ["OpDecorate %sg_id BuiltIn SubgroupId", "OpDecorate %sg_size BuiltIn SubgroupSize"]
         if gen.stage == "ps":
             dec += ["OpDecorate %sg_lane Flat"]
         gen.consts.setdefault(3, "%c3")
@@ -16091,6 +16130,8 @@ def assemble(gen):
               for n, k in gen.inputs.items()]
     if sg:
         gvars += ["%sg_lane = OpVariable %_ptr_Input_uint Input"]
+    if gen.relabel:
+        gvars += ["%sg_id = OpVariable %_ptr_Input_uint Input", "%sg_size = OpVariable %_ptr_Input_uint Input"]
     if tex:
         gvars += ["%images = OpVariable %_ptr_UC_rt_img UniformConstant",
                   "%samplers = OpVariable %_ptr_UC_rt_smp UniformConstant",
@@ -16193,7 +16234,9 @@ def assemble(gen):
         # v5 = first launch vertex ID of the lane = linear group index * NumThreads + local index (the game's mesh
         # entry does v5 >> 7 on lane 0 to get the group index; NumThreads is 128 in this corpus).
         # s3 = merged-wave info with the wave id in [27:24].
-        fn += ["%wgi = OpLoad %v3uint %wg_id", "%nwg = OpLoad %v3uint %num_wg", "%lidx = OpLoad %uint %local_index",
+        fn += relabel_index(gen)
+        fn += ["%wgi = OpLoad %v3uint %wg_id", "%nwg = OpLoad %v3uint %num_wg",
+               "%lidx = OpCopyObject %uint %rl_t" if gen.relabel else "%lidx = OpLoad %uint %local_index",
                "%wgx = OpCompositeExtract %uint %wgi 0", "%wgy = OpCompositeExtract %uint %wgi 1",
                "%wgz = OpCompositeExtract %uint %wgi 2", "%nwx = OpCompositeExtract %uint %nwg 0",
                "%nwy = OpCompositeExtract %uint %nwg 1", "%nxy = OpIMul %uint %nwx %nwy",
@@ -16206,7 +16249,16 @@ def assemble(gen):
                f"%s3p = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(3)}", "OpStore %s3p %mwi"]
     if cs:
         # After the user-data copy: workgroup ids overwrite s[user..], thread ids go to v0..v2.
-        fn += ["%wgi = OpLoad %v3uint %wg_id", "%lci = OpLoad %v3uint %local_id"]
+        fn += relabel_index(gen)
+        fn += ["%wgi = OpLoad %v3uint %wg_id"]
+        if gen.relabel:
+            # the relabelled index as x, y, z of the group (LocalInvocationIndex = x + sx * (y + sy * z))
+            sx, sy, _ = gen.cs["size"]
+            fn += [f"%rl_x = OpUMod %uint %rl_t {gen.cu(sx)}", f"%rl_q = OpUDiv %uint %rl_t {gen.cu(sx)}",
+                   f"%rl_y = OpUMod %uint %rl_q {gen.cu(sy)}", f"%rl_z = OpUDiv %uint %rl_t {gen.cu(sx * sy)}",
+                   "%lci = OpCompositeConstruct %v3uint %rl_x %rl_y %rl_z"]
+        else:
+            fn += ["%lci = OpLoad %v3uint %local_id"]
         for k, c in enumerate(gen.cs["tgid"]):
             r = gen.cs["user"] + k
             fn += [f"%wg{c} = OpCompositeExtract %uint %wgi {c}",
@@ -16411,7 +16463,7 @@ def assemble(gen):
              f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
              f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
              "OpSetMeshOutputsEXT %msv %msp",
-             "%mli = OpLoad %uint %local_index",
+             "%mli = OpCopyObject %uint %rl_t" if gen.relabel else "%mli = OpLoad %uint %local_index",
              "%mhv = OpLoad %bool %ms_has_vtx", "%mvi = OpULessThan %bool %mli %msv",
              "%mwv = OpLogicalAnd %bool %mhv %mvi",
              "OpSelectionMerge %ms_vend None", "OpBranchConditional %mwv %ms_vdo %ms_vend",
@@ -16615,9 +16667,69 @@ WAVE64_RE = re.compile(
 WAVE32_RE = re.compile(r"_(?:saveexec|wrexec)_b32\b")
 
 
+def compute_halves_inputs(g):
+    """(invocations per workgroup, lane-linear entry VGPRs) of a wave64 compute or mesh shader, for wave64_halves:
+    v5 of a mesh shader is group * NumThreads + thread and v0 of a compute shader the x thread id, both D + lane with
+    D a multiple of 64 when NumThreads / the x size is one."""
+    size = (g.cs or g.ms)["size"]
+    group = size[0] * size[1] * size[2]
+    if g.stage == "ms":
+        lin = (5,) if g.ms["threads"] % 64 == 0 else ()
+    else:
+        lin = (0,) if size[0] % 64 == 0 else ()
+    return group, lin
+
+
+def compute_halves(g, blocks, succ):
+    """SHADER-10 for compute and mesh (--wave64-emulate): run tools/wave64_halves.py on a wave64 CS/MS and keep the
+    exchange emulation only for tier C. Tier A/B runs natively in halves: each 32-lane subgroup is one half of a
+    console wave, its invocations relabelled from the subgroup (relabel_index), barriers put before the LDS or
+    memory accesses the wave's lockstep ordered (`sync`) and s_barrier left out where nothing is written. The
+    translator's own conditions: those barriers in blocks at the top level of the structured tree (which every
+    invocation runs) and, with them, no s_barrier anywhere else (that would need barrier rounds); a mesh shader's
+    s_barrier at the top level. Runs after the lane-mask analysis; once per shader."""
+    if not (WAVE64_TIERS and g.emulate and g.wave64 and g.stage in ("cs", "ms")) or g.w64c is not None:
+        return
+    group, lin = compute_halves_inputs(g)
+    try:
+        res = wave64_halves.analyse(blocks, succ, g.lane_masks, g.stage, group=group, lin=lin)
+    except Exception as e:      # never cost a translation: what the analysis could not decide is emulated
+        res = {"tier": "C", "reasons": ["analysis-error"], "idioms": [], "uniform_readlane": set(),
+               "scalar_spills": [], "sites": [("analysis-error", None, type(e).__name__)], "sync": set(),
+               "drop_barriers": False}
+    if res["tier"] != "C" and len(blocks) > 1:
+        tree, _ = capped_tree(succ)
+        top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
+        where = {id(ins): n for n, blk in enumerate(blocks) for ins in blk}
+        barrier_blocks = {n for n, blk in enumerate(blocks) for ins in blk if base_op(ins["op"]) == "s_barrier"}
+        late = []
+        if any(where[i] not in top for i in res["sync"]):
+            late.append("lds-in-wave")
+        if not res["drop_barriers"] and not barrier_blocks <= top and (res["sync"] or g.stage == "ms"):
+            late.append("nested-barrier")
+        if late:
+            res = dict(res, tier="C", reasons=sorted(set(res["reasons"]) | set(late)))
+    g.w64c = res
+    W64C_COUNTS[res["tier"]] += 1
+    if res["tier"] == "C":
+        return
+    g.emulate = False
+    g.relabel = True
+    g.w64g = res                # the readlane / scalar-spill rewrites (cur_uniform_readlane, halves_analysis)
+    g.w64_sync = frozenset(res["sync"])
+    g.drop_barriers = res["drop_barriers"]
+
+
 def halves_analysis(g, blocks, succ):
     """SHADER-10: tier of a wave64 VS/PS/GS on 32-wide subgroups (tools/wave64_halves.py); tier C is refused under
-    --wave64-graphics=error. Runs after the lane-mask analysis, which it reads."""
+    --wave64-graphics=error. Runs after the lane-mask analysis, which it reads. For a compute or mesh shader that
+    compute_halves runs natively it only puts the pure scalar-spill slots in place."""
+    if g.relabel and g.w64g:
+        for slot in g.w64g.get("scalar_spills", ()):
+            if slot not in g.parked:
+                g.parked[slot] = g.SGPRS + len(g.parked)
+            g.w64_scalar_spills.add(slot)
+        return
     if not g.wave64 or g.stage not in ("vs", "ps", "gs") or g.emulate or WAVE64_GRAPHICS == "off":
         return
     try:
@@ -17822,6 +17934,10 @@ def translate(path):
         # A branch target is relative to the next PC, which needs the branch's `; encoding:` bytes (missing in a
         # hand-written listing). Until 2026-11-22 this was a TypeError in next_pc.
         raise Unsupported("branch without encoding")
+    if not branchy and g.emulate and WAVE64_TIERS:
+        # SHADER-10: a wave64 CS/MS is emulated only when its halves are not exact as subgroups of their own
+        g.park_masks(([insns], [[]]))
+        compute_halves(g, [insns], [[]])
     if not branchy and not g.emulate:
         g.vm_latch = stage == "ps" and exec_changes_after_vm([insns], [[]])
         g.park_masks(([insns], [[]]))
@@ -17898,6 +18014,7 @@ def translate(path):
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
+    compute_halves(g, blocks, succ)
     halves_analysis(g, blocks, succ)
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
@@ -18219,8 +18336,10 @@ def needs_barrier_rounds(g, blocks, succ):
     Intel GPU hangs (device lost) when it isn't (cs_barrier_divergent.asm). A barrier is only certain to be
     uniform in a block at the top level of the structured tree, which every invocation runs; one under a guard
     or in a loop, or anywhere in the dispatch loop, may be reached by some waves and not others."""
-    if g.stage != "cs" or g.emulate or g.wave64:
-        return False                    # emulated: already rounds; native wave64 cs and ms run on AMD only
+    if g.stage != "cs" or g.emulate or (g.wave64 and not g.relabel) or g.drop_barriers:
+        # emulated: already rounds; native wave64 cs and ms run on AMD only, except a wave64 cs run in 32-lane halves
+        # (compute_halves), which meets in rounds like a wave32 one: each half is a subgroup of its own
+        return False
     with_barrier = set()
     for n, blk in enumerate(blocks):
         for ins in blk:
@@ -18688,7 +18807,18 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          # `subgroup_size` and `wave64_exchange`. This field stays true for VS/PS/GS wave64 (consumers rely on it):
          # it says the shader has no cross-half exchange, so it is per-subgroup, not that it must run 2x32.
          "wave64_emulated": bool(g.wave64 and (g.stage in ("vs", "ps", "gs") or g.emulate))}
-    if g.w64g:
+    if g.w64c:
+        # SHADER-10 for compute and mesh (--wave64-emulate): tier C is emulated (wave64_exchange below); A and B run
+        # natively in 32-lane halves with the relabelled thread index, exact on any subgroup size that is a multiple
+        # of 32, so they ask for 32 (64 would be exact too, but Intel's compute stage has no 64 and might pick 16).
+        m["wave64_compute"] = g.w64c["tier"]
+        if g.w64c["reasons"]:
+            m["wave64_compute_reasons"] = g.w64c["reasons"]
+        if g.w64c["idioms"]:
+            m["wave64_compute_idioms"] = g.w64c["idioms"]
+        if g.relabel:
+            m["subgroup_size"] = 32
+    elif g.w64g:
         # SHADER-10: partition invariance on 32-wide subgroups. A and B are exact there (B: aggregated atomics up to
         # the order of the slots), C is not; the reasons name the construct (docs/design.md, Wave64 graphics).
         m["wave64_graphics"] = g.w64g["tier"]
@@ -19092,8 +19222,13 @@ def main():
                          "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16 is false); NaN, inf, "
                          "-0 and f16 denormals are then not guaranteed")
     ap.add_argument("--wave64-emulate", action="store_true",
-                    help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
-                         "cross-lane operations go through workgroup memory instead of subgroup operations")
+                    help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): those "
+                         "whose two 32-lane halves are not exact as subgroups of their own (tier C of "
+                         "tools/wave64_halves.py) send cross-lane operations through workgroup memory instead of "
+                         "subgroup operations; tiers A and B run natively, one half per subgroup")
+    ap.add_argument("--wave64-emulate-all", action="store_true",
+                    help="--wave64-emulate for every wave64 compute and mesh shader, whatever its tier (as before "
+                         "SHADER-10 covered them)")
     ap.add_argument("--wave64-graphics", choices=("warn", "error", "off"), default="warn",
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
@@ -19166,7 +19301,7 @@ def main():
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     LOOP_LIMITS.clear()
     LOOP_LIMITS.update(a.loop_limit)
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_TIERS, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
@@ -19176,7 +19311,8 @@ def main():
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS
     FLOAT_CONTROLS = not a.no_float_controls
-    WAVE64_EMULATE = a.wave64_emulate
+    WAVE64_EMULATE = a.wave64_emulate or a.wave64_emulate_all
+    WAVE64_TIERS = WAVE64_EMULATE and not a.wave64_emulate_all
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
@@ -19339,6 +19475,9 @@ def main():
     if W64G_COUNTS:
         print("wave64 VS/PS/GS on 32-wide subgroups: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64G_COUNTS.items()))
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
+    if W64C_COUNTS:
+        print("wave64 CS/MS: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64C_COUNTS.items()))
+              + " (A and B run natively in 32-lane halves, C is emulated; see wave64_compute_reasons)")
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")
     if missing_inputs:
