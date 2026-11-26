@@ -243,6 +243,14 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
+// The resource an unordered-access view of `resource` whose T# names `image_address` is a view of: a depth texture
+// that allows unordered access (console only) has colour twins that carry its UAVs, and this is the twin. Any other
+// resource is itself. For the command list's UAV clears.
+ID3D12Resource* unordered_access_resource(ID3D12Resource* resource, std::uint64_t image_address);
+// True when `device` (or the device behind a console proxy) is the Vulkan layer's and gives a depth texture that
+// also allows unordered access colour twins for its UAVs, as rt::d3d12_xs::set_depth_unordered_handler asks.
+// LEONIDA_DEPTH_TWINS=0 turns it off.
+bool accepts_depth_unordered(ID3D12Device* device);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.

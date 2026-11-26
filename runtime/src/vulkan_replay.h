@@ -41,12 +41,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -97,7 +99,58 @@ struct ResourceBinding {
     bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
     bool sparse_buffer = false;
+    // A depth texture that also allows unordered access (the console allows ALLOW_DEPTH_STENCIL together with
+    // ALLOW_UNORDERED_ACCESS, Vulkan has no storage depth images): its UAVs are views of colour twins, which the
+    // replay keeps in step with it (DepthTwinSides, detail::sync_twins). depth_twin is the twin of its depth plane
+    // (R32 or R16), stencil_twin of its stencil plane (R8_UINT); 0 where it has none. On a twin, twin_of names the
+    // depth texture. twin_staging: the buffer the copies between the two go through where the device cannot copy a
+    // depth image into a colour one (no VK_KHR_maintenance8); null: vkCmdCopyImage. twin_starts_unordered: the
+    // texture was created in UNORDERED_ACCESS.
+    ResourceId depth_twin = 0;
+    ResourceId stencil_twin = 0;
+    ResourceId twin_of = 0;
+    VkBuffer twin_staging = VK_NULL_HANDLE;
+    bool twin_starts_unordered = false;
 };
+
+// A depth texture with twins and the twins, as the replay resolved them for a command that uses one of them.
+struct TwinSet {
+    ResourceId depth = 0, plane = 0, stencil = 0;  // plane: the depth plane's twin; either twin may be 0
+    ResourceBinding depth_binding, plane_binding, stencil_binding;
+};
+
+// Which side of a depth texture with twins holds what was written last, and which of its planes (bit 0 depth,
+// bit 1 stencil) are in an unordered-access state, as the lists emitted so far left them (LayoutTracker::twin).
+struct DepthTwinSides {
+    bool depth_ahead = false;  // the depth texture was written since the twins were last given it
+    bool twin_ahead = false;   // a twin was written since the depth texture was last given it
+    std::uint8_t unordered = 0;
+    TwinSet set;  // the bindings, as the last command that named it resolved them
+};
+
+// What the twins did in this process: textures given twins, copies into the twins and back into the depth textures
+// (each copy is every plane with a twin), the copies of those that went through a buffer, and the draws and
+// dispatches taken as writing twins. For tests and the frame statistics.
+struct DepthTwinCounts {
+    std::uint64_t made = 0, to_twin = 0, to_depth = 0, through_buffer = 0, shader_writes = 0;
+};
+
+namespace detail {
+inline std::atomic<std::uint64_t> depth_twin_counters[5]{};
+// Depth textures with twins alive: while there are none, prepare does not look for them.
+inline std::atomic<std::int64_t> live_depth_twins{0};
+}  // namespace detail
+
+inline DepthTwinCounts depth_twin_counts() {
+    const auto get = [](int i) { return detail::depth_twin_counters[i].load(std::memory_order_relaxed); };
+    return {get(0), get(1), get(2), get(3), get(4)};
+}
+
+// The device made (+1) or destroyed (-1) a depth texture with twins.
+inline void note_depth_twins(int delta) {
+    detail::live_depth_twins.fetch_add(delta, std::memory_order_relaxed);
+    if (delta > 0) detail::depth_twin_counters[0].fetch_add(1, std::memory_order_relaxed);
+}
 
 struct VulkanAccess {
     VkImageLayout layout;
@@ -624,9 +677,26 @@ public:
                     separate_ && two_planes(resource), {}};
         entry.layouts.assign(std::size_t(entry.mips) * entry.layers * (entry.two_planes ? 2 : 1), layout);
         entries_[id] = std::move(entry);
+        twins_.erase(id);
     }
 
-    void forget(ResourceId id) { entries_.erase(id); }
+    void forget(ResourceId id) {
+        entries_.erase(id);
+        twins_.erase(id);
+    }
+
+    // The sides of depth texture `id`, which has twins (ResourceBinding::depth_twin, stencil_twin): made on first use,
+    // with every plane in unordered access when the texture was created in that state.
+    DepthTwinSides& twin(ResourceId id, bool starts_unordered) {
+        const auto [it, made] = twins_.try_emplace(id);
+        if (made && starts_unordered) it->second.unordered = 3;
+        return it->second;
+    }
+    bool has_twins() const { return !twins_.empty(); }
+    template<typename F>
+    void for_each_twin(F&& f) {
+        for (auto& [id, sides] : twins_) f(id, sides);
+    }
     bool tracked(ResourceId id) const { return entries_.count(id) != 0; }
 
     // Current layout of one D3D12 subresource; UNDEFINED when the resource or index is unknown.
@@ -705,6 +775,7 @@ private:
 
     bool separate_;
     std::unordered_map<ResourceId, Entry> entries_;
+    std::unordered_map<ResourceId, DepthTwinSides> twins_;
 };
 
 // Each physical slot records one non-overlapping interval. Logical queries can share slots.
@@ -1042,6 +1113,11 @@ struct Prepared {
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
     std::uint32_t khr_postbuild = ~0u;  // index into PreparedList::khr_postbuilds; ~0u: skipped or XDXR
+    // The depth textures with twins the command names, by PreparedList::twin_sets (no_twin: none): a barrier's,
+    // clear's or draw's depth target in [0], a copy's or resolve's destination in [0] and source in [1], and for an
+    // unordered-access clear of a twin, the texture it stands for.
+    static constexpr std::uint32_t no_twin = ~0u;
+    std::array<std::uint32_t, 2> twins{no_twin, no_twin};
 };
 
 inline constexpr std::size_t max_render_targets = 8;  // D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
@@ -2309,7 +2385,272 @@ public:
     bool wrote_readback = false;
     VkPipelineStageFlags2 readback_src_stages = 0;
     std::vector<detail::PreparedKhrPostbuild> khr_postbuilds;
+    // The depth textures with twins the list names (Prepared::twins), one entry each.
+    std::vector<TwinSet> twin_sets;
 };
+
+// Depth textures that also allow unordered access, kept in step with their colour twins. Ported from VIctory
+// (GPL-3.0-or-later, Marvisak and contributors, DexNom fork): victory-gpu host.rs HostList::twin_use, twin_copy,
+// twins_to_depth and twins_written, and resource.rs Twin. The model is VIctory's: each use of a side first brings
+// that side up to date, by a copy if the other side was written since, and the twins are copied back where the
+// depth texture is used again. VIctory decides per list as it records, and copies at submission what a list found
+// behind; here the decision is made as lists are emitted, which is in submission order across the device's queues,
+// so the state carries from one list to the next (LayoutTracker::twin). What counts as a use:
+// - of the twins: a barrier that moves a plane of the texture into an unordered-access state (legacy
+//   UNORDERED_ACCESS, enhanced UNORDERED_ACCESS layouts or access) and an unordered-access clear of a twin; and
+//   every draw, dispatch and ExecuteIndirect while a plane is in that state counts as writing them. shortcut: the
+//   replay does not know which views a shader reads (descriptors are found through the hash table), so any shader
+//   work in that stretch is taken as writing, as VIctory takes any bound UAV as written;
+// - of the depth texture: a barrier that moves a plane out of unordered access (the next use may be a shader read,
+//   which the replay cannot see), a draw that binds it as the depth target (taken as writing), a depth-stencil
+//   clear, and copies and resolves from or into it.
+// shortcut: whole textures are copied, every mip and slice of each plane that has a twin, as in VIctory.
+namespace detail {
+
+// The planes (bit 0 depth, bit 1 stencil) a D3D12 subresource index names; all_subresources is every plane.
+inline std::uint8_t twin_planes(const ResourceBinding& depth, std::uint32_t subresource) {
+    const std::uint8_t all = two_planes(depth) ? 3 : 1;
+    if (subresource == all_subresources) return all;
+    const std::uint64_t per_plane = std::uint64_t(std::max(1u, depth.mip_levels)) * std::max(1u, depth.array_layers);
+    return std::uint8_t((1u << std::min<std::uint64_t>(subresource / per_plane, 1)) & all);
+}
+
+inline std::uint8_t twin_planes(const ResourceBinding& depth, const BarrierSubresourceRange& range) {
+    if (!range.mip_count) return twin_planes(depth, range.index_or_first_mip);
+    std::uint8_t planes = 0;
+    for (std::uint32_t plane = range.first_plane; plane < range.first_plane + range.plane_count && plane < 2; ++plane)
+        planes |= std::uint8_t(1u << plane);
+    return std::uint8_t(planes & (two_planes(depth) ? 3 : 1));
+}
+
+inline bool unordered_layout(std::uint32_t layout) {
+    return layout == d3d12_layout::unordered_access || layout == d3d12_layout::direct_queue_unordered_access ||
+           layout == d3d12_layout::compute_queue_unordered_access;
+}
+
+// A whole image moved to `wanted` for the copies of copy_twins, and back (release_twin_image): every piece of it in
+// GENERAL stays there; otherwise every piece goes to `wanted`. A piece never used yet is initialized to GENERAL first.
+struct HeldImage {
+    LayoutPieces pieces;
+    VkImageLayout used = VK_IMAGE_LAYOUT_GENERAL;
+};
+
+inline HeldImage hold_twin_image(const ReplayFunctions& vk, VkCommandBuffer cb, const ResourceBinding& image,
+                                 ResourceId id, VkImageLayout wanted, LayoutTracker* tracker) {
+    HeldImage held;
+    const VkImageSubresourceRange range{image.aspects, 0, image.mip_levels, 0, image.array_layers};
+    held.pieces = current(tracker, id, range, VK_IMAGE_LAYOUT_GENERAL);
+    initialize(vk, cb, image, id, held.pieces, VK_IMAGE_LAYOUT_GENERAL, tracker);
+    const bool general = std::all_of(held.pieces.begin(), held.pieces.end(),
+                                     [](const LayoutPiece& piece) { return piece.layout == VK_IMAGE_LAYOUT_GENERAL; });
+    held.used = general ? VK_IMAGE_LAYOUT_GENERAL : image_layout(image, wanted);
+    for (const auto& piece : held.pieces)
+        if (piece.layout != held.used)
+            image_barrier(vk, cb, image, piece.range, piece.layout, held.used,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    return held;
+}
+
+inline void release_twin_image(const ReplayFunctions& vk, VkCommandBuffer cb, const ResourceBinding& image,
+                               const HeldImage& held) {
+    for (const auto& piece : held.pieces)
+        if (piece.layout != held.used)
+            image_barrier(vk, cb, image, piece.range, held.used, piece.layout,
+                          VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+}
+
+// Copies the depth texture of `set` into its twins (`to_twin`) or the twins into it: the depth aspect into or out of
+// the depth plane's twin, the stencil aspect into or out of the stencil plane's, every mip and slice. With
+// VK_KHR_maintenance8 a depth or stencil aspect and a colour image of the same texel size copy with vkCmdCopyImage;
+// without it (ResourceBinding::twin_staging) each plane goes through the staging buffer, image to buffer to image,
+// which every Vulkan device allows for a depth or stencil aspect. Every image is left in the layouts it had, so the
+// barriers the title records next start from where they expect.
+inline void copy_twins(const ReplayFunctions& vk, VkCommandBuffer cb, const TwinSet& set, bool to_twin,
+                       LayoutTracker* tracker) {
+    if (!vk.copy_image || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.pipeline_barrier) return;
+    const ResourceBinding& depth = set.depth_binding;
+    const VkBuffer staging = depth.twin_staging;
+    memory_barrier(vk, cb, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const HeldImage held_depth =
+        hold_twin_image(vk, cb, depth, set.depth,
+                        to_twin ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, tracker);
+    bool staged = false;
+    const struct {
+        ResourceId id;
+        const ResourceBinding* twin;
+        VkImageAspectFlags aspect;
+    } planes[2] = {{set.plane, &set.plane_binding, VK_IMAGE_ASPECT_DEPTH_BIT},
+                   {set.stencil, &set.stencil_binding, VK_IMAGE_ASPECT_STENCIL_BIT}};
+    for (const auto& plane : planes) {
+        if (!plane.id || !(depth.aspects & plane.aspect)) continue;
+        const ResourceBinding& twin = *plane.twin;
+        const HeldImage held_twin =
+            hold_twin_image(vk, cb, twin, plane.id,
+                            to_twin ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            tracker);
+        const std::uint32_t mips = std::min(depth.mip_levels, twin.mip_levels);
+        const std::uint32_t layers = std::min(depth.array_layers, twin.array_layers);
+        const VkImage from = to_twin ? depth.image : twin.image, to = to_twin ? twin.image : depth.image;
+        const VkImageLayout from_layout = to_twin ? held_depth.used : held_twin.used;
+        const VkImageLayout to_layout = to_twin ? held_twin.used : held_depth.used;
+        const VkImageAspectFlags from_aspect = to_twin ? plane.aspect : VK_IMAGE_ASPECT_COLOR_BIT;
+        const VkImageAspectFlags to_aspect = to_twin ? VK_IMAGE_ASPECT_COLOR_BIT : plane.aspect;
+        if (!staging) {
+            std::vector<VkImageCopy> regions;
+            for (std::uint32_t mip = 0; mip < mips; ++mip) {
+                const VkExtent2D extent = mip_extent(depth, mip);
+                regions.push_back({{from_aspect, mip, 0, layers}, {0, 0, 0}, {to_aspect, mip, 0, layers}, {0, 0, 0},
+                                   {extent.width, extent.height, 1}});
+            }
+            vk.copy_image(cb, from, from_layout, to, to_layout, std::uint32_t(regions.size()), regions.data());
+        } else {
+            // The buffer may still be read by the copy of the plane before.
+            if (staged)
+                memory_barrier(vk, cb, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            const std::uint32_t texel = block_format(depth.format, plane.aspect).bytes;
+            std::vector<VkBufferImageCopy> reads, writes;
+            VkDeviceSize offset = 0;
+            for (std::uint32_t mip = 0; mip < mips; ++mip) {
+                const VkExtent2D extent = mip_extent(depth, mip);
+                VkBufferImageCopy region{};
+                region.bufferOffset = offset;
+                region.imageSubresource = {from_aspect, mip, 0, layers};
+                region.imageExtent = {extent.width, extent.height, 1};
+                reads.push_back(region);
+                region.imageSubresource = {to_aspect, mip, 0, layers};
+                writes.push_back(region);
+                offset += (VkDeviceSize(extent.width) * extent.height * layers * texel + 15) / 16 * 16;
+            }
+            vk.copy_image_to_buffer(cb, from, from_layout, staging, std::uint32_t(reads.size()), reads.data());
+            memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vk.copy_buffer_to_image(cb, staging, to, to_layout, std::uint32_t(writes.size()), writes.data());
+            staged = true;
+        }
+        release_twin_image(vk, cb, twin, held_twin);
+    }
+    release_twin_image(vk, cb, depth, held_depth);
+    memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    depth_twin_counters[to_twin ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+    if (staging) depth_twin_counters[3].fetch_add(1, std::memory_order_relaxed);
+}
+
+// Brings the side of `sides` a use needs up to date: the twins (`twin_side`) or the depth texture, by a copy when the
+// other side was written since. Both sides then hold the same.
+inline void bring_twin_side(const ReplayFunctions& vk, VkCommandBuffer cb, DepthTwinSides& sides, bool twin_side,
+                            LayoutTracker* tracker) {
+    if (twin_side ? sides.depth_ahead : sides.twin_ahead) copy_twins(vk, cb, sides.set, twin_side, tracker);
+    sides.depth_ahead = sides.twin_ahead = false;
+}
+
+// Before `command` is emitted: the copies its uses of depth textures with twins need, and what it leaves ahead.
+inline void sync_twins(const PreparedList& prepared, const Command& command, const Prepared& p, VkCommandBuffer cb,
+                       const ReplayFunctions& vk, LayoutTracker& tracker) {
+    const bool shader_work = std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
+                             std::holds_alternative<ExecuteIndirect>(command);
+    ResourceId depth_target = 0;  // a draw's: the draw writes it as depth, not through the twins
+    for (std::size_t k = 0; k < p.twins.size(); ++k) {
+        if (p.twins[k] == Prepared::no_twin) continue;
+        const TwinSet& set = prepared.twin_sets[p.twins[k]];
+        DepthTwinSides& sides = tracker.twin(set.depth, set.depth_binding.twin_starts_unordered);
+        sides.set = set;
+        if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
+            const std::uint8_t planes = twin_planes(set.depth_binding, transition->subresource);
+            if (transition->after & d3d12_state::unordered_access) {
+                bring_twin_side(vk, cb, sides, true, &tracker);
+                sides.unordered |= planes;
+            } else if ((sides.unordered & planes) || (transition->before & d3d12_state::unordered_access)) {
+                sides.unordered &= std::uint8_t(~planes);
+                bring_twin_side(vk, cb, sides, false, &tracker);
+            }
+        } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
+            const std::uint8_t planes = twin_planes(set.depth_binding, texture->range);
+            if (unordered_layout(texture->layout_after) || (texture->access_after & d3d12_access::unordered_access)) {
+                bring_twin_side(vk, cb, sides, true, &tracker);
+                sides.unordered |= planes;
+            } else if ((sides.unordered & planes) || unordered_layout(texture->layout_before) ||
+                       (texture->access_before & d3d12_access::unordered_access)) {
+                sides.unordered &= std::uint8_t(~planes);
+                bring_twin_side(vk, cb, sides, false, &tracker);
+            }
+        } else if (std::holds_alternative<ClearUnorderedAccess>(command)) {
+            bring_twin_side(vk, cb, sides, true, &tracker);
+            sides.twin_ahead = true;
+        } else {
+            // A draw's depth target, a depth-stencil clear, a copy or resolve: the depth texture's side. A draw is
+            // taken as writing its depth target (shortcut: also when it only tests), and a clear and the destination
+            // of a copy or resolve write it.
+            bring_twin_side(vk, cb, sides, false, &tracker);
+            const bool draw = std::holds_alternative<Draw>(command);
+            if (draw) depth_target = set.depth;
+            if (k == 0 && (draw || std::holds_alternative<ClearDepthStencil>(command) ||
+                           std::holds_alternative<CopyTexture>(command) || std::holds_alternative<CopyResource>(command) ||
+                           std::holds_alternative<ResolveSubresource>(command)))
+                sides.depth_ahead = true;
+        }
+    }
+    if (!shader_work) return;
+    tracker.for_each_twin([&](ResourceId id, DepthTwinSides& sides) {
+        if (!sides.unordered || id == depth_target || !sides.set.depth) return;
+        if (sides.depth_ahead) bring_twin_side(vk, cb, sides, true, &tracker);
+        sides.twin_ahead = true;
+        depth_twin_counters[4].fetch_add(1, std::memory_order_relaxed);
+    });
+}
+
+// The depth textures with twins each command of `list` names (Prepared::twins), resolved into out.twin_sets.
+template<typename Resolve>
+void attach_twins(const CommandList& list, Resolve& resolve, PreparedList& out) {
+    const auto set_of = [&](ResourceId id) -> std::uint32_t {
+        if (!id) return Prepared::no_twin;
+        const ResourceBinding* binding = resolve(id);
+        if (binding && binding->twin_of) {
+            id = binding->twin_of;
+            binding = resolve(id);
+        }
+        if (!binding || !binding->image || (!binding->depth_twin && !binding->stencil_twin)) return Prepared::no_twin;
+        for (std::size_t i = 0; i < out.twin_sets.size(); ++i)
+            if (out.twin_sets[i].depth == id) return std::uint32_t(i);
+        TwinSet set;
+        set.depth = id;
+        set.depth_binding = *binding;
+        for (const auto& [twin, slot, binding_slot] :
+             {std::tuple{binding->depth_twin, &set.plane, &set.plane_binding},
+              std::tuple{binding->stencil_twin, &set.stencil, &set.stencil_binding}}) {
+            if (!twin) continue;
+            const ResourceBinding* twin_binding = resolve(twin);
+            if (!twin_binding || !twin_binding->image) continue;
+            *slot = twin;
+            *binding_slot = *twin_binding;
+        }
+        if (!set.plane && !set.stencil) return Prepared::no_twin;
+        out.twin_sets.push_back(set);
+        return std::uint32_t(out.twin_sets.size() - 1);
+    };
+    const auto commands = list.commands();
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        const Command& command = commands[i];
+        ResourceId first = 0, second = 0;
+        if (const auto* transition = std::get_if<TransitionBarrier>(&command)) first = transition->resource;
+        else if (const auto* texture = std::get_if<TextureBarrier>(&command)) first = texture->resource;
+        else if (const auto* draw = std::get_if<Draw>(&command)) first = draw->depth.resource;
+        else if (const auto* clear = std::get_if<ClearDepthStencil>(&command)) first = clear->target.resource;
+        else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) first = uav->view.resource;
+        else if (std::holds_alternative<CopyTexture>(command) || std::holds_alternative<CopyResource>(command) ||
+                 std::holds_alternative<ResolveSubresource>(command))
+            std::tie(first, second) = copy_ids(command);
+        else
+            continue;
+        out.commands[i].twins = {set_of(first), set_of(second)};
+    }
+}
+
+}  // namespace detail
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     // Active logical queries cover a contiguous range of physical slots. A Begin or End closes the old
@@ -2424,8 +2765,8 @@ inline void plan_statistics_segments(PreparedList& out) {
 }
 
 // Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
-// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
-// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
+// builds, in the statistics pool. Each Begin and End of a statistics query ??? and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted ??? closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
 inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
@@ -3154,6 +3495,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
+    out.twin_sets.clear();
+    if (detail::live_depth_twins.load(std::memory_order_relaxed) > 0) detail::attach_twins(list, resolve, out);
     out.statistics_overlaps = statistics_overlaps;
     if (statistics_overlaps) {
         const auto result = plan_overlapping_statistics_segments(out);
@@ -3465,6 +3808,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             continue;
         }
+        // Depth textures with twins: the side this command uses brought up to date first (detail::sync_twins).
+        if (tracker && (p.twins[0] != detail::Prepared::no_twin || p.twins[1] != detail::Prepared::no_twin ||
+                        tracker->has_twins()))
+            detail::sync_twins(prepared, command, p, command_buffer, vk, *tracker);
         const ResourceId id = std::visit(
             [](const auto& c) -> ResourceId {
                 using T = std::decay_t<decltype(c)>;

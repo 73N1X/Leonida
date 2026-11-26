@@ -145,6 +145,19 @@ D3D12_SAMPLER_DESC console_sampler_desc(const std::uint32_t* words);
 using RefusedPipelineHandler = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
 void set_refused_pipeline_handler(RefusedPipelineHandler handler);
 
+// Depth textures that also allow unordered access (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS):
+// the console allows the pair (the title makes a 2560x1440 R32G8X24_TYPELESS one with flags 0x6), the PC runtime
+// refuses it. The device behind the proxy says whether it takes them through this handler, which the Vulkan layer
+// registers (rt::d3d12::accepts_depth_unordered: it gives such a texture colour twins for its UAVs). When it answers
+// true, slots 76 and 127 and the allocation-info slots 25 and 108 keep the flag, and slots 76 and 127 make their call
+// with console_depth_unordered() true on the calling thread, so the device accepts the pair for the title while it
+// still refuses it to PC callers. With no handler, or false (a PC device behind the proxy), the UAV flag is dropped
+// as before and the texture's UAVs stay null. Slot 133 always drops it (it makes buffers).
+using DepthUnorderedHandler = bool (*)(ID3D12Device* real);
+void set_depth_unordered_handler(DepthUnorderedHandler handler);
+// True while this thread is in a resource call the proxy makes for a console description that keeps both flags.
+bool console_depth_unordered();
+
 // Console list methods that work on title addresses (V list.rs:1294-1314, 1409-1431, 1891-1983), done by the device
 // behind the list's device proxy, which registers them (the Vulkan layer). `real` is the PC list, `device` the PC
 // device. With no handler a slot records nothing and answers 0, as before.

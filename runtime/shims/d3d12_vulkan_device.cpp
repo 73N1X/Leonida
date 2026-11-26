@@ -592,7 +592,10 @@ struct TextureCreateInfo {
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
-        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
+        // A depth texture that allows unordered access (console only) has none either: its UAVs are its colour twins'
+        // (Resource::make_twins), and Vulkan has no storage usage on depth formats.
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format) &&
+            !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -834,6 +837,14 @@ struct DeviceState {
                      arena.use_peak[arena_descriptor_heap] * mib, arena.use_peak[arena_shader] * mib,
                      arena.use_peak[arena_heap] * mib,
                      (unsigned long long)arena.allocations, (unsigned long long)arena.failures);
+        // Depth textures with unordered access (Resource::make_twins): how often the title switched sides.
+        if (const leonida::DepthTwinCounts twins = leonida::depth_twin_counts(); twins.made)
+            std::fprintf(stderr,
+                         "[rt] d3d12: depth textures with colour twins: %llu made, %llu copies into the twins and %llu "
+                         "back (%llu through a buffer), %llu draws and dispatches taken as writing them\n",
+                         (unsigned long long)twins.made, (unsigned long long)twins.to_twin,
+                         (unsigned long long)twins.to_depth, (unsigned long long)twins.through_buffer,
+                         (unsigned long long)twins.shader_writes);
     }
 
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
@@ -1744,7 +1755,11 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     }
     if (desc.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D)
         return "resource dimension";
-    if ((rt && ds) || (ds && uav) || ((flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !ds))
+    // Depth and unordered access together: the PC runtime refuses the pair, the console allows it. A call the console
+    // proxy makes for the title (rt::d3d12_xs::console_depth_unordered) is accepted, and the texture gets colour twins
+    // for its UAVs (Resource::make_twins).
+    if ((rt && ds) || (ds && uav && !rt::d3d12_xs::console_depth_unordered()) ||
+        ((flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !ds))
         return "resource flag combination";
     if (ds && !depth_stencil_family(desc.Format)) return "depth-stencil format";
     if (rt && !render_target_family(desc.Format)) return "render-target format";
@@ -1901,6 +1916,17 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        if (depth_twin_ || stencil_twin_) {
+            // The twins go after this texture leaves the context: no list prepared from now on names them.
+            device_.context->remove_resource(id());
+            for (Resource* twin : {depth_twin_, stencil_twin_})
+                if (twin) twin->Release();
+            depth_twin_ = stencil_twin_ = nullptr;
+            if (twin_staging_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, twin_staging_);
+            if (twin_staging_memory_)
+                device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, twin_staging_memory_);
+            leonida::note_depth_twins(-1);
+        }
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -2003,6 +2029,12 @@ public:
     }
     bool has_castable_formats() const { return !castable_formats_.empty(); }
     VkFormat uint_backed() const { return uint_backed_; }  // Format::uint_backed
+    // A depth texture that allows unordered access (console only): the colour twins that carry its UAVs (make_twins).
+    bool has_twins() const { return depth_twin_ || stencil_twin_; }
+    Resource* depth_twin() const { return depth_twin_; }
+    Resource* stencil_twin() const { return stencil_twin_; }
+    // The state CreateCommittedResource or CreatePlacedResource made it in, before create_texture.
+    void set_initial_state(D3D12_RESOURCE_STATES state) { initial_state_ = state; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -2442,6 +2474,154 @@ public:
         return S_OK;
     }
 
+    // The console lets a depth texture allow unordered access too (the title makes a 2560x1440 R32G8X24_TYPELESS one,
+    // flags 0x6, and its tiled lighting writes each pixel's material class into the stencil plane through a UAV);
+    // Vulkan has no storage depth images. Ported from VIctory (GPL-3.0-or-later, Marvisak and contributors, DexNom
+    // fork), victory-gpu resource.rs twin_texture: such a texture gets colour twins of its size, mips and slices that
+    // carry its UAVs, one for the depth plane (R32 typeless for 32-bit depth, R16 for 16-bit) and one for the stencil
+    // plane (R8 typeless, viewed as R8_UINT), and the replay copies one side into the other where the title switches
+    // between them (vulkan_replay.h, detail::sync_twins). A 24-bit depth plane has no twin, as no colour format holds
+    // its bits (its UAVs stay null; VIctory draws an R32 twin into such a plane with a pass of its own, left out here);
+    // the console's 16-bit depth with stencil (118) is one of those, as it is a D24 texture here (pc_format). A
+    // multisampled texture gets none (nor does it in VIctory). Without VK_KHR_maintenance8, or with
+    // LEONIDA_DEPTH_TWIN_COPY=buffer, the copies go through a buffer of the depth plane's size. LEONIDA_DEPTH_TWINS=0
+    // makes no twins: the console proxy then drops the UAV flag as before (rt::d3d12::accepts_depth_unordered).
+    HRESULT make_twins(const Format& format) {
+        if (desc_.SampleDesc.Count > 1) return S_OK;
+        DXGI_FORMAT plane = DXGI_FORMAT_UNKNOWN;
+        if (!format.d24) {
+            if (format.format == VK_FORMAT_D32_SFLOAT || format.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+                plane = DXGI_FORMAT_R32_TYPELESS;
+            else if (format.format == VK_FORMAT_D16_UNORM)
+                plane = DXGI_FORMAT_R16_TYPELESS;
+        }
+        const bool stencil = (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+        const auto make = [&](DXGI_FORMAT twin_format, Resource*& out) -> HRESULT {
+            D3D12_RESOURCE_DESC d = desc_;
+            d.Format = twin_format;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            d.Alignment = 0;
+            auto* twin = new Resource(device_, d, D3D12_HEAP_PROPERTIES{D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE);
+            twin->twin_of_ = id();
+            const HRESULT hr = twin->create_texture(texture_format(device_, d));
+            if (FAILED(hr)) {
+                twin->Release();
+                return hr;
+            }
+            out = twin;
+            return S_OK;
+        };
+        if (plane != DXGI_FORMAT_UNKNOWN)
+            if (const HRESULT hr = make(plane, depth_twin_); FAILED(hr)) return hr;
+        if (stencil)
+            if (const HRESULT hr = make(DXGI_FORMAT_R8_TYPELESS, stencil_twin_); FAILED(hr)) return hr;
+        if (!has_twins()) return S_OK;
+        leonida::note_depth_twins(1);  // undone by drop_twins or the destructor
+        static const bool buffer_copies = [] {
+            const char* mode = std::getenv("LEONIDA_DEPTH_TWIN_COPY");
+            return mode && std::strcmp(mode, "buffer") == 0;
+        }();
+        const bool through_buffer = !device_.info.maintenance8 || buffer_copies;
+        if (through_buffer) {
+            // The depth plane's mips and slices, four bytes a texel at most, each mip on 16 bytes (copy_twins).
+            VkDeviceSize bytes = 0;
+            for (UINT mip = 0; mip < desc_.MipLevels; ++mip) {
+                const VkDeviceSize w = std::max<UINT64>(1, desc_.Width >> mip);
+                const VkDeviceSize h = std::max<UINT>(1, desc_.Height >> mip);
+                bytes += (w * h * desc_.DepthOrArraySize * 4 + 15) / 16 * 16;
+            }
+            auto& vk = device_.context->vk;
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size = bytes;
+            info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            device_.share(info);
+            if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &twin_staging_) != VK_SUCCESS) {
+                twin_staging_ = VK_NULL_HANDLE;
+                return E_OUTOFMEMORY;
+            }
+            VkMemoryRequirements requirements{};
+            vk.vkGetBufferMemoryRequirements(device_.info.device, twin_staging_, &requirements);
+            VkMemoryPropertyFlags flags = 0;
+            twin_staging_memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &flags);
+            if (!twin_staging_memory_ ||
+                vk.vkBindBufferMemory(device_.info.device, twin_staging_, twin_staging_memory_, 0) != VK_SUCCESS)
+                return E_OUTOFMEMORY;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12: a depth texture that allows unordered access (format %d, %llux%u) gets colour "
+                         "twins for its UAVs (depth plane: %s, stencil plane: %s), copied %s\n",
+                         int(desc_.Format), static_cast<unsigned long long>(desc_.Width), desc_.Height,
+                         plane == DXGI_FORMAT_R32_TYPELESS   ? "R32"
+                         : plane == DXGI_FORMAT_R16_TYPELESS ? "R16"
+                                                             : "none",
+                         stencil ? "R8_UINT" : "none",
+                         through_buffer ? "through a buffer" : "with vkCmdCopyImage (VK_KHR_maintenance8)");
+        return S_OK;
+    }
+
+    // After make_twins failed: no twins, nothing of them left.
+    void drop_twins() {
+        if (has_twins()) leonida::note_depth_twins(-1);
+        if (depth_twin_) depth_twin_->Release();
+        if (stencil_twin_) stencil_twin_->Release();
+        depth_twin_ = stencil_twin_ = nullptr;
+        auto& vk = device_.context->vk;
+        if (twin_staging_) vk.vkDestroyBuffer(device_.info.device, twin_staging_, nullptr);
+        if (twin_staging_memory_) vk.vkFreeMemory(device_.info.device, twin_staging_memory_, nullptr);
+        twin_staging_ = VK_NULL_HANDLE;
+        twin_staging_memory_ = VK_NULL_HANDLE;
+        log_once("no colour twins for a depth texture that allows unordered access (its UAVs stay null); format",
+                 int(desc_.Format));
+    }
+
+    // The twin a UAV of this depth texture is a view of, and the view's description on it, as VIctory's twin_uav
+    // (victory-gpu descriptor/host.rs): the same mip and slices, plane 0, in the twin's colour format. A view of plane
+    // 1, or in a stencil or R8 format, is the stencil twin's (R8_UINT); any other the depth plane twin's, in its own
+    // format where it names an R32 or R16 colour one and else R32_FLOAT or R16_UNORM (a depth, typeless or plane
+    // format). Null when that plane has no twin.
+    Resource* twin_for_view(const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_UNORDERED_ACCESS_VIEW_DESC& out) const {
+        UINT plane = 0;
+        if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
+        if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) plane = desc->Texture2DArray.PlaneSlice;
+        const DXGI_FORMAT format = desc ? pc_format(desc->Format) : DXGI_FORMAT_UNKNOWN;
+        const bool stencil_view = plane == 1 || format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
+                                  format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                                  (format >= DXGI_FORMAT_R8_TYPELESS && format <= DXGI_FORMAT_R8_SINT);
+        Resource* twin = stencil_view ? stencil_twin_ : depth_twin_;
+        if (!twin) return nullptr;
+        if (desc) {
+            out = *desc;
+        } else {
+            out = {};
+            if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+                out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+            } else if (desc_.DepthOrArraySize > 1) {
+                out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                out.Texture2DArray.ArraySize = desc_.DepthOrArraySize;
+            } else {
+                out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            }
+        }
+        if (out.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) out.Texture2D.PlaneSlice = 0;
+        if (out.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) out.Texture2DArray.PlaneSlice = 0;
+        if (stencil_view) {
+            out.Format = DXGI_FORMAT_R8_UINT;
+        } else if (twin->desc().Format == DXGI_FORMAT_R32_TYPELESS) {
+            const bool r32 = format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_UINT ||
+                             format == DXGI_FORMAT_R32_SINT;
+            out.Format = r32 ? format : DXGI_FORMAT_R32_FLOAT;
+        } else {
+            const bool r16 = format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R16_UNORM ||
+                             format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R16_SNORM ||
+                             format == DXGI_FORMAT_R16_SINT;
+            out.Format = r16 ? format : DXGI_FORMAT_R16_UNORM;
+        }
+        return twin;
+    }
+
     HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -2499,6 +2679,10 @@ public:
         memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
         if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
+        if ((desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+            (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            if (FAILED(make_twins(format))) drop_twins();  // the texture is made all the same: its UAVs stay null
+        }
 
         leonida::ResourceBinding binding{};
         binding.image = image_;
@@ -2524,6 +2708,11 @@ public:
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
         binding.sampled_in_general = device_.bindless != nullptr;
+        binding.depth_twin = depth_twin_ ? depth_twin_->id() : 0;
+        binding.stencil_twin = stencil_twin_ ? stencil_twin_->id() : 0;
+        binding.twin_of = twin_of_;
+        binding.twin_staging = twin_staging_;
+        binding.twin_starts_unordered = (initial_state_ & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
         format_ = format.format;
         uint_backed_ = format.uint_backed;
         aspects_ = format.aspects;
@@ -2896,6 +3085,14 @@ private:
     const char* refusal_ = nullptr;  // create_host_buffer: why it refused
     VkResult allocate_result_ = VK_SUCCESS;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
+    // A depth texture that allows unordered access: its colour twins and the buffer copies between them go through
+    // (make_twins); on a twin, the depth texture's ID.
+    Resource* depth_twin_ = nullptr;
+    Resource* stencil_twin_ = nullptr;
+    leonida::ResourceId twin_of_ = 0;
+    VkBuffer twin_staging_ = VK_NULL_HANDLE;
+    VkDeviceMemory twin_staging_memory_ = VK_NULL_HANDLE;
+    D3D12_RESOURCE_STATES initial_state_ = D3D12_RESOURCE_STATE_COMMON;
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
@@ -6160,6 +6357,8 @@ public:
         rt::d3d12_xs::set_list_title_handlers(&kListTitleHandlers);
         // And slot 86's pipeline for a stream this device refuses (create_refused_pipeline_state).
         rt::d3d12_xs::set_refused_pipeline_handler(&rt::d3d12::create_refused_pipeline_state);
+        // And depth textures that allow unordered access, which the console proxy then passes on (make_twins).
+        rt::d3d12_xs::set_depth_unordered_handler(&rt::d3d12::accepts_depth_unordered);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -8024,6 +8223,18 @@ public:
             log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
             return;
         }
+        if (r->has_twins()) {
+            // A depth texture that allows unordered access (console only): its UAVs are views of its colour twins
+            // (Resource::make_twins), as in VIctory (victory-gpu descriptor/host.rs, twin_uav).
+            D3D12_UNORDERED_ACCESS_VIEW_DESC twin_desc{};
+            Resource* twin = r->twin_for_view(desc, twin_desc);
+            if (!twin) {
+                log_once("unordered-access view of a depth plane with no twin (24-bit depth); view format",
+                         desc ? int(desc->Format) : 0);
+                return;
+            }
+            return CreateUnorderedAccessView(twin, nullptr, &twin_desc, destination);
+        }
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
@@ -9313,6 +9524,7 @@ public:
             } else {
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                resource->set_initial_state(state);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -10536,6 +10748,7 @@ private:
             } else {
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                resource->set_initial_state(initial_state);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -10913,6 +11126,14 @@ VkImage vulkan_image(ID3D12Resource* resource) {
     return r ? r->image() : VK_NULL_HANDLE;
 }
 
+ID3D12Resource* unordered_access_resource(ID3D12Resource* resource, std::uint64_t image_address) {
+    const Resource* r = Resource::from<Resource>(resource);
+    if (!r || !r->has_twins()) return resource;
+    for (Resource* twin : {r->depth_twin(), r->stencil_twin()})
+        if (twin && twin->image_address() == image_address) return twin;
+    return resource;
+}
+
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->memory_flags() : 0;
@@ -10947,6 +11168,18 @@ Device* vulkan_device_of(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     return Device::from<Device>(real ? real : device);
 }
+
+}  // namespace
+
+bool accepts_depth_unordered(ID3D12Device* device) {
+    static const bool off = [] {
+        const char* twins = std::getenv("LEONIDA_DEPTH_TWINS");
+        return twins && std::strcmp(twins, "0") == 0;
+    }();
+    return !off && vulkan_device_of(device) != nullptr;
+}
+
+namespace {
 
 // [start, start + size) out of `ranges` (start -> size, non-overlapping), keeping what lies outside it.
 void cut_range(std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t start, std::uint64_t size) {

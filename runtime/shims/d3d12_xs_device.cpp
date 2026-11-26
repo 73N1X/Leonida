@@ -2602,15 +2602,44 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
 }
 
 // The console lets a depth texture allow unordered access as well (the title asks for a 2560x1440 R32G8X24_TYPELESS
-// one, flags 0x6, and asserts at game+0x344196 when its size is refused); the PC runtime refuses the pair. The UAV
-// flag is dropped, so the texture is made and its unordered-access views are left null (CreateUnorderedAccessView
-// logs them). VIctory gives such a texture a colour twin that carries its UAVs (victory-gpu descriptor/host.rs:3283).
+// one, flags 0x6, and asserts at game+0x344196 when its size is refused); the PC runtime refuses the pair. A device
+// behind the proxy that takes it (set_depth_unordered_handler: the Vulkan layer gives such a texture colour twins
+// that carry its UAVs, as VIctory does, victory-gpu resource.rs twin_texture) gets the description as it is, and the
+// call is made inside a DepthUnorderedScope, so the device knows it is the console's. For any other device the UAV
+// flag is dropped: the texture is made and its unordered-access views are left null (CreateUnorderedAccessView logs
+// them).
+std::atomic<DepthUnorderedHandler> g_depth_unordered{nullptr};
+// Plain data: no thread-exit callback (AGENTS.md, runtime traps).
+thread_local bool t_console_depth_unordered = false;
+
+class DepthUnorderedScope {
+public:
+    explicit DepthUnorderedScope(bool on) : before_(t_console_depth_unordered) {
+        if (on) t_console_depth_unordered = true;
+    }
+    ~DepthUnorderedScope() { t_console_depth_unordered = before_; }
+    DepthUnorderedScope(const DepthUnorderedScope&) = delete;
+    DepthUnorderedScope& operator=(const DepthUnorderedScope&) = delete;
+
+private:
+    bool before_;
+};
+
+// Whether the device behind `self` takes depth textures that allow unordered access.
+bool takes_depth_unordered(const DeviceProxy* self) {
+    const DepthUnorderedHandler handler = g_depth_unordered.load(std::memory_order_acquire);
+    return handler && self && self->real && handler(self->real);
+}
+
+// True when `desc` asks for both flags and `keep` says the device takes them; else the UAV flag is dropped from a
+// description that asks for both, and false.
 template <class Desc>
-void drop_depth_unordered_access(Desc& desc) {
+bool depth_unordered_access(Desc& desc, bool keep) {
     const auto flags = static_cast<std::uint32_t>(desc.Flags);
     constexpr std::uint32_t depth_and_uav = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if ((flags & depth_and_uav) != depth_and_uav) return;
+    if ((flags & depth_and_uav) != depth_and_uav) return false;
+    if (keep) return true;
     desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags & ~std::uint32_t(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed))
@@ -2618,6 +2647,7 @@ void drop_depth_unordered_access(Desc& desc) {
                      "[rt] d3d12_xs: a depth texture that allows unordered access (format %d, %llux%u) is made without "
                      "it; its UAVs stay null\n",
                      static_cast<int>(desc.Format), static_cast<unsigned long long>(desc.Width), desc.Height);
+    return false;
 }
 
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
@@ -2637,7 +2667,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    drop_depth_unordered_access(pc_desc);
+    const DepthUnorderedScope scope(depth_unordered_access(pc_desc, takes_depth_unordered(self)));
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -2679,7 +2709,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // for everything else, as slot 76 does.
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    drop_depth_unordered_access(pc_desc);
+    depth_unordered_access(pc_desc, false);
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -2705,24 +2735,25 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
 
 // A console resource description as the PC takes it: the Xbox layout word (0x101 tiled, 0x1 row-major buffer) becomes
 // ROW_MAJOR for a buffer and UNKNOWN for anything else, as slot 76 does, and the Xbox flag bits above the PC's are
-// cleared, as slot 133 does (the integer mask is slot 133's kPcResourceFlags).
+// cleared, as slot 133 does (the integer mask is slot 133's kPcResourceFlags). Depth with unordered access is kept
+// when `keep` (takes_depth_unordered); the return says it was.
 constexpr std::uint32_t kPcResourceFlagMask = 0x5ff;
 
-void make_pc_desc(D3D12_RESOURCE_DESC& desc) {
+bool make_pc_desc(D3D12_RESOURCE_DESC& desc, bool keep) {
     desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(desc.Flags) & kPcResourceFlagMask);
     desc.Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                     : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    drop_depth_unordered_access(desc);
+    return depth_unordered_access(desc, keep);
 }
 
 // D3D12_RESOURCE_DESC1 starts like the plain description (V resource.rs:2225-2231); its sampler feedback region is
 // not used by the title's resources and is cleared.
-void make_pc_desc(D3D12_RESOURCE_DESC1& desc) {
+bool make_pc_desc(D3D12_RESOURCE_DESC1& desc, bool keep) {
     desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(desc.Flags) & kPcResourceFlagMask);
     desc.Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                     : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.SamplerFeedbackMipRegion = {};
-    drop_depth_unordered_access(desc);
+    return depth_unordered_access(desc, keep);
 }
 
 // A copy of `count` descriptions with make_pc_desc applied, for the allocation-info calls. Up to 8 inline, more
@@ -2730,7 +2761,7 @@ void make_pc_desc(D3D12_RESOURCE_DESC1& desc) {
 template <class Desc>
 class PcDescs {
 public:
-    bool fill(std::uint64_t descs, std::uint64_t count) {
+    bool fill(std::uint64_t descs, std::uint64_t count, bool keep_depth_unordered) {
         const auto n = static_cast<std::uint32_t>(count);
         if (!descs || !n) return true;
         Desc* copy = inline_;
@@ -2740,7 +2771,7 @@ public:
             copy = heap_.get();
         }
         std::memcpy(copy, reinterpret_cast<const void*>(descs), sizeof(Desc) * n);
-        for (std::uint32_t i = 0; i < n; ++i) make_pc_desc(copy[i]);
+        for (std::uint32_t i = 0; i < n; ++i) make_pc_desc(copy[i], keep_depth_unordered);
         data_ = copy;
         return true;
     }
@@ -2789,7 +2820,7 @@ std::uint64_t device_struct_return(DeviceProxy* first, std::uint64_t a1, std::ui
     } else {
         // (visible_mask, count, descs[, each allocation's info for 108])
         PcDescs<std::conditional_t<Slot == 25, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DESC1>> descs;
-        if (self->layout == Layout::console && !descs.fill(a4, a3)) {  // the copy could not be allocated
+        if (self->layout == Layout::console && !descs.fill(a4, a3, takes_depth_unordered(self))) {  // the copy could not be allocated
             if (auto* info = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(out)) *info = {~0ull, 0};
             return out;
         }
@@ -3017,7 +3048,7 @@ HRESULT proxy_create_committed_resource3(DeviceProxy* self, std::uint64_t heap, 
     std::memcpy(&pc_desc, reinterpret_cast<const void*>(desc1), sizeof(D3D12_RESOURCE_DESC));
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
-    make_pc_desc(pc_desc);
+    const DepthUnorderedScope scope(make_pc_desc(pc_desc, takes_depth_unordered(self)));
     const auto xbox_heap_flags = static_cast<std::uint32_t>(heap_flags);
     const auto pc_heap_flags =
         static_cast<D3D12_HEAP_FLAGS>(xbox_heap_flags & ~static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY));
@@ -3382,6 +3413,12 @@ unsigned device_proxy_slot_count(const void* device) {
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
+
+void set_depth_unordered_handler(DepthUnorderedHandler handler) {
+    g_depth_unordered.store(handler, std::memory_order_release);
+}
+
+bool console_depth_unordered() { return t_console_depth_unordered; }
 
 void set_sampler_x_handler(SamplerXHandler handler) {
     g_sampler_x.store(handler, std::memory_order_release);

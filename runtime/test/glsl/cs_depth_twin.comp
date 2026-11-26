@@ -1,0 +1,64 @@
+#version 460
+// A compute shader for d3d12_depth_twin_test, written to the translator's runtime contract (docs/design.md, "User
+// data", "Xbox GPU addresses" and "Images"; the lookup is tools/rdna2spirv.py desc_probe), standing in for the
+// title's tiled lighting, which writes a depth texture's planes through unordered-access views. Its root arguments,
+// in the console compute layout (rt::rootsig::pack_stage: from s4, one dword per table):
+//   s4   where the UAV to write starts inside the view table, in dwords
+//   s5   0: the stencil plane's view (an 8_UINT T#, binding 9), 1: the depth plane's (a 32_FLOAT T#, binding 8)
+//   s6   columns written: x < s6; the others keep what the texture held
+//   s7   a seed for the stencil pattern
+//   s8   the table of views (its 32-bit console VA): a T# in the first eight dwords of each slot
+// The stencil plane gets (x * 7 + y * 13 + s7) & 255, the depth plane ((x + 64 * y) % 997) / 1024.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];  // mask, then 10 uints per slot: key[8], index, pad
+};
+layout(set = 0, binding = 8) uniform writeonly image2D float_images[];
+layout(set = 0, binding = 9) uniform writeonly uimage2D uint_images[];
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    const uvec2 xy = gl_GlobalInvocationID.xy;
+    if (xy.x >= pc.s[6]) return;
+    Words views = Words(add64(pc.heap_base, uvec2(pc.s[8], 0u)));
+    uint key[8];
+    for (int k = 0; k < 8; ++k) key[k] = views.w[pc.s[4] + k];
+    const uint image = lookup(key);
+    if (pc.s[5] == 0u)
+        imageStore(uint_images[image], ivec2(xy), uvec4((xy.x * 7u + xy.y * 13u + pc.s[7]) & 255u));
+    else
+        imageStore(float_images[image], ivec2(xy), vec4(float((xy.x + 64u * xy.y) % 997u) / 1024.0));
+}
