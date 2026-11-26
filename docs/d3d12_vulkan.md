@@ -1302,7 +1302,8 @@ and any validation error fails them.
 - `indirect_clamp_test`: the `ExecuteIndirect` argument clamp pass itself (section 4.7), with no game files: every
   argument kind (draw, draw indexed, dispatch, mesh dispatch) and the counted variants, in-range records
   bit-identical, garbage records bounded, records and counts past `max_command_count` empty, and the per-batch work
-  budget saturating; clean SKIP without a Vulkan device.
+  budget saturating; dispatch records bounded by the device's `maxComputeWorkGroupCount` (70 000 x 1 x 1 kept and run
+  where the device allows it, cut and counted where it does not); clean SKIP without a Vulkan device.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
@@ -4339,14 +4340,22 @@ Not implemented yet:
   `LEONIDA_SKIP_COMPUTE`) or mistranslates leaves whatever the memory held: a dispatch of billions of groups or a
   draw of four billion vertices runs until the host resets the display driver. One small compute pass per
   `ExecuteIndirect` call copies the active records into device-local scratch with their values bounded - 2^24
-  vertices or indices, 2^26 vertex instances (count times instances), 65 535 groups per dimension, 2^20 groups per
-  dispatch and a 2^27-unit work budget per call that saturates through an atomic compare-and-swap - and writes an
+  vertices or indices, 2^26 vertex instances (count times instances), the device's `maxComputeWorkGroupCount` groups
+  per dimension for a dispatch (65 535 for a mesh dispatch), 2^20 groups per dispatch and a 2^27-unit work budget per
+  call that saturates through an atomic compare-and-swap - and writes an
   empty record past `min(count, max_command_count)` and past the budget, and the clamped count word a `*Count` draw
   then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). A draw record
   of 2^23 vertices or indices an instance or more is a slot the title has not filled: it runs empty and charges
   nothing (RT-INDIRECT-DRAW-UNFILLED-COUNT). Before, each was cut to 2^24 and charged that, so eight of them used up
   the budget and every later draw in the list ran empty; a census in a VIctory fork found 90 such records in one
-  list. The indirect command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
+  list. A dispatch record's groups per dimension follow the device (#2230): the title's tile
+  passes ask for 67 440 groups in x at 2560x1440 (found in the VIctory-Belobug-AMD fork of VIctory,
+  `crates/victory-gpu/src/indirect.rs`), RADV runs 2^32 - 1 in x in one dispatch, and the cut at 65 535 dropped the
+  last 1 905 tiles of the pass. A device that allows less (llvmpipe: 65 535) still gets the record cut at its
+  limit: running the rest would take more dispatches with a group-ID base the translated shader does not read. The
+  counters' `indirect clamp dispatch:` line (every 10 s while dispatch records are clamped) gives the records, those
+  wider than 65 535 in x, the widest x that ran and those cut at the device's limits, so a run shows which case it
+  is. The indirect command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
   memory barrier with a transfer access are not allowed inside a dynamic-rendering scope. The records are
   bit-identical to the application's when they are within the limits, the argument and count buffers are left
   untouched, and the scratch comes from a per-submission pool (`vulkan_scratch.h`) that a list with many indirect

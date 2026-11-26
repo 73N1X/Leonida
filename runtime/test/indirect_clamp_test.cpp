@@ -103,6 +103,10 @@ struct Env {
         out.counters.records_clamped = after.records_clamped - before.records_clamped;
         out.counters.counts_clamped = after.counts_clamped - before.counts_clamped;
         out.counters.over_budget = after.over_budget - before.over_budget;
+        out.counters.dispatch_records = after.dispatch_records - before.dispatch_records;
+        out.counters.dispatch_wide = after.dispatch_wide - before.dispatch_wide;
+        out.counters.dispatch_widest = after.dispatch_widest;  // the largest so far: cases go from narrow to wide
+        out.counters.dispatch_cut = after.dispatch_cut - before.dispatch_cut;
         // The scratch is idle once the queue is; hand it back for the next case like a completed submission does.
         clamp.retire(VK_NULL_HANDLE, 0);
         clamp.collect();
@@ -294,6 +298,10 @@ int main() {
             CHECK(all_zero(per_dimension));
         CHECK(all_zero(record(out, 1, 3)));
         CHECK(out.counters.records_clamped == 2);
+        // The dispatch counters: both records, neither wider than 65 535 in x, and the first cut at the device's
+        // limit where it still runs.
+        CHECK(out.counters.dispatch_records == 2 && out.counters.dispatch_wide == 0);
+        CHECK(out.counters.dispatch_cut == (max_y <= leonida::indirect_clamp_max_groups ? 1u : 0u));
     }
 
     // 6c. x within the device's limit is not cut at 65 535: 70 000 groups (fewer than 2^20) come back as asked on a
@@ -306,6 +314,10 @@ int main() {
         const auto words = record(out, 0, 3);
         CHECK(words[0] == std::min<std::uint32_t>(70000, max_x) && words[1] == 1 && words[2] == 1);
         CHECK(out.counters.records_clamped == (max_x >= 70000 ? 0u : 1u));
+        // Counted as wider than 65 535 where it runs so, and as cut at the device's limit where it is cut.
+        CHECK(out.counters.dispatch_records == 1 && out.counters.dispatch_wide == (max_x >= 70000 ? 1u : 0u));
+        CHECK(out.counters.dispatch_widest == std::min<std::uint32_t>(70000, max_x));
+        CHECK(out.counters.dispatch_cut == (max_x >= 70000 ? 0u : 1u));
     }
 
     // 7. A console mesh dispatch uses only x.
