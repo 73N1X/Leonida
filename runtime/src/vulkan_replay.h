@@ -48,7 +48,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -673,33 +672,7 @@ public:
 
     bool separate_depth_stencil_layouts() const { return separate_; }
 
-    // A submission's changes, undone when it does not reach the queue: begin() before it is emitted, then commit() or
-    // rollback(). The first change to an image saves what it was, so a submission costs what it touches. Until
-    // 2026-11-26 each submission copied the whole tracker (every image with its layouts), and a placed texture's
-    // upload is a submission per subresource: the title's world load made thousands of them on its main thread, which
-    // its 30 s hang watchdog ended (run 105: the stalled thread was in that copy).
-    void begin() {
-        journal_.clear();
-        twins_saved_.reset();
-        journaling_ = true;
-    }
-    void commit() {
-        journaling_ = false;
-        journal_.clear();
-        twins_saved_.reset();
-    }
-    void rollback() {
-        for (auto& [id, old] : journal_) {
-            if (old) entries_[id] = std::move(*old);
-            else entries_.erase(id);
-        }
-        if (twins_saved_) twins_ = std::move(*twins_saved_);
-        commit();
-    }
-
     void track(ResourceId id, const ResourceBinding& resource, VkImageLayout layout) {
-        save(id);
-        if (twins_.count(id)) save_twins();
         Entry entry{resource.mip_levels, resource.array_layers, two_planes(resource) ? 2u : 1u,
                     separate_ && two_planes(resource), {}};
         entry.layouts.assign(std::size_t(entry.mips) * entry.layers * (entry.two_planes ? 2 : 1), layout);
@@ -708,8 +681,6 @@ public:
     }
 
     void forget(ResourceId id) {
-        save(id);
-        if (twins_.count(id)) save_twins();
         entries_.erase(id);
         twins_.erase(id);
     }
@@ -717,7 +688,6 @@ public:
     // The sides of depth texture `id`, which has twins (ResourceBinding::depth_twin, stencil_twin): made on first use,
     // with every plane in unordered access when the texture was created in that state.
     DepthTwinSides& twin(ResourceId id, bool starts_unordered) {
-        save_twins();
         const auto [it, made] = twins_.try_emplace(id);
         if (made && starts_unordered) it->second.unordered = 3;
         return it->second;
@@ -725,7 +695,6 @@ public:
     bool has_twins() const { return !twins_.empty(); }
     template<typename F>
     void for_each_twin(F&& f) {
-        save_twins();
         for (auto& [id, sides] : twins_) f(id, sides);
     }
     bool tracked(ResourceId id) const { return entries_.count(id) != 0; }
@@ -770,7 +739,6 @@ public:
     void set(ResourceId id, const VkImageSubresourceRange& range, VkImageLayout layout) {
         const auto it = entries_.find(id);
         if (it == entries_.end()) return;
-        save(id);
         Entry& e = it->second;
         visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
             e.layouts[index] = layout;
@@ -805,25 +773,9 @@ private:
         }
     }
 
-    // While journaling: an image's entry as it was before its first change (none: it was not tracked).
-    void save(ResourceId id) {
-        if (!journaling_) return;
-        const auto [it, first] = journal_.try_emplace(id);
-        if (!first) return;
-        const auto e = entries_.find(id);
-        if (e != entries_.end()) it->second = e->second;
-    }
-    // The twins are few (depth textures with separate sides): saved whole on the first change.
-    void save_twins() {
-        if (journaling_ && !twins_saved_) twins_saved_ = twins_;
-    }
-
     bool separate_;
     std::unordered_map<ResourceId, Entry> entries_;
     std::unordered_map<ResourceId, DepthTwinSides> twins_;
-    bool journaling_ = false;
-    std::unordered_map<ResourceId, std::optional<Entry>> journal_;
-    std::optional<std::unordered_map<ResourceId, DepthTwinSides>> twins_saved_;
 };
 
 // Each physical slot records one non-overlapping interval. Logical queries can share slots.
