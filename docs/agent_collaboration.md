@@ -15,14 +15,14 @@ with fixed fields, and how sure a claim is. It adds to [CONTRIBUTING.md](../CONT
   [`gpu-test-results/`](../gpu-test-results).
 - The coordination issue has a comment cap and is already in its second thread. A block goes on the pull request or
   issue it is about; only run reports ([running.md](running.md#reporting)) and `claiming:` / `done:` / `finding:`
-  lines go in the coordination issue, plus a `TEST-WANTED` block that has no pull request (below).
+  lines go in the coordination issue.
 
 ## Each machine does what only it can do
 
 | Profile | Machine | Work it is best placed for |
 |---|---|---|
 | L | 24 GB of video memory or more | Long runs into the world, the large ray-tracing programs described in [running.md](running.md), the control arm of an A/B test |
-| M | 8 GB to under 24 GB | What fails first when video memory is short, reproducing a reported failure (a guess: running.md has no run on this class yet) |
+| M | 8 GB to under 24 GB | Stalls and timing limits, such as the driver's time on pipeline creation (reported by others on one 8 GB laptop card: [#2415, comment](https://github.com/ubiquitarianism/leonida/pull/2415#issuecomment-7206470912)), reproducing a reported failure, what fails when video memory is short |
 | S | Integrated, older, Intel, Apple | The GPU test suite ([testing.md](testing.md)) and a file in `gpu-test-results/`, driver-specific problems |
 | F | Several GPUs in one machine | Disjoint shards and pull request checks ([multi_gpu_validation.md](multi_gpu_validation.md)) |
 | Z | No free GPU, or one busy with a long run | The translator suite, unit tests, docs, tools, pull request review |
@@ -32,6 +32,8 @@ with fixed fields, and how sure a claim is. It adds to [CONTRIBUTING.md](../CONT
   `finding:` to say whether it needs game files or particular hardware.
 - While a long run holds the GPU, the agent takes profile Z work instead of waiting.
 - Add the profile to `GPUs tested:` in a pull request, so a reviewer sees which profile has not run it.
+- M is wide: say the video memory and whether it is a laptop, since an 8 GB laptop and a 16 GB desktop card behave
+  differently. A laptop with an integrated and a discrete GPU has the profile of its discrete GPU; it is not F.
 
 ## Three blocks
 
@@ -43,7 +45,7 @@ A message from one agent to another:
 ```
 AGENT-MSG | <date, time, UTC> | <GitHub handle> | AI-assisted: <tool>
 BASE:     <short commit of main> + <pull requests applied, by number> + <local change in one line, or none>
-MACHINE:  <GPU, video memory> | <driver> | <OS> | <RAM>
+MACHINE:  <GPU, video memory, laptop or desktop> | <driver> | <OS> | <RAM>
 RECIPE:   documented (running.md, "<section title>") + DEVIATIONS: <VAR=value ...>, or none
 ASK:      <one sentence, or none>
 RETURNED: <numbers, a table, a link to a pull request or a comment>
@@ -52,31 +54,35 @@ EVIDENCE: <one tag per claim: MEASURED | READ IN CODE | ASSUMED>
 ```
 
 `RECIPE` shortens what [running.md](running.md#reporting) asks for: every `LEONIDA_*` variable that differs from the
-section named, or from the defaults where that section says TBD. Never the watchdog's values.
+section named, or from the defaults where that section says TBD. Never the watchdog's values. A run on a profile
+that section does not cover says so: a recipe checked on one profile can behave differently on another.
 
 A run of the game, in the fields of [running.md](running.md#reporting) in a fixed order, plus the prediction, how the
-run ended, the caches and the rank of the run:
+run ended, the caches, the rank of the run and the diagnostic instruments:
 
 ```
 RUN <id> | <date UTC> | <GitHub handle> | AI-assisted: <tool>
-BASE:      <short commit> + <pull requests applied> | shaders: <make_game.py options>
-MACHINE:   <GPU, video memory> | <driver> | <OS> | <RAM>
-RECIPE:    documented ("<section title>") + DEVIATIONS: <VAR=value ...> | precompile: <yes/no, how many>
-OS/DRIVER: <settings, for example the GPU timeout>
-TARGET:    <the metric> | PREDICTED (written before the run): <value or range>
-MEASURED:  <value> | duration <s> | frame rate <if known>
-END:       <time limit | process crash | device lost | stall | watchdog exit | title breakpoint>, read from the log
-CACHES:    <cold | warm: which> | RUN <k> of <n>, same recipe
-VERDICT:   prediction <held | missed by ...>
+BASE:        <short commit> + <pull requests applied> | shaders: <make_game.py options>
+MACHINE:     <GPU, video memory, laptop or desktop> | <driver> | <OS> | <RAM>
+RECIPE:      documented ("<section title>") + DEVIATIONS: <VAR=value ...> | precompile: <yes/no, how many>
+OS/DRIVER:   <settings, for example the GPU timeout>
+TARGET:      <the metric> | PREDICTED (written before the run): <value or range>
+MEASURED:    <value> | duration <s> | frame rate <if known>
+END:         <time limit | process crash | device lost | stall | watchdog exit | title breakpoint>, read from the log
+CACHES:      <cold | warm: which> | RUN <k> of <n>, same recipe
+INSTRUMENTS: <none | what was switched on to diagnose: crash dumps, compile trace, stacks, ...>
+VERDICT:     prediction <held | missed by ...>
 ```
 
-Two runs compare only when `BASE`, `RECIPE` and `CACHES` match, apart from the variable under study.
+Two runs compare only when `BASE`, `RECIPE`, `CACHES` and `INSTRUMENTS` match, apart from the variable under study:
+a diagnostic run and a progress run do not compare even when the recipe reads the same.
 
-A request for a test on a machine you do not have, as a comment on the pull request to test (with no pull request:
-in the coordination issue, after a line `finding: test wanted, profile <X>`):
+A request for a test on a machine you do not have, as a comment on the pull request to test. With no pull request, it
+is its own issue titled `TEST-WANTED [<profile>] <one line>`, closed by its author when done, so that
+`gh issue list --search "TEST-WANTED in:title"` lists what is waiting; labels would do better if maintainers add them:
 
 ```
-TEST-WANTED | <date UTC> | from: <GitHub handle> | AI-assisted: <tool>
+TEST-WANTED | <date UTC> | from: <GitHub handle> | to: <a handle, or any> | AI-assisted: <tool>
 NEEDS:      <profile> | <estimated minutes> | game files: <yes/no>
 BUILD:      same executable for A and B: <short commit> + <pull requests applied>
 VARIABLE:   <ONE variable> | A = <value> | B = <value>
@@ -85,9 +91,15 @@ CACHES:     <clear before each run | keep>
 SEND BACK:  <the values wanted, named one by one> + END + duration, one RUN block per run
 PREDICTED:  <what the author expects for A and for B>
 REFUTED IF: <the result that would contradict it>
+EXPIRES:    <date UTC after which the request is stale, since main moves fast>
 ```
 
 One variable per request: two variables are two requests. `SEND BACK` names values, never "the log".
+
+Whoever takes a request answers under it with `TAKEN | <handle> | ETA <time UTC>` before starting and with
+`DONE | <link to the RUN>` after, so a request is not run twice and its author finds the result. To reach someone,
+mention them by handle: GitHub notifies the human, who starts their agent. Mention only a person you are answering
+or who agreed to take the test, never a group.
 
 ## How sure a claim is
 
