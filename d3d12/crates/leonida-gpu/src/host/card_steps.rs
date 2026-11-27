@@ -191,16 +191,33 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     if copies.is_empty() {
         return false;
     }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
-                .iter()
-                .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
-            Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
-            Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
-            _ => false,
-        })
-    })
+    for list in runs {
+        for step in &list.deferred().copies {
+            // What reads it (for the frame line's "waited for flights"), its range, and the copy's destination.
+            let hit = match step {
+                Step::Refresh(shadow, at, len) => copies
+                    .iter()
+                    .find(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow)))
+                    .map(|w| ("a refresh of another host copy of what a copy done on the card wrote", *at, *len, w)),
+                Step::Host(_, (from, to)) => copies
+                    .iter()
+                    .find(|w| w.from < *to && *from < w.to)
+                    .map(|w| ("a step of the host's that reads what a copy done on the card wrote", *from, *to - *from, w)),
+                Step::Plane((at, len), _) => copies
+                    .iter()
+                    .find(|w| w.from < at.saturating_add(*len) && *at < w.to)
+                    .map(|w| ("a movie plane over what a copy done on the card wrote", *at, *len, w)),
+                _ => None,
+            };
+            if let Some((_kind, _at, _len, _w)) = hit {
+                // Named by the copy's destination (the "declared" range of the line) and where the reader meets it.
+                #[cfg(feature = "diagnostics")]
+                super::blame(_kind, &[(_w.from, _w.to)], _at.max(_w.from), _len);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// What a step of a submission does to title memory, as the plan sees it.

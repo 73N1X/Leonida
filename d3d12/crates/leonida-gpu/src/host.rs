@@ -3083,6 +3083,35 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
     on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
 }
 
+/// Whether a copy at its place in a list ([`place`]) into bytes that flights in the air have declared
+/// written, but that no shader's write went into lately, is taken for the title's own: title memory takes it
+/// at submission, as with nothing in the air, and the steps of the submission that read its destination on
+/// the CPU do not wait for the flights (`LEONIDA_PLACED_TITLE=1`; off by default).
+///
+/// The title copies 288 bytes of constants a frame into its ring, in the heap that the skinning passes
+/// declare written as a whole, and fills a constant buffer from them in the same submission. The copy was
+/// left to the card alone (the flights "may write the destination"), so the fill stood until every flight
+/// had landed: one wait a frame, 44-48 ms of a 100 ms frame at the save and 20-37 ms at the dock
+/// (2026-11-27, "a fill of upload memory from what a copy at its place in a list writes"), which is what
+/// put the card's time and the submitting thread's one after the other.
+///
+/// The reference of the destination's host copy is left as it is (it takes the bytes when this submission
+/// lands, [`place::Placed::prepare`]): a flight ahead of it, whose snapshot holds the bytes from before
+/// the copy, finds them equal to the reference and puts nothing over the copy in title memory.
+///
+/// What can go wrong: a flight in the air whose shader does write those bytes, for the first time in 600
+/// frames, lands after the copy was taken: title memory holds its bytes, not the copy's, until this
+/// submission lands (the card has them in the right order all along).
+fn placed_is_titles(dst: usize, len: usize) -> bool {
+    const SMALL: usize = 64 << 10;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("LEONIDA_PLACED_TITLE").is_some_and(|v| v == "1"));
+    // `LEONIDA_AB=<s>,LEONIDA_PLACED_TITLE` turns it on and off by turns in one run.
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("LEONIDA_PLACED_TITLE").unwrap_or(on);
+    on && len <= SMALL && !crate::watch::landed_lately(dst, len, 600)
+}
+
 /// Diagnostics: the waits for flights, by what waited, why it was not done
 /// on the card ([`card_steps`]), its bytes, and the declared write it lies
 /// in (start, bytes).
@@ -3296,7 +3325,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    if placed.is_empty() {
+        return None;
+    }
+    let (_kind, _at, _len) = place::reader(runs, placed)?;
+    // Named for the frame line (it was the one wait there with no name: 20-37 ms once a frame at the dock,
+    // 2026-11-27).
+    #[cfg(feature = "diagnostics")]
+    if count {
+        blame(_kind, written, _at, _len);
+    }
+    Some(WHY_READ)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -7975,11 +8014,26 @@ impl HostList {
                         crate::port_journal::prep_wrote();
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
+                    // Declared by flights, but the title's own by what has landed there (`placed_is_titles`).
+                    let titles = !free && p.titles(air);
                     batch.fill();
-                    if free {
+                    if free || titles {
                         batch.title_written();
                     }
-                    if let Some(bytes) = p.prepare(free) {
+                    if titles {
+                        static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = TAKEN.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::info!(
+                                n,
+                                dst = format_args!("{:#x}", p.dst),
+                                src = format_args!("{:#x}", p.src),
+                                len = p.len,
+                                "a copy at its place taken for the title's own under flights' declared writes: what reads it on the CPU does not wait for them (LEONIDA_PLACED_TITLE)"
+                            );
+                        }
+                    }
+                    if let Some(bytes) = p.prepare(free, titles) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
                     }
                     (started, p.len)

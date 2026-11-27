@@ -62,8 +62,19 @@ pub(super) struct Placed {
 }
 
 impl Placed {
+    /// Whether the copy's bytes are the title's own although flights in the air (`written`) declare them
+    /// (`super::placed_is_titles`): the destination by what has landed there, and the source either not
+    /// declared or the title's by the rule for fills (`super::fill_is_titles`).
+    pub(super) fn titles(&self, written: &[(usize, usize)]) -> bool {
+        super::placed_is_titles(self.dst, self.len)
+            && (!touches(written, self.src, self.src + self.len) || super::fill_is_titles(self.src, self.len))
+    }
+
     /// Whether flights that write `written` are waited for.
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
+        if self.titles(written) {
+            return Waits::No;
+        }
         let source = touches(written, self.src, self.src + self.len);
         if source && self.from.is_some() {
             return Waits::Yes;
@@ -76,10 +87,14 @@ impl Placed {
 
     /// At submission, in the order of the steps: the list's upload memory
     /// takes the source's bytes and, if `free` (no flight in the air may write
-    /// source or destination), title memory at the destination does. Gives
-    /// the bytes if it took them.
-    pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
-        if !free && self.from.is_none() {
+    /// source or destination) or `titles` ([`Placed::titles`]), title memory at
+    /// the destination does. Gives the bytes if it took them and the
+    /// destination's reference is to take them too (`free` alone: with flights
+    /// in the air the reference is left to this submission's landing, so that
+    /// a flight ahead of it does not find the bytes from before the copy to
+    /// differ from it and put them back).
+    pub(super) fn prepare(&self, free: bool, titles: bool) -> Option<Vec<u8>> {
+        if !free && !titles && self.from.is_none() {
             return None;
         }
         let mut bytes = vec![0u8; self.len];
@@ -89,11 +104,14 @@ impl Placed {
             // SAFETY: the list's own upload memory of that many bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
         }
-        if !free {
+        if !free && !titles {
             return None;
         }
         copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
+        if !free {
+            return None;
+        }
         // Title memory that is not all there was left alone.
         let mut there = vec![0u8; self.len];
         (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
@@ -110,19 +128,29 @@ pub(super) enum Waits {
 }
 
 /// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
+pub(super) fn read_by(runs: &[&HostList], ranges: Vec<(usize, usize)>) -> bool {
+    reader(runs, ranges).is_some()
+}
+
+/// The first step of `runs` that reads one of `ranges` on the CPU: what kind of step, and the bytes it reads
+/// (address, length).
+pub(super) fn reader(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> Option<(&'static str, usize, usize)> {
     join_ranges(&mut ranges, []);
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
-                touches(&ranges, at, at + len)
-            }
-            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
-            Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-            Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
-            _ => false,
+    runs.iter().find_map(|list| {
+        list.deferred().copies.iter().find_map(|step| {
+            let (kind, at, len) = match step {
+                &Step::Copy(_, src, len) => ("a buffer copy's source, written by a copy at its place in a list", src, len),
+                &Step::Fill(_, src, len, _) => ("a fill of upload memory from what a copy at its place in a list writes", src, len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    ("a texture over what a copy at its place in a list writes", at, len)
+                }
+                &Step::Plane((at, len), _) => ("a movie plane over what a copy at its place in a list writes", at, len),
+                Step::Host(_, (from, to)) => ("a step of the host's that reads what a copy at its place in a list writes", *from, *to - *from),
+                Step::Placed(p) if p.from.is_some() => ("a copy at its place whose source another one at its place writes", p.src, p.len),
+                _ => return None,
+            };
+            touches(&ranges, at, at.saturating_add(len)).then_some((kind, at, len))
         })
     })
 }
