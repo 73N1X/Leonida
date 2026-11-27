@@ -385,7 +385,7 @@ void test_a_checkpoint_sees_a_demand_that_started_during_it() {
     EXPECT(log.wait_finished(1));
     EXPECT(second_look == 1);
     build.release();
-    EXPECT(log.wait_finished(2));
+    pool.wait_idle();  // the job leaves the running list after its function returns
     EXPECT(!pool.has_compile_waiter());
     pool.release();
 }
