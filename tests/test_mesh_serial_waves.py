@@ -107,3 +107,32 @@ def test_without_the_flag_the_waves_are_side_by_side(make_shader, name):
     assert "OpExecutionMode %main LocalSize 128 1 1" in spvasm
     assert "%msw_" not in spvasm and "mesh_serial_waves" not in meta
     assert "OpDecorate %local_index BuiltIn LocalInvocationIndex" in spvasm
+
+
+@requires_tools
+def test_a_wave_that_ends_early_does_not_skip_the_later_passes(make_shader):
+    # ms_w64x_wave_votes with an s_endpgm in the middle of the program, behind a branch on the wave's number (7,
+    # so never taken here): the end of one wave's program must end its pass, not the invocation.
+    name = "ms_w64x_wave_votes"
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", name + ".asm"), encoding="utf-8") as f:
+        text = f.read()
+    at = "s_bfe_u32 s4, s3, 0x40018\n"
+    assert text.count(at) == 1
+    text = text.replace(at, at + "s_cmp_eq_u32 s4, 7\ns_cbranch_scc0 1\ns_endpgm\n")
+    shader = make_shader(text, name, dxbc=SAMPLE_DXBC[name])
+    old = rdna2spirv.MESH_SERIAL_WAVES, rdna2spirv.WAVE64_EMULATE
+    rdna2spirv.MESH_SERIAL_WAVES, rdna2spirv.WAVE64_EMULATE = True, True
+    try:
+        spvasm = shader.translate()
+        meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    finally:
+        rdna2spirv.MESH_SERIAL_WAVES, rdna2spirv.WAVE64_EMULATE = old
+    shader.validate(spvasm)
+    assert meta["mesh_serial_waves"] == 2
+    assert spvasm != _translate(make_shader, name, True)[1]     # the early end is in the module
+    assert "OpExecutionMode %main LocalSize 64 1 1" in spvasm
+    main = spvasm[spvasm.index("%main = OpFunction"):]
+    main = main[:main.index("OpFunctionEnd")]
+    # One return, after the loop over the passes and after the outputs are written.
+    assert main.count("OpReturn") == 1 and "OpKill" not in main and "OpTerminateInvocation" not in main
+    assert main.index("%msw_exit = OpLabel") < main.index("OpSetMeshOutputsEXT") < main.index("OpReturn")
