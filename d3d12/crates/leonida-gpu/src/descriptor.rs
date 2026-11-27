@@ -691,6 +691,11 @@ pub(crate) fn constant_slot(
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
+        // A list of ours being recorded ahead of a frame may be at it, if
+        // shaders see it (`crate::draw::passes_ahead`).
+        if self.desc.flags & SHADER_VISIBLE != 0 && self.desc.kind == VIEWS_KIND {
+            crate::draw::view_heap_gone(at);
+        }
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
@@ -1770,6 +1775,43 @@ mod tests {
             offset / 32 + 2,
             "the next allocation took the table's second slot"
         );
+    }
+
+    /// The list of ours ahead of a frame (`crate::draw::passes_ahead`) is
+    /// recorded for the view heap a draw had set while the title has it, and
+    /// a heap the title lets go of is no longer looked at.
+    #[cfg(windows)]
+    #[test]
+    fn the_list_ahead_of_a_frame_is_for_a_heap_the_title_still_has() {
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        assert!(heap(h).host().is_some(), "a host view heap");
+        let list = device.new_list().expect("a host list");
+        let (recorded, theirs) = crate::draw::test_record_passes_ahead(Some((h as usize, 4)), &list);
+        assert!(recorded, "the passes over a live heap are recorded");
+        assert_eq!(theirs, h as usize);
+        // The title's last reference: the heap is taken out before it is freed.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        let (recorded, theirs) = crate::draw::test_record_passes_ahead(None, &list);
+        assert!(!recorded && theirs == 0, "a heap let go of is not looked at");
+        // One that was never the title's (or whose address is nobody's now).
+        let (recorded, _) = crate::draw::test_record_passes_ahead(Some((0x1000, 4)), &list);
+        assert!(!recorded);
+        let _ = crate::draw::test_record_passes_ahead(Some((0, 0)), &list);
+        list.close();
     }
 
     #[test]

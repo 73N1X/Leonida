@@ -460,6 +460,26 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     parts
 }
 
+/// A list of ours for a frame's first submission to run behind: the
+/// once-a-frame passes over the heap's views, recorded now
+/// (`crate::draw::passes_ahead`). `None`: there was nothing to record (no draw
+/// has had a view heap yet, or nothing of it changed), or no host list.
+#[cfg(windows)]
+pub(crate) fn ahead_of_frame() -> Option<Detached> {
+    let host = fresh_list()?;
+    let recorded = crate::draw::record_passes_ahead(&host);
+    // (Nothing recorded: no step, no texture, nothing kept.)
+    let empty = !recorded || host.untouched();
+    host.close();
+    let list = Detached { host, _uploads: Vec::new(), _state: Default::default() };
+    if empty {
+        // Used again as it is.
+        recycle(vec![list], &[0]);
+        return None;
+    }
+    Some(list)
+}
+
 /// Takes the host sides of submitted lists (each once, however often the
 /// submission names it) and leaves each list a new, closed host list for
 /// its next reset: what was taken, and which of them run in what order.

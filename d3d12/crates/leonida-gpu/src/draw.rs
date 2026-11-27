@@ -206,6 +206,224 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Whether the once-a-frame passes over the heap's views (the buffers and the
+/// textures shaders pick by an index they compute) are recorded into a list of
+/// ours that is sent ahead of the frame's first submission
+/// (`LEONIDA_PASSES_AHEAD`: 1 or 0, or 2 for [`passes_ahead_where_sent`];
+/// unset: with `LEONIDA_THIN=1`). Only with the line of submissions
+/// (`crate::queue::line_on`), whose thread sends that list
+/// (`crate::queue::ahead_of_frame`).
+///
+/// From PastiiJay/klbf-lab a5f5a75 by way of Fayberr/Victory-United b963101f
+/// (GPL-3.0, as this). The passes were recorded into the list whose draw asked
+/// first. With lists translated by threads of ours that list is any of the
+/// frame's, often one submitted late: the lists submitted before it read last
+/// frame's buffers through the heap (there, run ve167: hair and whole people
+/// drawn from old bones, 44 dark patches in 25 s; one translating thread: 2).
+///
+/// What differs here: the list is sent by the thread of the line of
+/// submissions, the only place lists are sent from with thin lists; a list
+/// keeps its own passes, as before, where the lists ahead do not have them
+/// ([`done_ahead`]); and the buffers' pass is in them only once a shader has
+/// asked for it.
+pub(crate) fn passes_ahead() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`). A list
+    // recorded ahead and not sent when it goes off is sent when it is on again,
+    // and the lists keep their own passes until one has had them again.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_PASSES_AHEAD") {
+        return on && crate::queue::line_on();
+    }
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| match std::env::var("LEONIDA_PASSES_AHEAD") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => crate::list::thin::wanted(),
+    }) && crate::queue::line_on()
+}
+
+/// Whether the list ahead of a frame is recorded where it is sent, by the
+/// line's thread at the frame's first submission (`LEONIDA_PASSES_AHEAD=2`),
+/// not by a thread of its own from the present before on.
+///
+/// Begun at the present, the list has the views the title had written into
+/// its heap by then: with the title a frame ahead of the line that is the
+/// frame's, with the line caught up (the title has not begun the frame when
+/// the one before is presented) a view written for the frame gets its host
+/// slot and its bytes a frame late. Recorded where it is sent, it has what
+/// the title wrote up to the frame's first submission, and the line's thread
+/// stands for the whole pass where it otherwise waits for what is left of it
+/// (the source: 12.4 ms a frame against 10, its runs ve170 and ve172). Not
+/// measured here.
+pub(crate) fn passes_ahead_where_sent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEONIDA_PASSES_AHEAD").is_ok_and(|v| v.trim() == "2"))
+}
+
+/// The title's view heap whose passes the lists ahead of frames record
+/// ([`passes_ahead`]; 0: none yet), and its slots: the biggest a draw has had
+/// set, as elsewhere (`crate::descriptor::lent_heap`).
+static AHEAD_HEAP: std::sync::Mutex<(usize, u32)> = std::sync::Mutex::new((0, 0));
+/// Held while a list ahead of a frame is recorded: a heap that is let go waits
+/// for it ([`view_heap_gone`]).
+static AHEAD_RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A shader has picked a buffer from [`AHEAD_HEAP`] by index: the lists ahead
+/// of frames have the buffers' pass from now on.
+static AHEAD_BUFFERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The frame, plus one, of the last list ahead of a frame that had the
+/// buffers' pass, and of the last that had the textures' (0: none yet).
+static AHEAD_DID: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Frames a pass in a list ahead of a frame counts for ([`done_ahead`]): the
+/// title's count of frames and the line's presents are not in step (a list
+/// translated late in a frame the title recorded a frame ahead of the line is
+/// three of them from the last such pass), and a list that makes the pass for
+/// itself beside those makes it twice. Past these the lists ahead have
+/// stopped coming: nothing is presented.
+const AHEAD_FRAMES: u64 = 8;
+/// Since the last frame line: lists recorded ahead of a frame and the
+/// microseconds that took; passes lists made for themselves all the same
+/// (buffers, textures).
+pub(crate) static AHEAD_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether the lists ahead of frames make pass `which` (0: the buffers', 1:
+/// the textures') over the heap at `at` ([`passes_ahead`]); if not, the list
+/// that asks makes it for itself, as before: the switch is off, another heap
+/// is theirs, or none of them has had that pass for [`AHEAD_FRAMES`] frames
+/// (the first frames, a heap just taken, frames that are not presented).
+fn done_ahead(which: usize, at: usize, host: &crate::descriptor::host::HostHeap) -> bool {
+    if !passes_ahead() {
+        return false;
+    }
+    let theirs = {
+        let mut theirs = AHEAD_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = ahead_takes(&mut theirs, at, host.count());
+        if taken == Some(true) {
+            // What was made for the heap before it counts for nothing.
+            AHEAD_BUFFERS.store(false, Ordering::Relaxed);
+            AHEAD_DID.iter().for_each(|did| did.store(0, Ordering::Relaxed));
+        }
+        if taken.is_some() && which == 0 {
+            AHEAD_BUFFERS.store(true, Ordering::Relaxed);
+        }
+        taken.is_some()
+    };
+    let done = theirs && ahead_counts(AHEAD_DID[which].load(Ordering::Relaxed), crate::frame::current());
+    if !done {
+        AHEAD_STATS[2 + which].fetch_add(1, Ordering::Relaxed);
+    }
+    done
+}
+
+/// Whether the heap at `at`, of `count` slots, is the one the lists ahead of
+/// frames record for (`theirs`: that heap and its slots; 0: none), which it
+/// becomes if there is none or it is bigger (`Some(true)`). A heap that is let
+/// go is taken out ([`view_heap_gone`]).
+fn ahead_takes(theirs: &mut (usize, u32), at: usize, count: u32) -> Option<bool> {
+    if theirs.0 == at {
+        return Some(false);
+    }
+    if theirs.0 != 0 && count <= theirs.1 {
+        return None;
+    }
+    *theirs = (at, count);
+    Some(true)
+}
+
+/// Whether a pass a list ahead of a frame made in frame `did - 1` (0: none
+/// did) still counts in `frame`.
+fn ahead_counts(did: u64, frame: u64) -> bool {
+    did != 0 && (frame + 1).saturating_sub(did) <= AHEAD_FRAMES
+}
+
+/// The title lets go of the descriptor heap at `at`: the lists ahead of frames
+/// do not look at it any more, and a recording under way, which may be at it
+/// (or at one a bigger heap has taken the place of since), has ended when this
+/// returns. Called before the heap leaves `crate::descriptor`'s list, with
+/// none of its locks held.
+pub(crate) fn view_heap_gone(at: usize) {
+    {
+        let mut theirs = AHEAD_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+        if theirs.0 == at {
+            *theirs = (0, 0);
+        }
+    }
+    drop(AHEAD_RECORDING.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// Records into `list`, a list of ours that is sent ahead of a frame's first
+/// submission, what the frame's lists then find done ([`passes_ahead`]): the
+/// heap's buffer views brought up to date, if a shader has picked one, and the
+/// textures picked by index uploaded. `false`: nothing was recorded (no draw
+/// has had a view heap set yet, or that heap is gone).
+pub(crate) fn record_passes_ahead(list: &HostList) -> bool {
+    let began = std::time::Instant::now();
+    let _recording = AHEAD_RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+    let at = AHEAD_HEAP.lock().unwrap_or_else(|e| e.into_inner()).0;
+    // (It stays from here on: `view_heap_gone` waits for this recording.)
+    if at == 0 || crate::descriptor::with_heap(at, |_| ()).is_none() {
+        return false;
+    }
+    let heap = crate::descriptor::heap(at as This);
+    let Some(host) = heap.host() else {
+        return false;
+    };
+    let frame = crate::frame::current();
+    let buffers = AHEAD_BUFFERS.load(Ordering::Relaxed) && host.strides_gpu().is_some();
+    let mut stage = crate::timeline::span("ahead of a frame: the heap's buffer views");
+    if buffers {
+        for (shadow, from, to) in heap_buffer_pass(heap, host, frame) {
+            shadow.refresh(list, from, to - from);
+        }
+        HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    let refreshed = std::time::Instant::now();
+    stage.next("ahead of a frame: textures picked by index");
+    // With the budget the pass has where it is: a frame's own behind the
+    // buffers' pass, the early one's before any shader picks a buffer.
+    let (early_ms, _) = early_budgets();
+    let textures = buffers || early_ms > 0;
+    if textures {
+        if !buffers {
+            EARLY_TEXTURE_PASSES[0].fetch_add(1, Ordering::Relaxed);
+            PASS_BUDGET.set(Some((early_ms, 64 << 20, false)));
+        }
+        let _ = State::default().heap_textures(list, heap, host, None);
+        PASS_BUDGET.set(None);
+    }
+    stage.end();
+    #[cfg(feature = "diagnostics")]
+    if buffers {
+        HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    if buffers {
+        HEAP_BUFFER_MICROS.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    // What the lists that ask may now leave to these: unless the heap is
+    // another's by now.
+    if AHEAD_HEAP.lock().unwrap_or_else(|e| e.into_inner()).0 == at {
+        for (did, made) in AHEAD_DID.iter().zip([buffers, textures]) {
+            if made {
+                did.store(frame + 1, Ordering::Relaxed);
+            }
+        }
+    }
+    AHEAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+    AHEAD_STATS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    true
+}
+
+/// For a test: [`record_passes_ahead`] into `list` as if a draw had had the
+/// heap at `at`, of `count` slots, set (`None`: whatever heap is theirs now);
+/// and the heap that is theirs afterwards.
+#[cfg(test)]
+pub(crate) fn test_record_passes_ahead(heap: Option<(usize, u32)>, list: &HostList) -> (bool, usize) {
+    if let Some(heap) = heap {
+        *AHEAD_HEAP.lock().unwrap_or_else(|e| e.into_inner()) = heap;
+    }
+    let recorded = record_passes_ahead(list);
+    (recorded, AHEAD_HEAP.lock().unwrap_or_else(|e| e.into_inner()).0)
+}
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2113,6 +2331,11 @@ impl State {
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
+        // The pass is the list's that goes ahead of the frame, and the
+        // textures' with it ([`passes_ahead`]).
+        if done_ahead(0, std::ptr::from_ref(heap) as usize, host) {
+            return Some(gpu);
+        }
         // The pass itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
@@ -2441,6 +2664,11 @@ impl State {
         } else {
             return;
         };
+        // The pass is the list's that goes ahead of the frame
+        // ([`passes_ahead`]).
+        if done_ahead(1, std::ptr::from_ref(heap) as usize, host) {
+            return;
+        }
         EARLY_TEXTURE_PASSES[0].fetch_add(1, Ordering::Relaxed);
         PASS_BUDGET.set(Some((budget.0, budget.1, false)));
         let _ = self.heap_textures(list, heap, host, None);
@@ -5151,6 +5379,43 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+}
+
+#[cfg(test)]
+mod passes_ahead_tests {
+    use super::{AHEAD_FRAMES, ahead_counts, ahead_takes};
+
+    /// The lists ahead of frames record for the first view heap a draw has
+    /// set, then for a bigger one; a list with another keeps its own passes.
+    #[test]
+    fn the_biggest_heap_asked_for_is_theirs() {
+        let mut theirs = (0, 0);
+        assert_eq!(ahead_takes(&mut theirs, 0x1000, 64), Some(true));
+        assert_eq!(ahead_takes(&mut theirs, 0x1000, 64), Some(false));
+        assert_eq!(ahead_takes(&mut theirs, 0x2000, 64), None, "one as big keeps its own passes");
+        assert_eq!(ahead_takes(&mut theirs, 0x3000, 16), None);
+        assert_eq!(theirs, (0x1000, 64));
+        assert_eq!(ahead_takes(&mut theirs, 0x4000, 1 << 20), Some(true));
+        assert_eq!(ahead_takes(&mut theirs, 0x1000, 64), None, "the one it was is another's now");
+        // Let go of (`view_heap_gone`): the next that asks.
+        theirs = (0, 0);
+        assert_eq!(ahead_takes(&mut theirs, 0x3000, 16), Some(true));
+        assert_eq!(theirs, (0x3000, 16));
+    }
+
+    /// A list leaves its pass to the lists ahead only while one of them had
+    /// it a moment ago; else it makes it for itself, as before.
+    #[test]
+    fn a_pass_ahead_counts_for_a_few_frames() {
+        assert!(!ahead_counts(0, 0), "none had it");
+        assert!(!ahead_counts(0, 100));
+        // Made in frame 7 (kept as 8).
+        assert!(ahead_counts(8, 7));
+        assert!(ahead_counts(8, 7 + AHEAD_FRAMES));
+        assert!(!ahead_counts(8, 8 + AHEAD_FRAMES), "frames went by without one: not presented, or the line stood");
+        // The title's count read a moment before the list ahead read it.
+        assert!(ahead_counts(8, 6));
     }
 }
 

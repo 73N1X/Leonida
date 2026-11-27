@@ -472,7 +472,168 @@ pub(crate) fn behind_line(frames: f64) {
     if behind::on() {
         crate::list::thin::line(frames);
         behind::line(frames);
+        ahead_line(frames);
     }
+}
+
+/// The list ahead of the next frame ([`ahead_of_frame`]): 0 not begun, 1 being
+/// recorded by its thread, 2 recorded; and the list.
+#[cfg(windows)]
+struct Ahead {
+    state: u8,
+    list: Option<crate::list::Detached>,
+}
+
+// SAFETY: a host list and what it holds, handed from the thread that records
+// it to the one that sends it, as the line hands its submissions on.
+#[cfg(windows)]
+unsafe impl Send for Ahead {}
+
+#[cfg(windows)]
+static AHEAD: (std::sync::Mutex<Ahead>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Ahead { state: 0, list: None }), std::sync::Condvar::new());
+
+/// The list ahead of the frame being sent has been sent, or there was none.
+#[cfg(windows)]
+static AHEAD_SENT: AtomicBool = AtomicBool::new(false);
+
+/// There is no thread to record the lists ahead of frames: they are recorded
+/// where they are sent.
+#[cfg(windows)]
+static AHEAD_NONE: AtomicBool = AtomicBool::new(false);
+
+/// Since the last frame-rate line: microseconds the line's thread waited for
+/// lists ahead of frames, and the lists it sent.
+#[cfg(windows)]
+static AHEAD_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Ahead of the first submission since the last present, and of a present
+/// nothing was submitted before: the list of the frame's passes over the
+/// heap's views (`crate::draw::passes_ahead`), sent as a submission of its
+/// own. Called by the line's thread alone ([`behind`]), which sends the
+/// submissions in their order.
+///
+/// From PastiiJay/klbf-lab a5f5a75 by way of Fayberr/Victory-United b963101f
+/// (GPL-3.0, as this); there the queues' own threads sent it.
+#[cfg(windows)]
+fn ahead_of_frame(host: &crate::host::Host) {
+    if !crate::draw::passes_ahead() || AHEAD_SENT.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let list = {
+        let _waiting = crate::timeline::span("the line: the list ahead of the frame is waited for");
+        let mut ahead = lock(&AHEAD.0);
+        if ahead.state == 0 {
+            // Not begun (the first frame, no thread for it, or
+            // `LEONIDA_PASSES_AHEAD=2`): recorded here.
+            drop(ahead);
+            crate::list::ahead_of_frame()
+        } else {
+            while ahead.state == 1 {
+                ahead = AHEAD.1.wait(ahead).unwrap_or_else(|e| e.into_inner());
+            }
+            ahead.state = 0;
+            ahead.list.take()
+        }
+    };
+    AHEAD_WAITED[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if let Some(list) = list {
+        AHEAD_WAITED[1].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::op(0, || "RUN the list of ours ahead of the frame (its passes over the heap's views)".to_string());
+        host.execute_late(vec![list], vec![0]);
+    }
+}
+
+/// The line's thread is at a present, with everything of that frame sent: the
+/// list ahead of the next one is recorded from now on, by a thread of its own,
+/// beside the present and whatever comes before the next frame's first
+/// submission. (Begun at the title's present call instead it no longer saw
+/// what the title wrote into its heap while the line caught up, and what
+/// streamed in flickered: the fork's run ve173.)
+#[cfg(windows)]
+fn ahead_begin() {
+    AHEAD_SENT.store(false, Ordering::Relaxed);
+    if !crate::draw::passes_ahead() {
+        return;
+    }
+    // None is begun, so each is recorded where it is sent, by this thread.
+    if crate::draw::passes_ahead_where_sent() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "the once-a-frame passes over the heap's views are recorded into a list of ours at each frame's first \
+                 submission, by the thread that sends it (LEONIDA_PASSES_AHEAD=2; 1: by a thread of its own, from the present \
+                 before on)"
+            )
+        });
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let worker = || {
+            crate::cores::keep_on_fast_cores("leonida-ahead");
+            // The line waits for this thread: it does not wait for the line.
+            behind::no_drain_here();
+            loop {
+                {
+                    let mut ahead = lock(&AHEAD.0);
+                    while ahead.state != 1 {
+                        ahead = AHEAD.1.wait(ahead).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                let Ok(list) = std::panic::catch_unwind(crate::list::ahead_of_frame) else {
+                    // The line's thread would wait for the list for good.
+                    crate::host::fail(format_args!("the thread that records the lists ahead of frames panicked"));
+                };
+                let mut ahead = lock(&AHEAD.0);
+                ahead.list = list;
+                ahead.state = 2;
+                drop(ahead);
+                AHEAD.1.notify_all();
+            }
+        };
+        match std::thread::Builder::new().name("leonida-ahead".into()).stack_size(8 << 20).spawn(worker) {
+            Ok(_) => tracing::info!(
+                "the once-a-frame passes over the heap's views are recorded into a list of ours sent ahead of each frame's \
+                 first submission (LEONIDA_PASSES_AHEAD=0: into the list that asks first, as before)"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread for the list ahead of a frame: it is recorded where it is sent");
+                AHEAD_NONE.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    if AHEAD_NONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut ahead = lock(&AHEAD.0);
+    // (The one before was taken, at this present at the latest. One left from
+    // before the line was last off, `crate::ab`, is sent first as it is.)
+    if ahead.state == 0 {
+        ahead.state = 1;
+        drop(ahead);
+        AHEAD.1.notify_all();
+    }
+}
+
+/// For the frame-rate line.
+#[cfg(windows)]
+fn ahead_line(frames: f64) {
+    if !crate::draw::passes_ahead() {
+        return;
+    }
+    let [lists, micros, buffers, textures] = [0, 1, 2, 3].map(|i| crate::draw::AHEAD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [waited, sent] = [0, 1].map(|i| AHEAD_WAITED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "lists of ours ahead of a frame's first submission, for its passes over the heap's views (LEONIDA_PASSES_AHEAD=0: in the \
+         list that asks first; 2: recorded where they are sent): {lists:.2} recorded a frame in {:.1} ms, {sent:.2} sent; the \
+         line's thread stood {:.1} ms a frame for them; lists left to make the pass for themselves: {buffers:.2} (buffers), \
+         {textures:.2} (textures) a frame",
+        micros / 1000.0,
+        waited / 1000.0
+    );
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with

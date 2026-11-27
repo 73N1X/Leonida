@@ -545,7 +545,12 @@ impl Work for Job {
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
-                    Some(host) => host.execute_late(lists, order),
+                    Some(host) => {
+                        // The frame's first: behind the list of its passes
+                        // over the heap's views.
+                        super::ahead_of_frame(host);
+                        host.execute_late(lists, order)
+                    }
                     None => drop(lists),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
@@ -557,7 +562,10 @@ impl Work for Job {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
                 match crate::host::host() {
-                    Some(host) => host.execute_parts(lists, order, &parts),
+                    Some(host) => {
+                        super::ahead_of_frame(host);
+                        host.execute_parts(lists, order, &parts)
+                    }
                     None => drop(lists),
                 }
                 // (A part that had no list is one all the same.)
@@ -574,6 +582,13 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
+                // A frame none of whose submissions came behind the list
+                // ahead of it: that goes now, so that what it uploads is there
+                // for the next; and the next frame's is recorded from here on.
+                if let Some(host) = crate::host::host() {
+                    super::ahead_of_frame(host);
+                }
+                super::ahead_begin();
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
