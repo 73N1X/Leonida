@@ -1119,6 +1119,18 @@ extern "system" fn present(
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // `LEONIDA_EARLY_DEPTH`: what became of the console's early depth
+            // test in the pixel programs translated so far (those served from
+            // the cache are not counted).
+            let [given, off, exports] = leonida_shader::emit::early_depth_counts();
+            if given + off + exports > 0 {
+                tracing::info!(
+                    given,
+                    off,
+                    exports,
+                    "pixel programs translated so far whose console code tests depth before them: given the host's early test (LEONIDA_EARLY_DEPTH=1), left with the late test (switch off), left with it as they write depth or stencil"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
