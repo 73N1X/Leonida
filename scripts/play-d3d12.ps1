@@ -10,10 +10,10 @@
 # them from NVIDIA's GitHub once (about 70 MB). Without them the picture is stretched to the screen instead.
 # In the game: F1 = settings (frame generation, frame-rate cap, DLSS preset ...), F3 = the numbers panel.
 #
-# By default leonida_sm.exe is started, the copy NVIDIA's Smooth Motion profile is set for (scripts\smooth-motion.ps1
-# -State on sets it, once): the driver shows twice the frames the game renders (RTX 40 and 50). The window title and
-# the log give the rendered rate; the shown one is twice that.
-# -NoSmoothMotion  starts leonida.exe itself: only rendered frames are shown (measurements are made this way)
+# -SmoothMotion  starts leonida_sm.exe, the copy NVIDIA's Smooth Motion profile is set for (scripts\smooth-motion.ps1
+#                -State on sets it): the driver shows twice the frames the game renders (RTX 40 and 50). Not the
+#                default: the one start made that way on 2026-11-27 ended 2.4 s in with the title's own breakpoint
+#                (0x80000003 in its main loop), and the next start without it ran. Not looked into yet.
 # -NoDlss        the picture is stretched instead of going through DLSS
 # -Resolution    the older path: the game renders at this height and the title's own upscaler does the rest
 # -RayTracing    the title's real ray tracing (slower; shaders build for minutes the first time)
@@ -60,9 +60,9 @@ $env:LEONIDA_GAME_DIR = (Resolve-Path $Game).Path
 $env:LEONIDA_CACHE_DIR = Join-Path $Data "cache-2"
 $env:LEONIDA_DATA_DIR = Join-Path $Data "data"
 
-# Leonida: Smooth Motion unless -NoSmoothMotion (the user's call, 2026-11-27: generated frames to play with while the
-# rendered rate is under 30; -SmoothMotion is kept and means the same as the default).
-$launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = [bool]$NoSmoothMotion; More = $More }
+# Leonida: Smooth Motion only with -SmoothMotion (it was the default for one start, which the title did not
+# survive; -NoSmoothMotion is kept and means the same as leaving -SmoothMotion out).
+$launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = (-not $SmoothMotion); More = $More }
 # Leonida: the Series X profile is the default (the user's call: 1080p-1440p as on the bigger consoles).
 if (-not $SeriesS) {
     $launch.SeriesX = $true
