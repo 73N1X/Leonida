@@ -410,6 +410,10 @@ fn resolved(known: &Known) -> Vec<(usize, Layout, bool)> {
 }
 
 fn ready() -> Result<(), String> {
+    // The title's own ped, when the game actions found it (`LEONIDA_GAME_ACTIONS=1`).
+    if crate::game_actions::position().is_some() {
+        return Ok(());
+    }
     let Some(k) = known() else {
         return Err(format!(
             "No player position known: run once with LEONIDA_FIND_PLAYER (docs/mod-menu.md), which writes {}.",
@@ -436,10 +440,17 @@ fn primary() -> Result<(usize, Layout, Mat), String> {
 }
 
 fn position() -> Result<[f32; 3], String> {
+    // The ped's own position, which the title's own position function reads, before any found copy of it.
+    if let Some(at) = crate::game_actions::position() {
+        return Ok(at);
+    }
     primary().map(|(_, _, m)| m.pos)
 }
 
 fn heading() -> Option<[f32; 2]> {
+    if let Some(facing) = crate::game_actions::heading() {
+        return Some(facing);
+    }
     // The forward axis was measured on the first group that has axes.
     let k = known()?;
     let (address, layout, _) = resolved(&k).into_iter().find(|g| g.1.has_axes())?;
@@ -455,6 +466,14 @@ fn heading() -> Option<[f32; 2]> {
 /// `hold_ms` so that the physics does not put the player back and it does not
 /// fall through ground that is not loaded yet.
 pub fn teleport(to: [f32; 3], hold_ms: u32) -> Result<String, String> {
+    // With the game actions on, the write is the title's thread's (an experiment, `LEONIDA_GAME_ACTIONS_WARP=1`).
+    if let Some(asked) = crate::game_actions::warp(to, hold_ms) {
+        return asked;
+    }
+    if crate::game_actions::on() && known().is_none() {
+        return Err("Moving the player is not done yet: the title's own function for it was not found                     (docs/mod-menu.md). LEONIDA_GAME_ACTIONS_WARP=1 tries a write of the ped's position."
+            .into());
+    }
     let k = known().ok_or("No player position known.")?;
     let all = resolved(&k);
     let lift = std::env::var("LEONIDA_TELEPORT_LIFT")

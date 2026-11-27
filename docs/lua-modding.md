@@ -192,10 +192,11 @@ alone; a mod can have both. Load order is the folder names', sorted.
 
 - `leonida.teleport(x, y, z [, hold_seconds])` (true line, or nil and why) and `leonida.player_position()` (x, y, z) move
   and read the player by memory, once the runtime knows where the player is (`docs/mod-menu.md`, "Teleport by memory").
-- God mode, wanted level, vehicles, weapons, weather, time of day: these are the title's own script
-  functions, which the runtime cannot call (no table of them was found in the executable, `docs/mod-menu.md`), so
-  there is no `leonida.player` and no `leonida.world`. A mod that wants them has the memory API and has to find the
-  addresses itself.
+- God mode, wanted level, vehicles, weapons, weather, time of day: there is no `leonida.player` and no
+  `leonida.world` yet. With `LEONIDA_GAME_ACTIONS=1` the F4 menu does wanted level, time of day, weather and the
+  title's own cheats through the title's own code (`docs/mod-menu.md`, "Game actions"), and
+  `leonida.player_position()` is the ped's own position then; that is not offered to mods until it has run in the
+  title. A mod that wants the rest has the memory API and has to find the addresses itself.
 - Anything online, any file outside the mod's folder, any process or library: not offered, on purpose.
 - No keys, decryption or protection workarounds, and no game data in the repository: a mod holds its own script and
   the addresses its author found, not pieces of the title.

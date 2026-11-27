@@ -128,13 +128,110 @@ reads the processor's time-stamp counter directly 1,037 times (`rdtsc`, `0F 31`,
 no import reaches; what the title times that way keeps its pace, and which of the two its game clock uses was not
 established. Until the rate is first changed, the host's count is passed through unchanged.
 
+## Game actions: the title's own cheat system
+
+`LEONIDA_GAME_ACTIONS=1` (off by default: **built and unit-tested, not yet run in the title**) makes these items
+real. They are done by the title's own code, on the title's own thread, at the place where the title runs its own
+cheats; a thread of ours only queues what was asked.
+
+| Page, item | What is asked of the title | How sure |
+|---|---|---|
+| Player, Wanted level / Clear wanted level | its function that sets a ped's wanted level (ped, level, three flags; level 0 is its clear), with the flags its own two wanted cheats pass | found once; arguments read from its two callers in the cheat table |
+| Player, Never wanted | the same, to 0, whenever the level is above 0 (looked at twice a second) | as above |
+| Player, Heal and armour | cheat 2 of its table, through its dispatcher | the handler is in the table; that it is the health cheat is read from its code (it returns at once when the ped's health is 0 or less, resets the ped's health state, repairs the player's vehicle), not seen |
+| Time, Hour / Hour forward / Hour back / Sync with system | its function that sets the time of day (hour, minute, second) | found once; three plain numbers, checked to be a time before the call |
+| Time, Clock paused | the byte its clock's rate function tests (its own setter is that one store) | found once |
+| Weather, Weather / Freeze weather | its function that forces a weather type by index, and the one that lets the weather run again | found once each; the index is looked up by the type's name (below) |
+| Vehicle, Spawn vehicle, nine items | cheats 7 to 15 of its table, in the table's order | the handlers are in the table; **which vehicle each holds is not known**: the labels are the menu's, the answer line says so |
+| Teleport, Save position (and `leonida.player_position()`) | nothing: the ped's own position is read | the title's own position function reads the same place |
+
+The other items still say why they are not there (next section). `d3d12/crates/leonida-loader/src/game_actions.rs`
+has the places and the hook, `d3d12/apps/leonida/src/game_actions.rs` the work, `knobs::GameHook` lends it to the
+menu.
+
+### How it was found (2026-11-27, the 1.0.2.1 executable, read locally)
+
+- **Strings.** `.rdata` and `.data` hold 76,113 runs of four or more printable characters; two contain "cheat":
+  the formats `CHEAT%d` and `CHEAT%d_%d`, both used by one function that shows a text label. It has 14 call
+  sites, in 13 functions that take no argument, and those are what 13 of the 16 entries of a table of pointers
+  in `.rdata` lead to; the table is used once, by a dispatcher that takes a pointer to a cheat's number and jumps
+  through it (numbers 16 to 18 flip a byte each instead, and nothing else reads those bytes).
+- **The table.** Cheats 0 and 1 show a label only; 2 is health (above); 3 raises and 4 lowers the wanted level by
+  one; 5 is an empty function; 6 moves the weather to the next type of its cycle (three stores into the weather
+  state); 7 to 15 ask for a vehicle by a 64-bit hash of its model's name, in front of the player (8 different
+  hashes; 7 and 12 hold the same, and 7 and 10 do nothing in some state of the player). The hash function of
+  model names is not known, so the vehicles have no names here. A handler first calls the title's own
+  bookkeeping for a used cheat, as for a typed one: what the title does with that (a saved game marked as
+  cheated, say) happens here too. The direct calls (wanted level, time, weather) do not go through it.
+- **The player.** Cheats 2 to 4 read one global, the player's ped: 1,842 instructions in the code refer to it. The
+  title's function that gives the player's position reads four floats at 70h of that ped; the vehicle cheats add
+  the vectors at 40h and 50h, scaled, to it: a 4x4 matrix at 40h, right, forward, up, position. An entity's id is
+  the `u32` at 9Ch; per-entity state (wanted, health) is looked up by that id.
+- **Wanted level.** The function cheats 3 and 4 call takes (ped, level, flag, flag, flag) and tail-calls the clear
+  function at level 0; it reads the current level from the ped's wanted state, raises the title's maximum when the
+  level is above it, and reports a crime or lowers the level. The flags are (0, 1, 1) from cheat 3 and (1, 1, 1)
+  from cheat 4, and the backend passes the first when it raises and the second when it lowers.
+- **Weather.** Cheat 6 gave the weather state: a global whose first `u32` is the number of types, with the cycle,
+  the previous and next type index, the blend between them and a forced index (-1: none). 37 instructions refer
+  to its start. The function that forces a type sets previous, next and forced to the index; the one beside it
+  sets forced to -1. The types are 38h bytes each behind a pointer, the `joaat` of the type's name first: the
+  code compares a type's hash with `joaat("RAIN")` (11 places hold that constant), `joaat("THUNDER")` (5) and
+  `joaat("SNOW")` (8). So a type is found by its name at run time, in the table the title loaded from its data:
+  the menu's nine choices are looked up as `EXTRASUNNY`, `CLEAR`, `CLOUDS`, `OVERCAST`, `FOGGY`, `RAIN`,
+  `THUNDER`, `SMOG`, `WINDY` (GTA V's names; only `RAIN` and `THUNDER` are confirmed by the code), and a choice
+  the title has no type for says so. `info` (below) lists the table's types, named where a name matches.
+- **Time of day.** The clock is a global of a date (weekday, day, month from 0, year) and a time (hour, minute,
+  second, millisecond: four `i32`; the hour is read by 126 instructions, the minute by 66, the second by 28). No
+  instruction writes the hour through its address: the setters take the clock's address. The one taken sets the
+  time with the title's checked setter, marks the clock as set and re-bases its counters; the title's start-up
+  calls it with the starting hour. A byte makes the rate function give 0 ms a minute: the pause.
+- **Thread and moment.** The cheat input function (it turns twelve pad buttons into letters and matches the
+  last ones against the cheats) is called from one place, a step registered by a hashed name in the function
+  that builds the title's update graph. A typed cheat is not run there directly: the dispatcher is given to the
+  title's deferred call (2,342 calls and jumps to it in the code), queue 4, as a closure of four words (argument, function,
+  copy, drop). That function runs the closure at once when the thread is not inside a parallel update, else it
+  copies it into the thread's queue, which the title runs later (where was not read: its own cheats go the same
+  way). Our hook is the one
+  `call` of the cheat input function: it calls that function, then, if something was asked, gives the same queue
+  a closure of its own. So our work runs exactly where a cheat of the title's would.
+- **Finding it again.** Ten places are named by patterns of 24 to 77 bytes (19 to 36 of them fixed, `??` for
+  what another build changes: short signatures, no longer than they must be), which give 19 things: 8 functions,
+  the hook's call, 9 globals and the place of the level in the wanted state. Each
+  pattern is in the 99.9 MB of code exactly once (`cargo test -p leonida-loader game_actions` with
+  `LEONIDA_GAME_DIR` set checks it, and that functions lie in code and globals behind it). None contains a load
+  of the thread's TLS array, which the loader rewrites. A place that is not found leaves its items saying so; the
+  hook and the deferred call must be found or nothing is changed.
+
+What can go wrong, since none of it has run: the update step may not run in every state (a menu, a cutscene: the
+items then say "the title's update has not run" or simply wait); a function may need a state the cheats' own
+checks ensure and a direct call does not (the wanted function is called by the title with the player's ped only,
+as here); a wrong reading of an argument would be a wrong call inside the title, which faults like any fault of
+the title's. A panic in our own work stops the work and not the title.
+
+### Trying it without the keyboard
+
+`LEONIDA_GAME_ACTIONS_RUN="<seconds>:<command>;..."` asks for commands that many seconds after the start: `info`
+(what the runtime sees: threads, whether the work ran at once or at the queue's point of rest, the ped, its
+position and forward vector, wanted level, clock, the weather types, the cheat table), `cheat <n>`, `wanted <n>`,
+`time <h> [m [s]]`, `hours <n>`, `pause <0|1>`, `weather <index|NAME|freeze|free>`, `nudge <dx> <dy> <dz>
+[frames]`. Everything asked and done is written to `%TEMP%\leonida-actions\log.txt` (addresses of the run: not
+for the repository).
+
 ## What is not there yet, and why
 
-Everything that needs the title's own scripts: god mode, wanted level, stamina, fast run and swim, super jump,
-invisibility, ragdoll, every vehicle and weapon item, moon gravity, traffic, pedestrians, police, blackout, time
-of day, weather, teleports, HUD and radio. These items go through `GameActions` (`actions.rs`); the backend there
-today, `NotYet`, answers every one with the reason, and the menu shows them dimmed with that reason in the help
-box. A backend that can call the title's script commands only has to implement `GameActions`.
+God mode, stamina, fast run and swim, super jump, invisibility, ragdoll, the vehicle items other than the nine
+spawns, every weapon item, moon gravity, traffic, pedestrians, police, blackout, strong wind, moving the player
+(teleports), HUD and radio. These items go through `GameActions` (`actions.rs`); for them the backend answers
+with the reason, and the menu shows them dimmed with that reason in the help box. The title's functions for them
+were not looked for one by one: the cheat table has none of them, and the script commands (below) have no names.
+
+Moving the player: the ped and its position are known now (above), but the title's function that moves a ped was
+not found. Looked for among the script commands (below) by their arguments: 46 commands take a 16-byte handle,
+a vector and then at most plain numbers, and give no value back (by a reading of each one's first instructions
+that is sometimes wrong); the handful read were other things (a query around a place, a sound at a place), and
+without names the rest is a function at a time. `LEONIDA_GAME_ACTIONS_WARP=1` lets a teleport write
+the ped's position on the title's thread for the hold time instead (`nudge` does the same, relative): an
+experiment to see what the title does with it, since its physics most likely puts the ped back.
 
 ### Teleport by memory
 
@@ -173,6 +270,10 @@ fall through ground that is not loaded yet. The menu items work only when a posi
 
 None of the addresses or paths is committed; they are the user's own run's.
 
+With `LEONIDA_GAME_ACTIONS=1` none of this is needed to know where the player is: the position and the heading
+are read from the title's own ped ("Game actions" above), which is what the finder's best candidate was a camera's
+copy of. Save position and `leonida.player_position()` use it; moving the player is still open (below).
+
 ### Looking for the script natives
 
 A trainer for a RAGE title calls the script engine's natives: GTA V's registers each command's handler under a
@@ -200,6 +301,42 @@ not as a plain table). They may be registered from data built at run time or kep
 following that would need either a run-time trace of the script VM (finding where a script thread dispatches a
 command) or the scripts decoded first. If it turns out to be obfuscated on purpose, the rules say to stop and write
 it down here, which is where this stands.
+
+### The script commands, found (2026-11-27)
+
+The searches above looked for a registration (a hash next to a handler). There is none to find, because each
+command carries its own hash. Following the title's time-of-day function back from the cheat code led to a
+function that does nothing but unpack arguments and call it, and 6,811 functions of the code have that shape:
+
+- one argument, a context: a pointer to the arguments (8-byte slots, which also take the first result), a
+  pointer to the result slot at +8, a signed argument count at +10h;
+- a test of that count at entry: when it is negative, the function first writes a 64-bit constant into the
+  first argument slot, then goes on as usual. The 6,811 constants are all different, and each is in the code
+  once: the command's hash. (Counted as `mov rax, [context]; movabs rcx, imm64; mov [rax], rcx` in a function
+  that tests `[rcx + 10h]` in its first 48 bytes: 6,889 such stores, 6,811 in such functions.)
+- 6,692 of them take a process-wide lock (one global, the same in every one) around the call of the command's
+  own function, which takes plain arguments (integers, floats, pointers to 16-byte values);
+- they lie in blocks: 1,481 in one MiB, 1,463, 1,230, 1,041, 684, 519 and 254 in six others, 139 elsewhere.
+
+Arguments as read from 6,811 of them: an entity (or another object) is a 16-byte handle, turned into a pointer
+by a lookup; a vector is 16 bytes too (three floats); 912 commands take one integer, 615 one 16-byte value, 600
+nothing.
+
+What is still not found is how a script reaches a command. Nothing in the file refers to any of the 6,811
+functions: no pointer to one in any section, no `call`, `jmp` or `lea` (their starts are in the unwind table;
+6 values in the data sections equal one by chance), and no table holds them encoded in a simple way. Tried over `.rdata` and `.data`, at strides of 4
+to 48 bytes, as 32-bit and 64-bit values: the gaps between neighbouring functions as differences of consecutive
+entries (0 runs of 8), every function plus or xor one constant (0 constants, by four probes), every function
+plus, minus or xor its own hash (0 of 6,811), offsets from the entry's own address (1 chance hit), arrays of the
+gaps themselves (0). The hashes are not in the data either (0 of 6,811). So the table is built at run time by
+something these searches do not see, or is kept in a form made not to be read; that path stops here, as the
+rules say. Whether the scripts are bytecode was not settled: the commands' own functions can be called without
+them, which is what the game actions above do for the three they need.
+
+A run-time look would now be exact: `LEONIDA_NATIVE_SCAN` counted every pointer into code and drowned (its
+candidates in the run of 100 s were all 32-bit noise), but a scan for pointers to these 6,811 functions only
+(found in the mapped code by the shape above) would show where the title keeps them and in what layout. Not
+built: the actions did not need it.
 
 ### Looking for the tables at run time (stage 1)
 
@@ -259,6 +396,13 @@ interpreter is simply not found by these signatures, which is why the run-time s
   Skipped without a D3D12 device.
 - `cargo test -p leonida-hle --features diagnostics --lib -- gameinput clock`: the input shim with the kept keys in
   place, and the title's clock.
+- `cargo test -p leonida-loader --lib game_actions`: the ten places on made-up code (found wherever they lie,
+  displacements and numbers read, a place missing, twice or pointing outside left out), the hook on made-up code
+  that runs (the update step calls a function of ours and returns as before) and, with `LEONIDA_GAME_DIR` set to
+  the package's folder, every place once in the retail executable, functions in code and globals behind it.
+- `cargo test -p leonida game_actions`: the script's commands, the weather names and their hashes, the menu's
+  ids, the closure the title's queue is given. `cargo test -p leonida-menu --lib actions`: the game hook answers
+  its items and the rest say why not.
 - `cargo run -p leonida-menu --example preview -- <out.png> [height] [main|player|display]`: the same picture
   painted on the CPU alone.
 

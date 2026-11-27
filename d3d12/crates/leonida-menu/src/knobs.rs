@@ -157,6 +157,30 @@ pub fn player() -> Option<&'static PlayerHook> {
     PLAYER.get()
 }
 
+/// What the runtime can do in the title itself, through the title's own code on the title's own thread
+/// (`apps/leonida/src/game_actions.rs`, `LEONIDA_GAME_ACTIONS=1`): wanted level, time of day, weather, the
+/// title's cheats. Each answers `None` for an item that is not its own, and the menu then asks elsewhere.
+pub struct GameHook {
+    /// `Ok` when the item can work now, else why not.
+    pub available: fn(id: &str) -> Option<Result<(), String>>,
+    /// The item's value now.
+    pub value: fn(id: &str) -> Option<crate::model::Value>,
+    /// Does it (asks the title's thread to): a line for the menu.
+    pub apply: fn(id: &str, value: crate::model::Value) -> Option<Result<Option<String>, String>>,
+}
+
+static GAME: OnceLock<GameHook> = OnceLock::new();
+
+/// The runtime can act in the title (once; later calls change nothing).
+pub fn provide_game(hook: GameHook) {
+    let _ = GAME.set(hook);
+}
+
+/// The game hook, when the runtime provided one.
+pub fn game() -> Option<&'static GameHook> {
+    GAME.get()
+}
+
 /// Why nothing can be done with the player.
 pub const NO_PLAYER: &str = "Not available: this run has no way to find the player in the title's memory.";
 

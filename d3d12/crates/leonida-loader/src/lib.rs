@@ -29,6 +29,9 @@ mod crash;
 mod hooks;
 // Leonida: the game patches after VI-Patch (60 fps always, the others by `LEONIDA_VIPATCH_*`); docs/vi_patch.md.
 mod vipatch;
+// Leonida: where the title's own cheat system is, and the once-a-frame hook the trainer menu's game actions
+// run through (`LEONIDA_GAME_ACTIONS=1`); docs/mod-menu.md.
+pub mod game_actions;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
