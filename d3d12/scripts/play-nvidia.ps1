@@ -117,6 +117,12 @@ $settings = @{
     # more): the frame is GPU-bound, and shaders read the small ones over the bus otherwise. Static scene, Series X
     # 1440p: 120.7 -> 94.7 ms a frame, the card's time 64.1 -> 33.9 ms (2026-11-27, two runs each way).
     LEONIDA_CARD_BUFFERS_MIN_MB = '1'; LEONIDA_CARD_BUFFERS_MIN_KB = '64'; LEONIDA_CARD_BUFFERS_MB = '1536'
+    # Leonida: a small fill of upload memory the title wrote itself goes on without waiting for the flights whose
+    # shaders are declared to write around it (host.rs fill_is_titles). Each such wait emptied the pipeline, about
+    # 75 ms, every few frames. A/B over moves, 7 phases of 30 s each way (2026-11-27): mean 116.8 -> 104.9 ms, median
+    # 112.3 -> 102.3, p90 158 -> 130; waits behind placed copies 266 -> 5. The standard moves captured with it on:
+    # 227 frames, none with a one-frame dip or spike, lighting as before (run x34).
+    LEONIDA_FILL_TITLE = '1'
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 if ($Resolution) {
