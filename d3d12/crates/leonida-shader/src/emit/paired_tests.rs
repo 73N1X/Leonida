@@ -177,6 +177,9 @@ fn the_switch_reads_its_modes() {
         super::parse_paired_lanes(Some(" first ")),
         PairedLanes::First
     );
+    assert_eq!(super::parse_paired_lanes(Some("exact")), PairedLanes::Exact);
+    // (each mode is another translation: the shader cache keys on its number)
+    assert_eq!(PairedLanes::Exact as u8, 3);
 }
 
 #[test]
@@ -657,4 +660,45 @@ fn the_console_threads_of_an_8_by_8_group_are_each_given_once() {
     eprintln!(
         "ran on the hardware device: 64 of 64 console threads of the 8 x 8 group, each in its lane"
     );
+}
+
+/// `LEONIDA_PAIRED_LANES=exact` (after aki-gta6/aki-runtime fe9c736): a console wave's OR taken
+/// inside a lane branch ([`super::wave64_tests::program`] with `s_cbranch_scc0`) is no form's
+/// that is exact without a group barrier, so by default each host half-wave is given an OR of
+/// its own (`local waves (APPROXIMATE)`); with `exact` the paired form takes it first, where the
+/// OR is of the console wave's 64 lanes. With `0` and by default the paired form is not asked.
+/// (No card: which form translates the program. What the paired form computes for it is
+/// `a_wave_or_and_a_lane_read_over_both_halves`.)
+#[test]
+fn the_paired_form_before_the_approximate_ones_when_asked() {
+    let native = super::wave64_tests::program(0xBF84_0000);
+    let p = crate::spill::build(&native).expect("build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = dxbc::build(&[]);
+    let c = dxbc::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let mut shaders = Vec::new();
+    for (mode, paired) in [
+        (PairedLanes::BeforeWide, 0),
+        (PairedLanes::Exact, 1),
+        (PairedLanes::Off, 0),
+    ] {
+        let was_mode = super::TEST_PAIRED_LANES.replace(Some(mode));
+        let taken = super::TEST_PAIRED_TAKEN.get();
+        let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+        assert_eq!(super::TEST_PAIRED_TAKEN.get() - taken, paired, "{mode:?}");
+        super::TEST_PAIRED_LANES.set(was_mode);
+        shaders.push(shader);
+    }
+    lower::TEST_HOST_WAVE.set(was);
+    // the paired program is another one; without the form the translation is the default's
+    assert_ne!(shaders[1].dxil, shaders[0].dxil);
+    assert_eq!(shaders[2].dxil, shaders[0].dxil);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shaders[1].dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
 }

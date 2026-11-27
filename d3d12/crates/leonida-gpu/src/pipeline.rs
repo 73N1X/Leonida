@@ -472,6 +472,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Whether the skip list leaves this pipeline out ([`is_skipped`]), kept
+    /// from the first time it is asked ([`kept_answer`]).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    skip: std::sync::atomic::AtomicU8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -523,6 +527,21 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
         return make::for_formats(p, bound);
     }
     make::ready(p)
+}
+
+/// Why the title pipeline `this` has no host pipeline now, for the drop
+/// counters (`crate::drops`): on a skip list, not made yet, or refused.
+#[cfg(windows)]
+pub(crate) fn why_gone(this: This) -> crate::drops::Why {
+    use crate::drops::Why;
+    if this.is_null() {
+        return Why::Other;
+    }
+    match make::gone(&pipeline(this).host) {
+        make::Gone::LeftOut => Why::SkipList,
+        make::Gone::Making => Why::NotMade,
+        make::Gone::Refused => Why::Refused,
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -577,9 +596,44 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// A yes or no asked once and kept in `cell` (0: not asked yet, 1: no, 2:
+/// yes): `ask` runs the first time only. (Two threads that ask at once both
+/// run it and store the same answer.)
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+fn kept_answer(cell: &std::sync::atomic::AtomicU8, ask: impl FnOnce() -> bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match cell.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let answer = ask();
+            cell.store(1 + u8::from(answer), Relaxed);
+            answer
+        }
+    }
+}
+
+/// Whether the skip list (`LEONIDA_SKIP_PIPELINES`) leaves the pipeline out.
+/// Every draw, dispatch and indirect execution asks, on the threads that
+/// record lists; each ask looked every shader of the pipeline up in the
+/// list (a string hashed for each). The list is read once and a pipeline's
+/// shaders never change, so the pipeline keeps its answer: one byte read.
+/// `LEONIDA_SKIP_KEPT=0`: looked up each time, as before.
+///
+/// From aki-gta6/aki-runtime f8cdc2d (Aki-Developer), GPL-3.0 (there the
+/// list can change while the title runs, and the answer is kept by the
+/// list's count of changes).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    static KEPT: OnceLock<bool> = OnceLock::new();
+    if !*KEPT.get_or_init(|| std::env::var_os("LEONIDA_SKIP_KEPT").is_none_or(|v| v != "0")) {
+        return skipped_shader(p).is_some();
+    }
+    kept_answer(&p.skip, || skipped_shader(p).is_some())
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -660,6 +714,8 @@ fn hand_out(
         builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        skip: std::sync::atomic::AtomicU8::new(0),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -861,6 +917,27 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+#[cfg(test)]
+mod kept_tests {
+    /// A pipeline's skip answer is asked for once, whichever it is.
+    #[test]
+    fn an_answer_is_asked_for_once_and_kept() {
+        use std::sync::atomic::AtomicU8;
+        for answer in [false, true] {
+            let cell = AtomicU8::new(0);
+            let asked = std::cell::Cell::new(0);
+            for _ in 0..5 {
+                let got = super::kept_answer(&cell, || {
+                    asked.set(asked.get() + 1);
+                    answer
+                });
+                assert_eq!(got, answer);
+            }
+            assert_eq!(asked.get(), 1);
+        }
+    }
 }
 
 #[cfg(test)]

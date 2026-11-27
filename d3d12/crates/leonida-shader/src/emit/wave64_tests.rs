@@ -19,7 +19,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// the result to dword 0 of the raw UAV.
 /// `skip`: the branch past the body when no thread is below s0: `s_cbranch_execz`, or
 /// `s_cbranch_scc0` on the SCC `s_and_saveexec` sets ("some lane is left").
-fn program(skip: u32) -> NativeProgram {
+pub(super) fn program(skip: u32) -> NativeProgram {
     let mut words = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
         0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
