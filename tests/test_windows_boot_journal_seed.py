@@ -121,6 +121,19 @@ class BootJournalSeedTest(unittest.TestCase):
         (self.runtime / "pipeline_cache.d").mkdir()
         self.assertNotIn(SEED, self.env_lines(f"LEONIDA_PIPELINE_CACHE_DIR=\\\\?\\{self.runtime}"))
 
+    def test_a_device_path_prefix_names_the_same_folder(self):
+        (self.runtime / "pipeline_cache.d").mkdir()
+        self.assertNotIn(SEED, self.env_lines(f"LEONIDA_PIPELINE_CACHE_DIR=\\\\.\\{self.runtime}"))
+
+    def test_a_junction_to_the_runtime_folder_is_recognised(self):
+        (self.runtime / "pipeline_cache.d").mkdir()
+        alias = self.tmp / "port-alias"
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.runtime)], capture_output=True)
+        if made.returncode != 0 or not alias.is_dir():
+            self.skipTest("could not make a junction here")
+        self.addCleanup(lambda: os.path.isdir(alias) and os.rmdir(alias))   # removes the junction, not its target
+        self.assertNotIn(SEED, self.env_lines(f"LEONIDA_PIPELINE_CACHE_DIR={alias}"))
+
     def test_an_unusable_cache_folder_name_does_not_stop_the_script(self):
         (self.runtime / "pipeline_cache.d").mkdir()
         self.assertNotIn(SEED, self.env_lines("LEONIDA_PIPELINE_CACHE_DIR=C:\\a|b"))

@@ -288,6 +288,46 @@ if ($bootEnv["LEONIDA_CAPTURE"]) { $Capture = $bootEnv["LEONIDA_CAPTURE"] }
 # journal (pipeline_cache_journal.h, resolve_roots). A relative cache folder is resolved by the runtime against its own
 # working folder, so it gets no seed here; a name that cannot be resolved gets none either, rather than a stop.
 if (-not $bootEnv.Contains("LEONIDA_PIPELINE_JOURNAL_SEED_DIR")) {
+    # Windows' final path of a folder (GetFinalPathNameByHandle) sees through junctions, symbolic links, substituted
+    # and mapped drives, short 8.3 names and the \\?\ and \\.\ prefixes, as the runtime's std::filesystem checks do.
+    # A folder that does not exist yet is named from its deepest existing parent. Without the helper (a compile error,
+    # a restricted session), the comparison falls back to the spelled paths.
+    function Get-FinalFolderPath([string]$path) {
+        $plain = ($path -replace '^\\\\[?.]\\UNC\\', '\\' -replace '^\\\\[?.]\\', '').TrimEnd('\', '/')
+        try {
+            if (-not ('LeonidaFinalPath' -as [type])) {
+                Add-Type -ErrorAction Stop -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text; using Microsoft.Win32.SafeHandles;
+public static class LeonidaFinalPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+    public static string Of(string path) {
+        // No access asked, all sharing, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (needed to open a folder).
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) return null;
+            StringBuilder b = new StringBuilder(32768);
+            uint n = GetFinalPathNameByHandleW(h, b, (uint)b.Capacity, 0);
+            return (n == 0 || n >= b.Capacity) ? null : b.ToString();
+        }
+    }
+}
+'@
+            }
+            $existing = $path.TrimEnd('\', '/'); $tail = @()
+            while ($existing -and -not [System.IO.Directory]::Exists($existing)) {
+                $tail = @([System.IO.Path]::GetFileName($existing)) + $tail
+                $existing = [System.IO.Path]::GetDirectoryName($existing)
+            }
+            if (-not $existing) { return $plain }
+            $final = [LeonidaFinalPath]::Of($existing)
+            if (-not $final) { return $plain }
+            $final = $final -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+            foreach ($part in $tail) { $final = [System.IO.Path]::Combine($final, $part) }
+            return $final.TrimEnd('\', '/')
+        } catch { return $plain }
+    }
     $seed = $null
     try {
         $runtimeFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RuntimeDir)
@@ -300,12 +340,10 @@ if (-not $bootEnv.Contains("LEONIDA_PIPELINE_JOURNAL_SEED_DIR")) {
                 $ownJournal = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($cacheDir, "pipeline_cache.d")).TrimEnd('\', '/')
             }
             if ($ownJournal) {
-                # \\?\ spellings name the same folder for the runtime: compare without the prefix.
-                $ownJournal = $ownJournal -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
-                $precompiled = $precompiled -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+                $a = Get-FinalFolderPath $ownJournal
+                $b = Get-FinalFolderPath $precompiled
                 $c = [System.StringComparison]::OrdinalIgnoreCase
-                $overlap = $ownJournal.Equals($precompiled, $c) -or $ownJournal.StartsWith($precompiled + '\', $c) -or
-                           $precompiled.StartsWith($ownJournal + '\', $c)
+                $overlap = $a.Equals($b, $c) -or $a.StartsWith($b + '\', $c) -or $b.StartsWith($a + '\', $c)
                 if (-not $overlap) { $seed = $precompiled }
             }
         }
