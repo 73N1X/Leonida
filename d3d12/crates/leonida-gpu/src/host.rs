@@ -3741,6 +3741,118 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the
+/// next landing without the submission lock (`LEONIDA_DYNAMIC_WAIT=1`; off
+/// by default: everything in the air is settled under the submission lock,
+/// as before, [`settle_for_fence`]; `LEONIDA_AB` can name it).
+///
+/// Why (fxceless/victory-fork 52dfd12, measured there on a GeForce RTX 4070
+/// at 9,000 to 11,000 draws a frame): the slots come back flight by flight,
+/// when the thread that lands flights is done with one
+/// (`Detached::release_tables`), and that thread never takes the submission
+/// lock. The settle waited for all of them and kept the lock meanwhile, so
+/// the submitting thread stood at the lock with submissions ready and the
+/// card ran dry behind it: 0.64 such settles a frame of 19.7 ms each, and
+/// the frames with one took 92.7 ms against 68.1 ms.
+///
+/// What changes: the thread that records the draw waits until a landing
+/// gave slots back, and takes them; other submissions go on meanwhile. With
+/// nothing in the air and nothing being landed no slot can come back that
+/// way: then, and without the relay ([`relay`]), as before. Off by default
+/// here: whether a draw of this title ever finds no slot with the
+/// launcher's 524,288 is what the line says ([`dynamic_wait_line`]).
+fn dynamic_wait() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_DYNAMIC_WAIT") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_DYNAMIC_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: draws that found no free dynamic
+/// descriptor slot; the microseconds they waited; those that had their slots
+/// after a landing ([`dynamic_wait`]); those that settled everything in the
+/// air under the submission lock; and those that went without.
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// [`wait_for_slots`]' asking with [`dynamic_wait`]: `take` again after each
+/// landing (`landed` waits for one) until it has its slots, or nothing was
+/// in the air when it asked (`in_air`, looked at before the asking: what
+/// lands after that look is waited for).
+fn take_after_landings(
+    mut take: impl FnMut() -> Option<u32>,
+    mut in_air: impl FnMut() -> bool,
+    mut landed: impl FnMut(),
+) -> Option<u32> {
+    loop {
+        let flying = in_air();
+        let found = take();
+        if found.is_some() || !flying {
+            return found;
+        }
+        landed();
+    }
+}
+
+/// `take` found no free dynamic descriptor slots (it gives `None`): waits
+/// for flights to land, which gives their lists' slots back, and asks again.
+/// With [`dynamic_wait`] without the submission lock and only until `take`
+/// has its slots; else by [`settle_for_fence`], as before.
+pub(crate) fn wait_for_slots(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found = None;
+    if dynamic_wait() && relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        found = take_after_landings(
+            &mut take,
+            || {
+                let line = line();
+                !(line.line.is_empty() && !line.settling)
+            },
+            || {
+                // A landing that ended between the asking and here is not
+                // told again: looked at once a millisecond all the same.
+                let line = line();
+                drop(LINE_LANDED.wait_timeout(line, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner()));
+            },
+        );
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// For the frame-rate line: [`DYNAMIC_WAITS`] per frame, if any draw found
+/// no slot.
+fn dynamic_wait_line(frames: f64) {
+    let w: Vec<f64> = DYNAMIC_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: per frame {:.2} draws found none and waited {:.1} ms, {:.2} had their slots after a landing, \
+         {:.2} settled everything in the air under the submission lock, {:.2} went without (LEONIDA_DYNAMIC_WAIT=1 waits for the \
+         next landing without that lock: now {})",
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        w[4],
+        if dynamic_wait() && relay() { "on" } else { "off" }
+    );
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4181,6 +4293,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     read_backs_line(frames);
+    dynamic_wait_line(frames);
     crate::draw::waits_line(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
@@ -8360,6 +8473,55 @@ impl std::hash::Hasher for AddressHash {
     }
     fn write_u32(&mut self, n: u32) {
         self.write_usize(n as usize);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_wait_tests {
+    use super::take_after_landings;
+    use std::cell::Cell;
+
+    /// A draw without slots asks again after each landing, and no more: it
+    /// stops with its slots, or when nothing was in the air at an asking
+    /// that found none (nothing can give slots back then).
+    #[test]
+    fn slots_are_asked_for_again_after_each_landing_while_something_flies() {
+        // There at once: nothing is waited for.
+        let (asked, waited) = (Cell::new(0), Cell::new(0));
+        let take = || {
+            asked.set(asked.get() + 1);
+            Some(7)
+        };
+        assert_eq!(take_after_landings(take, || true, || waited.set(waited.get() + 1)), Some(7));
+        assert_eq!((asked.get(), waited.get()), (1, 0));
+
+        // Given back by the second landing.
+        let (asked, waited) = (Cell::new(0), Cell::new(0));
+        let take = || {
+            asked.set(asked.get() + 1);
+            (waited.get() == 2).then_some(40)
+        };
+        assert_eq!(take_after_landings(take, || true, || waited.set(waited.get() + 1)), Some(40));
+        assert_eq!((asked.get(), waited.get()), (3, 2));
+
+        // Never: it stops at the asking that found the air empty, which is
+        // made after that look (a landing between the two is not missed).
+        let (asked, waited, looked) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let take = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        let in_air = || {
+            looked.set(looked.get() + 1);
+            assert_eq!(looked.get(), asked.get() + 1, "looked at before the asking");
+            looked.get() < 3
+        };
+        assert_eq!(take_after_landings(take, in_air, || waited.set(waited.get() + 1)), None);
+        assert_eq!((asked.get(), waited.get(), looked.get()), (3, 2, 3));
+
+        // Nothing in the air, and the slots are there all the same (given
+        // back by the landing that emptied it): taken.
+        assert_eq!(take_after_landings(|| Some(1), || false, || panic!("nothing to wait for")), Some(1));
     }
 }
 
