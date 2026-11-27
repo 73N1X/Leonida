@@ -68,3 +68,36 @@ Shapes are discs, polygons, thick polylines and a small stroke font written in t
 the options (`--out`, `--zlib`, `--pad-to`, `--selftest`). The movie is 13,551 bytes, 5,721 as one zlib stream, below the
 original stored 9,644, so it can be padded to that size. The ActionScript block is minimal (empty `MovieClip`
 subclasses, no `Main` behaviour, no sound hook); whether the title's loader needs more has not been tried in the game.
+
+## How the runtime swaps the movie
+
+The D3D12 runtime (`leonida-hle`, `modules/glyphs.rs`, hooked in `modules/dstorage.rs` `execute`) answers the title's
+read of the movie with the movie built by `tools/ps_prompt_glyphs.py` while a PlayStation pad is in use
+(`gameinput::active_family()`, see [gameinput.md](gameinput.md)). The archive is never written and its table of contents
+is not touched or needed.
+
+- **What is matched.** A DirectStorage request is a file object (our `dstorage` file keeps the path the title opened it by),
+  an offset, a stored size, options and a destination size. A zlib request on a file named `data.rpf` at offset
+  `0x117d7000` whose destination size is `28,148` is the movie. The stored size is not looked at, because the runtime
+  never reads the archive for it: it fills the destination with the replacement itself. Whatever the table of contents says
+  the stored size is (it is encrypted and unused here, so it is not known), the title gets the replacement as if
+  inflated. A replacement stream written into the archive instead would have to fit that stored size (ours would:
+  5,721 bytes against 9,644 for the standalone movie), but that needs the archive changed and the stored size known; the
+  runtime does neither.
+- **What is served.** `ps_prompt_glyphs.gfx` beside `leonida.exe` (or one of the six folders above it), or the file
+  `LEONIDA_PS_GLYPHS` names (`off` turns the swap off). It must be exactly 28,148 bytes, begin with `GFX` or `FWS`, and say so
+  in its length field; otherwise one warning is logged and the title keeps the Xbox movie. The file is read once.
+- **When.** At the title's read, so the family at that moment decides: the pad held at start (a Sony pad connected counts as
+  PlayStation before any input), or `LEONIDA_PROMPTS=playstation`. Whether the title loads the movie once at start or each
+  time a menu loads is not known (nothing has run); if once, plugging in or picking up a PlayStation pad later does not
+  show until the next start, and a live switch is impossible without a way to make the title load the movie again.
+- **Builds.** `python -I tools/ps_prompt_glyphs.py --from-archive "<package>/data.rpf" --out ps_prompt_glyphs.gfx` builds
+  over the title's own movie: the shapes are replaced and every other tag (the ActionScript, export and class tables) is
+  kept as it is, so the title's code finds the symbols as before. The output holds those tags of the game's movie: keep it
+  on your PC, never commit it. `--pad-inflated 28148 --out ps_prompt_glyphs.gfx` builds the standalone movie
+  (with its own ActionScript block, which has never run in the title) padded to the same length.
+- **Checking it.** Run with `LEONIDA_PROMPTS=playstation` and look in the log for `prompt glyphs: PlayStation movie loaded` and
+  `prompt glyphs: the title reads its glyph movie`. If the second line never appears, the title does not read the movie
+  through a zlib DirectStorage request on `data.rpf` (or not at that offset); `LEONIDA_DSTORAGE_TRACE=2` lists the
+  requests. The warning `a read at the glyph movie's offset is not the movie` means the offset matched but the file or size
+  did not.

@@ -23,6 +23,7 @@ pub mod dstorage;
 pub mod ffx;
 pub mod files;
 pub mod gameinput;
+pub mod glyphs;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
