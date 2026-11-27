@@ -109,6 +109,15 @@ const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
+/// Whether a page given its place at a submission ([`Memory::place`])
+/// remembers the write-watch asking it was taken at (on;
+/// `LEONIDA_PLACE_TAKEN=0`: it counts as never taken, as before). Only the
+/// structure builder's pages come that way (`LEONIDA_BVH_BUILDER=1`).
+fn place_taken() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_PLACE_TAKEN").is_none_or(|v| v != "0"))
+}
+
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
@@ -626,7 +635,24 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        // Taken as of now: the number of the write-watch asking before its
+        // bytes go up. Without it the page counted as never taken, and the
+        // next [`Memory::bring`] sent all of title memory's bytes up again,
+        // over what the builder had made of them on the card meanwhile (a
+        // structure unpacked there went back to its packed bytes, built
+        // nodes sharing the page to the title's). With it that `bring` takes
+        // only what the title wrote since. (`LEONIDA_PLACE_TAKEN=0`: as
+        // before.)
+        let now = place_taken()
+            .then(|| crate::watch::writes((page * PAGE) as usize, ((page + 1) * PAGE) as usize, true))
+            .flatten()
+            .map(|(now, _)| now);
         self.take(page, 0, PAGE as usize, true);
+        if let Some(now) = now
+            && let Some(held) = self.pages.get_mut(&page)
+        {
+            held.taken = now.max(1);
+        }
         true
     }
 

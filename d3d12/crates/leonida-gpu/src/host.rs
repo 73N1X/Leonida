@@ -443,6 +443,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        trim_spare_backs();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -1307,7 +1308,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<ByCopy<TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1371,10 +1372,9 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+/// By host copy, as every table of a list that is asked at each draw: the
+/// keys are addresses of ours ([`AddressHash`]).
+type States = ByCopy<(u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -1961,10 +1961,15 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping, and its address on the card. A buffer has one address for as
+/// long as it lives, so it is asked once, when the chunk is made: a list
+/// asked the buffer each time it took scratch memory (every constant buffer
+/// of a table made afresh, every root constant buffer copied), and took a
+/// reference to the buffer for the asking.
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2046,6 +2051,149 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Whether a list's read-back buffers are kept, when the list is reset, for
+/// the next read backs of their sizes (`LEONIDA_READ_BACK_POOL=0`: each is
+/// made for its read back and let go with its list, as before; `LEONIDA_AB`
+/// can name it).
+///
+/// A read back is recorded into a buffer of ours in read-back memory: a
+/// texture the title copies into a buffer of its own (`crate::list`), or a
+/// texture shaders wrote that the title reads on the CPU, copied when the
+/// list closes (`crate::texback`). Each buffer was a committed resource made
+/// for the one copy, on the thread that records, and released when its list
+/// was reset. In a CPU profile of the threads that record lists (Series X
+/// profile, about 9,500 draws a frame, 2026-11-27) [`Host::read_back_buffer`]
+/// was 5 % of their running time, and the closing of lists, which makes the
+/// second kind, 5 % of the submitting thread's.
+///
+/// With the switch a buffer is made in whole 64 KiB ([`read_back_size`]; the
+/// card gives a buffer of its own whole 64 KiB either way), a list's buffers
+/// go to a table when the list is reset or dropped ([`give_read_backs`]),
+/// and a read back takes one of its size from there before one is made.
+///
+/// Why a buffer in the table is nobody's: a list's read-backs are read when
+/// its submission has run ([`read_backs`], which copies the texels out under
+/// the list's lock), a list is reset only after its last submission
+/// finished, and the buffers go to the table only then, each only if the
+/// list's reference to it is the last ([`sole`]). What differs for who reads
+/// one: the bytes its copy did not write (the padding of rows) are what the
+/// buffer held before, not zeros.
+fn read_back_pool() -> bool {
+    crate::toggled!("LEONIDA_READ_BACK_POOL")
+}
+
+/// The bytes a read-back buffer for `size` bytes is made with when such
+/// buffers are kept ([`read_back_pool`]): whole 64 KiB, so that read backs of
+/// nearly one size share their buffers.
+fn read_back_size(size: u64) -> u64 {
+    size.max(1).next_multiple_of(1 << 16)
+}
+
+/// The most bytes of read-back buffers kept while no list holds them; with
+/// little memory in the PC (`crate::residency::limited_host_ram`).
+const SPARE_BACKS_MOST: u64 = 64 << 20;
+const SPARE_BACKS_FEW: u64 = 16 << 20;
+
+/// A read-back buffer no list holds.
+struct SpareBack(ID3D12Resource);
+
+// SAFETY: a D3D12 resource (free-threaded) that nothing else names.
+unsafe impl Send for SpareBack {}
+
+/// Read-back buffers no list holds ([`read_back_pool`]).
+static SPARE_BACKS: Mutex<Spare<SpareBack>> = Mutex::new(Spare::new());
+
+/// Since the last frame-rate line: read-back buffers made, taken from the
+/// table, kept there at a list's reset, and let go there (the table full, a
+/// buffer something else still names, or one not made in whole 64 KiB).
+static BACKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether this reference to `buffer` is the only one.
+fn sole(buffer: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    // SAFETY: a live resource: a reference is taken and given back at once,
+    // and giving it back says how many are left.
+    unsafe {
+        let unknown = &Interface::vtable(buffer).base__.base__.base__.base__;
+        (unknown.AddRef)(buffer.as_raw());
+        (unknown.Release)(buffer.as_raw()) == 1
+    }
+}
+
+/// A list is done with its read-back `buffers` (it was reset after its
+/// submissions ran, or dropped): kept for the next read backs of their
+/// sizes ([`read_back_pool`]), or let go as before.
+fn give_read_backs(buffers: Vec<ID3D12Resource>) {
+    if buffers.is_empty() || !read_back_pool() {
+        return;
+    }
+    let most = if crate::residency::limited_host_ram() { SPARE_BACKS_FEW } else { SPARE_BACKS_MOST };
+    // (Asked of each before the table is taken.)
+    let sized: Vec<(ID3D12Resource, Option<u64>)> = buffers
+        .into_iter()
+        .map(|buffer| {
+            // SAFETY: a live buffer.
+            let size = unsafe { buffer.GetDesc() }.Width;
+            let ours = size == read_back_size(size) && sole(&buffer);
+            (buffer, ours.then_some(size))
+        })
+        .collect();
+    let mut gone = Vec::new();
+    {
+        let mut spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in sized {
+            let back = match size {
+                Some(size) => spare.give(SpareBack(buffer), size, most).map(|back| back.0),
+                None => Some(buffer),
+            };
+            match back {
+                None => {
+                    BACKS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                Some(buffer) => {
+                    BACKS[3].fetch_add(1, Ordering::Relaxed);
+                    gone.push(buffer);
+                }
+            }
+        }
+    }
+    // Released outside the lock.
+    drop(gone);
+}
+
+/// Lets go of the read-back buffers kept while host memory is pressured.
+fn trim_spare_backs() {
+    let freed = {
+        let mut spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    drop(freed);
+}
+
+/// For the frame-rate line: what [`read_back_pool`] did per frame, if there
+/// were read backs.
+fn read_backs_line(frames: f64) {
+    let b: Vec<u64> = BACKS.iter().map(|b| b.swap(0, Ordering::Relaxed)).collect();
+    if b.iter().all(|&n| n == 0) {
+        return;
+    }
+    let (kept, bytes) = {
+        let spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        (spare.kept.len(), spare.bytes)
+    };
+    tracing::info!(
+        "read-back buffers per frame: {:.1} made, {:.1} taken from those kept; at their lists' resets {:.1} kept and {:.1} let go; \
+         {kept} kept now, {:.1} MB (LEONIDA_READ_BACK_POOL=0: one made for each read back, as before; now {})",
+        b[0] as f64 / frames,
+        b[1] as f64 / frames,
+        b[2] as f64 / frames,
+        b[3] as f64 / frames,
+        bytes as f64 / (1 << 20) as f64,
+        if read_back_pool() { "on" } else { "off" }
+    );
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -2060,9 +2208,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     Some(Chunk {
         buffer,
         data: data as usize,
+        gpu,
     })
 }
 
@@ -2522,9 +2673,9 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: ByCopy<usize>,
     /// Of them, those the list's prelude copies into their host copies if
     /// the submission finds them changed ([`HostList::upload_in_prelude`]).
     prelude_uploads: Vec<crate::texture::PreludeUpload>,
@@ -2581,6 +2732,16 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        // (Most lists read nothing back.)
+        if !(self.backs.is_empty() && self.texture_backs.is_empty()) {
+            give_read_backs(
+                self.backs
+                    .drain(..)
+                    .map(|(buffer, ..)| buffer)
+                    .chain(self.texture_backs.drain(..).map(crate::texback::Back::into_buffer))
+                    .collect(),
+            );
+        }
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -3580,6 +3741,118 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the
+/// next landing without the submission lock (`LEONIDA_DYNAMIC_WAIT=1`; off
+/// by default: everything in the air is settled under the submission lock,
+/// as before, [`settle_for_fence`]; `LEONIDA_AB` can name it).
+///
+/// Why (fxceless/victory-fork 52dfd12, measured there on a GeForce RTX 4070
+/// at 9,000 to 11,000 draws a frame): the slots come back flight by flight,
+/// when the thread that lands flights is done with one
+/// (`Detached::release_tables`), and that thread never takes the submission
+/// lock. The settle waited for all of them and kept the lock meanwhile, so
+/// the submitting thread stood at the lock with submissions ready and the
+/// card ran dry behind it: 0.64 such settles a frame of 19.7 ms each, and
+/// the frames with one took 92.7 ms against 68.1 ms.
+///
+/// What changes: the thread that records the draw waits until a landing
+/// gave slots back, and takes them; other submissions go on meanwhile. With
+/// nothing in the air and nothing being landed no slot can come back that
+/// way: then, and without the relay ([`relay`]), as before. Off by default
+/// here: whether a draw of this title ever finds no slot with the
+/// launcher's 524,288 is what the line says ([`dynamic_wait_line`]).
+fn dynamic_wait() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_DYNAMIC_WAIT") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_DYNAMIC_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: draws that found no free dynamic
+/// descriptor slot; the microseconds they waited; those that had their slots
+/// after a landing ([`dynamic_wait`]); those that settled everything in the
+/// air under the submission lock; and those that went without.
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// [`wait_for_slots`]' asking with [`dynamic_wait`]: `take` again after each
+/// landing (`landed` waits for one) until it has its slots, or nothing was
+/// in the air when it asked (`in_air`, looked at before the asking: what
+/// lands after that look is waited for).
+fn take_after_landings(
+    mut take: impl FnMut() -> Option<u32>,
+    mut in_air: impl FnMut() -> bool,
+    mut landed: impl FnMut(),
+) -> Option<u32> {
+    loop {
+        let flying = in_air();
+        let found = take();
+        if found.is_some() || !flying {
+            return found;
+        }
+        landed();
+    }
+}
+
+/// `take` found no free dynamic descriptor slots (it gives `None`): waits
+/// for flights to land, which gives their lists' slots back, and asks again.
+/// With [`dynamic_wait`] without the submission lock and only until `take`
+/// has its slots; else by [`settle_for_fence`], as before.
+pub(crate) fn wait_for_slots(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found = None;
+    if dynamic_wait() && relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        found = take_after_landings(
+            &mut take,
+            || {
+                let line = line();
+                !(line.line.is_empty() && !line.settling)
+            },
+            || {
+                // A landing that ended between the asking and here is not
+                // told again: looked at once a millisecond all the same.
+                let line = line();
+                drop(LINE_LANDED.wait_timeout(line, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner()));
+            },
+        );
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// For the frame-rate line: [`DYNAMIC_WAITS`] per frame, if any draw found
+/// no slot.
+fn dynamic_wait_line(frames: f64) {
+    let w: Vec<f64> = DYNAMIC_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: per frame {:.2} draws found none and waited {:.1} ms, {:.2} had their slots after a landing, \
+         {:.2} settled everything in the air under the submission lock, {:.2} went without (LEONIDA_DYNAMIC_WAIT=1 waits for the \
+         next landing without that lock: now {})",
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        w[4],
+        if dynamic_wait() && relay() { "on" } else { "off" }
+    );
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4019,6 +4292,8 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    read_backs_line(frames);
+    dynamic_wait_line(frames);
     crate::draw::waits_line(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
@@ -7575,31 +7850,39 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+        let (base, at, data, _) = self.scratch_piece(len, false)?;
+        Some((base + at, data))
     }
 
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
     /// slot to hold: the slot outlives the list's use of it.
     pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
+        let (base, at, data, buffer) = self.scratch_piece(len, true)?;
+        Some((buffer?, base + at, data))
     }
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (_, at, data, buffer) = self.scratch_piece(len, true)?;
+        Some((buffer?, at, data))
+    }
+
+    /// A piece of the list's scratch memory: its buffer's address on the
+    /// card ([`Chunk`]: not asked of the buffer each time), the offset in
+    /// the buffer, the CPU pointer and, with `held`, the buffer.
+    fn scratch_piece(&self, len: u64, held: bool) -> Option<(u64, u64, *mut u8, Option<ID3D12Resource>)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
-            self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            // SAFETY: a live buffer.
+            let base = unsafe { buffer.GetGPUVirtualAddress() };
+            let kept = held.then(|| buffer.clone());
+            self.deferred().hold_upload(buffer, len);
+            return Some((base, 0, data, kept));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -7616,10 +7899,11 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
         let at = s.used;
+        let chunk = &s.chunks[s.current].0;
+        let found = (chunk.gpu, at, (chunk.data + at as usize) as *mut u8, held.then(|| chunk.buffer.clone()));
         s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some(found)
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -8160,9 +8444,24 @@ impl std::hash::Hasher for AddressHash {
     fn finish(&self) -> u64 {
         self.0
     }
+    /// Eight bytes a step, and one more for what is left (with how many
+    /// bytes that is: `ab` and `ab\0` differ). A key of several words comes
+    /// here as its bytes: a descriptor record's three
+    /// (`crate::descriptor::host::ListViews`) took twelve steps a byte at a
+    /// time, for every slot of every table a list makes, and takes two.
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            let mut eight = [0u8; 8];
+            eight.copy_from_slice(word);
+            self.write_u64(u64::from_le_bytes(eight));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            // (At most seven bytes: the top one is free for their number.)
+            self.write_u64(u64::from_le_bytes(last) | (rest.len() as u64) << 56);
         }
     }
     fn write_usize(&mut self, n: usize) {
@@ -8174,6 +8473,268 @@ impl std::hash::Hasher for AddressHash {
     }
     fn write_u32(&mut self, n: u32) {
         self.write_usize(n as usize);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_wait_tests {
+    use super::take_after_landings;
+    use std::cell::Cell;
+
+    /// A draw without slots asks again after each landing, and no more: it
+    /// stops with its slots, or when nothing was in the air at an asking
+    /// that found none (nothing can give slots back then).
+    #[test]
+    fn slots_are_asked_for_again_after_each_landing_while_something_flies() {
+        // There at once: nothing is waited for.
+        let (asked, waited) = (Cell::new(0), Cell::new(0));
+        let take = || {
+            asked.set(asked.get() + 1);
+            Some(7)
+        };
+        assert_eq!(take_after_landings(take, || true, || waited.set(waited.get() + 1)), Some(7));
+        assert_eq!((asked.get(), waited.get()), (1, 0));
+
+        // Given back by the second landing.
+        let (asked, waited) = (Cell::new(0), Cell::new(0));
+        let take = || {
+            asked.set(asked.get() + 1);
+            (waited.get() == 2).then_some(40)
+        };
+        assert_eq!(take_after_landings(take, || true, || waited.set(waited.get() + 1)), Some(40));
+        assert_eq!((asked.get(), waited.get()), (3, 2));
+
+        // Never: it stops at the asking that found the air empty, which is
+        // made after that look (a landing between the two is not missed).
+        let (asked, waited, looked) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let take = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        let in_air = || {
+            looked.set(looked.get() + 1);
+            assert_eq!(looked.get(), asked.get() + 1, "looked at before the asking");
+            looked.get() < 3
+        };
+        assert_eq!(take_after_landings(take, in_air, || waited.set(waited.get() + 1)), None);
+        assert_eq!((asked.get(), waited.get(), looked.get()), (3, 2, 3));
+
+        // Nothing in the air, and the slots are there all the same (given
+        // back by the landing that emptied it): taken.
+        assert_eq!(take_after_landings(|| Some(1), || false, || panic!("nothing to wait for")), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod scratch_address_tests {
+    use super::*;
+
+    /// A list's scratch memory is where its buffer is: the address kept
+    /// with a chunk is the buffer's own, pieces follow each other in whole
+    /// 256 bytes on the card as in the mapping, and a piece bigger than a
+    /// chunk has a buffer to itself.
+    #[test]
+    fn a_lists_scratch_memory_is_at_its_buffers_address() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; scratch addresses not tested");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (first, first_data) = list.scratch(100).unwrap();
+        let (buffer, held, held_data) = list.scratch_held(300).unwrap();
+        // SAFETY: a live buffer.
+        let base = unsafe { buffer.GetGPUVirtualAddress() };
+        assert_eq!(first, base);
+        assert_eq!(held, base + 256);
+        assert_eq!(held_data as usize, first_data as usize + 256);
+        let (third, third_data) = list.scratch(1).unwrap();
+        assert_eq!(third, base + 256 + 512);
+        assert_eq!(third_data as usize, first_data as usize + 256 + 512);
+        let (big, big_at, _) = list.scratch_held(SCRATCH_CHUNK + 1).unwrap();
+        // SAFETY: a live buffer.
+        assert_eq!(big_at, unsafe { big.GetGPUVirtualAddress() });
+        assert_ne!(big_at, base);
+        list.close();
+        list.reset();
+    }
+}
+
+#[cfg(test)]
+mod read_back_pool_tests {
+    use super::*;
+    use windows::core::Interface;
+
+    #[test]
+    fn a_read_back_buffer_is_made_in_whole_64_kib() {
+        assert_eq!(read_back_size(0), 1 << 16);
+        assert_eq!(read_back_size(1), 1 << 16);
+        assert_eq!(read_back_size(512), 1 << 16);
+        assert_eq!(read_back_size(1 << 16), 1 << 16);
+        assert_eq!(read_back_size((1 << 16) + 1), 2 << 16);
+        assert_eq!(read_back_size(350_000), 6 << 16);
+    }
+
+    /// A list's read-back buffer is the next read back's of its size once
+    /// the list is reset, and not before; one something else still names
+    /// when the list is reset is not kept.
+    #[test]
+    fn a_reset_lists_read_back_buffer_is_the_next_read_backs() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; the read-back buffers' table not tested");
+            return;
+        };
+        if !read_back_pool() {
+            return;
+        }
+        // (A size no other test reads back: the table is the process's.)
+        let size = (7 << 16) - 100;
+        let mut title = [0u8; 64];
+        let list = host.new_list().unwrap();
+        let buffer = host.read_back_buffer(size).unwrap();
+        // SAFETY: a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, 7 << 16);
+        let first = buffer.as_raw() as usize;
+        list.defer_read_back(buffer, title.as_mut_ptr(), [16, 2, 32]);
+        // The list holds it: another read back gets another buffer.
+        let other = host.read_back_buffer(size).unwrap();
+        assert_ne!(other.as_raw() as usize, first);
+        list.close();
+        list.reset();
+        // Nobody's now: the next read back of that size takes it, once.
+        let again = host.read_back_buffer(size - 4096).unwrap();
+        assert_eq!(again.as_raw() as usize, first);
+        let third = host.read_back_buffer(size).unwrap();
+        assert_ne!(third.as_raw() as usize, first);
+        // Still named elsewhere when its list is reset: let go, not kept.
+        let named = again.clone();
+        list.defer_read_back(again, title.as_mut_ptr(), [16, 2, 32]);
+        list.close();
+        list.reset();
+        assert!(sole(&named));
+        let fourth = host.read_back_buffer(size).unwrap();
+        assert_ne!(fourth.as_raw() as usize, first);
+        drop((other, third, fourth, named));
+    }
+}
+
+#[cfg(test)]
+mod address_hash_tests {
+    use super::AddressHash;
+    use std::hash::{BuildHasher, BuildHasherDefault};
+
+    fn hash<K: std::hash::Hash>(key: K) -> u64 {
+        BuildHasherDefault::<AddressHash>::default().hash_one(key)
+    }
+
+    /// What a table makes of `hashes`: its place from the low bits, its tag
+    /// from the top seven. No two the same, every tag in use, and with as many
+    /// places as keys no place crowded and the keys looked at to find one not
+    /// many more than chance leaves (which is 1.5: a key and half of the others
+    /// at its place).
+    ///
+    /// Measured 2026-11-27, 4,096 keys: host copies 16, 48 and 64 bytes apart
+    /// 2.1, 1.8 and 2.0 keys looked at (the fullest place 22, 15 and 12 keys),
+    /// 192 bytes apart 1.5, a page and 64 KiB apart 1.1 and 1.2; root views
+    /// 2.0, fills 1.5. Not as even as the standard hash for keys a few bytes
+    /// apart, and far from all in one place.
+    fn spread(what: &str, hashes: &[u64]) {
+        let places = hashes.len().next_power_of_two();
+        let mut at = vec![0u32; places];
+        let mut tags = [false; 128];
+        let mut seen = std::collections::BTreeSet::new();
+        for &h in hashes {
+            assert!(seen.insert(h), "{what}: two keys with one hash");
+            at[h as usize & (places - 1)] += 1;
+            tags[(h >> 57) as usize] = true;
+        }
+        let fullest = at.iter().copied().max().unwrap_or(0);
+        assert!(fullest <= 32, "{what}: {fullest} keys in one place of {places}");
+        let looked: u64 = at.iter().map(|&n| u64::from(n) * u64::from(n + 1) / 2).sum();
+        let looked = looked as f64 / hashes.len() as f64;
+        assert!(looked <= 2.5, "{what}: {looked:.2} keys looked at to find one");
+        let used = tags.iter().filter(|&&t| t).count();
+        assert!(used >= 120, "{what}: {used} tags of 128 in use");
+    }
+
+    /// The tables a list asks at every draw are keyed by addresses of ours
+    /// (host copies, title heaps, title addresses): keys that differ in few
+    /// bits, at even steps. This hash has to tell them apart as the standard
+    /// one did.
+    #[test]
+    fn the_keys_of_a_lists_per_draw_tables_spread() {
+        // Host copies by address: objects of one size, one after the other.
+        for step in [16usize, 48, 64, 192, 4096, 1 << 16] {
+            let keys: Vec<u64> = (0..4096).map(|i| hash(0x0000_01f4_8a20_0040usize + i * step)).collect();
+            spread(&format!("copies {step} bytes apart"), &keys);
+        }
+        // Root views: (title heap, title address), bit 63 for a view that
+        // begins early (`crate::draw::State::root_srv_table`).
+        let heap = 0x0000_0234_5678_9000usize;
+        let keys: Vec<u64> = (0..2048u64)
+            .flat_map(|i| {
+                let address = 0x4_2000_0000 + i * 0x140;
+                [hash((heap, address)), hash((heap, address | 1 << 63))]
+            })
+            .collect();
+        spread("root views", &keys);
+        // Fills of scratch memory: (source, bytes).
+        let keys: Vec<u64> = (0..4096usize).map(|i| hash((0x2_8000_0000usize + (i / 4) * 0x100, 0x100usize << (i % 4)))).collect();
+        spread("fills", &keys);
+    }
+
+    /// What a hasher is handed, in order: a number, or so many bytes at once.
+    #[derive(Default)]
+    struct Handed(Vec<(bool, usize)>);
+
+    impl std::hash::Hasher for Handed {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.push((true, bytes.len()));
+        }
+        fn write_usize(&mut self, n: usize) {
+            self.0.push((false, n));
+        }
+    }
+
+    /// A descriptor record (tag, index, generation: the key of the views a
+    /// list made, `crate::descriptor::host::ListViews`) is handed over as its
+    /// length and its twelve bytes at once, and hashed in three steps: the
+    /// length, eight bytes, and the four left with their number. Records
+    /// that differ in one word hash apart, and a list's records spread.
+    #[test]
+    fn a_record_of_three_words_is_hashed_a_word_at_a_time() {
+        use std::hash::{Hash, Hasher};
+        let record = [0x5649_4557u32, 0x0001_2345, 7];
+        let mut handed = Handed::default();
+        record.hash(&mut handed);
+        assert_eq!(handed.0, [(false, 3), (true, 12)], "the standard library hands a record over otherwise now");
+        let mut by_hand = AddressHash::default();
+        by_hand.write_usize(3);
+        by_hand.write_u64(u64::from(record[0]) | u64::from(record[1]) << 32);
+        by_hand.write_u64(u64::from(record[2]) | 4 << 56);
+        assert_eq!(hash(record), by_hand.finish());
+        for word in 0..3 {
+            for bit in 0..32 {
+                let mut other = record;
+                other[word] ^= 1 << bit;
+                assert_ne!(hash(other), hash(record), "word {word}, bit {bit}");
+            }
+        }
+        // The bytes left over count: a shorter key is not the longer one
+        // that ends in zeros.
+        let bytes = |b: &[u8]| {
+            let mut h = AddressHash::default();
+            h.write(b);
+            h.finish()
+        };
+        assert_ne!(bytes(b"ab"), bytes(b"ab\0"));
+        assert_ne!(bytes(b"12345678"), bytes(b"12345678\0"));
+        assert_eq!(bytes(&7u64.to_le_bytes()), hash(7u64));
+        // A list's records: one tag, slots one after the other, a few generations.
+        let keys: Vec<u64> = (0..4096u32).map(|i| hash([0x5649_4557u32, 0x4000 + i / 2, 1 + i % 2])).collect();
+        spread("records", &keys);
     }
 }
 
@@ -8356,7 +8917,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -9670,10 +10231,26 @@ impl Host {
         &self.queue
     }
 
-    /// A buffer in the upload heap, mapped for writing.
-    /// A buffer of `size` bytes the card writes and we read (a read back),
-    /// in the state copies into it need.
+    /// A buffer of at least `size` bytes the card writes and we read (a read
+    /// back), in the state copies into it need: one a list was done with, if
+    /// one of its size is kept ([`read_back_pool`]), else a new one.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        if !read_back_pool() {
+            return self.new_read_back_buffer(size);
+        }
+        let size = read_back_size(size);
+        let kept = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner()).take(size);
+        if let Some(SpareBack(buffer)) = kept {
+            BACKS[1].fetch_add(1, Ordering::Relaxed);
+            return Some(buffer);
+        }
+        self.new_read_back_buffer(size)
+    }
+
+    /// A new buffer of `size` bytes in read-back memory, in the state copies
+    /// into it need.
+    fn new_read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        BACKS[0].fetch_add(1, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()

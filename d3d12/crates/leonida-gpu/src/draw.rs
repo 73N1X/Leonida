@@ -807,9 +807,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -2407,7 +2407,7 @@ impl State {
                 }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
-                for &(slot, param) in views {
+                for (at, &(slot, param)) in views.iter().enumerate() {
                     if srv && slot == leonida_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -2450,12 +2450,10 @@ impl State {
                         }
                         continue;
                     };
-                    // The shader adds the bytes a raw view begins early by.
-                    let biased = srv
-                        && t.host.user_data.iter().any(|u| {
-                            u.slot == slot
-                                && u.root == RootType::Other(leonida_shader::emit::USER_VIEW_BIAS)
-                        });
+                    // The shader adds the bytes a raw view begins early by
+                    // (known with the pipeline, not asked of its user data
+                    // at every draw).
+                    let biased = srv && stage.root_srv_biased(at);
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
@@ -2626,10 +2624,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = host.dynamic(1).or_else(|| crate::host::wait_for_slots(|| host.dynamic(1))) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2694,10 +2689,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = host.dynamic(1).or_else(|| crate::host::wait_for_slots(|| host.dynamic(1))) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -4658,10 +4650,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = host.dynamic(n).or_else(|| crate::host::wait_for_slots(|| host.dynamic(n))) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
