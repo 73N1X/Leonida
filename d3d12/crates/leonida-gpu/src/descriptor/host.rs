@@ -1479,6 +1479,11 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+thread_local! {
+    /// Leonida: this thread is in [`HostHeap::mirror_for_pass`].
+    static IN_BUFFER_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -2570,7 +2575,7 @@ impl HostHeap {
         } else {
             self.buffers.remove(index)
         };
-        if was {
+        if was && !IN_BUFFER_PASS.get() {
             self.changed.put(index);
         }
         stale
@@ -3004,6 +3009,19 @@ impl HostHeap {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Leonida: [`HostHeap::mirror`] for the heap buffer pass itself. The
+    /// pass takes in the copy of every slot it makes, so the slot is not
+    /// marked for the next pass again ([`HostHeap::buffer_changes`]); marked,
+    /// the next pass looked at each such slot once more for nothing (after
+    /// realblastex/flamingo d56f7b0 and fxceless/victory-fork #1043, GPL-3.0:
+    /// 14,089 to 9,111 slots a frame there, the pass 31.6 to 27.0 ms).
+    pub(crate) fn mirror_for_pass(&self, index: u32, handle: u64) -> Option<View> {
+        let was = IN_BUFFER_PASS.replace(true);
+        let view = self.mirror(index, handle, true);
+        IN_BUFFER_PASS.set(was);
+        view
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
