@@ -458,7 +458,7 @@ public:
             if (!held((at - first_) / kPage)) {
                 const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
                 bool opened = false;
-                std::vector<const Target*> over;  // the targets with bytes in [a, b)
+                Vector<const Target*> over;    // the targets with bytes in [a, b)
                 for (const Target& t : targets_)
                     if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
                 // Piece by piece, against the title's bytes as they were before any copy went back here: a copy that
