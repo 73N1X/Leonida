@@ -771,6 +771,119 @@ int gate_review_cases() {
     return 0;
 }
 
+// The second review of #2412: whether a create that holds is in the driver is checked on every pass of the wait, the
+// held limit applies on its own, the notice comes once per wait, and a present or wait never uses the probe budget.
+int gate_second_review() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): second review cases not checked\n");
+        return 0;
+    }
+    using Verdict = SubmitMutex::GateVerdict;
+    using Kind = SubmitMutex::CreateKind;
+    const SubmitMutex::CreateInfo compute{Kind::compute, "test compute", "test", 1000};
+    const SubmitMutex::CreateInfo graphics{Kind::graphics, "test mesh", "test", 2000};
+    const auto adaptive = [](SubmitMutex& m) {
+        m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
+        m.set_gate_probe_budget_ms(0);
+    };
+    // Compute gets the held verdict: a submission goes ahead at a 100 ms limit, stays 2 s, and comes back just after
+    // the create leaves.
+    const auto compute_holds = [&](SubmitMutex& m) {
+        m.set_gate_wait_limit_ms(100);
+        HeldCreate first(m, compute);
+        if (!eventually([&] { return first.in.load(); })) return false;
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            std::this_thread::sleep_for(2000ms);
+            first.let_go();
+            std::this_thread::sleep_for(50ms);
+        }
+        return m.gate_verdict(Kind::compute) == Verdict::driver_holds;
+    };
+    // (a) The holding compute create leaves while a graphics create (no verdict) stays: the submission goes ahead at
+    // the plain limit, even with no held limit.
+    {
+        SubmitMutex m;
+        adaptive(m);
+        const bool holds = compute_holds(m);
+        m.set_gate_wait_limit_ms(300);
+        m.set_gate_held_limit_ms(0);
+        HeldCreate c(m, compute);
+        HeldCreate g(m, graphics);
+        EXPECT(eventually([&] { return c.in.load() && g.in.load(); }));
+        std::atomic<std::int64_t> waited{-1};
+        std::atomic<bool> ahead{false};
+        std::thread submit([&] {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m);
+            waited = now_ms() - start;
+            ahead = turn.went_ahead();
+        });
+        std::this_thread::sleep_for(150ms);
+        c.let_go();
+        const bool went = eventually([&] { return waited.load() >= 0; });  // within 2 s, the graphics one still there
+        g.let_go();
+        submit.join();
+        EXPECT(holds);
+        EXPECT(went && ahead.load() && waited.load() >= 290 && waited.load() < 1000);
+        std::printf("compile gate: the holding create left, the other kind's stayed: went ahead after %lld ms "
+                    "(limit 300 ms, no held limit)\n", static_cast<long long>(waited.load()));
+    }
+    // (b) and (c): a held limit under the plain limit applies on its own, and one over it gives one notice per wait.
+    for (const bool shorter : {true, false}) {
+        SubmitMutex m;
+        adaptive(m);
+        const bool holds = compute_holds(m);
+        m.set_gate_wait_limit_ms(shorter ? 2000 : 100);
+        m.set_gate_held_limit_ms(shorter ? 300 : 400);
+        HeldCreate c(m, compute);
+        EXPECT(eventually([&] { return c.in.load(); }));
+        const unsigned notices = m.gate_held_notices();
+        std::int64_t waited = 0;
+        bool ahead = false;
+        {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m);
+            waited = now_ms() - start;
+            ahead = turn.went_ahead();
+        }
+        const unsigned noted = m.gate_held_notices() - notices;
+        c.let_go();
+        EXPECT(holds && ahead);
+        if (shorter) {
+            EXPECT(waited >= 290 && waited < 1000 && noted == 0);
+        } else {
+            EXPECT(waited >= 390 && waited < 1000 && noted == 1);
+        }
+        std::printf("compile gate: held limit %s the plain limit: went ahead after %lld ms, %u notice(s)\n",
+                    shorter ? "300 ms, under" : "400 ms, over", static_cast<long long>(waited), noted);
+    }
+    // (d) A present or wait beside a create with no verdict never goes ahead at the probe budget, only at the limit.
+    {
+        SubmitMutex m;
+        adaptive(m);
+        m.set_gate_wait_limit_ms(1000);
+        m.set_gate_probe_budget_ms(200);
+        HeldCreate c(m, compute);
+        EXPECT(eventually([&] { return c.in.load(); }));
+        std::int64_t waited = 0;
+        bool ahead = false;
+        {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m, false);
+            waited = now_ms() - start;
+            ahead = turn.went_ahead();
+        }
+        c.let_go();
+        EXPECT(ahead && waited >= 990 && waited < 2000);
+        EXPECT(m.gate_verdict(Kind::compute) == Verdict::pending);
+        std::printf("compile gate: a present beside an unverified create waited %lld ms (budget 200 ms, limit 1000 "
+                    "ms)\n", static_cast<long long>(waited));
+    }
+    return 0;
+}
+
 // The classic gate (LEONIDA_COMPILE_GATE unset, the default): compute creates are waited for however long they take,
 // graphics creates do not pass the gate, nothing probes.
 int gate_classic() {
@@ -840,7 +953,8 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
         compile_gate() || gate_wait_limit() || gate_adapts() ||
-        gate_probe_budget() || gate_per_kind() || gate_review_cases() || gate_classic())
+        gate_probe_budget() || gate_per_kind() || gate_review_cases() || gate_second_review() ||
+        gate_classic())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;

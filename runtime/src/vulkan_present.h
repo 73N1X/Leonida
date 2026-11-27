@@ -650,8 +650,9 @@ private:
         {
             std::lock_guard lock(context_.submit_mutex());
             // One turn of the compile gate for the submit and the present after it: no pipeline create enters the
-            // driver between the two (queue_submit's own turn nests inside this one).
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            // driver between the two (queue_submit's own turn nests inside this one). Not a probe: it also covers
+            // finish_startup_frame's fence wait and the present; the nested turn probes the vkQueueSubmit alone.
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, frame.done),
                                                 "vkQueueSubmit (present)");
             if (submitted == VK_SUCCESS) context_.note_image_work_locked();

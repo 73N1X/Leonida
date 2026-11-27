@@ -2955,15 +2955,17 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   and without `VK_NV_device_diagnostics_config` and a shared pipeline cache) never held a submission past 80 ms.
   The recent leaves are kept in a ring, so a create that entered after the submission and left after the one it
   entered beside does not hide that one. Only submissions (`vkQueueSubmit`, `vkQueueBindSparse`) probe: presents and
-  idle or semaphore waits pass the gate the same way but can take seconds on their own, so they judge nothing. While
-  a create of a kind that holds submissions is in the driver, no submission goes ahead at the limit or the budget,
-  and such a create is waited for even when one went past it before the verdict, up to the held limit
-  (`LEONIDA_COMPILE_GATE_HELD_WAIT_MS`, 60 s; 0 waits however long): then the creates in the driver are gone past
-  and the next submissions no longer wait for them. A false "holds" verdict so costs at most that per create, not the
-  rest of the run. On a device loss the log names every create
-  in the driver (kind, program, SPIR-V size, thread, how long it had been there, whether submissions waited for it)
-  and each kind's gate. Long graphics creates would leave the title's process only through the compile helper, which
-  builds compute pipelines alone today.
+  idle or semaphore waits pass the gate the same way but can take seconds on their own, so they judge nothing, and
+  they never go ahead at the probe budget, only at the limit. While a create of a kind that holds submissions is in
+  the driver, no submission goes ahead at the limit or the budget, and such a create is waited for even when one went
+  past it before the verdict, up to the held limit (`LEONIDA_COMPILE_GATE_HELD_WAIT_MS`, 60 s; 0 waits however long,
+  and a held limit under the plain one applies on its own): then the creates in the driver are gone past and the
+  next submissions no longer wait for them. This is checked on every pass of the wait: once such a create leaves
+  while creates of a kind with no verdict stay, the plain limit and budget apply again. A false
+  "holds" verdict so costs at most that per create, not the rest of the run. On a device loss the log names every
+  create in the driver (kind, program, SPIR-V size, thread, how long it had been there, whether submissions waited
+  for it) and each kind's gate. Long graphics creates would leave the title's process only through the compile
+  helper, which builds compute pipelines alone today.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

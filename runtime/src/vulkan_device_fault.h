@@ -516,7 +516,7 @@ public:
         // `probe` false for a present or an idle or semaphore wait: it waits at the gate like a submission, but its
         // time in the driver judges nothing (it can take seconds on its own while the GPU is busy).
         explicit SubmitTurn(SubmitMutex& gate, bool probe = true) : gate_(gate) {
-            gate.enter_submit(&ahead_);
+            gate.enter_submit(&ahead_, probe);
             ahead_.probe = probe;
         }
         ~SubmitTurn() { gate_.leave_submit(ahead_); }
@@ -652,6 +652,12 @@ public:
         return verdict_[std::size_t(kind)];
     }
 
+    // How many "reached the limit, but a create of a kind that holds ..." notices were due (for tests: one per wait).
+    unsigned gate_held_notices() {
+        std::lock_guard lock(gate_mutex_);
+        return logged_held_waits_;
+    }
+
     // The thread waiting in enter_submit for creates to leave the driver, or 0.
     std::uint32_t gate_waiter() const { return gate_waiter_.load(std::memory_order_relaxed); }
 
@@ -705,7 +711,9 @@ public:
 
     // `ahead` (optional) is told whether the submission entered the driver alongside creates the gate does not wait
     // for, and whether it went ahead at the wait limit or the probe budget, for leave_submit.
-    std::int64_t enter_submit(GateAhead* ahead = nullptr) {
+    // `probe` false (a present or an idle or semaphore wait): it never goes ahead at the probe budget, only at the
+    // wait limit, since its time in the driver judges nothing.
+    std::int64_t enter_submit(GateAhead* ahead = nullptr, bool probe = true) {
         if (!compile_gate_enabled()) return 0;
         std::unique_lock lock(gate_mutex_);
         ++submits_;
@@ -717,34 +725,48 @@ public:
         const std::uint32_t self = diagnostic_thread_id();
         gate_waiter_.store(self, std::memory_order_relaxed);
         const std::int64_t start = diagnostic_ms();
-        std::int64_t limit = wait_limit_ms_;
-        // The probe budget, only while every kind it waits for has no verdict.
-        std::int64_t budget = adaptive_ && blocking_kinds_pending() ? probe_budget_ms_ : 0;
         const GateWait what{self, blocking(), first->info};
         std::int64_t next_note = 2000;
         const char* why = nullptr;  // set: it goes ahead
+        std::int64_t limit = 0, budget = 0;  // in force at the last check
         std::int64_t window_ms = 0;  // with the probe budget: the waits of the window, this one's included
+        bool held_noted = false;     // the "reached the limit, but ..." notice, once per wait
         for (;;) {
             const std::int64_t now = diagnostic_ms();
             const std::int64_t waited = now - start;
-            if (limit > 0 && waited >= limit) {
-                why = "limit";
-            } else if (budget > 0 && (window_ms = recent_waits_ms(now) + waited) >= budget) {
-                why = "probe budget";
+            // Checked each time: a create of a kind that holds submissions, not gone past, may have left (or entered)
+            // since, while creates of other kinds stay.
+            const bool held = held_blocking();
+            // The plain limit, and the probe budget only for a probe while every kind it waits for has no verdict.
+            const std::int64_t plain_budget = probe && adaptive_ && blocking_kinds_pending() ? probe_budget_ms_ : 0;
+            const char* plain = nullptr;
+            if (plain_budget > 0) window_ms = recent_waits_ms(now) + waited;
+            if (wait_limit_ms_ > 0 && waited >= wait_limit_ms_) {
+                plain = "limit";
+            } else if (plain_budget > 0 && window_ms >= plain_budget) {
+                plain = "probe budget";
             }
-            if (why && why[0] != 'h' && held_blocking()) {
+            if (!held) {
+                limit = wait_limit_ms_;
+                budget = plain_budget;
+                why = plain;
+            } else {
                 // Not into the driver beside a create of a kind that holds submissions: there it would wait for the
                 // create anyway, and the driver lost the device under such waits (621.40, a mesh create). It waits
-                // here for those, up to the held limit (LEONIDA_COMPILE_GATE_HELD_WAIT_MS; 0: however long).
-                if (logged_held_waits_++ < 8)
-                    std::fprintf(stderr, "[rt] compile-gate: vkQueueSubmit on thread %u reached the %s after %lld ms, "
-                                         "but a create of a kind that holds submissions is in the driver: it waits "
-                                         "until that create leaves or %lld ms have passed\n",
-                                 self, why, static_cast<long long>(waited), static_cast<long long>(held_limit_ms_));
-                why = nullptr;
-                budget = 0;
+                // here for those, up to the held limit (LEONIDA_COMPILE_GATE_HELD_WAIT_MS; 0: however long), which
+                // applies on its own, also when it is shorter than the plain limit.
                 limit = held_limit_ms_;
+                budget = 0;
                 if (limit > 0 && waited >= limit) why = "held limit";
+                if (plain && !why && !held_noted) {
+                    held_noted = true;
+                    if (logged_held_waits_++ < 8)
+                        std::fprintf(stderr, "[rt] compile-gate: vkQueueSubmit on thread %u reached the %s after %lld "
+                                             "ms, but a create of a kind that holds submissions is in the driver: it "
+                                             "waits until that create leaves or %lld ms have passed\n",
+                                     self, plain, static_cast<long long>(waited),
+                                     static_cast<long long>(held_limit_ms_));
+                }
             }
             if (why) {
                 // Every create in the driver now stops holding submissions back; later ones are waited for.
@@ -761,7 +783,10 @@ public:
             if (limit > 0) step = (std::min)(step, limit - waited);
             if (budget > 0) step = (std::min)(step, budget - window_ms);
             step = (std::max)(step, std::int64_t{1});
-            if (gate_changed_.wait_for(lock, std::chrono::milliseconds(step), [&] { return !first_blocking(); }))
+            // Woken when no create holds it back any more, or when whether a holding create does has changed.
+            if (gate_changed_.wait_for(lock, std::chrono::milliseconds(step),
+                                       [&] { return !first_blocking() || held_blocking() != held; }) &&
+                !first_blocking())
                 break;
         }
         gate_waiter_.store(0, std::memory_order_relaxed);
