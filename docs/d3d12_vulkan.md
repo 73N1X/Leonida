@@ -2792,6 +2792,30 @@ Pipeline creation:
   a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
   synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by
   the title.
+  `LEONIDA_PIPELINE_ORDER_LOG=1` records the order in which the title first asks for pipelines
+  (RT-PIPELINE-PREWARM-ORDER, phase 1; `runtime/src/pipeline_order.h`). It is off by default: nothing reads the file yet,
+  so a run that does not ask for it writes nothing and its pipelines carry no hook. For each pipeline and variant (the
+  unbound-slot mask for graphics, 0 for compute) that a dispatch or draw names for the first time, one line is
+  appended to `pipeline_order.log` beside `pipeline_cache.session.bin` (so `LEONIDA_PIPELINE_CACHE_DIR` moves it):
+  `P <c|g|m> <key> <variant hex> <created ms> <first use ms> <build ms or -> <ready 0|1> *<checksum>`, with the
+  times in milliseconds since the process started. The key is the SHA-256 of the title's own description of the PSO
+  (`GetCachedBlob`'s key; a mesh pipeline's MS is folded in), not of the SPIR-V, so a translator change keeps it. A
+  build that ends after its line was written adds `B <key> <variant hex> <build ms> *<checksum>`; a session starts
+  with `S 1 <vendor hex> <device hex>`. A compute pipeline's `P` line is followed by
+  `E <key> <variant hex> <name hash hex> *<checksum>`: the name hash is 16 hex digits of FNV-1a 64 over the name of
+  the library entry the pipeline was made from (the name itself is not written). A reader from before `E` lines
+  skips them (counted as lines not read). Each line ends with an FNV-1a checksum: a cut or damaged line is skipped on
+  read, never fatal. The hook sits in replay's `ComputePipeline::requested` / `GraphicsPipeline::requested`, called
+  where a submission is prepared, also for a handle that exists already (a warm-up build, a cached one); the
+  recorder decides "first" with one compare-and-swap in a table made at start, never blocks and allocates nothing (a non-blocking `try_lock` on the first request of a pipeline and of a variant),
+  and a thread of its own appends every 250 ms, so a killed process loses at most that. The record holds 8192 lines
+  per run (the rest is counted, not kept); a file past 8 MiB is set aside as `pipeline_order.log.prev`. At exit (the
+  exit cache save, or the device's release) one line gives the counts: `[rt] pipeline-order: requested N, already
+  ready M, median lead X ms`. "Lead" is first use minus creation. A PSO made from a pipeline state stream on the
+  console path is created when it is first bound, so its lead is the title's, not an upper bound on a head start.
+  A root signature the runtime does not know is hashed by its address, so the key of a pipeline made with one can
+  change from one run to the next. The file is local, like the cache files, and is not meant to be attached to a
+  report: quote the counts. It changes no build, order or cache.
   A queued build holds no reference to its PSO or device (`PipelineCompiler`, `runtime/shims/d3d12_pipeline_compile.h`).
   A PSO's last release drops its queued builds and returns at once; one already running is left to finish, and the
   worker deletes the PSO after it (`PipelineState::last_release`). The PSO's device reference goes at the release, so
