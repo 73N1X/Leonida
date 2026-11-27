@@ -23,13 +23,47 @@ V vs(uint id : SV_VertexID) {
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
+// Leonida: the scene sharpened before the interface goes over it (SHARPEN, 0 to 1, set when the pass is made from
+// LEONIDA_SHARPEN). Contrast-adaptive, after the idea of AMD FidelityFX CAS (MIT): each pixel is pushed away from
+// its four neighbours by an amount that shrinks where the neighbourhood already spans much of the range, so soft
+// areas gain detail and hard edges get no halo; the result stays inside the neighbourhood's range.
+float3 at(float2 uv) { return scene.SampleLevel(smooth_, uv, 0).rgb; }
+float3 sharpened(float2 uv) {
+    float3 g = at(uv);
+    if (SHARPEN <= 0.0) return g;
+    float w, h;
+    scene.GetDimensions(w, h);
+    float2 t = 1.0 / float2(w, h);
+    float3 l = at(uv - float2(t.x, 0)), r = at(uv + float2(t.x, 0));
+    float3 u = at(uv - float2(0, t.y)), d = at(uv + float2(0, t.y));
+    float3 lo = min(g, min(min(l, r), min(u, d)));
+    float3 hi = max(g, max(max(l, r), max(u, d)));
+    float3 amp = sqrt(saturate(min(lo, 1.0 - hi) / max(hi, 1e-4)));
+    float3 k = -amp * lerp(0.125, 0.2, saturate(SHARPEN));
+    float3 c = (g + (l + r + u + d) * k) / (1.0 + 4.0 * k);
+    return clamp(c, lo, hi);
+}
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
-    float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+    float3 s = sharpened(v.uv);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    return float4(saturate(o.rgb + s * (1 - saturate(o.a))), 1);
 }
 "#;
+
+/// Leonida: how much the scene is sharpened before the interface goes over it (`LEONIDA_SHARPEN`, 0 to 1;
+/// default 0.6; 0: off). The title renders 1280x720 on Series S and DLSS takes it to 1920x1080; the DLSS
+/// release the launcher fetches ignores its own sharpness setting, so without this nothing sharpens the picture.
+fn sharpen() -> f32 {
+    static SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("LEONIDA_SHARPEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map_or(0.6, |v| v.clamp(0.0, 1.0))
+    })
+}
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
@@ -43,13 +77,15 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+    let source = format!("#define SHARPEN {:.3}
+{SOURCE}", sharpen());
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("compose"),
             None,
             None,
