@@ -525,9 +525,9 @@ struct WriteBack {
     ID3D12CommandQueue* queue = nullptr;  // the context's when null
 };
 
-// One submission that dispatches through a root UAV at `va` and waits for it. With `wait` false it is only executed
-// (no signal: the caller knows when it is done). False on a failed call.
-int submit_write(WriteBack& s, std::uint64_t va, bool wait = true) {
+// One submission that dispatches through a root UAV at `va` (and at `va2` too, when given) and waits for it. With
+// `wait` false it is only executed (no signal: the caller knows when it is done). False on a failed call.
+int submit_write(WriteBack& s, std::uint64_t va, std::uint64_t va2 = 0, bool wait = true) {
     EXPECT(s.allocator->Reset() == S_OK);
     EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
     ID3D12DescriptorHeap* heaps[] = {s.heap};
@@ -538,6 +538,10 @@ int submit_write(WriteBack& s, std::uint64_t va, bool wait = true) {
     s.list->SetComputeRootUnorderedAccessView(1, va);
     s.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{s.gpu});
     s.list->Dispatch(1, 1, 1);
+    if (va2) {
+        s.list->SetComputeRootUnorderedAccessView(1, va2);
+        s.list->Dispatch(1, 1, 1);
+    }
     D3D12_RESOURCE_BARRIER to_copy{};
     to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     to_copy.Transition.pResource = s.out;
@@ -715,7 +719,13 @@ int check_window_write_back(Context& c, bool geometry) {
 //      and copies the page forward again;
 //   3. a geometry cell over the ring's first 64 KiB makes the hot page read-only, unknown to the tracker;
 //   4. the next submission's write-back faults on that page, and must return with the GPU's words in the pages.
-int check_window_write_back_fault(Context& c) {
+// With `same_tile`, a second run in the same 64 KiB tile: step 2's submission dispatches at the third page too, and
+// the title then writes the second page (hot, so no fault: the write watch has it). Step 4's write-back (of step 2's
+// results) then runs over [page 0] (faults; the geometry cell reopens the whole tile, and the tracker's pages there
+// with it), [page 1] (the title's: held) and [page 2 ...]. The tile's reopening on the write-back's own thread used to
+// make page 2 count as written by the title, so its GPU words were dropped and the forward copy put the title's zeros
+// over them. The title's word on page 1 must still win.
+int check_window_write_back_fault(Context& c, bool same_tile) {
     if (!leonida::title_write_watch::enabled()) {
         std::fprintf(stderr, "SKIP: write watching is off (LEONIDA_WRITE_WATCH=0, Wine, or no host heap)\n");
         return 77;
@@ -766,13 +776,18 @@ int check_window_write_back_fault(Context& c) {
     const std::uint64_t title_faults = rt::d3d12::title_shadow_watch(c.inner).faults - faults_before;
     EXPECT(title_faults == 1);
     EXPECT(rt::d3d12::title_shadow_watch(c.inner).watched_bytes > 0);  // the window's pages are write-watched
-    EXPECT(submit_write(s, ring_va) == 0);
+    constexpr UINT kPageWords = 4096 / 4;
+    EXPECT(submit_write(s, ring_va, same_tile ? ring_va + 2 * 4096 : 0) == 0);
     UINT dropped = 0;
     for (UINT i = 0; i < kElements; ++i) dropped += ring[i] == 0;
     EXPECT(dropped == kElements);  // the title wrote that page since it was copied: the GPU's words were not taken
     const DWORD hot = protection(ring);
     EXPECT(hot == PAGE_READWRITE);  // asked about, not guarded
     EXPECT(rt::d3d12::title_shadow_watch(c.inner).hot_bytes > 0);
+    if (same_tile) {
+        EXPECT(protection(ring + kPageWords) == PAGE_READWRITE);  // the fault made the whole block hot
+        ring[kPageWords + 500] = 0x5EED0002u;                     // no fault: the write watch has it
+    }
 
     // Step 3: what a geometry view over these pages arms (GeometryViews), standing in for the other guard.
     const auto tile = std::uintptr_t(ring_va);
@@ -812,6 +827,16 @@ int check_window_write_back_fault(Context& c) {
                 ring[1000] == 0x5EED0001u ? "kept" : "lost");
     EXPECT(nonzero > 0);
     EXPECT(ring[1000] == 0x5EED0001u);
+    if (same_tile) {
+        // The run past the title's page, in the tile the faulting copy reopened: its GPU words went back too.
+        UINT later = 0;
+        for (UINT i = 0; i < kElements; ++i) later += ring[2 * kPageWords + i] != 0;
+        std::printf("write back fault, same tile: %u of %u words the second dispatch wrote on the third page are in "
+                    "the title's pages, the title's word on the second page %s\n",
+                    later, kElements, ring[kPageWords + 500] == 0x5EED0002u ? "kept" : "lost");
+        EXPECT(later == nonzero);  // the same shader, the same words
+        EXPECT(ring[kPageWords + 500] == 0x5EED0002u);
+    }
 
     leonida::geometry_writes::release(tile);
     aliases.remove_title_memory(ring_va);
@@ -1272,7 +1297,7 @@ int check_retired_window_write_back(Context& c) {
     // Held on the GPU: it writes the ring's window once the gate opens.
     const auto empty = rt::d3d12::title_windows(c.inner);
     EXPECT(SUCCEEDED(gated->Wait(gate.p, 1)));
-    EXPECT(submit_write(held, ring_va + held_at, false) == 0);
+    EXPECT(submit_write(held, ring_va + held_at, 0, false) == 0);
     EXPECT(SUCCEEDED(gated->Signal(held_done.p, 1)));
     const std::uint64_t window = aliases.shader_va(ring_va);
     const auto before = rt::d3d12::title_windows(c.inner);
@@ -1281,7 +1306,7 @@ int check_retired_window_write_back(Context& c) {
     EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, ring, buffer_desc(ring_bytes), 0xFFFFFFFFu,
                                                               IID_PPV_ARGS(&placed.p))));
     EXPECT(!aliases.answers_into(window, 1));
-    EXPECT(submit_write(next, arena_va, false) == 0);  // its refresh retires the window, its write still queued
+    EXPECT(submit_write(next, arena_va, 0, false) == 0);  // its refresh retires the window, its write still queued
     const auto retired = rt::d3d12::title_windows(c.inner);
     EXPECT(retired.retired == before.retired + 1 && retired.waiting >= 1);
     EXPECT(held_done->GetCompletedValue() == 0);  // the write has not run yet
@@ -1715,7 +1740,9 @@ int main(int argc, char** argv) {
     const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
     const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
     const bool window_orphans = argc == 2 && std::strcmp(argv[1], "--window-orphans") == 0;
-    const bool window_write_back_fault = argc == 2 && std::strcmp(argv[1], "--window-writeback-fault") == 0;
+    const bool window_write_back_tile = argc == 2 && std::strcmp(argv[1], "--window-writeback-fault-tile") == 0;
+    const bool window_write_back_fault =
+        window_write_back_tile || (argc == 2 && std::strcmp(argv[1], "--window-writeback-fault") == 0);
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
@@ -1850,7 +1877,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (window_write_back_fault) {
-            if (const int result = check_window_write_back_fault(c)) return result;
+            if (const int result = check_window_write_back_fault(c, window_write_back_tile)) return result;
             if (d.validation_errors()) {
                 std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
                 return 1;
