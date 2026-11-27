@@ -34,5 +34,8 @@ diagnostics = [
     "leonida-shader/diagnostics",
 ]
 
+# mimalloc as the process allocator (off by default: the system allocator).
+mimalloc = ["leonida-hle/mimalloc"]
+
 [lints]
 workspace = true

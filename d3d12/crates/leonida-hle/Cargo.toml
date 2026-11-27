@@ -55,6 +55,7 @@ tempfile.workspace = true
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["leonida-gpu/diagnostics", "leonida-loader/diagnostics", "dep:windows", "dep:windows-core"]
+mimalloc = ["leonida-gpu/mimalloc"]
 
 [lints]
 workspace = true
