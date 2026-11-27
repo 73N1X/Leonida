@@ -898,6 +898,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
             }
+            // (an LDS atomic: the counter of a reservation in group-shared memory; known in the
+            // last forms, `lds_exact`)
+            Fields::Ds { data, .. } if !name.starts_with("ds_read") && super::lds_exact::on() => data.clone(),
             _ => Vec::new(),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
@@ -986,19 +989,32 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
-                let want = match op {
-                    Op::AddU => "buffer_atomic_add",
-                    Op::MinU => "buffer_atomic_umin",
-                    Op::MaxU => "buffer_atomic_umax",
-                    Op::MinI => "buffer_atomic_smin",
-                    Op::MaxI => "buffer_atomic_smax",
-                    Op::Or => "buffer_atomic_or",
-                    Op::And => "buffer_atomic_and",
-                    Op::Xor => "buffer_atomic_xor",
+            (_, [Wave::Total(op)])
+                if name.contains("_atomic_") || matches!(inst.fields, Fields::Ds { .. }) && super::lds_exact::on() =>
+            {
+                let lds = matches!(inst.fields, Fields::Ds { .. });
+                let want = match (lds, op) {
+                    (false, Op::AddU) => "buffer_atomic_add",
+                    (false, Op::MinU) => "buffer_atomic_umin",
+                    (false, Op::MaxU) => "buffer_atomic_umax",
+                    (false, Op::MinI) => "buffer_atomic_smin",
+                    (false, Op::MaxI) => "buffer_atomic_smax",
+                    (false, Op::Or) => "buffer_atomic_or",
+                    (false, Op::And) => "buffer_atomic_and",
+                    (false, Op::Xor) => "buffer_atomic_xor",
+                    (true, Op::AddU) => "ds_add_u32",
+                    (true, Op::MinU) => "ds_min_u32",
+                    (true, Op::MaxU) => "ds_max_u32",
+                    (true, Op::MinI) => "ds_min_i32",
+                    (true, Op::MaxI) => "ds_max_i32",
+                    (true, Op::Or) => "ds_or_b32",
+                    (true, Op::And) => "ds_and_b32",
+                    (true, Op::Xor) => "ds_xor_b32",
                     _ => "",
                 };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                // (with or without the old value back)
+                let called = name.replacen("_rtn", "", 1);
+                if called != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err(TOTAL);
                 }
                 reserved = true;
@@ -1129,6 +1145,10 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     pass(&mut kind, &mut firsts, true)
 }
 
+/// `halves` of a program with no LDS dword left for the counter of `wave_base`: its console
+/// threads are taken from the flat id.
+const NO_COUNTER: u32 = u32::MAX;
+
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `LEONIDA_GROUP_SYNC=0` ([`super::group_sync`]).
@@ -1151,8 +1171,8 @@ fn meeting_mode() -> u32 {
 /// joined without an all-lane block between them): refused, unless the region only raises a
 /// flag ([`super::lds_flags`]), which needs no order inside it.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
-    lds_meetings_or_why(p, st, all).ok()
+fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool], threads: [u32; 3]) -> Option<Vec<(bool, bool)>> {
+    lds_meetings_or_why(p, st, all, threads).ok()
 }
 
 /// The blocks a lane goes to from block `b` (none past an end or an indirect exit).
@@ -1216,10 +1236,13 @@ fn lds_meetings_or_why(
     p: &crate::ir::Program,
     st: &Structured,
     all: &[bool],
+    threads: [u32; 3],
 ) -> Result<Vec<(bool, bool)>, Vec<(Vec<usize>, Why)>> {
     let n = st.exits.len();
     let succ = |b: usize| lane_successors(st, b);
     let (region, reads, writes) = lds_regions(p, st, all);
+    // (blocks one thread of the group runs: `lds_exact`)
+    let single = if super::lds_exact::on() { super::lds_exact::single_thread_blocks(p, st, threads) } else { Vec::new() };
     // A region that reads and writes LDS is still taken when it only raises a flag: a read
     // that misses the other host wave's write changes nothing the region leaves behind.
     let mut refused = Vec::new();
@@ -1228,6 +1251,10 @@ fn lds_meetings_or_why(
             continue;
         }
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && region[b] == r).collect();
+        // one thread's region, or one whose reads and writes cannot meet: no order to keep
+        if super::lds_exact::exact_region(p, &blocks, &single, LOCAL_WAVES.get()).is_ok() {
+            continue;
+        }
         let flag = if super::lds_flags::on() {
             super::lds_flags::flag_region(p, st, &blocks)
         } else {
@@ -1933,7 +1960,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, cs.threads) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1954,7 +1981,12 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 let waves = group.div_ceil(64);
-                                s.lds_dwords += 2 * waves;
+                                // (each host wave on its own, `with_local_waves`, gives and
+                                // takes nothing through LDS: no dwords where a program with all
+                                // of D3D12's 32 KiB of its own has not got them)
+                                if !LOCAL_WAVES.get() || s.lds_dwords + 2 * waves + 1 <= 8192 {
+                                    s.lds_dwords += 2 * waves;
+                                }
                                 if group > 32 {
                                     // pairs of their own, as far as D3D12's 32 KiB of group
                                     // memory and the dword a ticket may still take allow
@@ -1994,14 +2026,17 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st).map(|all| lds_meetings_or_why(p, x.st, &all)) {
+                        match all_lane_blocks(x.st).map(|all| lds_meetings_or_why(p, x.st, &all, cs.threads)) {
                             None => why.push("an indirect exit"),
                             Some(Err(regions)) => {
                                 why.push("an LDS read and write in one lane-branch region");
                                 // (and what keeps each from being a flag region)
                                 for (blocks, what) in regions {
+                                    let (lo, hi) = blocks.iter().fold((usize::MAX, 0), |(lo, hi), &b| {
+                                        (lo.min(p.blocks[b].offset), hi.max(p.blocks[b].offset))
+                                    });
                                     eprintln!(
-                                        "WAVE64-LDS-REGION B{} ({} blocks): {what} [{}]",
+                                        "WAVE64-LDS-REGION B{} ({} blocks, {lo:#x}..{hi:#x}): {what} [{}]",
                                         blocks.first().copied().unwrap_or(0),
                                         blocks.len(),
                                         super::lds_flags::describe(p, &blocks),
@@ -2015,11 +2050,20 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
+            // A group of one dimension whose LDS leaves no dword for a counter (all of D3D12's
+            // 32 KiB: the title's culling program of 1,024 threads) takes its console threads
+            // from the flat id, as a host does that gives each wave a run of consecutive ids (it
+            // is only the other shapes, whose waves are tiles, that the counter is for).
+            let no_room = s.lds_dwords >= 8192 && cs.threads[1] == 1 && cs.threads[2] == 1;
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
-            } else if console_lanes && group > wave && ticket_on() {
+                if no_room {
+                    halves = Some(NO_COUNTER);
+                } else {
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
+            } else if console_lanes && group > wave && ticket_on() && !no_room {
                 // the flat id rounded down is not a host wave's base on every host (#1243)
                 ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
@@ -2969,6 +3013,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -4845,6 +4890,9 @@ impl<'a> Lower<'a> {
     /// thread runs.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves.or(self.ticket)?;
+        if slot == NO_COUNTER {
+            return None;
+        }
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4917,6 +4965,34 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// The LDS dwords a compute program initialises for accumulation
+    /// ([`super::lds_init::init_hoists`]), stored with their starting values by every thread
+    /// first thing, then a group barrier (not for a group of one host wave): every thread of the
+    /// group is still here, before any other LDS access, so the dwords hold their starting value
+    /// whether or not the thread that stores them in the program gets there.
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || self.pack.is_some() || !super::lds_init::on() {
+            return;
+        }
+        let inits = super::lds_init::init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        if cs.threads.iter().product::<u32>() > 32 {
+            self.group_sync(e);
+        }
     }
 
     /// A group barrier with an LDS fence in `block`.

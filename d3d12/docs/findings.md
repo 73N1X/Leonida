@@ -104,6 +104,103 @@ every branch of a program (`createHandleFromHeap` of an index that is a root con
 offset, behind a branch on a load), and reads of read-only views repeated in blocks that
 follow one another (70 of 118 in `922e1d0ee1e19a85`).
 
+## Console wave64 programs a 32-lane host refused: the water's tiles and the culling program (2026-11-27)
+
+26 of the 2,734 compute programs of the title were refused on the RTX 4060 Ti ("no wave32
+lowering for this wave64 program") and every dispatch of them was dropped. Five were taken
+apart with `LEONIDA_WAVE_WHY=1` and `translate_cdxil`; what each trips on, and what takes it now:
+
+- **`5dc3b25986622949`, `6f225b641c5b0708`, `926c46bab3b86bd6`** (the water's
+  `CS_TransmissionVolumetrics`; 8 x 8 groups of one console wave, 512 bytes of LDS), and four more
+  of the family (`2889c21328c69e58`, `6871d6e4b3ac9a10`, `888af37a584acf98`,
+  `a10179ab7eda0dc3`): a lane's early return (`s_and_saveexec` and `s_cbranch_execz`) around code
+  that writes and reads LDS (`ds_write2_b32`, `ds_min_u32`, `ds_max_u32`, `ds_read2_b32`, at
+  `0x230` and `0x404`-`0x4c4` of the first) and takes wave reductions and first-lane reads where
+  not every lane runs. Thread (0, 0) stores the tile's starting maximum and minimum after those
+  returns. Taken by the branches wave-wide, and by `lds_init`.
+- **`6b82bc7d22016cb5`** (culling, 1,024 threads in one dimension, 32 KiB of LDS; its sibling
+  `6832a9da15c2e584` too): LDS read and written in lane-branch regions (thread 0's
+  read-modify-write of a counter at `0x36dc`-`0x3704`; the allocation loop's bitset read and
+  `ds_add_rtn_u32` at `0x39c4`-`0x3a14`); a reservation by an LDS atomic, which the allocation
+  idiom did not know (only buffer atomics); and one LDS dword over D3D12's 32 KiB
+  (`LDS-OVER-32K`: the dword of `wave_base`'s counter, and two exchange dwords for each console
+  wave, of a program that has all of the 8,192 dwords itself). Taken by `lds_exact`, the idiom
+  for `ds_*` atomics and no counter.
+- **`02384a60fda6f2d0`** (token compaction, 128 threads in one dimension, two console waves):
+  not taken, see the end.
+
+**Wave-wide branches.** The console takes a branch on EXEC for the whole wave of 64: the body
+runs unless no lane is left. `emit` has had that form (`widen`: each host wave asks its lanes,
+the halves exchange the answers, so both go the same way and can meet inside) behind
+`LEONIDA_WAVE_WIDE=1`. It is exact, so it is now the last form tried for an 8 x 8 group (after
+every other one, the approximate ones too: no program that translated before changes; 4, 6 and
+20 branches of the three programs above are taken so, every lane running the code with its EXEC
+bit clear where it has no work). `LEONIDA_WAVE_WIDE_LAST=all` takes the 1-D groups of 64 as well:
+13 more programs of the title translate and validate that way (2-30 KiB of LDS), but none has run
+on a card yet and runs 121-124 lost the card with the form on for the light atlas's programs, so
+they stay refused; `0` takes none, `LEONIDA_WAVE_WIDE=0` turns the form off everywhere. With the
+form on from the start (`LEONIDA_WAVE_WIDE=1`) 33 programs that translate without it change,
+which is why it is not the default.
+
+**LDS starts (`lds_init.rs`; `LEONIDA_LDS_INIT_HOIST=0` off).** Every lane `ds_max_u32`s and
+`ds_min_u32`s its key into two dwords that thread (0, 0) set to 0 and `0xFFFFFFFF` after the early
+returns, with no barrier (one console wave). When (0, 0) has returned nothing stores and the
+atomics combine with what the LDS held: another group's values on the console, anything on the
+host (a dark patch in a lit tile: the "dark tiles" of the wave-wide form). A dword that every
+write sets to one constant and every atomic accumulates into with that constant as its identity
+is stored by every thread first thing, behind a group barrier. That is exact where the dword is
+defined: where the program's own store runs it stores the same value again before the first use,
+and a read that would see the early store instead of a later write of the group would have read
+memory the group never wrote. Confirmed on the card with a hand-written 8 x 8 fixture
+(`water_tests`): with the corner thread returned, the minimum came out as what the LDS held (0)
+without the hoist and as the others' minimum with it; a start that is not the maximum's identity,
+a write at a computed address, or no atomic hoists nothing. Ported from fxceless/victory-fork
+a918163 (GPL-3.0). Its paired FP32 and wave64 sums (`paired_fp32.rs`, `wave64_after_loop.rs`) are
+not needed here: the sums of these programs (the count of the lanes as `f64` and `f32`, a sum of
+`0.0` over the launched lanes, lanes that have left included) are the tree sums `wave.rs` replays
+bit for bit with lanes left out (`wave64_tests`: "a sum of halves where lanes have left").
+
+**LDS regions that need no order between the halves (`lds_exact.rs`; `LEONIDA_LDS_EXACT=0`
+off).** A lane-branch region that reads and writes LDS was refused unless it only raised a flag
+(a group barrier cannot stand inside it). Two more are taken, in the last forms `emit` tries (after
+the wave-wide one, each form whole and as the allocation idiom's local waves), so that a program
+that translates without them keeps its form. A region **one thread runs**: every
+way in is the taken edge of a branch on `v_cmp_eq(thread id, k)` in a group of one dimension, or
+comes from a block that thread alone runs (a loop's mask joined by a phi is followed); its reads
+and writes are one thread's, in its own order. And a region whose **reads and writes cannot
+meet**: the byte range of each access is bounded from how its address is made (a constant, a
+mask, a shift, a sum, the access's own offsets); no range read meets a range written, and atomics
+that meet are the same operation, so no order of the halves can show. An atomic that returns the
+old value (`ds_add_rtn_u32`) only in the form of `with_local_waves`, whose idiom check (a wave's
+count goes to the first lane's atomic, the lanes take the base it returned plus their rank among
+the lanes) makes the order of the halves legal; that idiom now knows `ds_add_u32`, `ds_min_u32`,
+... as the reservation. A group of one dimension whose LDS fills all of the 32 KiB takes its
+console threads from the flat id (no counter dword), and in the idiom's form gives no exchange
+dwords, which it never touches. Confirmed with hand-written 128-thread fixtures on the card (two
+console waves): thread 0's three read-modify-writes of a dword; the same by threads 0 and 1 (no
+one-thread region: the form without the skip gives it a barrier per access); the odd threads'
+wave allocation through an LDS counter (64 slots, each once, 8 runs) and the same in a loop the
+lanes leave one by one (192 allocations, each once); and offline over the corpus
+(`translate_cdxil --census`, every translation through `dxil.dll`'s validator): 22 programs are
+still refused, none invalid, and the instruction counts of the others change only where a hoist
+adds its stores. `6b82bc7d22016cb5` translates and validates in the form with the idiom (exact
+in the sense of `with_local_waves`: each lane a slot of its own; the order of the slots between
+the halves is any).
+
+**What is left: `02384a60fda6f2d0`.** Its counter in LDS is read by every lane of a console wave
+and then read and written by lane 63 alone (`ds_read_b32` at `0x254`, `v_mbcnt` ranks,
+`ds_write2st64_b32` at `0x288`, `ds_read_b32` and `ds_write_b32` at `0x2b4`-`0x2c4`), in a loop
+each console wave runs for as many rounds as it has tokens (the second wave in another loop at
+`0x364`-`0x5d8`, with a counter of its own). The halves have to be in step at both places of
+every round: no group barrier gives that (the other console wave is in a loop of its own, with
+another count of rounds), and the idiom does not cover a counter updated without an atomic. What
+would: the wave-wide branches for groups of several console waves, the two host waves of one
+console wave meeting through a pair of LDS flags (each half counts the meetings it has entered
+and waits until the other's count is not below its own) in place of a group barrier. Not
+written: it spins on LDS, which no run on a card has tried, and it needs LDS for the flags.
+`LEONIDA_WAVE_LDS_LOOSE=1` takes the program, approximately (the halves meet only around the
+loops): wrong for the counter.
+
 ## Group packing (`LEONIDA_GROUP_PACK`, off by default)
 
 The card's time barely moves between 1080p and 1440p and is far above what the instructions of
