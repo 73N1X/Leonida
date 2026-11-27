@@ -276,6 +276,7 @@ pub(crate) fn fetched<'a>(pieces: impl Iterator<Item = (&'a Arc<Shadow>, usize, 
 }
 
 /// A line for the frame lines, when watching.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn log(frames: f64) {
     if !enabled() {
         return;
