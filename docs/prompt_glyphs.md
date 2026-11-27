@@ -52,6 +52,15 @@ Not identified: nothing is unknown by shape, but the Xbox/Guide button has no gl
 rotate variants (20/29 against 58/59) the title picks for which prompt is not known. N 8 and 9 are told apart only
 by the lighting; which one the title uses for a plain "D-pad" prompt is not measured.
 
+## The PlayStation package (not read)
+
+The user's PS5 copy is one package file, `EP1004-PPSA38500_00-GRANDTHEFTAUTO00-A0102-V0102.pkg` (212,421,953,822
+bytes; header magic `7F 46 49 48`). Samples of 64 KiB at 5, 25, 50, 75 and 95 % of the file measure 7.85-8.00 bits a byte:
+the game's files inside are encrypted (a package's image is, until the console's keys open it). Under the ground rules
+nothing is decrypted, so the title's own PlayStation glyph movie, if the PS5 build has one, is not read from it; the
+replacement below stays the PlayStation set. A PS5 build's files already extracted by the user's own console as a plain
+folder could be read like the Xbox archive (2026-11-27).
+
 ## The PlayStation replacement
 
 `tools/ps_prompt_glyphs.py` writes a movie with the same export names, canvas sizes and class names:

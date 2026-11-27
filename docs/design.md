@@ -17,6 +17,8 @@ executable is in place; booting can start as soon as `game_scarlett_master.exe` 
   (`0x41`, ReadOnly and RegionIdInXts; EncryptionDisabled `0x2` is clear); ContentType at 0x284 (1, Title);
   XvcDataLength at 0x290 (non-zero for an XVC); PackageVersion at 0x3BC, four u16 stored lowest part first
   (1, 2, 0, 1 is 1.0.2.1). No key field is read.
+- A PS5 package (`.pkg`, magic `7F 46 49 48`) is encrypted in the same sense: 64 KiB samples across a 212 GB one
+  measure 7.85-8.00 bits/byte. Nothing reads its contents ([prompt_glyphs.md](prompt_glyphs.md)).
 
 ## Why a loader before a recompiler
 
