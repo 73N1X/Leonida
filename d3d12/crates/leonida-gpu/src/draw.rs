@@ -651,6 +651,66 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
+/// Whether a wait for every earlier shader write that the title asks for (a
+/// barrier on a buffer, its barrier groups, a pipeline sync) is left out
+/// where its host list has had such a wait and no command since that can
+/// write through unordered access (`LEONIDA_BARRIER_MERGE=1`; off by default;
+/// `LEONIDA_AB` can name it).
+///
+/// The title's buffers have host copies that no barrier of the host's can
+/// name, so each of those calls is a barrier on every resource, which the
+/// card may take for a full wait: between passes that only draw into their
+/// targets (shadow cascades, the geometry passes, thousands of mesh draws)
+/// there is nothing it orders. A wait is still recorded after anything of the
+/// title's that binds a compute pipeline, or a pipeline with a stage whose
+/// code stores to a buffer or a texture or is not known
+/// (`crate::pipeline::Translated::writes`), after a clamp of ours, after an
+/// upscale, and first thing in every host list ([`State::wait_for_writes`]).
+/// Those are all that write through unordered access in a title's host list
+/// today (the light stand-in runs behind a dispatch, which binds a compute
+/// pipeline); a pass of ours added to one has to say so (`waited`).
+///
+/// After felicienradio/cold-project-vi 1141d35 and 5044b98 (vitutu, from
+/// ZigZagBoi1/ScarlettPort; GPL-3.0-or-later): `VICTORY_BARRIER_MERGE`, "skip
+/// redundant global UAV barriers on a host list when no unordered-access
+/// write has been recorded since the previous" one. That tree counts them
+/// in its frame line and gives no frame time for this change alone (its
+/// whole pack: 10-14 fps on a Ryzen 7 9800X3D and RTX 4070 SUPER), so it is
+/// off here until an A/B says what it is worth.
+fn barrier_merge() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_BARRIER_MERGE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_BARRIER_MERGE"))
+}
+
+/// Since the last frame-rate line: waits for every shader write the title
+/// asked for that were recorded, that [`barrier_merge`] left out, and that it
+/// would leave out were it on.
+static WAITS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// For the frame-rate line: what became of the title's waits for every
+/// shader write.
+pub(crate) fn waits_line(frames: f64) {
+    let [recorded, left_out, could] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if recorded + left_out > 0.0 {
+        tracing::info!(
+            "the title's waits for every shader write per frame (LEONIDA_BARRIER_MERGE={}): {recorded:.0} recorded, {left_out:.0} left \
+             out with nothing written through unordered access since the last; {could:.0} of those recorded could be left out",
+            u8::from(barrier_merge())
+        );
+    }
+}
+
+/// Whether a title's wait for every shader write is recorded: `waited`, its
+/// list has had one and nothing since that can write through unordered
+/// access; `merge`, [`barrier_merge`].
+fn wait_needed(waited: bool, merge: bool) -> bool {
+    !(waited && merge)
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -695,6 +755,10 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// The host list has had a wait for every shader write, and nothing
+    /// recorded since can write through unordered access
+    /// ([`State::wait_for_writes`]).
+    waited: bool,
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -1823,6 +1887,8 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        // Another host list, or one a pass of ours wrote in (an upscale).
+        self.waited = false;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -2123,6 +2189,12 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // What is drawn or dispatched with it may write through unordered
+        // access: the title's next wait for shader writes is one
+        // ([`State::wait_for_writes`]).
+        if compute || p.stages.iter().any(|stage| stage.translated().writes) {
+            self.waited = false;
+        }
         // (Clears the cache if the switch changed since the last call.)
         self.cache.sync();
         // Textures picked by index, before anything asks for them.
@@ -2396,6 +2468,7 @@ impl State {
     /// bind sets its pipeline and root signature again. The graphics side
     /// stays as it was.
     fn clamped(&mut self) {
+        self.waited = false;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         self.cache.side_changed(true);
@@ -4927,6 +5000,30 @@ impl State {
         self.batch = None;
     }
 
+    /// The title asks for a wait for every earlier shader write (a barrier on
+    /// a buffer, its barrier groups, a pipeline sync): whether one is to be
+    /// recorded into `list`. Not with [`barrier_merge`], if the list has had
+    /// one and nothing recorded since can write through unordered access.
+    pub(crate) fn wait_for_writes(&mut self, list: &HostList) -> bool {
+        const WAIT_USE: usize = usize::MAX - 0x79;
+        // Another host list (a new one after a cut, or this one after its
+        // reset): what ran before it is not known here.
+        if list.first_use(WAIT_USE) {
+            self.waited = false;
+        }
+        let needed = wait_needed(self.waited, barrier_merge());
+        if !needed {
+            WAITS[1].fetch_add(1, Ordering::Relaxed);
+        } else {
+            WAITS[0].fetch_add(1, Ordering::Relaxed);
+            if self.waited {
+                WAITS[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.waited = true;
+        needed
+    }
+
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
@@ -6134,5 +6231,31 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    /// A title's wait for every shader write is left out only with the
+    /// switch, and only when its list has had one with nothing since that
+    /// can write through unordered access; a list starts with nothing waited
+    /// for, and a clamp of ours, another host list and a reset are waited
+    /// for again.
+    #[test]
+    fn a_wait_is_left_out_only_after_one_with_nothing_written_since() {
+        assert!(wait_needed(false, false));
+        assert!(wait_needed(false, true));
+        assert!(wait_needed(true, false));
+        assert!(!wait_needed(true, true));
+        let mut state = State::default();
+        assert!(!state.waited);
+        state.waited = true;
+        state.clamped();
+        assert!(!state.waited);
+        state.waited = true;
+        state.reset(std::ptr::null());
+        assert!(!state.waited);
     }
 }

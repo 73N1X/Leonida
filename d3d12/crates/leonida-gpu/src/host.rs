@@ -3927,6 +3927,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::draw::waits_line(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::port::log(frames);

@@ -153,6 +153,11 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Whether its code can write through unordered access at all: a store
+    /// to buffer memory ([`stores`]) or to a texture ([`image_stores`]); true
+    /// when its code is not known. What a later wait for every shader write
+    /// has to wait for (`crate::draw::State::wait_for_writes`).
+    pub(crate) writes: bool,
     /// A compute program translated to run several console groups to a host group
     /// (`LEONIDA_GROUP_PACK`): where its console grid goes (`crate::draw::pack_of`).
     pub(crate) pack: Option<crate::draw::PackWords>,
@@ -235,6 +240,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let writes = stores || programs.iter().any(image_stores);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -259,6 +265,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        writes,
         pack,
         pack_logged: Default::default(),
         picks: Default::default(),
@@ -417,6 +424,20 @@ fn stores(program: &leonida_shader::NativeProgram) -> bool {
             _ => false,
         }
     })
+}
+
+/// Whether a console program has an image store or atomic (it writes a
+/// texture through unordered access), or code that does not decode.
+/// After felicienradio/cold-project-vi 1141d35 (vitutu, from
+/// ZigZagBoi1/ScarlettPort; GPL-3.0-or-later).
+#[cfg(windows)]
+fn image_stores(program: &leonida_shader::NativeProgram) -> bool {
+    use leonida_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter()
+        .any(|i| matches!(i.encoding, Encoding::Mimg) && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic")))
 }
 
 /// Whether a console program can store to memory through raw addresses
