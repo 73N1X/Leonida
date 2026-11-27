@@ -101,3 +101,8 @@ is not touched or needed.
   through a zlib DirectStorage request on `data.rpf` (or not at that offset); `LEONIDA_DSTORAGE_TRACE=2` lists the
   requests. The warning `a read at the glyph movie's offset is not the movie` means the offset matched but the file or size
   did not.
+- **Tried in the title (2026-11-27, Series X profile, `--from-archive` movie, `LEONIDA_PROMPTS=playstation`, no pad).**
+  Both log lines appeared about 4 s after start, and the pause menu's prompts showed the replacement glyphs with the
+  usual PlayStation mapping (Photo Studio on square, Select on cross, Back on circle): Scaleform accepts the movie and
+  the swap at the DirectStorage read works. Not tried yet: a real DualSense or DualShock 4 over HID, Bluetooth, and
+  whether the title reads the movie again after start (a live switch).
