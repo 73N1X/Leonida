@@ -236,6 +236,8 @@ fn diagnostics(image: &leonida_loader::LoadedImage, cfg: &leonida_core::Config) 
     leonida_loader::profile_on_schedule(leonida_hle::frame_phase);
     leonida_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    // `LEONIDA_NATIVE_SCAN=<seconds>`: looks for the script engine's handler tables (docs/mod-menu.md).
+    crate::native_scan::start(image.base(), image.info());
     poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `LEONIDA_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.

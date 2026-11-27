@@ -164,6 +164,27 @@ following that would need either a run-time trace of the script VM (finding wher
 command) or the scripts decoded first. If it turns out to be obfuscated on purpose, the rules say to stop and write
 it down here, which is where this stands.
 
+### Looking for the tables at run time (stage 1)
+
+The static searches above read the file; the title builds its script tables in memory. A diagnostics build
+(`--features diagnostics`) can look there: `LEONIDA_NATIVE_SCAN=<seconds>[,<seconds>...]` starts a thread that, that
+many seconds after the title starts, walks the process's committed memory (`VirtualQuery`; read through
+`ReadProcessMemory` on the own process, so a page that vanishes fails the read instead of the process; nothing is
+written to the title). Its own copy buffer is a separate allocation that the walk skips; the runtime's other
+allocations cannot be told apart, so the output tags each region (`heap-rw`, `title-image-rw`, ...) instead.
+
+It looks for runs of at least `LEONIDA_NATIVE_MIN_RUN` (64) elements that all point into an executable section of
+the title: qwords with a stride of 1 to 8 qwords (an array, `(hash, handler)` pairs, wider buckets; any slot may
+hold the handler) and 32-bit values that are RVAs into code. A stride-1 run hides the longer strides inside it. Runs
+with at least `LEONIDA_NATIVE_MIN_DISTINCT` (200) distinct handlers are listed (the 200 best), with their overlap,
+the share of the union of handlers each covers and, for strided runs, per slot how many distinct values and how
+many look like a 64-bit hash. `LEONIDA_NATIVE_ALL=1` also scans read-only and DLL-backed memory.
+
+Output, kept out of the repository because it holds addresses of the title: `%TEMP%\leonida-natives\scan-<s>s\`
+with `summary.txt` (memory scanned, runs by distinct count, the union and its RVA histogram per MiB),
+`candidates.txt`, `targets.txt` (handler RVAs per candidate) and `union.txt`. Results of a real run go here next,
+as counts and method only.
+
 ## Tests
 
 - `cargo test -p leonida-menu`: the model (navigation, wrap-around, scrolling, the back stack, toggles, numbers,

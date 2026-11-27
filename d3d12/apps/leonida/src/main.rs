@@ -7,6 +7,8 @@ mod census;
 mod inspect;
 mod leonida;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod native_scan;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
 mod shader;
