@@ -201,6 +201,20 @@ written: it spins on LDS, which no run on a card has tried, and it needs LDS for
 `LEONIDA_WAVE_LDS_LOOSE=1` takes the program, approximately (the halves meet only around the
 loops): wrong for the counter.
 
+**What the wave-wide form costs on the card.** In a GPU timing run at the save (Series X,
+1440p, RTX 4060 Ti; `LEONIDA_GPU_TIMING=1`, 2026-11-27) one indirect dispatch of
+`6f225b641c5b0708` took 76-80 ms of the frame, every frame; the next heaviest command took 3 ms
+and all the others together about 65. Its translation (`dxc -dumpbin`) has 125 group barriers, 115
+of them inside an outer loop that holds nearly the whole program and 50-76 inside each of two loops
+nested in it: each branch on EXEC and each wave read where not every lane runs is an exchange of the
+two host waves through LDS with two barriers, every iteration, in every 8 x 8 tile of the screen.
+Runs x31-x33 had looked right with the water fix, at about 35 ms on the card: the program's
+pipeline was not made yet in them (dispatches without a host pipeline are dropped), so what they
+show is the water without it. The NVIDIA launcher drops its dispatches again
+(`LEONIDA_WATER_TRANSMISSION=1` runs it). What would make it cheap: one barrier per exchange (two
+dwords used by turns), and no exchange for a branch whose condition the console wave already holds
+in an SGPR (uniform by construction).
+
 ## Group packing (`LEONIDA_GROUP_PACK`, off by default)
 
 The card's time barely moves between 1080p and 1440p and is far above what the instructions of

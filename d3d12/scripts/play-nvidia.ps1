@@ -149,6 +149,17 @@ if ($RayTracing) {
     $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
     if ($env:LEONIDA_SKIP_RT_RESOLVE -eq '1' -and (Test-Path $rtList)) { $settings.LEONIDA_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim() }
 }
+# Leonida: the water's CS_TransmissionVolumetrics program 6f225b641c5b0708 translates since the wave-wide form
+# (docs/findings.md), but that form puts 115 group barriers in its outer loop (an exchange between the two host
+# waves of each console wave at every branch on EXEC): one indirect dispatch of it took 76-80 ms of an RTX 4060 Ti's
+# frame, the next heaviest command 3 ms (GPU timing run, 2026-11-27; frames 180-260 ms against about 95 without it).
+# Its dispatches are dropped, as they were before it translated (the water looked the same in runs x31-x33, where
+# its pipeline was not made yet). LEONIDA_WATER_TRANSMISSION=1 runs it.
+if ($env:LEONIDA_WATER_TRANSMISSION -ne '1') {
+    $skip = @('6f225b641c5b0708')
+    if ($settings.LEONIDA_SKIP_PIPELINES) { $skip = @($settings.LEONIDA_SKIP_PIPELINES) + $skip }
+    $settings.LEONIDA_SKIP_PIPELINES = $skip -join ','
+}
 if ($Adapter) { $settings.LEONIDA_ADAPTER = $Adapter }
 if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
     $settings.LEONIDA_WINDOWS_BAR_MB = $WindowsBarMB.ToString([Globalization.CultureInfo]::InvariantCulture)
