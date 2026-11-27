@@ -8159,9 +8159,24 @@ impl std::hash::Hasher for AddressHash {
     fn finish(&self) -> u64 {
         self.0
     }
+    /// Eight bytes a step, and one more for what is left (with how many
+    /// bytes that is: `ab` and `ab\0` differ). A key of several words comes
+    /// here as its bytes: a descriptor record's three
+    /// (`crate::descriptor::host::ListViews`) took twelve steps a byte at a
+    /// time, for every slot of every table a list makes, and takes two.
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            let mut eight = [0u8; 8];
+            eight.copy_from_slice(word);
+            self.write_u64(u64::from_le_bytes(eight));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            // (At most seven bytes: the top one is free for their number.)
+            self.write_u64(u64::from_le_bytes(last) | (rest.len() as u64) << 56);
         }
     }
     fn write_usize(&mut self, n: usize) {
@@ -8239,6 +8254,61 @@ mod address_hash_tests {
         // Fills of scratch memory: (source, bytes).
         let keys: Vec<u64> = (0..4096usize).map(|i| hash((0x2_8000_0000usize + (i / 4) * 0x100, 0x100usize << (i % 4)))).collect();
         spread("fills", &keys);
+    }
+
+    /// What a hasher is handed, in order: a number, or so many bytes at once.
+    #[derive(Default)]
+    struct Handed(Vec<(bool, usize)>);
+
+    impl std::hash::Hasher for Handed {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.push((true, bytes.len()));
+        }
+        fn write_usize(&mut self, n: usize) {
+            self.0.push((false, n));
+        }
+    }
+
+    /// A descriptor record (tag, index, generation: the key of the views a
+    /// list made, `crate::descriptor::host::ListViews`) is handed over as its
+    /// length and its twelve bytes at once, and hashed in three steps: the
+    /// length, eight bytes, and the four left with their number. Records
+    /// that differ in one word hash apart, and a list's records spread.
+    #[test]
+    fn a_record_of_three_words_is_hashed_a_word_at_a_time() {
+        use std::hash::{Hash, Hasher};
+        let record = [0x5649_4557u32, 0x0001_2345, 7];
+        let mut handed = Handed::default();
+        record.hash(&mut handed);
+        assert_eq!(handed.0, [(false, 3), (true, 12)], "the standard library hands a record over otherwise now");
+        let mut by_hand = AddressHash::default();
+        by_hand.write_usize(3);
+        by_hand.write_u64(u64::from(record[0]) | u64::from(record[1]) << 32);
+        by_hand.write_u64(u64::from(record[2]) | 4 << 56);
+        assert_eq!(hash(record), by_hand.finish());
+        for word in 0..3 {
+            for bit in 0..32 {
+                let mut other = record;
+                other[word] ^= 1 << bit;
+                assert_ne!(hash(other), hash(record), "word {word}, bit {bit}");
+            }
+        }
+        // The bytes left over count: a shorter key is not the longer one
+        // that ends in zeros.
+        let bytes = |b: &[u8]| {
+            let mut h = AddressHash::default();
+            h.write(b);
+            h.finish()
+        };
+        assert_ne!(bytes(b"ab"), bytes(b"ab\0"));
+        assert_ne!(bytes(b"12345678"), bytes(b"12345678\0"));
+        assert_eq!(bytes(&7u64.to_le_bytes()), hash(7u64));
+        // A list's records: one tag, slots one after the other, a few generations.
+        let keys: Vec<u64> = (0..4096u32).map(|i| hash([0x5649_4557u32, 0x4000 + i / 2, 1 + i % 2])).collect();
+        spread("records", &keys);
     }
 }
 
