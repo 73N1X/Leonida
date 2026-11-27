@@ -515,8 +515,81 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    // Let go of on the reaper thread ([`reaper`]), if there is one.
+    if let Some(tx) = reaper()
+        && let Err(std::sync::mpsc::SendError(Reaped::Objects(done))) = tx.send(Reaped::Objects(done))
+    {
+        drop(done);
+    }
 }
+
+/// Whether what the host is done with is let go of on a thread of its own
+/// ([`reaper`]; on by default, `LEONIDA_REAPER=0` turns it off;
+/// `LEONIDA_AB` can turn it on and off while the title runs).
+fn reaping() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_REAPER") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_REAPER").is_none_or(|v| v != "0"))
+}
+
+/// The thread that lets go of what the host is done with, when
+/// [`reaping`]: resetting the host lists of landed flights and keeping
+/// them for reuse ([`land`]), and dropping retired objects whose
+/// submissions have run ([`bury`]). Both are the driver's work (command
+/// allocators reset, allocations destroyed, addresses freed), and both ran
+/// on the submitting thread at the end of each submission sent ahead: in a
+/// timeline of the world (Series X, RX 7900 XTX) host lists were reset 250
+/// times a frame, 20 ms of threads' time. Only what is already due is
+/// sent ([`bury_lag`] and [`land`]'s lag are unchanged). After mgrein's
+/// VIctory-7900XTX a2cf68bb (GPL-3.0-or-later, as this), through
+/// Grimkaaah/Victory-Grimkaaah f2586ef (GPL-3.0), which measured -2.3 to
+/// -3.8 ms a frame with it on its host.
+fn reaper() -> Option<&'static std::sync::mpsc::Sender<Reaped>> {
+    if !reaping() {
+        return None;
+    }
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Reaped>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Reaped>();
+            std::thread::Builder::new()
+                .name("leonida-reaper".into())
+                .spawn(move || {
+                    for reaped in rx {
+                        match reaped {
+                            Reaped::Lists(landed) => {
+                                let _reaping = crate::timeline::span("reaper: landed lists reset and given back");
+                                for (lists, order) in landed {
+                                    crate::list::recycle(lists, &order);
+                                }
+                            }
+                            Reaped::Objects(objects) => {
+                                let _reaping = crate::timeline::span("reaper: retired objects dropped");
+                                drop(objects);
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// What goes to the reaper thread ([`reaper`]): landed flights' host lists
+/// ([`land`]), or retired objects whose submissions have run ([`bury`]).
+enum Reaped {
+    Lists(Vec<(Vec<crate::list::Detached>, Vec<usize>)>),
+    Objects(Vec<(u64, Retired)>),
+}
+
+// SAFETY: the lists have run and nothing else names them; D3D12 objects
+// may be released and reset on any thread (as the line, which held them,
+// and [`Retired`]).
+unsafe impl Send for Reaped {}
 
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
@@ -3315,6 +3388,19 @@ fn land() {
         let mut line = line();
         let n = line.landed.len().saturating_sub(bury_lag() as usize);
         line.landed.drain(..n).collect()
+    };
+    if landed.is_empty() {
+        return;
+    }
+    // On the reaper thread ([`reaper`]): the lists have run; nothing else
+    // holds them.
+    let landed = match reaper() {
+        Some(tx) => match tx.send(Reaped::Lists(landed)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(Reaped::Lists(landed))) => landed,
+            Err(_) => return,
+        },
+        None => landed,
     };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
