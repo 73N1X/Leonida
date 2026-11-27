@@ -557,14 +557,14 @@ private:
     // The first job this worker may take, most urgent first (see the class comment). With one worker: any job for the
     // general worker, a graphics job for the graphics one, but not one whose PSO has a build running on the other.
     std::multimap<std::size_t, Job>::iterator next_locked(bool graphics_only) {
-        // Either way a job whose PSO has one running waits: two variants of one graphics PSO, one on each worker, and
-        // its last release (after_running, which waits for the running job only) would delete the PSO under the other.
-        const auto pso_busy = [this](const Job& job) {
-            return std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; });
-        };
+        // As on main with #2361 (qhukz13, RT-COMPILE-OWNER-RACE): a job whose PSO has an entry running waits, so
+        // after_running never deletes a PSO while another build of it runs on the other worker.
         if (!pool_ || pool_->threads < 2) {
-            return std::find_if(jobs_.begin(), jobs_.end(), [&](const auto& entry) {
-                return (!graphics_only || entry.second.graphics) && !pso_busy(entry.second);
+            return std::find_if(jobs_.begin(), jobs_.end(), [this, graphics_only](const auto& entry) {
+                if (graphics_only && !entry.second.graphics) return false;
+                const void* owner = entry.second.owner;
+                // A finished entry may still be running what comes after its job (the PSO's deletion): it counts too.
+                return std::none_of(running_.begin(), running_.end(), [owner](const Running& r) { return r.owner == owner; });
             });
         }
         unsigned heavy = 0, large = 0, speculative = 0, demanded = 0;
@@ -580,7 +580,8 @@ private:
                 if (running_.empty()) return it;
                 continue;
             }
-            if (pso_busy(job)) continue;
+            if (std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; }))
+                continue;
             if ((job.large || it->first != 0) && heavy >= pool_->threads - 1) continue;
             if (job.large && large >= pool_->heavy) continue;
             if (it->first != 0 && (speculative || demanded)) continue;
