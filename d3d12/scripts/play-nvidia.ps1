@@ -127,8 +127,8 @@ $settings = @{
     # its 33^3 identity grading tables at a log-encoded colour, and read unfiltered they hand back 33 steps over 14
     # stops, about five flat levels per doubling of brightness (runs p3, p4, c1: 700-1,400 colours in a sky region;
     # run s1 with every program's made linear: 28,000-32,000). What read them unfiltered was a pipeline restored
-    # from the pipeline library with another run's sampler places, and such pipelines skip the library since
-    # (pipeline/library.rs allows_static_samplers), so this is a second guard for the tonemap alone.
+    # from the pipeline library with another run's sampler places; such pipelines are kept by those places since,
+    # or left to the driver (pipeline/places.rs), so this is a second guard for the tonemap alone.
     # It was '1' (every program) until 2026-11-27. The title point-samples on purpose in 1,468 of its program names:
     # the pass that puts the low-resolution fog on the picture picks its four texels by depth one by one, and read
     # linearly each of them is a mix across the silhouette (pipeline/host.rs LinearScope; the expected cause of the

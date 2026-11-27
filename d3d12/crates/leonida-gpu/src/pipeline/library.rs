@@ -7,7 +7,8 @@
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
 //!    an entry whose description differs, so neither is ever used. NVIDIA
-//!    pipelines with static samplers use the driver's own cache instead.
+//!    pipelines with static samplers are named by the places of their
+//!    samplers too ([`super::places`]), or left to the driver's own cache.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -398,7 +399,7 @@ pub(crate) fn trim() {
     }
 }
 
-struct Library {
+pub(super) struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
     _blob: Blob,
@@ -442,6 +443,48 @@ const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
+
+/// The host's library, for what is kept in it beside title pipelines
+/// ([`super::places`]).
+pub(super) fn host_library() -> Option<&'static Library> {
+    library()
+}
+
+impl Library {
+    /// The pipeline stored as `name`, loaded by `load`; `None` if it is not
+    /// there with that description.
+    pub(super) fn load(
+        &self,
+        name: &str,
+        load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    ) -> Option<ID3D12PipelineState> {
+        let wide = HSTRING::from(name);
+        let _all = one_call();
+        let _one = same_name(name);
+        let _call = call("load", name);
+        let loaded = load(&self.library, PCWSTR(wide.as_ptr())).ok();
+        // The load read the library's file (see `trim`).
+        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+        TRIMMED.store(false, Ordering::Relaxed);
+        loaded
+    }
+
+    /// Stores `pso` as `name` (with the next save); false if the name is
+    /// taken.
+    pub(super) fn store(&self, name: &str, pso: &ID3D12PipelineState) -> bool {
+        let wide = HSTRING::from(name);
+        let _all = one_call();
+        let _stores = self.saving.read().unwrap_or_else(|e| e.into_inner());
+        let _call = call("store", name);
+        // SAFETY: a live pipeline; a name already stored is refused, which
+        // leaves the library as it was.
+        let stored = unsafe { self.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok();
+        if stored {
+            self.added.fetch_add(1, Ordering::Relaxed);
+        }
+        stored
+    }
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -571,11 +614,15 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// The NVIDIA driver can restore a pipeline with static sampler indices from
-/// the process that stored it. When the next process creates samplers in a
-/// different order, the pipeline can pick the wrong filter or address mode,
-/// so on NVIDIA such pipelines are made by the driver every run.
-/// `LEONIDA_LIBRARY_STATIC_SAMPLERS=1` enables library reuse for comparison.
+/// Whether a pipeline with static samplers is kept in the library under its
+/// plain name: on every card but NVIDIA's. That driver restores a pipeline
+/// with the places its static samplers had in the table of the process
+/// that stored it; in a process that made static samplers in another order
+/// it samples through others (a wrong filter or address mode). There such
+/// pipelines are kept by the places of their samplers, or made by the
+/// driver every run ([`super::places`]).
+/// `LEONIDA_LIBRARY_STATIC_SAMPLERS=1`: under their plain names on NVIDIA
+/// too, for comparison.
 pub(super) fn allows_static_samplers(host: &crate::host::Host) -> bool {
     const NVIDIA: u32 = 0x10DE;
     static ALLOWED: OnceLock<bool> = OnceLock::new();

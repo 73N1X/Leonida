@@ -112,9 +112,9 @@ impl Default for GraphicsState {
 /// that stored it (trustno1-coder/VIctory-NVIDIA 7fa0e95, reproduced there;
 /// Spaghetih/victory-sley-fork 63714f3 found the same: any change of the
 /// composite's root signature, or a new library, took the bands away). Such
-/// pipelines skip the library since ([`super::library::allows_static_samplers`]),
-/// so the setting is kept for the composite's programs alone, as a second
-/// guard.
+/// pipelines are in the library by the places of their samplers since, or
+/// not at all ([`super::places`]), so the setting is kept for the
+/// composite's programs alone, as a second guard.
 ///
 /// Why not every program: the title point-samples on purpose. Counted over the
 /// 26,503 programs of a work folder's disassembly (2026-11-27), 21,876 sample
@@ -754,6 +754,10 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // On NVIDIA a pipeline with static samplers is in the library by the
+        // places of its samplers, or not at all ([`super::places`]); asked
+        // before the root signature gives a sampler new to this run a place.
+        let library = super::places::library_use(host, &samplers);
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -770,9 +774,6 @@ impl HostPipeline {
                 },
             )
         };
-        // Pipelines with static samplers skip the library on NVIDIA
-        // ([`super::library::allows_static_samplers`]).
-        let use_library = samplers.is_empty() || super::library::allows_static_samplers(host);
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -782,7 +783,7 @@ impl HostPipeline {
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
-                use_library.then_some(name.as_str()),
+                library.name(&name).as_deref(),
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -847,7 +848,7 @@ impl HostPipeline {
             );
             let pso = match mesh_pipeline(
                 &host.device, &root, code(0), code(1), g, depth_bounds,
-                use_library.then_some(name.as_str()),
+                library.name(&name).as_deref(),
             ) {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -934,7 +935,8 @@ impl HostPipeline {
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
-            let library_name = use_library.then_some(name);
+            let library_name = library.name(name);
+            let library_name = library_name.as_deref();
             if depth_bounds {
                 return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), library_name);
             }
@@ -1023,9 +1025,9 @@ impl HostPipeline {
 
 /// A stream subobject: its type, then its description, pointer-aligned.
 #[repr(C, align(8))]
-struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+pub(super) struct Sub<T>(pub(super) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, pub(super) T);
 
-fn stream_pipeline<S>(
+pub(super) fn stream_pipeline<S>(
     device: &ID3D12Device,
     stream: &mut S,
     name: Option<&str>,
@@ -1194,7 +1196,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
+pub(super) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
