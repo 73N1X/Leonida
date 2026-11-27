@@ -652,6 +652,38 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Gives back a list's dynamic slots (title heap, first, how many): the
+/// registry's lock taken once, and each host heap's once for the tables that
+/// follow each other in it (`LEONIDA_DYNAMIC_BITS=0`: each by itself, as
+/// before).
+#[cfg(windows)]
+pub(crate) fn release_dynamic_many(tables: &[(usize, u32, u32)]) {
+    if !host::dynamic_bits() {
+        for &(heap, first, n) in tables {
+            release_dynamic(heap, first, n);
+        }
+        return;
+    }
+    if tables.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(tables.len());
+    let mut rest = tables;
+    while let Some(&(heap, ..)) = rest.first() {
+        let same = rest.iter().take_while(|t| t.0 == heap).count();
+        runs.clear();
+        runs.extend(rest[..same].iter().map(|&(_, first, n)| (first, n)));
+        rest = &rest[same..];
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_many(&runs);
+        }
+    }
+}
+
 /// Runs `f` with the host heap of the title's largest view heap, if there is
 /// one (nothing is waited for).
 #[cfg(windows)]
