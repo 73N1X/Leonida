@@ -510,6 +510,17 @@ public:
                                     std::memcpy(reinterpret_cast<void*>(i), copy + (i - x), j - i);
                                     written += j - i;
                                 }
+                                // A retired copy's bytes are the title's now: the copies that held the older ones
+                                // take them too, as the next refresh would, so one read before it (the range that
+                                // replaced the window, when the window is freed after this submission's refresh)
+                                // is not behind the title. A copy that changed a byte keeps its own.
+                                if (pass == 1)
+                                    for (const Target* o : over) {
+                                        if (o == t) continue;
+                                        for (std::uintptr_t v = std::max(i, o->begin); v < std::min(j, o->end); ++v)
+                                            if (o->shadow[v - o->begin] == before[v - c])
+                                                o->shadow[v - o->begin] = copy[v - x];
+                                    }
                                 i = j;
                             }
                         }

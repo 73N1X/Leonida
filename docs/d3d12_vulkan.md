@@ -1724,7 +1724,9 @@ The copies:
   is freed (a range noted when a list was recorded can be copied back before a held batch has run). A retired copy goes
   back only on the bytes no live copy over them changed, byte by byte (the window and the buffer that replaced it can
   each have written their own bytes of one 256-byte piece), and every copy is compared with the title's bytes as
-  they were before any copy went back. `d3d12_title_window_orphans` covers it, with a writing batch held on a fence
+  they were before any copy went back. The bytes a retired copy returns are also written into every other copy over
+  them that still held the title's older bytes, as the next refresh would: a window is freed after its submission's
+  refresh, and the range that replaced it reads its last bytes in that same submission. `d3d12_title_window_orphans` covers it, with a writing batch held on a fence
   while the next submission's refresh retires its window. A window is
   not retired when its pages are released or remapped: a retail run measured no release at all of the pages windows
   cover (the title remaps its pool frames instead), and the tracker follows the pages.

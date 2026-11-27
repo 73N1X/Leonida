@@ -1220,6 +1220,30 @@ int check_retired_window_write_back(Context& c) {
     WriteBack held{&c, allocators[0].p, lists[0].p, out.p, heap.p, gpu, gated.p};
     WriteBack next{&c, allocators[1].p, lists[1].p, out.p, heap.p, gpu};
     const std::uint64_t arena_va = out->GetGPUVirtualAddress();  // not the title's memory: nothing to copy back
+    // A reader through the buffer placed over the ring, with its own heap and output.
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto readback_desc = buffer_desc(kBytes);
+    Ref<ID3D12Resource> read_out, readback;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&read_out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    Ref<ID3D12DescriptorHeap> read_heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&read_heap.p))));
+    const std::uint64_t read_out_va = read_out->GetGPUVirtualAddress();
+    std::memcpy(reinterpret_cast<void*>(reinterpret_cast<XboxHeapHandleFn>(slot(read_heap.p, 9))(read_heap.p)),
+                &read_out_va, sizeof(read_out_va));
+    Ref<ID3D12CommandAllocator> read_allocator;
+    Ref<ID3D12GraphicsCommandList> read_list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      IID_PPV_ARGS(&read_allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, read_allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&read_list.p))));
+    EXPECT(read_list->Close() == S_OK);
+    Reader reader{&c, read_allocator.p, read_list.p, read_out.p, readback.p, read_heap.p,
+                  reinterpret_cast<XboxHeapHandleFn>(slot(read_heap.p, 10))(read_heap.p)};
     // Pages no range answers for yet: a range of a buffer the tests before this one placed can outlive the buffer at
     // an address the ring might get again, so such pages are kept aside until the end. Write-combined, so the buffer
     // placed over them is a copy refreshed before each submission on every driver (one that imports read-write pages
@@ -1272,24 +1296,28 @@ int check_retired_window_write_back(Context& c) {
     // half of the 256-byte piece [256, 512) whose second half only the window wrote. Both go back, each its own bytes.
     EXPECT(submit_write(next, ring_va + held_at - 256) == 0);
     // The title resets the list it recorded (a list may be executed again until then); then the window goes, and
-    // what the held submission wrote in it reaches the title's pages first.
+    // what the held submission wrote in it reaches the title's pages first, and the copy of the buffer over them: the
+    // submission that frees it reads them through the buffer (256 bytes past ring + held_at - 256).
     EXPECT(allocators[0]->Reset() == S_OK);
     EXPECT(lists[0]->Reset(allocators[0].p, c.pso) == S_OK);
     EXPECT(lists[0]->Close() == S_OK);
     rt::d3d12::TitleWindows freed{};
+    UINT seen = 0;
     for (int i = 0; i < 8; ++i) {
-        EXPECT(submit_write(next, arena_va) == 0);
+        EXPECT(read_root(reader, ring_va + held_at - 256, ring + (held_at - 256) / 4, seen) == 0);
         freed = rt::d3d12::title_windows(c.inner);
         if (!freed.waiting) break;
     }
     UINT written = 0;
     for (UINT i = 0; i < kElements; ++i) written += ring[held_at / 4 + i] != 0;
     std::printf("retired window write back: kept while a held batch named it (%llu waiting); %u of %u words the held "
-                "submission wrote reached the title's pages, %llu retired windows wait for the GPU\n",
-                static_cast<unsigned long long>(kept.waiting), written, kElements,
+                "submission wrote reached the title's pages, %u read through the buffer by the submission that freed "
+                "the window; %llu retired windows wait for the GPU\n",
+                static_cast<unsigned long long>(kept.waiting), written, kElements, seen,
                 static_cast<unsigned long long>(freed.waiting));
     EXPECT(freed.waiting == 0);
     EXPECT(written == kElements);
+    EXPECT(seen == kElements);
     // The buffer's own words go back with its submission's batch (none with LEONIDA_TITLE_WRITEBACK=0).
     const char* write_back = std::getenv("LEONIDA_TITLE_WRITEBACK");
     UINT buffer_words = 0;
