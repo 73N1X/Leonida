@@ -1756,8 +1756,14 @@ The copies:
   that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, and never past the
   next mapping in either view; a geometry copy when the cap allows, a window otherwise). A request whose byte a
   mapping already holds in either view is served by it when the mapping holds all of the request's bytes, and the
-  other view is entered as far as that mapping reaches; a request no mapping can hold whole gets a zero-size view.
-  Both addresses of the pair are entered in the table, so a V# naming either reaches that one mapping instead of
+  other view is entered as far as that mapping reaches. A request never gets a mapping shorter than its bytes (a V#'s
+  size, 64 KiB for a root view): one that runs into the next mapping, or past the end of the one holding its first
+  byte, gets one mapping over itself and every window it reaches, each whole, in both views (`title_pool_cover`,
+  `TitleVaAliases::replace_twin`), and those windows are retired at the next submission. Only with a range in the way
+  that is not a window (a slot-133 buffer, a geometry copy), or pages that are not readable, does it get a zero-size
+  view: a refusal there would also have the root views a title rings through a pool read zeros where it served them
+  before. `vsharp_address` asks again, like `TitleVaAliases::resolve`, when the range holding a V#'s base ends before
+  the V# does. Both addresses of the pair are entered in the table, so a V# naming either reaches that one mapping instead of
   asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
   Acceleration-structure destinations and scratch also resolve through the table, and a structure no window holds
   whole gets a copy of its whole range, so the BVH builder's commands are recorded.

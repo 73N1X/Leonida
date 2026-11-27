@@ -1247,6 +1247,35 @@ int check_window_orphans(Context& c) {
     EXPECT(matched == kElements);
     EXPECT(rt::d3d12::title_windows(c.inner).count == pooled.count);
 
+    // A view whose bytes run from the second extent into the first gets one mapping for all of them, over both, never
+    // one that stops at the first one's start: a V# with too few bytes is refused, and a root view would reach past
+    // its copy into whatever the arena holds next. Both extents are retired at the next submission, and the GPU
+    // reads the title's bytes across the seam.
+    const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const std::uint64_t cbv = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p) + inc;
+    constexpr UINT64 seam = later - 0x8000, seam_bytes = 0x10000;  // 32 KiB on each side of the first extent's start
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC crossing{gpu_va + seam, UINT(seam_bytes)};
+    c.device->CreateConstantBufferView(&crossing, D3D12_CPU_DESCRIPTOR_HANDLE{cbv});
+    const std::uint64_t covered = aliases.shader_va(gpu_va + seam, seam_bytes);
+    const auto merged = rt::d3d12::title_windows(c.inner);
+    std::printf("window orphans: a 64 KiB view across the two extents' seam got V# base 0x%llx (%s), one mapping of "
+                "%llu KiB over both\n",
+                static_cast<unsigned long long>(vsharp_base(cbv)),
+                covered != gpu_va + seam ? "all its bytes in one copy" : "no copy holds them all",
+                static_cast<unsigned long long>((merged.bytes - pooled.bytes) >> 10));
+    EXPECT(covered != gpu_va + seam && vsharp_base(cbv) == (covered & 0xFFFFFFFFFFFFull));
+    EXPECT(aliases.shader_va(cpu_va + seam, seam_bytes) == covered);
+    EXPECT(merged.count == pooled.count + 1 && merged.bytes - pooled.bytes == pool_bytes - earlier);
+    EXPECT(aliases.shader_va(cpu_va + later) == covered + (later - seam));
+    EXPECT(aliases.shader_va(gpu_va + earlier) == covered - (seam - earlier));
+    EXPECT(read_root(r, gpu_va + later - 0x180, pool + (later - 0x180) / 4, matched) == 0);  // 512 bytes over it
+    EXPECT(matched == kElements);
+    const auto settled = rt::d3d12::title_windows(c.inner);
+    EXPECT(settled.retired == merged.retired + 2 && settled.count == merged.count - 2);
+    EXPECT(settled.bytes == pooled.bytes);
+    EXPECT(read_root(r, cpu_va + earlier, pool + earlier / 4, matched) == 0);
+    EXPECT(matched == kElements);
+
     // A 128 KiB constant ring: a window for its first page, then a buffer the title places over the whole ring.
     constexpr UINT64 ring_bytes = 128 * 1024;
     auto* ring = static_cast<std::uint32_t*>(
@@ -1259,8 +1288,8 @@ int check_window_orphans(Context& c) {
     EXPECT(matched == kElements);
     const auto windowed = rt::d3d12::title_windows(c.inner);
     const std::uint64_t window = aliases.shader_va(ring_va);
-    EXPECT(windowed.count == pooled.count + 1 && window != ring_va);
-    const std::uint64_t window_bytes = windowed.bytes - pooled.bytes;
+    EXPECT(windowed.count == settled.count + 1 && window != ring_va);
+    const std::uint64_t window_bytes = windowed.bytes - settled.bytes;
     Ref<ID3D12Resource> placed;
     EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, ring, buffer_desc(ring_bytes), 0xFFFFFFFFu,
                                                               IID_PPV_ARGS(&placed.p))));

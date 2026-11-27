@@ -78,6 +78,22 @@ public:
         return true;
     }
 
+    // add_twin over live ranges: every range either address's bytes overlap is replaced whole (each is told as a
+    // removal), then both are entered under one lock. For a stream-pool request that runs into the windows next to it
+    // (title_pool_cover): the new range covers each of them whole, so none of their bytes is left unanswered.
+    bool replace_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va) {
+        if (!bytes || va > UINT64_MAX - bytes || twin > UINT64_MAX - bytes) return false;
+        if (va != twin && va < twin + bytes && twin < va + bytes) return false;
+        std::unique_lock lock(mutex_);
+        erase_overlapping(va, va + bytes);
+        if (va != twin) erase_overlapping(twin, twin + bytes);
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader_va});
+        pending.try_emplace(twin, Range{twin + bytes, shader_va});
+        publish_pool_ranges(pending);
+        return true;
+    }
+
     bool reuse_pool_mapping(std::uint64_t va, std::uint64_t twin, std::uint64_t want, std::uint64_t max_size,
                             std::uint64_t& shader_va) {
         if (!want) return false;
@@ -180,6 +196,16 @@ public:
         std::shared_lock lock(mutex_);
         out.reserve(ranges_.size());
         for (const auto& [start, range] : ranges_) out.push_back({start, range.end, range.shader_va});
+    }
+    // The ranges that overlap [begin, end), in title-VA order.
+    void overlapping(std::uint64_t begin, std::uint64_t end, std::vector<Mapping>& out) const {
+        out.clear();
+        if (begin >= end || !count_.load(std::memory_order_acquire)) return;
+        std::shared_lock lock(mutex_);
+        auto it = ranges_.lower_bound(begin);
+        if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+        for (; it != ranges_.end() && it->first < end; ++it)
+            out.push_back({it->first, it->second.end, it->second.shader_va});
     }
 
     // Whether `shader_va` lies in the copy of a range added so far: an address the layer itself wrote for the title

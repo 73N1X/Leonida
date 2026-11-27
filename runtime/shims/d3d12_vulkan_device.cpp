@@ -3142,6 +3142,7 @@ struct DeviceState {
     std::uint64_t pool_spans_retired = 0;  // extents gone with their copy (forget_pool_span, retire_orphan_windows)
     std::uint64_t title_window_refusals = 0;  // windows neither the budget nor the arena allowed
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
+    std::uint64_t pool_covers = 0;            // stream-pool requests given one mapping over windows they ran into
 
     // Title windows no address range answers from any more (retire_orphan_windows): the removed ranges' copies, as the
     // alias table's listener records them, and the retired windows whose memory waits for the GPU: freed as a retired
@@ -3454,9 +3455,11 @@ struct DeviceState {
 
     // A window for [start, start + size): an arena range or a block outside the arena, charged to
     // LEONIDA_TITLE_WINDOWS_MB and refreshed before every submission by the tracker of its pages. 0 when neither the
-    // budget nor the arena has room. title_window_mutex held.
-    std::uint64_t make_title_window(std::uint64_t start, std::uint64_t size) {
-        if (!leonida::title_window_fits(title_window_cap, title_window_bytes, size)) {
+    // budget nor the arena has room. `credit`: bytes of windows this one replaces, retired at the next submission
+    // (cover_pool_request), not counted against it. title_window_mutex held.
+    std::uint64_t make_title_window(std::uint64_t start, std::uint64_t size, std::uint64_t credit = 0) {
+        if (!leonida::title_window_fits(title_window_cap, title_window_bytes - std::min(credit, title_window_bytes),
+                                        size)) {
             ++title_window_refusals;
             log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, no window; MiB copied "
                      "so far:",
@@ -3619,9 +3622,19 @@ struct DeviceState {
         std::uint64_t source_lo, source_hi, twin_lo, twin_hi;
         aliases.gap(source, source_lo, source_hi);
         aliases.gap(twin_view, twin_lo, twin_hi);
+        // A request that runs past what would serve it, the mapping holding its first byte or the extent clipped
+        // at the next one, gets one mapping over itself and the windows it reaches (cover_pool_request) rather than
+        // a zero-size view; only a range that is not a window in the way (a slot-133 buffer, a geometry copy) still
+        // leaves it with none.
+        const std::uint64_t request_end = source + want;
         if (!leonida::clip_title_pool_extent(extent, source, twin_view, source_lo, source_hi, twin_lo, twin_hi))
-            return reuse() || unbacked();
-        if (want > std::min(extent.size - (source - extent.start), run_end - source)) return reuse() || unbacked();
+            return reuse() || cover_pool_request(source, twin_view, source, request_end, source - offset, pool_end,
+                                                 out) ||
+                   unbacked();
+        if (want > std::min(extent.size - (source - extent.start), run_end - source))
+            return reuse() ||
+                   cover_pool_request(source, twin_view, extent.start, request_end, source - offset, pool_end, out) ||
+                   unbacked();
         const auto twin_start = twin_view - (source - extent.start);
         std::uint64_t shader = 0;
         if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
@@ -3642,6 +3655,58 @@ struct DeviceState {
                          static_cast<unsigned long long>(source), static_cast<unsigned long long>(shader),
                          pool_spans.size(), static_cast<unsigned long long>(pool_span_bytes >> 10));
         out = shader + (source - extent.start);
+        return true;
+    }
+
+    // One mapping for a stream-pool request [source, end) that what would serve it stops short of: the extent from
+    // `start` clipped at the next mapping, or the mapping holding `source`, ends first (title_pool_cover). It covers
+    // the request and, whole, the windows it reaches in either view; the range entered over theirs replaces them
+    // (TitleVaAliases::replace_twin), and they are retired at the next submission like any window nothing answers
+    // from (retire_orphan_windows), what the GPU wrote in them copied back first. Their bytes are not charged twice
+    // meanwhile. False when another kind of range is in the way (a slot-133 buffer, a geometry copy), the pages are not
+    // all readable, or the mapping cannot be made. title_window_mutex held.
+    bool cover_pool_request(std::uint64_t source, std::uint64_t twin_view, std::uint64_t start, std::uint64_t end,
+                            std::uint64_t pool_lo, std::uint64_t pool_end, std::uint64_t& out) {
+        std::vector<std::size_t> replaced;  // title_windows entries the ranges in the way answer from
+        const auto owned = [&](std::uint64_t shader_va) {
+            for (std::size_t i = 0; i < title_windows.size(); ++i) {
+                const TitleWindow& window = title_windows[i];
+                if (shader_va < window.shader_va || shader_va - window.shader_va >= window.size) continue;
+                if (std::find(replaced.begin(), replaced.end(), i) == replaced.end()) replaced.push_back(i);
+                return true;
+            }
+            return false;
+        };
+        auto& aliases = leonida::title_va_aliases();
+        leonida::TitleWindowRange cover{};
+        if (end > pool_end ||
+            !leonida::title_pool_cover(aliases, pool_lo, pool_end, source, twin_view, start, end, kTitleWindowAlign,
+                                       kTitleWindowMax, owned, cover))
+            return false;
+        const std::uint64_t cover_end = cover.start + cover.size;
+        if (readable_run_end(cover.start & ~(kTitleWindowAlign - 1), cover_end) < cover_end) return false;
+        std::uint64_t credit = 0;
+        for (const std::size_t i : replaced) credit += title_windows[i].size;
+        const std::uint64_t twin_start = twin_view - (source - cover.start);
+        std::uint64_t shader = 0;
+        if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(cover.start, cover.size))
+            shader = geometry.resolve(*this, cover.start, cover.size, copy_geometry);
+        const bool geometry_copy = shader != 0;
+        if (!shader) shader = make_title_window(cover.start, cover.size, credit);
+        if (!shader) return false;
+        aliases.replace_twin(cover.start, twin_start, cover.size, shader);
+        pool_spans.push_back({cover.start, twin_start, shader, cover.size, geometry_copy});
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        pool_span_bytes += cover.size;
+        ++pool_covers;
+        if (pool_covers <= 4 || !(pool_covers & (pool_covers - 1)))
+            std::fprintf(stderr,
+                         "[rt] d3d12: a stream-pool request ran past the mapping that would serve it: one %llu KiB "
+                         "%s covers it and the %zu window(s) it reached, retired at the next submission (%llu so "
+                         "far)\n",
+                         static_cast<unsigned long long>(cover.size >> 10), geometry_copy ? "geometry copy" : "window",
+                         replaced.size(), static_cast<unsigned long long>(pool_covers));
+        out = shader + (source - cover.start);
         return true;
     }
 
@@ -4320,6 +4385,11 @@ struct DeviceState {
         const auto path = [this](unsigned p) { vsharp_paths[p].fetch_add(1, std::memory_order_relaxed); };
         uint64_t to{}, room{};
         if (aliases.range_of(base, to, room)) {
+            // A range that ends before the V# does: the resolver may give a stream pool's request one mapping for all
+            // of it (resolve_pool_memory), as TitleVaAliases::resolve asks it for a short range.
+            uint64_t whole{};
+            if (to && room < bytes && make_window && resolve_title_memory(base, bytes, whole) && whole)
+                aliases.range_of(base, to, room);
             if (!to || room < bytes || !backed(to)) {
                 if (refused) *refused = to;
                 return path(1), 0;
