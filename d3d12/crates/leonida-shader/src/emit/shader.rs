@@ -118,6 +118,60 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` codes of the three user-data dwords the host sets at a dispatch of a program
+/// translated in packed groups (`LEONIDA_GROUP_PACK`, `lower::group_pack`): the host runs groups of
+/// `K` console groups (`K` x 32 threads) and gives the program the console's grid, from which its
+/// threads find their own group:
+///
+/// - [`USER_PACK_X`]: the console groups along X;
+/// - [`USER_PACK_Y`]: along Y;
+/// - [`USER_PACK_GROUPS`]: in all (X x Y x Z); a thread whose console group is not below it leaves.
+///
+/// The metadata's `dword` of each is `K`, which tells the host the program is packed and by how
+/// much (the translation cache holds nothing else of it). The host groups are the console groups
+/// numbered along X, Y, Z in turn, `K` to a host group: host group `h` of the grid
+/// `(min(n, 65535), ceil(n / 65535), 1)` (`n` = ceil(groups / K), [`pack_grid`]) is number
+/// `x + 65535 * y`, and its thread `t` runs console group `number * K + t / 32`.
+pub const USER_PACK_X: u32 = 0x107;
+/// See [`USER_PACK_X`].
+pub const USER_PACK_Y: u32 = 0x108;
+/// See [`USER_PACK_X`].
+pub const USER_PACK_GROUPS: u32 = 0x109;
+/// The most groups a host dispatch has along X when the grid of packed groups is folded into Y
+/// ([`pack_grid`]); the shader folds them back by this number.
+pub const PACK_FOLD: u32 = 65_535;
+
+/// What the host dispatches, and the three dwords it sets ([`USER_PACK_X`], [`USER_PACK_Y`],
+/// [`USER_PACK_GROUPS`]), for a console dispatch of `groups` run by a program packed `k` to a
+/// group. Pure.
+pub fn pack_grid(groups: [u32; 3], k: u32) -> ([u32; 3], [u32; 3]) {
+    let total = u64::from(groups[0]) * u64::from(groups[1]) * u64::from(groups[2]);
+    // (a total past 32 bits is no dispatch the title can run: the clamp keeps well below)
+    let total = total.min(u64::from(u32::MAX));
+    let n = total.div_ceil(u64::from(k.max(1)));
+    let (x, y) = if n == 0 {
+        (0, 1)
+    } else {
+        let x = n.min(u64::from(PACK_FOLD));
+        (x, n.div_ceil(x))
+    };
+    ([x as u32, y.min(u64::from(u32::MAX)) as u32, 1], [groups[0], groups[1], total as u32])
+}
+
+/// The console group (X, Y, Z) that thread `thread` of host group `(hx, hy)` runs in a program
+/// packed `k` to a group, for the console grid `groups`; `None` where it is past the grid and the
+/// thread leaves. Pure: what the translated program computes, for testing.
+pub fn pack_group(groups: [u32; 3], k: u32, host: [u32; 2], thread: u32) -> Option<[u32; 3]> {
+    let [gx, gy, _] = groups;
+    let total = u64::from(groups[0]) * u64::from(groups[1]) * u64::from(groups[2]);
+    let number = u64::from(host[0]) + u64::from(PACK_FOLD) * u64::from(host[1]);
+    let lin = number * u64::from(k) + u64::from(thread / 32);
+    if lin >= total {
+        return None;
+    }
+    let (gx, gy) = (u64::from(gx), u64::from(gy));
+    Some([(lin % gx) as u32, (lin / gx % gy) as u32, (lin / gx / gy) as u32])
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
