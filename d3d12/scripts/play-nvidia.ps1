@@ -123,6 +123,13 @@ $settings = @{
     # 112.3 -> 102.3, p90 158 -> 130; waits behind placed copies 266 -> 5. The standard moves captured with it on:
     # 227 frames, none with a one-frame dip or spike, lighting as before (run x34).
     LEONIDA_FILL_TITLE = '1'
+    # Leonida: what shaders write into host copies of memory the title asked for write-combined (1 MiB and more) is
+    # not copied back into title memory: the title does not read such memory on the CPU (after trustno1-coder/
+    # VIctory-NVIDIA 50c15a1 and 2f81d0c, GPL-3.0). Standing at the save, A/B of 20 s phases, three of each of 8
+    # combinations (2026-11-27): median 91.0 -> 80.2-82.5 ms a frame; pieces landed a frame 1,416 -> 341, their
+    # pages with a new byte 41 -> 6.6 MB, "copying back" 30-40 -> 10-12 ms. The standard moves captured with it on:
+    # 338 frames, one with a one-frame dip or spike, the picture as before (run x36).
+    LEONIDA_WC_NO_BACK = '1'
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 if ($Resolution) {
@@ -159,9 +166,12 @@ if ($RayTracing) {
 # (docs/findings.md), but that form puts 115 group barriers in its outer loop (an exchange between the two host
 # waves of each console wave at every branch on EXEC): one indirect dispatch of it took 76-80 ms of an RTX 4060 Ti's
 # frame, the next heaviest command 3 ms (GPU timing run, 2026-11-27; frames 180-260 ms against about 95 without it).
-# Its dispatches are dropped, as they were before it translated (the water looked the same in runs x31-x33, where
-# its pipeline was not made yet). LEONIDA_WATER_TRANSMISSION=1 runs it.
-if ($env:LEONIDA_WATER_TRANSMISSION -ne '1') {
+# Its dispatches were dropped for that. With the paired-lane form (emit/paired.rs, after Vice-Tay 5e588e8: a host
+# thread runs two console lanes, so the halves never exchange) it has 5 group barriers, none in a loop, and is no
+# longer among the 40 costliest commands of the timing run (under 0.3 ms a frame), so it runs again.
+# LEONIDA_WATER_TRANSMISSION=0 drops its dispatches as before (how the water looks with it has not been compared
+# on open water yet: the save in use stands in a street).
+if ($env:LEONIDA_WATER_TRANSMISSION -eq '0') {
     $skip = @('6f225b641c5b0708')
     if ($settings.LEONIDA_SKIP_PIPELINES) { $skip = @($settings.LEONIDA_SKIP_PIPELINES) + $skip }
     $settings.LEONIDA_SKIP_PIPELINES = $skip -join ','
