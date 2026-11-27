@@ -190,7 +190,9 @@ alone; a mod can have both. Load order is the folder names', sorted.
 
 ## What is not here, and why
 
-- God mode, wanted level, vehicles, weapons, weather, time of day, teleport: these are the title's own script
+- `leonida.teleport(x, y, z [, hold_seconds])` (true line, or nil and why) and `leonida.player_position()` (x, y, z) move
+  and read the player by memory, once the runtime knows where the player is (`docs/mod-menu.md`, "Teleport by memory").
+- God mode, wanted level, vehicles, weapons, weather, time of day: these are the title's own script
   functions, which the runtime cannot call (no table of them was found in the executable, `docs/mod-menu.md`), so
   there is no `leonida.player` and no `leonida.world`. A mod that wants them has the memory API and has to find the
   addresses itself.

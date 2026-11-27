@@ -136,6 +136,29 @@ of day, weather, teleports, HUD and radio. These items go through `GameActions` 
 today, `NotYet`, answers every one with the reason, and the menu shows them dimmed with that reason in the help
 box. A backend that can call the title's script commands only has to implement `GameActions`.
 
+### Teleport by memory
+
+The Teleport page and `leonida.teleport(x, y, z [, hold_seconds])` do not use the script natives: they write the
+player's position into the title's memory (`apps/leonida/src/player.rs`). The player's transform is a float
+matrix (three unit axes and a position row; a 4x4, a 3x4 or a packed 4x3) in the title's writable memory, and a
+physics copy of it moves with it, so every transform that moves with the player is shifted by the same amount and
+written again every 5 ms for a few seconds (`hold`), so that the physics does not put the player back and it does not
+fall through ground that is not loaded yet. The menu items work only when a position is known:
+
+1. **Find it once** (diagnostics build): `LEONIDA_FIND_PLAYER=<start s>,<seconds>` (`player_find.rs`) lists every
+   candidate transform at `<start>`, samples their positions every 250 ms while the test script's keys
+   (`LEONIDA_KEYS_FILE`) are held, and ranks the ones that stay put when no key is held and move with W/S/D and Shift.
+   Then it searches for pointers to the best ones from the title's image (up to `LEONIDA_PLAYER_LEVELS` = 3 levels).
+   Everything is written under `%TEMP%\leonida-player\`: `summary.txt`, `candidates.txt`, `tracks.csv`,
+   `comovers.txt`, `best.txt`, `pointers.txt` and `paths.txt`. The run that found them can teleport at once.
+2. **Use it later**: `paths.txt` (or `LEONIDA_PLAYER_PATHS=<file>`) is read at start-up; a path is a pointer
+   chain from a writable section of the image (an RVA, so it holds for the same build only).
+3. `LEONIDA_TELEPORT=<delay s>,x,y,z[,hold ms]` teleports once; `LEONIDA_TELEPORT_LIFT=<m>` is added to z;
+   `LEONIDA_VICE_CITY=x,y,z` (or `vice.txt` beside the paths) is the target of "To Vice City". Without a known position
+   the items keep saying they are not available.
+
+None of the addresses or paths is committed; they are the user's own run's.
+
 ### Looking for the script natives
 
 A trainer for a RAGE title calls the script engine's natives: GTA V's registers each command's handler under a

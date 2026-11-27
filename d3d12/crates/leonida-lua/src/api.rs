@@ -410,6 +410,42 @@ fn leonida(lua: &Lua, shared: &Rc_<Shared>, idx: usize, folder: &Path) -> Result
             Err(why) => refused(lua, Value::Nil, why),
         })?,
     )?;
+    // The player, by memory (`apps/leonida/src/player.rs`): not the title's own scripts.
+    t.set(
+        "teleport",
+        lua.create_function(
+            move |lua, (x, y, z, hold): (f64, f64, f64, Option<f64>)| {
+                let Some(hook) = leonida_menu::knobs::player() else {
+                    return refused(lua, Value::Nil, leonida_menu::knobs::NO_PLAYER);
+                };
+                if ![x, y, z].iter().all(|v| v.is_finite() && v.abs() < 1.0e6) {
+                    return refused(lua, Value::Nil, "teleport(x, y, z): finite numbers expected");
+                }
+                let hold_ms = (hold.unwrap_or(3.0).clamp(0.0, 30.0) * 1000.0) as u32;
+                let result = (hook.ready)().and_then(|()| (hook.teleport)([x as f32, y as f32, z as f32], hold_ms));
+                match result {
+                    Ok(line) => one(lua, line),
+                    Err(why) => refused(lua, Value::Nil, why),
+                }
+            },
+        )?,
+    )?;
+    t.set(
+        "player_position",
+        lua.create_function(move |lua, ()| {
+            let Some(hook) = leonida_menu::knobs::player() else {
+                return refused(lua, Value::Nil, leonida_menu::knobs::NO_PLAYER);
+            };
+            match (hook.ready)().and_then(|()| (hook.position)()) {
+                Ok([x, y, z]) => Ok(MultiValue::from_iter([
+                    Value::Number(f64::from(x)),
+                    Value::Number(f64::from(y)),
+                    Value::Number(f64::from(z)),
+                ])),
+                Err(why) => refused(lua, Value::Nil, why),
+            }
+        })?,
+    )?;
     let s = shared.clone();
     t.set(
         "frame",

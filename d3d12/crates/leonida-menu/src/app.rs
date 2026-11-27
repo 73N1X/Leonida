@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::actions::NotYet;
+use crate::actions::Player;
 use crate::font::FontSource;
 use crate::input::{Held, Keys, Withheld};
 use crate::knobs;
@@ -138,7 +138,7 @@ impl App {
         App {
             mods_seen: crate::mods::generation(),
             menu: Menu::new(pages_with_mods(), VISIBLE),
-            backend: Leonida::new(Box::new(NotYet)),
+            backend: Leonida::new(Box::new(Player::default())),
             fonts: None,
             source,
             last: None,
