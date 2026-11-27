@@ -281,6 +281,37 @@ foreach ($pair in $EnvPairs) {
     $bootEnv[$Matches[1]] = $Matches[2]
 }
 if ($bootEnv["LEONIDA_CAPTURE"]) { $Capture = $bootEnv["LEONIDA_CAPTURE"] }
+# The journal `gta6rt --precompile-pipelines` fills beside gta6rt.exe (when it runs without LEONIDA_PIPELINE_CACHE_DIR)
+# is read here as the runtime's read-only seed (LEONIDA_PIPELINE_JOURNAL_SEED_DIR, docs/d3d12_vulkan.md), so the pipelines
+# it holds are not compiled again in the boot's own cache folder. Only when this shell or -SetEnv/KEY= did not decide, and
+# when the two journals are distinct: the runtime turns its journal off for a seed that is, holds or sits in its writable
+# journal (pipeline_cache_journal.h, resolve_roots). A relative cache folder is resolved by the runtime against its own
+# working folder, so it gets no seed here; a name that cannot be resolved gets none either, rather than a stop.
+if (-not $bootEnv.Contains("LEONIDA_PIPELINE_JOURNAL_SEED_DIR")) {
+    $seed = $null
+    try {
+        $runtimeFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RuntimeDir)
+        $precompiled = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($runtimeFull, "pipeline_cache.d")).TrimEnd('\', '/')
+        if (Test-Path -LiteralPath $precompiled -PathType Container) {
+            $cacheDir = $bootEnv["LEONIDA_PIPELINE_CACHE_DIR"]
+            $ownJournal = $null
+            if (-not $cacheDir) { $ownJournal = $precompiled }   # the runtime then keeps its journal beside gta6rt.exe
+            elseif ($cacheDir -match '^([A-Za-z]:[\\/]|[\\/]{2})') {
+                $ownJournal = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($cacheDir, "pipeline_cache.d")).TrimEnd('\', '/')
+            }
+            if ($ownJournal) {
+                # \\?\ spellings name the same folder for the runtime: compare without the prefix.
+                $ownJournal = $ownJournal -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+                $precompiled = $precompiled -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+                $c = [System.StringComparison]::OrdinalIgnoreCase
+                $overlap = $ownJournal.Equals($precompiled, $c) -or $ownJournal.StartsWith($precompiled + '\', $c) -or
+                           $precompiled.StartsWith($ownJournal + '\', $c)
+                if (-not $overlap) { $seed = $precompiled }
+            }
+        }
+    } catch { $seed = $null }
+    if ($seed) { $bootEnv["LEONIDA_PIPELINE_JOURNAL_SEED_DIR"] = $seed }
+}
 
 $launchMode = if ($FirstRunUi) { "--first-run-ui" } else { "--run" }
 $gameArgs = @($launchMode, $Exe, "--game-dir", $GameDir, "--overlay", $Overlay, "--trace", $TraceFile, "--trace-d3d12") + $ExtraArgs
