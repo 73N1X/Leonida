@@ -14,6 +14,8 @@
 # -Resolution    the older path: the game renders at this height and the title's own upscaler does the rest
 # -RayTracing    the title's real ray tracing (slower; shaders build for minutes the first time)
 # -Capture       F9 in the game saves that frame and the pictures it drew
+# -NoPrecompile  start at once: by default every shader is translated and the pipelines earlier runs drew with are
+#                made before the title starts (minutes the first time, seconds after)
 # -Log           the runtime's log goes to a file under %LOCALAPPDATA%\Leonida\logs
 #
 # Builds d3d12/ when it is missing (d3d12\scripts\build-nvidia.ps1: the diag profile, with DLSS when NVIDIA's files
@@ -32,6 +34,7 @@ param(
     [switch]$NoDlss,
     [switch]$RayTracing,
     [switch]$Capture,
+    [switch]$NoPrecompile,
     [switch]$Log
 )
 
@@ -52,7 +55,7 @@ $env:LEONIDA_CACHE_DIR = Join-Path $Data "cache-2"
 $env:LEONIDA_DATA_DIR = Join-Path $Data "data"
 
 $launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = (-not $SmoothMotion); More = $More }
-foreach ($switch in 'SeriesX', 'Quality', 'NoDlss', 'RayTracing', 'Capture', 'Log') {
+foreach ($switch in 'SeriesX', 'Quality', 'NoDlss', 'RayTracing', 'Capture', 'NoPrecompile', 'Log') {
     if ($PSBoundParameters[$switch]) { $launch[$switch] = $true }
 }
 if ($Resolution) { $launch.Resolution = $Resolution }

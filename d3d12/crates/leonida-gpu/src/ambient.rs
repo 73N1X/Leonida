@@ -134,14 +134,20 @@ fn most() -> f32 {
 }
 
 /// Leonida: the brightest a reflection may be, as a multiple of the light
-/// around (`LEONIDA_REFLECT_MOST=<multiple>`, 3; 0: reflections as the
+/// around (`LEONIDA_REFLECT_MOST=<multiple>`; unset or 0: reflections as the
 /// title left them). Also pulls colours far from grey towards it: the
 /// misses' sky and stale history are what made eyes and posters glow.
+///
+/// Off unless asked for since the renderer changed (cool_fox's, with DLSS
+/// in place of the title's upscaler): on, the whole picture came out
+/// posterized and greyed, sky and skin in a few flat tones (run n2, every
+/// one of 411 frames; with `LEONIDA_REFLECT_MOST=0`, run n3, none of 431).
+/// The program it follows is not only the reflections' on this renderer.
 fn reflect_most() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("LEONIDA_REFLECT_MOST").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(3.0)
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(0.0)
     })
 }
 

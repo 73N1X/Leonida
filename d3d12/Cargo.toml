@@ -77,3 +77,11 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Leonida: the build to play with. The diag build's code and switches (the launchers' settings are diagnostics
+# switches), optimized across crates: thin LTO and one code generation unit per crate. It takes several minutes to
+# build, so development stays on `diag`. `cargo build --profile play -p leonida --features diagnostics[,dlss]`.
+[profile.play]
+inherits = "diag"
+lto = "thin"
+codegen-units = 1

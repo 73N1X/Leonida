@@ -13,12 +13,26 @@ project name changed where it named the program.
 
 | What it fixes | Setting (default) | Where | Credit |
 | --- | --- | --- | --- |
-| A 540p picture | `-Resolution native`, now `scripts/play-d3d12.ps1`'s default: the title's own 1920x1080 on Series S, no render scale pinned, its own temporal upscaler kept. A pinned scale of 1 stops the title in its init (twice in two runs, frame 0); without the own upscaler hair and curtains stay grainy. Measured on an RTX 4060 Ti: about 11.8 fps without `-Quality`, 8.3 with it; skin and bodies right in every frame of 100 taken walking, turning and strafing either way | `scripts/play-nvidia.ps1` | lepotane/VIctory-leonida runs native 1080p |
-| A soft world | `LEONIDA_SHARPEN` (0.4; 0 off): the game plane is sharpened before the interface goes over it, limited to each pixel's neighbourhood so there are no halos | `crates/leonida-gpu/src/compose.rs` | Leonida's own; lepotane's `VICTORY_COMPOSE_SHARPEN` was the hint |
+| A 540p picture | DLSS, the default of `scripts/play-d3d12.ps1` since the renderer merged at `00698e1e8`: the title renders its own 1280x720 on Series S and DLSS takes it to 1920x1080 in place of the title's upscaler (`d3d12/Get-NVIDIA-DLSS.cmd` fetches NVIDIA's files once). Before that: `-Resolution native`, the title's own upscaler at 1:1 | `scripts/play-nvidia.ps1`, `crates/leonida-gpu/src/dlss.rs` | DLSS: avatarmanz/VIctory-7900XTX pull request 203 through trustno1-coder/VIctory-NVIDIA `6395727` |
+| A soft world | `LEONIDA_DLSS_SHARPNESS` (F1 menu, live). `LEONIDA_SHARPEN`, Leonida's own sharpening of the game plane, lived in the compose pass the merged renderer replaced and is gone with it | `crates/leonida-gpu/src/dlss.rs` | trustno1-coder/VIctory-NVIDIA `6395727` |
 | Black skin, faces and clothes | `LEONIDA_PAGE_WRITES` (bits 1, 2 and 8): textures picked by index that were uploaded before DirectStorage or a plain read filled them are uploaded again | `crates/leonida-gpu/src/watch.rs` | fxceless/victory-fork `e4245f3` |
 | Skin that turns black later and stays so | `LEONIDA_HEAP_RECHECK_EVERY` (300 frames; 0 off): uploaded textures picked by index are looked at again on a slow beat after the first five looks | `crates/leonida-gpu/src/draw.rs` | fxceless/victory-fork, after RyanCase94 `920423a9` |
 | Black pixels where a NaN or infinity was scrubbed | `v_mac_legacy_f32` / `v_mad_legacy_f32` fused with flushed sources, as RDNA 2 runs them: a subnormal factor is a zero, so subnormal times infinity is no longer infinity (test `mad_legacy_takes_a_subnormal_factor_as_a_zero`) | `crates/leonida-shader/src/emit/lower.rs` | fxceless/victory-fork `f6a09d3` |
-| White glitter on floors, glowing windows and eyes | `LEONIDA_REFLECT_MOST` (3; 0 off): after `CS_UpdateHistory`, reflections are capped at a multiple of the room's light and colours far from grey pulled towards it; without rays they hold the sky of every miss | `crates/leonida-gpu/src/ambient.rs` | Leonida's own pass; the program and its view from lepotane/VIctory-leonida |
+| White glitter on floors, glowing windows and eyes | `LEONIDA_REFLECT_MOST` (off unless set, since it posterized the picture on the renderer merged at `00698e1e8`; 3 was the default before): after `CS_UpdateHistory`, reflections are capped at a multiple of the room's light and colours far from grey pulled towards it; without rays they hold the sky of every miss | `crates/leonida-gpu/src/ambient.rs` | Leonida's own pass; the program and its view from lepotane/VIctory-leonida |
+
+
+## Shaders and pipelines are made before the title starts
+
+`scripts/play-d3d12.ps1` (through `d3d12/scripts/play-nvidia.ps1`) precompiles before it starts the title, as
+Hookshot's release builds do; `-NoPrecompile` skips it.
+
+1. `leonida shaders <the title's shaders.rpf>` translates every shader into the cache with the settings of this
+   start. That takes minutes the first time and after a change of the translator or of a setting a translation
+   depends on (`crates/leonida-gpu/src/shader_cache.rs` lists them); later starts find every shader there.
+2. `leonida warm --used` makes the host pipelines earlier runs drew with, in processes of their own, so that the
+   driver's cache on disk has them (`crates/leonida-gpu/src/pipeline/known.rs`). Runs write the title's pipelines
+   down for it (`LEONIDA_PIPELINE_BOOK=1`, set by the launcher), so the first session in a place still makes that
+   place's pipelines as it meets them; from the next start on they are made ahead.
 
 ---
 

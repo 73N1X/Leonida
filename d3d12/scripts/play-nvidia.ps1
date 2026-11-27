@@ -21,6 +21,10 @@
 # -Build           target\diag (the default, the build all measurements are of) or target\release
 # -DlssDir         the folder with nvngx_dlss.dll, if not nvidia-sdk\DLSS\lib\Windows_x86_64\rel
 # -StreamlineDir   the folder with sl.interposer.dll (frame generation), if not nvidia-sdk\Streamline\bin\x64
+# -NoPrecompile    start at once. By default every shader of the title is translated into the cache and the
+#                  pipelines earlier runs drew with are made before the title starts (minutes the first time
+#                  and after a change of the layer, seconds otherwise), so that the world does not come up
+#                  half drawn or stall while they are made.
 # -Log             the layer's log goes to a file in %LOCALAPPDATA%\Leonida\logs instead of this window
 # -Capture         F9 in the game saves that frame and the pictures it drew, in %LOCALAPPDATA%\Leonida\captures
 # -WindowsBarMB    maximum MiB of title memory windows in CPU-mapped VRAM (by default 3072 on PCs with under
@@ -39,6 +43,7 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$DlssDir,
     [string]$StreamlineDir,
+    [switch]$NoPrecompile,
     [switch]$Log,
     [switch]$Capture,
     [hashtable]$More = @{},
@@ -156,6 +161,8 @@ if (Test-Path $menuFile) {
         if ($v) { $settings[$k] = $v } else { $settings.Remove($k) }
     }
 }
+# Leonida: the runs write down the pipelines the title creates (pipeline/known.rs), for the precompile below.
+if (-not $NoPrecompile) { $settings.LEONIDA_PIPELINE_BOOK = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 # DLSS only where it can be: a menu choice of it without the files or the build falls back to the stretch.
 if ($settings.LEONIDA_UPSCALE -eq 'dlss' -and -not $dlss) { $settings.LEONIDA_UPSCALE = 'stretch' }
@@ -177,7 +184,7 @@ $settings.LEONIDA_MENU_CONSOLE = $console
 $settings.LEONIDA_MENU_FILE = $menuFile
 $settings.LEONIDA_MENU_PLAY = $MyInvocation.MyCommand.Path
 $again = @("-Exe '$($Exe -replace "'", "''")'", "-Build $Build")
-foreach ($s in 'NoSmoothMotion', 'NoDlss', 'SeriesX', 'Quality', 'RayTracing', 'Log', 'Capture') {
+foreach ($s in 'NoSmoothMotion', 'NoDlss', 'SeriesX', 'Quality', 'RayTracing', 'NoPrecompile', 'Log', 'Capture') {
     if ($PSBoundParameters[$s]) { $again += "-$s" }
 }
 foreach ($s in 'Resolution', 'Adapter', 'DlssDir', 'StreamlineDir') {
@@ -218,6 +225,32 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $toml = Join-Path $root 'leonida.toml'
 if (-not $env:LEONIDA_CACHE_DIR -and -not ((Test-Path $toml) -and (Select-String -Path $toml -Pattern '^\s*cache_dir\s*=' -Quiet))) {
     $env:LEONIDA_CACHE_DIR = Join-Path $env:LOCALAPPDATA 'Leonida\cache-nvidia-2'
+}
+# Leonida: shaders and pipelines are made before the title starts, not while it plays (as Hookshot's release
+# builds do). Every shader of the title's shader archive is translated into the cache with the settings of this
+# start: once per change of the translator or of a setting a translation depends on; a later start finds them all
+# there. Then the host pipelines earlier runs drew with are made in processes of their own, so that the driver's
+# cache on disk has them: after a change of the layer or of the driver, and for places first seen in the last run.
+if (-not $NoPrecompile) {
+    $archive = Join-Path (Split-Path $Exe) 'shaders.rpf'
+    $from = if (Test-Path $archive) { $archive } else { Split-Path $Exe }
+    Push-Location $root
+    # Only what the two commands print themselves (their log goes to the error stream: quiet for these, and no
+    # redirection of it, which Windows PowerShell 5.1 turns into errors).
+    $logWas = $env:LEONIDA_LOG; $env:LEONIDA_LOG = 'error'
+    $stopWas = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        Write-Host 'Precompiling shaders (minutes the first time, seconds after; -NoPrecompile skips it) ...'
+        & $leonida shaders $from | Where-Object { $_ -match 'shaders in the cache|do not translate' } |
+            ForEach-Object { Write-Host "  $_" }
+        Write-Host 'Precompiling the pipelines earlier runs drew with ...'
+        & $leonida warm --used | Where-Object { $_ -match 'pipelines known|^\d+ of |made in' } |
+            ForEach-Object { Write-Host "  $_" }
+    } finally {
+        $ErrorActionPreference = $stopWas
+        if ($null -eq $logWas) { Remove-Item Env:LEONIDA_LOG -ErrorAction SilentlyContinue } else { $env:LEONIDA_LOG = $logWas }
+        Pop-Location
+    }
 }
 $stamp = Get-Date -Format 'MMdd-HHmmss'
 if ($Capture) {
