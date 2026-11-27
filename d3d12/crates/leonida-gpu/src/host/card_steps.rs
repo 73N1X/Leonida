@@ -533,18 +533,170 @@ enum To {
     Buffer(ID3D12Resource),
 }
 
+/// Whether a level's reads go into the buffer between by one dispatch for
+/// each host copy read, not by a copy command each (`LEONIDA_STEP_GATHER=1`;
+/// off by default; `LEONIDA_AB` can name it).
+///
+/// A street's submissions do 3,100 to 11,600 fills a frame this way, nearly
+/// all out of the one host copy of the title's 174 MB heap and a few hundred
+/// bytes each (480, 80, 288, 656, 256 in session cb2-64): as many
+/// `CopyBufferRegion` commands in one list of ours, which the card runs one
+/// after another whatever their size. With the switch the places read are
+/// written down as (offset in the copy, offset in the buffer between, bytes)
+/// in upload memory of the list, in pieces of at most [`PIECE`] bytes, and
+/// one dispatch of [`GATHER`] for each host copy copies them, a thread a
+/// piece. The bytes that arrive are the same; a level with a read that is
+/// not whole dwords at a dword's place is copied as before.
+///
+/// The technique is the masked pass of felicienradio/cold-project-vi aff5fb2
+/// (GextFRDD, GPL-3.0-or-later): many small ranges of a copy in the card's
+/// memory go as entries of one dispatch through upload memory, not as a copy
+/// each. There it carried the title's 106,000 changed runs a frame under
+/// flights' writes and took an 85 ms settle out of the frame (4.1-4.3 ->
+/// 4.6-4.7 fps, RTX 3060, Series S profile). Here it is put to the fills
+/// done on the card, which that tree did not have in this form: what it
+/// gains here is not measured yet, so it is off.
+fn gathers() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_STEP_GATHER") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_STEP_GATHER"))
+}
+
+/// Copies pieces of a host copy into the buffer between ([`gathers`]): an
+/// entry is (offset in the copy, offset between, bytes), all of whole dwords.
+const GATHER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Part : register(b0) { uint at; uint count; };
+ByteAddressBuffer entries : register(t0);
+ByteAddressBuffer source : register(t1);
+RWByteAddressBuffer between : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= count) return;
+    uint3 e = entries.Load3(at + id.x * 12u);
+    [loop] for (uint i = 0u; i < e.z; i += 4u) {
+        between.Store(e.y + i, source.Load(e.x + i));
+    }
+}
+"#;
+
+/// The most bytes an entry of [`GATHER`] copies: a thread's work.
+const PIECE: u64 = 256;
+
+/// The bytes of a list's memory for entries, every level's behind the one
+/// before. (Each place takes whole [`PIECE`]s of the buffer between, so a
+/// submission has [`BETWEEN`] / [`PIECE`] entries at most, 12 bytes each.)
+const ENTRIES: u64 = 256 << 10;
+
+struct Pass {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Pass {}
+// SAFETY: as above.
+unsafe impl Sync for Pass {}
+
+/// [`GATHER`]'s root signature and pipeline, if it compiled.
+fn pass(host: &Host) -> Option<&'static Pass> {
+    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        let code = compile(GATHER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+        // SAFETY: the code lives through the calls; the root signature is
+        // inside it.
+        let made = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .ok()?;
+            name(&pso, || "leonida: pieces of host copies gathered for steps on the card".into());
+            Pass { root, pso }
+        };
+        Some(made)
+    })
+    .as_ref()
+}
+
+/// The entries of [`GATHER`] for a level's `reads` (the host copy read, by a
+/// number; the offset in it; the offset in the buffer between; the bytes):
+/// for each host copy, in the order they first come, its number, its first
+/// entry and how many, and the entries, a read's in pieces of [`PIECE`]
+/// bytes at most. `None` if a read is not whole dwords at a dword's place in
+/// both buffers, reaches past what 32 bits can say, or there are more than
+/// `room` entries: the level is copied command by command then.
+fn gather_entries(reads: &[(usize, u64, u64, u64)], room: usize) -> Option<(Vec<(usize, u32, u32)>, Vec<[u32; 3]>)> {
+    let mut sources: Vec<usize> = Vec::new();
+    for &(source, ..) in reads {
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    let mut parts = Vec::with_capacity(sources.len());
+    let mut entries: Vec<[u32; 3]> = Vec::with_capacity(reads.len());
+    for &source in &sources {
+        let from = entries.len();
+        for &(_, offset, at, len) in reads.iter().filter(|r| r.0 == source) {
+            if len == 0 || offset % 4 != 0 || at % 4 != 0 || len % 4 != 0 {
+                return None;
+            }
+            u32::try_from(offset.checked_add(len)?).ok()?;
+            u32::try_from(at.checked_add(len)?).ok()?;
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(PIECE);
+                entries.push([(offset + done) as u32, (at + done) as u32, n as u32]);
+                done += n;
+            }
+            if entries.len() > room {
+                return None;
+            }
+        }
+        parts.push((source, from as u32, (entries.len() - from) as u32));
+    }
+    Some((parts, entries))
+}
+
+/// What [`record`] does a level's reads by [`GATHER`] with: the pass, the
+/// list's upload memory for entries (the buffer, its mapping), and the bytes
+/// of it earlier levels took.
+struct Gathering<'a> {
+    pass: &'static Pass,
+    entries: &'a ID3D12Resource,
+    data: usize,
+    used: u64,
+}
+
+/// Since the last frame-rate line: dispatches of [`GATHER`], and their
+/// entries.
+static GATHERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
 /// `between`, bytes). `between` is left readable as constants (and must be
 /// so, unless this is the `first` level), the others in the common state,
-/// as the submission's lists expect them.
+/// as the submission's lists expect them. With `gather` the reads are one
+/// dispatch for each source where they can be ([`gathers`]).
 fn record(
     first: bool,
     list: &ID3D12GraphicsCommandList,
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
+    gather: Option<&mut Gathering>,
 ) {
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -559,29 +711,71 @@ fn record(
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
     let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-    let mut barriers = vec![transition(between, dest, constants)];
-    barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
+    // The reads as entries of the gathering pass, if all of them can be.
+    let gathered = gather.and_then(|g| {
+        let numbered: Vec<(usize, u64, u64, u64)> =
+            reads.iter().map(|&(buffer, offset, at, len)| (buffer.as_raw() as usize, offset, at, len)).collect();
+        let room = (ENTRIES.saturating_sub(g.used) / 12) as usize;
+        let (parts, entries) = gather_entries(&numbered, room)?;
+        Some((g, parts, entries))
+    });
+    // The states the reads leave `between` and the sources in.
+    let (filled, read) = match gathered {
+        Some(_) => (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        None => (dest, source),
+    };
+    let mut barriers = vec![transition(between, filled, constants)];
+    barriers.extend(sources.iter().map(|b| transition(b, read, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
+    // What earlier lists' shaders wrote, first.
+    let every_write = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
     // SAFETY: an open list; live buffers, and the callers' ranges lie in
     // them. The buffers start in the common state (the list is the first of
-    // its call) and are promoted by their first use.
+    // its call) and are promoted by their first use. The entries are written
+    // into the list's own upload memory, behind those of the levels before,
+    // where `gather_entries` found room for them.
     unsafe {
-        if first {
-            // What earlier lists' shaders wrote, first.
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
+        if let Some((g, parts, entries)) = gathered {
+            std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), (g.data + g.used as usize) as *mut u8, entries.len() * 12);
+            let opened = transition(between, if first { common } else { constants }, filled);
+            if first {
+                list.ResourceBarrier(&[every_write, opened]);
+            } else {
+                list.ResourceBarrier(&[opened]);
+            }
+            list.SetComputeRootSignature(&g.pass.root);
+            list.SetPipelineState(&g.pass.pso);
+            list.SetComputeRootShaderResourceView(1, g.entries.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, between.GetGPUVirtualAddress());
+            for &(number, from, count) in &parts {
+                let Some(buffer) = sources.iter().find(|b| b.as_raw() as usize == number) else {
+                    continue;
+                };
+                list.SetComputeRootShaderResourceView(2, buffer.GetGPUVirtualAddress());
+                let part = [g.used as u32 + from * 12, count];
+                list.SetComputeRoot32BitConstants(0, 2, part.as_ptr().cast(), 0);
+                list.Dispatch(count.div_ceil(64), 1, 1);
+            }
+            g.used += entries.len() as u64 * 12;
+            GATHERED[0].fetch_add(parts.len() as u64, Ordering::Relaxed);
+            GATHERED[1].fetch_add(entries.len() as u64, Ordering::Relaxed);
         } else {
-            list.ResourceBarrier(&[transition(between, constants, dest)]);
-        }
-        for &(buffer, offset, at, len) in reads {
-            list.CopyBufferRegion(between, at, buffer, offset, len);
+            if first {
+                list.ResourceBarrier(&[every_write]);
+            } else {
+                list.ResourceBarrier(&[transition(between, constants, dest)]);
+            }
+            for &(buffer, offset, at, len) in reads {
+                list.CopyBufferRegion(between, at, buffer, offset, len);
+            }
         }
         list.ResourceBarrier(&barriers);
         for &(buffer, offset, at, len) in writes {
@@ -597,6 +791,9 @@ fn record(
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    /// Upload memory for the entries of [`GATHER`] ([`ENTRIES`] bytes) and
+    /// its mapping, once a submission gathered with this list ([`gathers`]).
+    entries: Option<(ID3D12Resource, usize)>,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -779,8 +976,21 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
+        let Some(mut own) = self.own_list() else {
             return Err("no host list or buffer for it");
+        };
+        // The reads by a dispatch for each host copy (`gathers`): the pass,
+        // and upload memory of the list's for its entries.
+        let gather_pass = if gathers() { pass(self) } else { None };
+        if gather_pass.is_some() && own.entries.is_none() {
+            own.entries = self.upload_buffer(ENTRIES).map(|(buffer, data)| {
+                name(&buffer, || "places read by steps on the card".into());
+                (buffer, data as usize)
+            });
+        }
+        let mut gathering = match (gather_pass, &own.entries) {
+            (Some(pass), Some((entries, data))) => Some(Gathering { pass, entries, data: *data, used: 0 }),
+            _ => None,
         };
         // First every refresh, then the writes: the bytes compared with are
         // the title's. (One step for each host copy, over all that is read of
@@ -826,8 +1036,9 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            record(level == 0, &own.list.list, &own.between, &reads, &writes, gathering.as_mut());
         }
+        drop(gathering);
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -870,7 +1081,7 @@ impl Host {
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
-        Some(Own { list, between })
+        Some(Own { list, between, entries: None })
     }
 }
 
@@ -911,6 +1122,12 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let [passes, pieces] = [0, 1].map(|i| GATHERED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if passes > 0.0 {
+        tracing::info!(
+            "their reads gathered per frame (LEONIDA_STEP_GATHER=1): {passes:.2} dispatches of ours for {pieces:.0} pieces, no copy command each"
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1175,9 +1392,10 @@ mod tests {
             &own.between,
             &[(&a, 33, 0, 100), (&a, 2000, 256, 100), (&a, 5001, 512, 7), (&a, 9, 1024, 4)],
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
+            None,
         );
         // A level behind it, of what it wrote.
-        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
+        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)], None);
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();
@@ -1206,6 +1424,128 @@ mod tests {
         POOL.lock().unwrap().push(own);
         let own = host.own_list().unwrap();
         own.list.close();
+    }
+
+    /// A level's reads as entries of the gathering pass: every byte of a
+    /// read in one entry, in pieces, by host copy; a read that is not whole
+    /// dwords, or more entries than there is room for, and there are none.
+    #[test]
+    fn reads_are_gathered_in_pieces_by_host_copy() {
+        const A: usize = 0xa000;
+        const B: usize = 0xb000;
+        let reads = [(A, 0x9a8df00, 0, 480), (B, 64, 512, 80), (A, 0x98efd00, 768, 600), (A, 16, 1536, 4)];
+        let (parts, entries) = gather_entries(&reads, 64).unwrap();
+        assert_eq!(parts, [(A, 0, 6), (B, 6, 1)]);
+        assert_eq!(
+            entries,
+            [
+                [0x9a8df00, 0, 256],
+                [0x9a8df00 + 256, 256, 224],
+                [0x98efd00, 768, 256],
+                [0x98efd00 + 256, 768 + 256, 256],
+                [0x98efd00 + 512, 768 + 512, 88],
+                [16, 1536, 4],
+                [64, 512, 80],
+            ]
+        );
+        // Every read's bytes once, in order, source and place between alike.
+        for (number, from, count) in parts {
+            let mut covered: Vec<(u64, u64, u64)> = Vec::new();
+            for e in &entries[from as usize..(from + count) as usize] {
+                assert!(u64::from(e[2]) <= PIECE && e[2] % 4 == 0 && e[2] > 0);
+                match covered.last_mut() {
+                    Some(c) if c.0 + c.2 == u64::from(e[0]) && c.1 + c.2 == u64::from(e[1]) => c.2 += u64::from(e[2]),
+                    _ => covered.push((u64::from(e[0]), u64::from(e[1]), u64::from(e[2]))),
+                }
+            }
+            let asked: Vec<(u64, u64, u64)> = reads.iter().filter(|r| r.0 == number).map(|r| (r.1, r.2, r.3)).collect();
+            assert_eq!(covered, asked);
+        }
+        // Exactly the room it needs, and one entry less.
+        assert!(gather_entries(&reads, 7).is_some());
+        assert!(gather_entries(&reads, 6).is_none());
+        // Not whole dwords, not at a dword, nothing, past 32 bits.
+        assert!(gather_entries(&[(A, 0, 0, 7)], 64).is_none());
+        assert!(gather_entries(&[(A, 33, 0, 100)], 64).is_none());
+        assert!(gather_entries(&[(A, 32, 2, 100)], 64).is_none());
+        assert!(gather_entries(&[(A, 32, 0, 0)], 64).is_none());
+        assert!(gather_entries(&[(A, u64::from(u32::MAX) - 3, 0, 8)], 64).is_none());
+        assert_eq!(gather_entries(&[], 64), Some((Vec::new(), Vec::new())));
+    }
+
+    /// [`the_card_copies_what_is_recorded`], the reads by the gathering
+    /// pass: two levels, two sources in the first, a read longer than a
+    /// piece, and a level that cannot be gathered between them and behind.
+    #[test]
+    fn the_card_gathers_what_is_recorded() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(pass) = pass(host) else {
+            return; // no compiler
+        };
+        let (a, a_data) = host.shared_buffer(1 << 16).unwrap();
+        let (b, b_data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: mappings of 64 KiB.
+        let (a_bytes, b_bytes) =
+            unsafe { (std::slice::from_raw_parts_mut(a_data, 1 << 16), std::slice::from_raw_parts_mut(b_data, 1 << 16)) };
+        for (i, (x, y)) in a_bytes.iter_mut().zip(b_bytes.iter_mut()).enumerate() {
+            (*x, *y) = (i as u8 ^ (i >> 8) as u8, (i as u8).wrapping_mul(7) ^ (i >> 7) as u8);
+        }
+        let (a_was, b_was) = (a_bytes.to_vec(), b_bytes.to_vec());
+        let own = host.own_list().unwrap();
+        let (entries, data) = host.upload_buffer(ENTRIES).unwrap();
+        let mut gathering = Gathering { pass, entries: &entries, data: data as usize, used: 0 };
+        // Within `a` (there and back), from `a` to `b` (700 bytes: three
+        // pieces), from `b` to `a`, and a read alone.
+        record(
+            true,
+            &own.list.list,
+            &own.between,
+            &[(&a, 32, 0, 100), (&a, 2000, 256, 100), (&a, 5000, 512, 700), (&b, 300, 1280, 48), (&a, 8, 1536, 4)],
+            &[(&a, 2000, 0, 100), (&a, 32, 256, 100), (&b, 76, 512, 700), (&a, 9000, 1280, 48)],
+            Some(&mut gathering),
+        );
+        assert_eq!(gathering.used, 12 * (1 + 1 + 3 + 1 + 1));
+        // A level behind it, of what it wrote: gathered too.
+        record(false, &own.list.list, &own.between, &[(&b, 76, 2048, 700)], &[(&b, 1076, 2048, 700)], Some(&mut gathering));
+        assert_eq!(gathering.used, 12 * (7 + 3));
+        // One that is not whole dwords: copied, the entries left as they are.
+        record(false, &own.list.list, &own.between, &[(&b, 1077, 3072, 7)], &[(&b, 3001, 3072, 7)], Some(&mut gathering));
+        assert_eq!(gathering.used, 12 * (7 + 3));
+        // And a gathered one behind that.
+        record(false, &own.list.list, &own.between, &[(&b, 3000, 3328, 8)], &[(&a, 12000, 3328, 8)], Some(&mut gathering));
+        own.list.close();
+        // A list behind it that uses the buffers in other ways.
+        let next = host.new_list().unwrap();
+        let (out, out_data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: an open list; live buffers.
+        unsafe {
+            next.list.CopyBufferRegion(&out, 0, &own.between, 1536, 4);
+            next.list.CopyBufferRegion(&b, 4096, &a, 32, 100);
+        }
+        next.close();
+        host.execute(&[&own.list, &next]);
+        // With the debug layer (`LEONIDA_D3D12_DEBUG=1`, diagnostics).
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(a_bytes[2000..2100], a_was[32..132]);
+        assert_eq!(a_bytes[32..132], a_was[2000..2100]);
+        assert_eq!(b_bytes[76..776], a_was[5000..5700]);
+        assert_eq!(a_bytes[9000..9048], b_was[300..348]);
+        assert_eq!(b_bytes[1076..1776], a_was[5000..5700]);
+        assert_eq!(b_bytes[3001..3008], a_was[5001..5008]);
+        assert_eq!(a_bytes[12000..12001], b_was[3000..3001]);
+        assert_eq!(a_bytes[12001..12008], a_was[5001..5008]);
+        assert_eq!(b_bytes[4096..4196], a_was[2000..2100]);
+        // SAFETY: a mapping of 64 KiB.
+        assert_eq!(unsafe { std::slice::from_raw_parts(out_data, 4) }, &a_was[8..12]);
+        // Nothing else moved.
+        assert_eq!(b_bytes[..76], b_was[..76]);
+        assert_eq!(b_bytes[776..1076], b_was[776..1076]);
+        assert_eq!(a_bytes[..32], a_was[..32]);
+        assert_eq!(a_bytes[132..2000], a_was[132..2000]);
+        assert_eq!(a_bytes[2100..9000], a_was[2100..9000]);
+        POOL.lock().unwrap().push(own);
     }
 
     /// The whole way, in a process of its own with the relay on:
