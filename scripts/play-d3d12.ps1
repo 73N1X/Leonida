@@ -3,6 +3,9 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\play-d3d12.ps1 -Game <folder with game_scarlett_master.exe>
 #
+# -SmoothMotion starts leonida_sm.exe, the copy NVIDIA's Smooth Motion profile is set for (scripts\smooth-motion.ps1
+# -State on sets it): the driver shows twice the frames the game renders (RTX 40 and 50).
+#
 # Builds d3d12/ (diag profile, the one d3d12/scripts/play-nvidia.ps1 measures) when it is missing, keeps the caches
 # and saves under -Data, and hands everything else to victory\scripts\play-nvidia.ps1: its measured NVIDIA settings,
 # -SeriesX, -Quality, -Resolution, -Adapter and -More pass through. Nothing goes online.
@@ -14,7 +17,8 @@ param(
     [ValidateSet('native', '2160', '1440', '1080', '720', '540', '480')][string]$Resolution = 'native',
     [string]$Adapter = '',
     [hashtable]$More = @{},
-    [switch]$Rebuild
+    [switch]$Rebuild,
+    [switch]$SmoothMotion
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,7 +39,7 @@ $env:LEONIDA_GAME_DIR = (Resolve-Path $Game).Path
 $env:LEONIDA_CACHE_DIR = Join-Path $Data "cache"
 $env:LEONIDA_DATA_DIR = Join-Path $Data "data"
 
-$launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = $true; More = $More }
+$launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = (-not $SmoothMotion); More = $More }
 if ($SeriesX) { $launch.SeriesX = $true }
 if ($Quality) { $launch.Quality = $true }
 if ($Resolution) { $launch.Resolution = $Resolution }
