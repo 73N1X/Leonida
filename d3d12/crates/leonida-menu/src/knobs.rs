@@ -126,6 +126,40 @@ impl<T> Default for Owned<T> {
 }
 
 /// Tests that change these settings take turns.
+/// What the runtime can do with the local player by reading and writing the
+/// title's memory (`apps/leonida/src/player.rs`), for the Teleport page and
+/// `leonida.teleport`. Set once by the runtime; without it every teleport
+/// says it is not available.
+pub struct PlayerHook {
+    /// `Ok` when the player's position can be found now, else why not.
+    pub ready: fn() -> Result<(), String>,
+    /// Where the player is, in the title's world units (metres).
+    pub position: fn() -> Result<[f32; 3], String>,
+    /// The horizontal direction the player faces, as a unit vector (x, y).
+    pub heading: fn() -> Option<[f32; 2]>,
+    /// Moves the player there and keeps it there for `hold_ms` milliseconds
+    /// (so that the physics and the unloaded ground do not take it back or
+    /// let it fall); a line for the menu.
+    pub teleport: fn(to: [f32; 3], hold_ms: u32) -> Result<String, String>,
+    /// A named place (`"vice"`) the user has told the runtime about.
+    pub place: fn(name: &str) -> Option<[f32; 3]>,
+}
+
+static PLAYER: OnceLock<PlayerHook> = OnceLock::new();
+
+/// The runtime can move the player (once; later calls change nothing).
+pub fn provide_player(hook: PlayerHook) {
+    let _ = PLAYER.set(hook);
+}
+
+/// The player hook, when the runtime provided one.
+pub fn player() -> Option<&'static PlayerHook> {
+    PLAYER.get()
+}
+
+/// Why nothing can be done with the player.
+pub const NO_PLAYER: &str = "Not available: this run has no way to find the player in the title's memory.";
+
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 

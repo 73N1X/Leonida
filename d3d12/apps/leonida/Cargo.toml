@@ -14,6 +14,7 @@ leonida-loader.workspace = true
 leonida-hle.workspace = true
 leonida-gpu.workspace = true
 leonida-lua.workspace = true
+leonida-menu.workspace = true
 leonida-shader = { workspace = true, features = ["host"] }
 leonida-game.workspace = true
 anyhow.workspace = true

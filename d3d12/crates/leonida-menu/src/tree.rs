@@ -345,6 +345,11 @@ pub fn pages() -> Vec<Page> {
                 "Back to the remembered place.",
             ),
             action("teleport.forward", "Forward 10 m", "A short hop forward."),
+            action(
+                "teleport.vice",
+                "To Vice City",
+                "To the position in LEONIDA_VICE_CITY (x,y,z in metres), held in place for a few seconds while the ground loads.",
+            ),
         ],
     };
     pages[MISC] = Page {
