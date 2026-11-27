@@ -1192,6 +1192,20 @@ mod tests {
         }
     }
 
+    /// Only what lies before, between and after the runs is zeroed (after
+    /// DoubleGhosty/cool_fox e8b62de); runs that overlap leave no gap.
+    #[test]
+    fn only_bytes_outside_the_runs_are_zeroed() {
+        let mut dst = [7u8; 16];
+        super::zero_between(&mut dst, 100, &[(102, 3), (104, 2), (110, 4)]);
+        assert_eq!(dst, [0, 0, 7, 7, 7, 7, 0, 0, 0, 0, 7, 7, 7, 7, 0, 0]);
+        let mut dst = [7u8; 4];
+        super::zero_between(&mut dst, 100, &[(100, 4)]);
+        assert_eq!(dst, [7; 4]);
+        super::zero_between(&mut dst, 100, &[]);
+        assert_eq!(dst, [0; 4]);
+    }
+
     /// Zeros for a title destination that went meanwhile are no fault.
     #[test]
     fn zeros_where_nothing_is_are_lost() {
@@ -9486,12 +9500,22 @@ pub(crate) fn lua_write(address: usize, data: &[u8]) -> bool {
 /// reads). What the runtime's record says is mapped is read in one go each,
 /// and by pieces where that fails; memory it has no record of by pieces.
 pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
-    dst.fill(0);
     let (start, len) = (src as usize, dst.len());
     let mut got = 0;
     let mut runs = crate::inplace::shown_runs(start, len);
     if runs.is_empty() {
         runs.push((start, len));
+    }
+    // Every byte of a run is read or zeroed below, so only what the runs
+    // leave out is zeroed here, not the whole buffer first: one write over
+    // all of a texture's bytes less at each read of it
+    // (`LEONIDA_READ_ZERO_GAPS=0`: the whole buffer first, as before). After
+    // DoubleGhosty/cool_fox e8b62de (Esteban Viera; GPL-3.0-or-later).
+    static GAPS: OnceLock<bool> = OnceLock::new();
+    if *GAPS.get_or_init(|| std::env::var_os("LEONIDA_READ_ZERO_GAPS").is_none_or(|v| v != "0")) {
+        zero_between(dst, start, &runs);
+    } else {
+        dst.fill(0);
     }
     for (at, n) in runs {
         let piece = &mut dst[at - start..at - start + n];
@@ -9519,6 +9543,22 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// Zeros what of `dst` (title memory from `start`) `runs` leave out
+/// (address, bytes: in order, inside `dst`; runs that meet or overlap leave
+/// nothing between them).
+fn zero_between(dst: &mut [u8], start: usize, runs: &[(usize, usize)]) {
+    let mut done = 0;
+    for &(at, n) in runs {
+        let from = at - start;
+        if from > done {
+            dst[done..from].fill(0);
+        }
+        done = done.max(from + n);
+    }
+    let rest = done.min(dst.len());
+    dst[rest..].fill(0);
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -10018,6 +10058,8 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            // Where the windows outside buffers lie (card or PC memory).
+            crate::shadow::window_line();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

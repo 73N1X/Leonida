@@ -156,6 +156,32 @@ fn the_size_of_a_heap_texture_nothing_reads() {
     }
 }
 
+/// A slot that shows no texture (a null view) is one texel each way to the program, as the
+/// console's empty descriptor reads: the host's count of none, less one, filled the fields
+/// (65,536 each way). `LEONIDA_NULL_VIEW_SIZE=0`: as before.
+#[test]
+fn the_size_of_a_null_texture_is_one_texel() {
+    let words = [TABLE, FROM_HEAP, SIZES, STORE].concat();
+    let one = [[0.0; 4]; 1];
+    let views = [View::Texture(1, 1, &one), View::NullTexture, View::RawUav(2)];
+    let shader = build(&words, (8, 0)).expect("translates");
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [1, 1], "{label}");
+    }
+    let was = lower::TEST_NULL_VIEW_SIZE.replace(Some(false));
+    let before = build(&words, (8, 0)).expect("translates");
+    lower::TEST_NULL_VIEW_SIZE.set(was);
+    for (label, got) in run(&before, &views) {
+        assert_eq!(got[..2], [65536, 65536], "{label}: without the floor");
+    }
+    // (a texture that is there keeps its size either way)
+    let texels = [[0.0; 4]; 15];
+    let views = [View::Texture(1, 1, &one), View::Texture(5, 3, &texels), View::RawUav(2)];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [5, 3], "{label}");
+    }
+}
+
 /// Without the height nothing tells a 2D texture from the others: taken for
 /// one, as most are. A volume's depth or an array's layers are no 2D
 /// texture's.
@@ -408,10 +434,12 @@ fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
         (0xFF80_0001, 0xFF80_0001),
         (0x7F80_0001, 0x7F80_0001),
         (0x1234_5678, 0x1234_5678),
-        // the patterns arithmetic makes, taken for what a float computation left
+        // the patterns arithmetic makes, taken for what a float computation left: "no
+        // number" is 0, an infinity the largest finite half-float of its sign
         (0x7FFF_FFFF, 0),
         (0xFFC0_0000, 0),
-        (0x7F80_0000, 0),
+        (0x7F80_0000, 0x477F_E000),
+        (0xFF80_0000, 0xC77F_E000),
     ];
     let shaders: Vec<_> = integers.iter().map(|&(bits, _)| program(&moved(bits))).collect();
     // a float image: 0 x infinity, made by a float instruction, is no number on any card
@@ -421,6 +449,24 @@ fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
         0x7F80_0000,
         0x1004_0F06, // v_mul_f32 v2, v6, v7
     ]);
+    // 2 x an infinity of either sign, made by a float instruction: (the infinity, what the
+    // texel holds), then the same with `LEONIDA_NAN_SCRUB_INF=0` (0, as before), computed and
+    // as bits moved in
+    let twice = |infinity: u32| {
+        program(&[
+            0x7E0C_02FF, // v_mov_b32 v6, 2.0
+            0x4000_0000,
+            0x7E0E_02FF, // v_mov_b32 v7, infinity
+            infinity,
+            0x1004_0F06, // v_mul_f32 v2, v6, v7
+        ])
+    };
+    let mut infinities: Vec<_> =
+        [(0x7F80_0000u32, 0x477F_E000u32), (0xFF80_0000, 0xC77F_E000)].map(|(i, want)| (twice(i), i, want)).into();
+    let held = lower::TEST_NAN_SCRUB_INF.replace(Some(false));
+    infinities.push((twice(0x7F80_0000), 0x7F80_0000, 0));
+    infinities.push((program(&moved(0xFF80_0000)), 0xFF80_0000, 0));
+    lower::TEST_NAN_SCRUB_INF.set(held);
     // `LEONIDA_NAN_SCRUB=2`: every image store as a float, all-ones too
     lower::TEST_NAN_SCRUB.set(Some(2));
     let all = program(&moved(0xFFFF_FFFF));
@@ -439,6 +485,11 @@ fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
     let views = [View::TextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
     for (label, got) in run(&product, &views) {
         assert_eq!(got[0], 0, "{label}: 0 x infinity stored to a float image");
+    }
+    for (shader, infinity, want) in &infinities {
+        for (label, got) in run(shader, &views) {
+            assert_eq!(got[0], *want, "{label}: {infinity:#010x} stored to a float image");
+        }
     }
     // (without the switch the store writes what it is given)
     for (label, got) in run(&unscrubbed, &views) {

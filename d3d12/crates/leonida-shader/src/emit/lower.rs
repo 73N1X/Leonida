@@ -131,6 +131,42 @@ fn nan_scrub_mode() -> u8 {
 thread_local! {
     /// A test's choice for [`nan_scrub_mode`], for its thread only.
     pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`nan_scrub_holds_infinity`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB_INF: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the scrub (`LEONIDA_NAN_SCRUB`) holds an infinity at the largest finite half-float
+/// of its sign, 65504, instead of making it 0 (on; `LEONIDA_NAN_SCRUB_INF=0`: 0, as before).
+/// NaN is 0 either way. See `Lower::scrub_nan`.
+fn nan_scrub_holds_infinity() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_SCRUB_INF.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_NAN_SCRUB_INF").is_none_or(|v| v != "0"))
+}
+
+/// The bits of 65504.0, the largest finite 16-bit float.
+const HALF_MAX: u32 = 0x477F_E000;
+
+/// Whether the size fields a program reads from a descriptor count a view that shows nothing
+/// as one texel and one level, as the console's empty descriptor reads (on;
+/// `LEONIDA_NULL_VIEW_SIZE=0`: the host's zeros less one, as before). See
+/// `Lower::descriptor_data`.
+fn null_view_size() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NULL_VIEW_SIZE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_NULL_VIEW_SIZE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`null_view_size`], for its thread only.
+    pub(super) static TEST_NULL_VIEW_SIZE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the title dispatches the program by a count of threads whose last
@@ -7758,7 +7794,22 @@ impl<'a> Lower<'a> {
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+                // A slot that shows nothing (a null view: a texture not there yet, a view the
+                // host refused) reports no texels and no levels, and 0 - 1 filled every bit of
+                // these fields: 65,536 texels each way, sixteen levels and a type of all ones.
+                // The console's empty descriptor holds 0 in them, which reads as one texel and
+                // one level, so each count is taken as at least 1
+                // (`LEONIDA_NULL_VIEW_SIZE=0`: as it comes, as before). After brcly/TuxBox
+                // 0a5ebfa (Apache-2.0), which found the same in its own translator.
+                let floor = null_view_size();
+                let less = |l: &mut Self, x: V| {
+                    let x = if floor && x != one {
+                        l.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[x, one])
+                    } else {
+                        x
+                    };
+                    l.s.m.bin(c, Bin::Sub, x, one)
+                };
                 let (w, height, depth, levels) = (
                     less(self, w),
                     less(self, height),
@@ -13493,7 +13544,9 @@ impl<'a> Lower<'a> {
     /// reaches the title's bloom, blur or temporal
     /// upscaler spreads into black patches that stay in its history (seen on
     /// NVIDIA as black blobs on faces and in the air). Not what the console
-    /// does, so it is a switch; part of the shader cache key.
+    /// does, so it is a switch; part of the shader cache key. An infinity is
+    /// held at 65504 with its sign (`LEONIDA_NAN_SCRUB_INF=0`: made 0 too, as
+    /// before; also part of the key).
     fn scrub_nan(&mut self, f: V) -> V {
         if !nan_scrub() {
             return f;
@@ -13504,9 +13557,27 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let a = self.unary(6, f);
         let inf = self.s.m.f32(0x7f80_0000);
-        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
         let zero = self.s.m.f32(0);
-        self.s.m.select(c, bad, zero, f)
+        if !nan_scrub_holds_infinity() {
+            let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+            return self.s.m.select(c, bad, zero, f);
+        }
+        // An infinity is the brightest a colour can be, and made 0 it was the
+        // darkest: the sun's disc came out black (felicienradio/cold-project-vi
+        // ec62312, GPL-3.0-or-later, from players' screenshots; this scrub is
+        // the same code). It is held at the largest finite half-float of its
+        // sign instead: still the brightest thing in the picture, and nothing
+        // infinite reaches the bloom or the exposure. Only an infinity is
+        // changed, not every value past 65504 as there: 32-bit float images
+        // come through here too, and a large finite number in one (a far
+        // distance) is data.
+        let nan = self.s.m.cmp(c, pred::UNO, f, f);
+        let infinite = self.s.m.cmp(c, pred::OEQ, a, inf);
+        let below = self.s.m.cmp(c, pred::OLT, f, zero);
+        let (top, bottom) = (self.s.m.f32(HALF_MAX), self.s.m.f32(HALF_MAX | 0x8000_0000));
+        let held = self.s.m.select(c, below, bottom, top);
+        let x = self.s.m.select(c, infinite, held, f);
+        self.s.m.select(c, nan, zero, x)
     }
 
     /// [`Self::scrub_nan`] of the 32 bits an image store writes where no float instruction
@@ -13517,7 +13588,8 @@ impl<'a> Lower<'a> {
     /// numbers): made 0, a mask with every bit set comes out empty. So only the bits a GPU's
     /// arithmetic gives for "no number" and for an infinity are taken: 0x7FFFFFFF (NVIDIA,
     /// measured on this tree's test host: every NaN its float operations make or pass on),
-    /// 0x7FC00000 of either sign (AMD, x86), and the two infinities.
+    /// 0x7FC00000 of either sign (AMD, x86), and the two infinities (held at 65504 with
+    /// their sign, as `scrub_nan` holds them; 0 with `LEONIDA_NAN_SCRUB_INF=0`).
     /// `LEONIDA_NAN_SCRUB=2`: every NaN and infinity, as before this was told apart.
     // shortcut: an integer that is one of those five patterns is still made 0, and a NaN
     // with other bits (negated last, or loaded and stored without arithmetic) is stored.
@@ -13537,10 +13609,20 @@ impl<'a> Lower<'a> {
         let is_inf = self.s.m.cmp(c, pred::EQ, abs, inf);
         let is_quiet = self.s.m.cmp(c, pred::EQ, abs, quiet);
         let is_ones = self.s.m.cmp(c, pred::EQ, bits, ones);
-        let bad = self.s.m.bin(c, Bin::Or, is_inf, is_quiet);
-        let bad = self.s.m.bin(c, Bin::Or, bad, is_ones);
         let zero = self.s.m.f32(0);
-        self.s.m.select(c, bad, zero, f)
+        if !nan_scrub_holds_infinity() {
+            let bad = self.s.m.bin(c, Bin::Or, is_inf, is_quiet);
+            let bad = self.s.m.bin(c, Bin::Or, bad, is_ones);
+            return self.s.m.select(c, bad, zero, f);
+        }
+        // An infinity is held at 65504 with its sign, as in `scrub_nan`.
+        let (sign, half) = (self.s.m.i32(0x8000_0000), self.s.m.i32(HALF_MAX));
+        let sign = self.s.m.bin(c, Bin::And, bits, sign);
+        let held = self.s.m.bin(c, Bin::Or, sign, half);
+        let held = self.as_float(held);
+        let nan = self.s.m.bin(c, Bin::Or, is_quiet, is_ones);
+        let x = self.s.m.select(c, is_inf, held, f);
+        self.s.m.select(c, nan, zero, x)
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {

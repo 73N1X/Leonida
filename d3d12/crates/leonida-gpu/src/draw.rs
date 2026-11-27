@@ -195,6 +195,26 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
+/// Whether `frame` is new to `seen`, which then holds it. With `peek` the
+/// shared word is read first and written only when the frame changed
+/// (`LEONIDA_FRAME_PEEK=0`: swapped at every ask, as before).
+///
+/// `State::early_textures` asks at every draw's bind, on every thread that
+/// translates lists: the swap wrote the word's cache line from all of them,
+/// some 4,000 times a frame, and each write takes the line from the other
+/// threads. The first ask of a frame still finds it first (the swap decides
+/// among threads that read the old frame together); the others only read.
+/// After DoubleGhosty/cool_fox ca7e76a (Esteban Viera; GPL-3.0-or-later).
+fn first_of_frame(seen: &AtomicU64, frame: u64, peek: bool) -> bool {
+    (!peek || seen.load(Ordering::Relaxed) != frame) && seen.swap(frame, Ordering::Relaxed) != frame
+}
+
+/// [`first_of_frame`]'s `peek` (on; `LEONIDA_FRAME_PEEK=0`: off).
+fn frame_peek() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_FRAME_PEEK").is_none_or(|v| v != "0"))
+}
+
 /// Whether a draw of the title's bake finds the textures it picks by index
 /// as title memory has them at that moment (`LEONIDA_BAKE_EXACT=0`: as the
 /// pass leaves them, as before). The pass looks at a slot whose memory was
@@ -2973,7 +2993,7 @@ impl State {
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        let first = first_of_frame(&FRAME, frame, frame_peek());
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
@@ -6173,7 +6193,20 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_depth_srv, staging_budget_per_frame};
+    use super::{first_of_frame, is_depth_srv, staging_budget_per_frame};
+
+    /// A frame is new once, with the look before the swap and without it; the look leaves
+    /// the word as it is when the frame is the one it holds.
+    #[test]
+    fn a_frame_is_first_once_whether_the_word_is_read_first_or_not() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for peek in [false, true] {
+            let seen = AtomicU64::new(u64::MAX);
+            let asks: Vec<bool> = [7, 7, 7, 8, 8, 7].iter().map(|&frame| first_of_frame(&seen, frame, peek)).collect();
+            assert_eq!(asks, [true, false, false, true, false, true], "peek {peek}");
+            assert_eq!(seen.load(Ordering::Relaxed), 7);
+        }
+    }
 
     #[test]
     fn depth_srv_checks_the_plane_not_the_number_of_levels() {
