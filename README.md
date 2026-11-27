@@ -288,6 +288,7 @@ pull requests.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
+- Aki-Developer: shared the private `aki-runtime` port with the project for reference.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
 endorsed by them.
