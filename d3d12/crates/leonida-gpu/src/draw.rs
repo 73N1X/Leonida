@@ -4803,9 +4803,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
+            // (Held while the copy is recorded: the title may release the
+            // source meanwhile. The list's states hold its host copy after.)
             let source = crate::resource::alias_of(*resource as This);
             alias = source.is_some();
-            let aliased = source.is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let aliased =
+                source.as_ref().is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
+            drop(source);
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
