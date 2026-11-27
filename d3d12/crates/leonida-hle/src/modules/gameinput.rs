@@ -1,5 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) and, read over HID, from Sony pads (`hid`; the kind of input in use is `family`);
+//! while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A focused window also has a mouse. A poll thread records changes
 //! and runs device callbacks on connect and disconnect.
@@ -20,6 +21,30 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+mod family;
+mod hid;
+
+pub use family::Family;
+
+/// Leonida: the kind of input the player is using (Xbox pad, PlayStation pad, keyboard and mouse), for the
+/// runtime's own use: the button prompts follow it. `LEONIDA_PROMPTS` forces it. Reading it starts the input hub.
+pub fn active_family() -> Family {
+    LazyLock::force(&HUB);
+    family::current()
+}
+
+/// Goes up by one with each change of [`active_family`].
+pub fn family_generation() -> u32 {
+    LazyLock::force(&HUB);
+    family::generation()
+}
+
+/// Whether `LEONIDA_PROMPTS` forces [`active_family`].
+pub fn family_forced() -> bool {
+    LazyLock::force(&HUB);
+    family::forced()
+}
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -228,6 +253,11 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Leonida: start of a poll, before the pads are read.
+    fn begin(&mut self) {}
+    /// Leonida: end of a poll, with the keys and the mouse look stick it read: where the kind of input in use is
+    /// followed.
+    fn observe(&mut self, _keys: &[KeyState], _look: (f32, f32)) {}
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -549,9 +579,12 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys, mouse, look) = {
             let mut source = lock(&self.source);
+            source.begin();
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             let (keys, mouse) = (source.keys(), source.mouse());
-            (pads, keys, mouse, source.look())
+            let look = source.look();
+            source.observe(&keys, look);
+            (pads, keys, mouse, look)
         };
         let events = self
             .state()
@@ -1341,6 +1374,21 @@ mod host {
         look: MouseLook,
         stick: (f32, f32),
         sampled: Option<Instant>,
+        /// Leonida: Sony pads read over HID (`hid`), as of this poll.
+        sony: hid::Sony,
+        view: hid::View,
+        /// Which XInput slots had a pad this poll, and what they read (before the scripted keys): the Sony pad
+        /// takes the first empty slot, and what is followed for [`Family`] is the pad's own input.
+        xin_connected: [bool; PADS],
+        xin_last: [Option<PadState>; PADS],
+        xin_edges: [family::Detector; PADS],
+        sony_edges: family::Detector,
+        key_edges: family::KeyDetector,
+        /// Whether a remapper (Steam Input, DS4Windows) shows a Sony pad as an XInput one.
+        mirror: family::Mirror,
+        /// The keys held down for real: not the scripted ones.
+        real_keys: Vec<KeyState>,
+        began: bool,
     }
 
     /// `LEONIDA_MOUSE_LOOK=0` turns mouse look off (and with it the click that takes the mouse).
@@ -1374,7 +1422,29 @@ mod host {
         unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
     }
 
+    fn clock() -> Duration {
+        Duration::from_micros(super::now())
+    }
+
     impl Host {
+        /// A remapper makes the Sony pad an XInput one: its own reading is left out.
+        fn mirrored(&self) -> bool {
+            self.mirror.active(clock())
+        }
+
+        /// The slot the Sony pad takes: the first the XInput has no pad in.
+        fn sony_slot(&self) -> Option<usize> {
+            (self.view.pad.is_some() && !self.mirrored())
+                .then(|| (0..PADS).find(|&s| !self.xin_connected[s]))
+                .flatten()
+        }
+
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
+            let pad = self.xinput_pad(slot);
+            self.xin_connected[slot] = pad.is_some();
+            pad
+        }
+
         fn release(&mut self) {
             if self.captured {
                 self.captured = false;
@@ -1444,15 +1514,28 @@ mod host {
         }
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    /// Leonida: the buttons the trainer menu keeps from the title (XInput's bits), taken from a pad of ours.
+    fn withhold(mut pad: PadState) -> PadState {
+        let mask = leonida_menu::withheld_pad();
+        for (host, bit) in BUTTONS {
+            if mask & host != 0 {
+                pad.buttons &= !bit;
+            }
+        }
+        pad
+    }
+
+    impl Host {
+        fn xinput_pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                self.xin_last[slot] = None;
                 return None;
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                self.xin_last[slot] = None;
                 return None;
             }
             self.empty_until[slot] = None;
@@ -1461,6 +1544,7 @@ mod host {
             state.Gamepad.wButtons &= !leonida_menu::withheld_pad();
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            self.xin_last[slot] = Some(pad);
             // The scripted keys (`LEONIDA_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1474,9 +1558,62 @@ mod host {
             }
             Some(pad)
         }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // Leonida: a Sony pad read over HID takes the first slot XInput leaves empty, unless XInput is that
+            // same pad through a remapper.
+            self.xinput(slot)
+                .or_else(|| (self.sony_slot() == Some(slot)).then(|| self.view.pad.map(withhold)).flatten())
+        }
+
+        fn begin(&mut self) {
+            self.view = self.sony.poll();
+            if !std::mem::replace(&mut self.began, true) {
+                let mut shared = family::SHARED.lock().unwrap_or_else(|e| e.into_inner());
+                if self.view.present {
+                    shared.tracker().start_with(Family::PlayStation);
+                }
+                shared.publish(if self.view.present { "a Sony pad is connected" } else { "no input yet" });
+            }
+        }
+
+        fn observe(&mut self, _keys: &[KeyState], look: (f32, f32)) {
+            let now = clock();
+            let mut shared = family::SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            match self.view.pad {
+                Some(pad) => {
+                    if self.sony_edges.deliberate(&pad) {
+                        self.mirror.sony_input(now);
+                        shared.input(Family::PlayStation, now, "Sony pad input");
+                    }
+                }
+                None => self.sony_edges.reset(),
+            }
+            for slot in 0..PADS {
+                match self.xin_last[slot] {
+                    Some(pad) => {
+                        if self.xin_edges[slot].deliberate(&pad) {
+                            self.mirror.xinput_input(now);
+                            // A Sony pad behind a remapper, or one we cannot read (hidden from us), is still a
+                            // PlayStation pad in the player's hands.
+                            let sony = self.mirror.active(now) || (self.view.present && !self.view.readable);
+                            let family = if sony { Family::PlayStation } else { Family::Xbox };
+                            shared.input(family, now, "XInput pad input");
+                        }
+                    }
+                    None => self.xin_edges[slot].reset(),
+                }
+            }
+            if self.key_edges.deliberate(&self.real_keys, look) {
+                shared.input(Family::KeyboardMouse, now, "keyboard or mouse input");
+            }
+        }
 
         fn keys(&mut self) -> Vec<KeyState> {
             let mut down = scripted();
+            self.real_keys.clear();
             // LOCAL (11/26): the F1 settings menu takes the keyboard while shown.
             if leonida_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
                 return Vec::new();
@@ -1492,6 +1629,7 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                self.real_keys.extend(held.iter().map(|&vk| KeyState { virtual_key: vk, ..Default::default() }));
                 down.extend(held);
                 // Leonida: the mouse buttons are the stand-in pad's triggers (right button LT, left button RT);
                 // not while the trainer menu is open (the F1 menu returned above). With mouse look on, only while
@@ -1504,6 +1642,7 @@ mod host {
                         // SAFETY: plain query.
                         if unsafe { GetAsyncKeyState(i32::from(host_vk)) } < 0 {
                             down.push(vk);
+                            self.real_keys.push(KeyState { virtual_key: vk, ..Default::default() });
                         }
                     }
                 }
@@ -1586,6 +1725,10 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            if self.sony_slot() == Some(slot) {
+                self.sony.rumble(low, high);
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
