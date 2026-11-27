@@ -9,7 +9,7 @@
 //! `stack <thread> <phase> <count> <frame>;<frame>;...` (innermost first, as
 //! `module+rva`), where the phase is what the caller's function says of the
 //! frame at that moment. `LEONIDA_PROFILE_ONLY=<name>[,<name>..]` samples only
-//! the threads with such a name, which makes the rounds short.
+//! the threads whose name or start (`module+rva`) holds one of them, which makes the rounds short.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -150,7 +150,7 @@ fn choose(threads: &mut HashMap<u32, Thread>, chosen: &mut Vec<u32>) {
     *chosen = ran
         .into_iter()
         .map(|(_, id)| id)
-        .filter(|id| only.is_empty() || threads.get(id).is_some_and(|t| only.iter().any(|n| t.name.contains(n.as_str()))))
+        .filter(|id| only.is_empty() || threads.get(id).is_some_and(|t| only.iter().any(|n| t.name.contains(n.as_str()) || t.start.contains(n.as_str()))))
         .take(BUSIEST)
         .collect();
 }

@@ -360,15 +360,16 @@ $paths = 'LEONIDA_CONFIG', 'LEONIDA_GAME_DIR', 'LEONIDA_CACHE_DIR', 'LEONIDA_DAT
 Get-ChildItem Env:LEONIDA_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 # The title's own graphics settings (storage\settings\settings.xml in the data folder). It writes the file with its
-# console defaults whenever it exits by itself: ray-traced dynamic shadows on (this layer builds no structure for
-# them by default), two samples of screen-space occlusion, motion blur, full detail and grass distances. The lighter
-# set below is aki-runtime's (Aki-Developer, Apply-LowVramSettings.ps1 and docs/session-2026-11-26.md there: the
-# card's wait went from 50-69 ms to about 10 on its machine). Here, Series X, the same road: 7,700-9,500 draws a
-# frame became 3,100-4,800 and the submitting thread's preparing 40-45 ms became 25-34 (2026-11-27).
-# The first file found is kept beside it as settings.xml.original. -More @{LEONIDA_TITLE_GRAPHICS='keep'} leaves the
-# file alone; copy the .original back over it for the console's own settings.
-$titleGraphics = if ($settings.LEONIDA_TITLE_GRAPHICS) { "$($settings.LEONIDA_TITLE_GRAPHICS)" } else { 'performance' }
-if (-not $DryRun -and $titleGraphics -ne 'keep' -and $env:LEONIDA_DATA_DIR) {
+# console defaults whenever it exits by itself: ray-traced dynamic shadows on, two samples of screen-space
+# occlusion, motion blur, full detail and grass distances. -More @{LEONIDA_TITLE_GRAPHICS='performance'} writes the
+# lighter set aki-runtime uses (Aki-Developer, Apply-LowVramSettings.ps1 and docs/session-2026-11-26.md of
+# aki-gta6/aki-runtime: on its Series S profile the card's wait went from 50-69 ms to about 10) and keeps the first
+# file beside it as settings.xml.original. Off by default: on the Series X profile here it changed nothing that
+# could be measured at the save (three minutes of the idle camera each, 2026-11-27: 92.5 ms a frame and 6,353
+# draws with the console's settings, 90.9-101.7 ms and 6,636-7,079 draws with the lighter set) and 338-350 draws a
+# frame were dropped for want of a pipeline against 191.
+$titleGraphics = if ($settings.LEONIDA_TITLE_GRAPHICS) { "$($settings.LEONIDA_TITLE_GRAPHICS)" } else { 'keep' }
+if (-not $DryRun -and $titleGraphics -eq 'performance' -and $env:LEONIDA_DATA_DIR) {
     $lighter = [ordered]@{
         rtDynamicShadows = 'false'; rtLODLightShadows = 'false'; ssroSampleCount = '0'; motionBlur = 'false'
         shadowParticleShadows = 'false'; sharpenEnabled = 'false'; grassLod = '0.300000'; lodScale = '0.600000'
@@ -385,7 +386,7 @@ if (-not $DryRun -and $titleGraphics -ne 'keep' -and $env:LEONIDA_DATA_DIR) {
         if ($new -ne $text) {
             if (-not (Test-Path "$file.original")) { Copy-Item $file "$file.original" }
             [IO.File]::WriteAllText($file, $new, (New-Object Text.UTF8Encoding $false))
-            Write-Host "The title's graphics settings: the lighter set written (LEONIDA_TITLE_GRAPHICS='keep' in -More leaves them; the first file is $file.original)."
+            Write-Host "The title's graphics settings: the lighter set written (the first file is $file.original)."
         }
     }
 }
