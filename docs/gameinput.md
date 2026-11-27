@@ -161,8 +161,18 @@ with a stand-in pad made from the keyboard and mouse, present while no host pad 
 | Esc, Tab | Menu, View |
 
 The mouse buttons pull the triggers fully while held. They are not passed to the title while the F1 settings menu or
-the F4 trainer menu is open, and they never reach the title as keyboard keys. Mouse movement still turns the camera
-(the title reads the mouse itself).
+the F4 trainer menu is open, and they never reach the title as keyboard keys.
+
+**Mouse look (D3D12 runtime).** The console title turns its camera with the right stick only; it does not read the
+mouse for that. A left click in the game window makes the window hold the mouse: the cursor is hidden and kept in the
+window, and the mouse's motion becomes a right-stick push (`MouseLook` in `d3d12/crates/leonida-hle/src/modules/
+gameinput.rs`): its speed over the last 40 ms, a full push at 1600 pixels a second, lifted past a 0.24 dead zone with a
+0.6 power curve, merged with the pad's own stick. That click is not a shot; the mouse buttons reach the title as
+triggers only while the window holds the mouse. Esc (which also pauses), the F1 or F4 menu, or another window in front
+gives the mouse back. Settings: `LEONIDA_MOUSE_SENSITIVITY` (1, 0.1..10), `LEONIDA_MOUSE_INVERT_Y=1`,
+`LEONIDA_MOUSE_DEADZONE` (0.24), `LEONIDA_MOUSE_CURVE` (0.6), `LEONIDA_MOUSE_LOOK=0` (off: the old behaviour, buttons
+whenever the window has focus). Unit-tested (`mouse_look_turns_speed_into_a_stick_past_the_dead_zone`); the dead zone
+and curve are first guesses at the title's own stick response, not measured.
 
 ## Rumble and triggers
 

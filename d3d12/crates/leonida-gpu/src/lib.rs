@@ -50,6 +50,9 @@ mod host;
 
 /// LOCAL (11/26): the F1 settings menu is shown (host/menu.rs): the title gets no keyboard.
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Leonida: the game window holds the mouse for mouse look (leonida-hle `gameinput`): its window procedures hide the
+/// cursor over the client area while this is set.
+pub static MOUSE_CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(windows)]
 pub mod streamline;
 #[cfg(windows)]

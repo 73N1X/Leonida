@@ -71,7 +71,7 @@ const POLL: Duration = Duration::from_millis(8);
 /// The keyboard's stand-in gamepad (virtual key, button), in Leonida's layout (the one its Vulkan runtime's
 /// gameinput shim has): the pad-named keys, and PC-style ones beside them: Space confirms/jumps (A), F interacts (Y),
 /// R goes back/reloads (B), Left Shift and C click the sticks. H stays a second right-stick click.
-/// Sticks: W/A/S/D left, I/J/K/L right (the mouse also turns the camera: the title reads it directly);
+/// Sticks: W/A/S/D left, I/J/K/L right (and the mouse, once a click in the window has it: `MouseLook`);
 /// triggers Z (left) and V (right), and the mouse: the right button is the left trigger (aim), the left button the
 /// right trigger (fire); both only while a window of the runtime has focus and neither menu is open.
 const FALLBACK_BUTTONS: [(u8, u32); 19] = [
@@ -152,6 +152,67 @@ fn mouse_delta(
     (current, delta)
 }
 
+/// Leonida: mouse look. The title turns its camera with the right stick only (the console build reads no mouse for
+/// it), so while the game window holds the mouse its motion becomes a right-stick push: the speed over the last
+/// `tau` seconds, over `full_speed` pixels a second is the push, lifted past the title's dead zone and shaped by
+/// `curve` (below 1 makes slow motion count for more, against the title's own stick curve).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LookTune {
+    full_speed: f32,
+    dead: f32,
+    curve: f32,
+    tau: f32,
+    invert_y: bool,
+}
+
+impl LookTune {
+    /// `LEONIDA_MOUSE_SENSITIVITY` (1; 0.1..10), `LEONIDA_MOUSE_DEADZONE` (0.24), `LEONIDA_MOUSE_CURVE` (0.6),
+    /// `LEONIDA_MOUSE_INVERT_Y` (0).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn from_env() -> LookTune {
+        let num = |name: &str, default: f32, lo: f32, hi: f32| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).map_or(default, |v| v.clamp(lo, hi))
+        };
+        LookTune {
+            full_speed: 1600.0 / num("LEONIDA_MOUSE_SENSITIVITY", 1.0, 0.1, 10.0),
+            dead: num("LEONIDA_MOUSE_DEADZONE", 0.24, 0.0, 0.9),
+            curve: num("LEONIDA_MOUSE_CURVE", 0.6, 0.2, 2.0),
+            tau: 0.04,
+            invert_y: std::env::var_os("LEONIDA_MOUSE_INVERT_Y").is_some_and(|v| v == "1"),
+        }
+    }
+}
+
+/// The mouse's recent motion: the samples of the last `tau` seconds (a moving window, so the stick lets go
+/// `tau` after the mouse stops, however fast it went).
+#[derive(Clone, Debug, Default)]
+struct MouseLook {
+    samples: VecDeque<(f32, i64, i64)>,
+}
+
+impl MouseLook {
+    /// Takes the motion since the last sample, `dt` seconds ago, and gives the right stick (x right, y up).
+    fn step(&mut self, dx: i64, dy: i64, dt: f32, tune: &LookTune) -> (f32, f32) {
+        let dt = dt.clamp(0.001, 0.1);
+        self.samples.push_back((dt, dx, dy));
+        let mut span: f32 = self.samples.iter().map(|s| s.0).sum();
+        while self.samples.len() > 1 && span - self.samples[0].0 >= tune.tau {
+            span -= self.samples[0].0;
+            self.samples.pop_front();
+        }
+        let (mx, my) = self.samples.iter().fold((0, 0), |(x, y), s| (x + s.1, y + s.2));
+        let (vx, vy) = (mx as f32 / span, my as f32 / span);
+        let sx = vx / tune.full_speed;
+        let sy = if tune.invert_y { vy } else { -vy } / tune.full_speed;
+        let push = sx.hypot(sy);
+        if push < 0.004 {
+            return (0.0, 0.0);
+        }
+        let out = tune.dead + (1.0 - tune.dead) * push.min(1.0).powf(tune.curve);
+        (sx / push * out, sy / push * out)
+    }
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -160,6 +221,10 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     fn mouse(&mut self) -> Option<MouseState> {
         None
+    }
+    /// Leonida: the right stick mouse look gives (see [`MouseLook`]), read after `mouse`.
+    fn look(&mut self) -> (f32, f32) {
+        (0.0, 0.0)
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
@@ -482,14 +547,15 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, keys, mouse, look) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            let (keys, mouse) = (source.keys(), source.mouse());
+            (pads, keys, mouse, source.look())
         };
         let events = self
             .state()
-            .poll(&self.devices, self.one_pad, pads, keys, mouse);
+            .poll(&self.devices, self.one_pad, pads, keys, mouse, look);
         self.deliver(events);
     }
 
@@ -536,8 +602,12 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
+        look: (f32, f32),
     ) -> Vec<Event> {
         let now = now();
+        // Leonida: mouse look turns the camera through the right stick of the pad the title plays with.
+        let look = PadState { right_x: look.0, right_y: look.1, ..Default::default() };
+        let mut pads = pads;
         let pad_keys = keys;
         let keys: Vec<KeyState> = pad_keys
             .iter()
@@ -547,16 +617,19 @@ impl State {
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&pad_keys), merged);
+            let pad = pads.into_iter().flatten().fold(merged(fallback(&pad_keys), look), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
+        if let Some(first) = pads.iter_mut().flatten().next() {
+            *first = merged(*first, look);
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&pad_keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merged(fallback(&pad_keys), look)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1198,10 +1271,10 @@ mod host {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1212,7 +1285,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+        ClipCursor, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1259,6 +1332,116 @@ mod host {
         empty_until: [Option<Instant>; PADS],
         previous_cursor: Option<(i32, i32)>,
         mouse: MouseState,
+        /// Leonida mouse look: the window holds the mouse (a click in it took it; Esc, a menu or another window
+        /// in front gives it back).
+        captured: bool,
+        /// The click that took the mouse is not the title's: the left button counts again once it is up.
+        swallow_left: bool,
+        left_was: bool,
+        look: MouseLook,
+        stick: (f32, f32),
+        sampled: Option<Instant>,
+    }
+
+    /// `LEONIDA_MOUSE_LOOK=0` turns mouse look off (and with it the click that takes the mouse).
+    fn look_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("LEONIDA_MOUSE_LOOK").is_none_or(|v| v != "0"));
+        *ON
+    }
+
+    fn look_tune() -> &'static LookTune {
+        static TUNE: LazyLock<LookTune> = LazyLock::new(LookTune::from_env);
+        &TUNE
+    }
+
+    /// The client area in screen coordinates; `None` when empty.
+    fn client_on_screen(window: HWND) -> Option<RECT> {
+        let mut rect = RECT::default();
+        let mut origin = POINT::default();
+        // SAFETY: outputs are local.
+        let ok = unsafe { GetClientRect(window, &mut rect) != 0 && ClientToScreen(window, &mut origin) != 0 };
+        (ok && rect.right > 0 && rect.bottom > 0).then(|| RECT {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + rect.right,
+            bottom: origin.y + rect.bottom,
+        })
+    }
+
+    fn down(vk: u16) -> bool {
+        // SAFETY: plain query.
+        unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
+    }
+
+    impl Host {
+        fn release(&mut self) {
+            if self.captured {
+                self.captured = false;
+                leonida_gpu::MOUSE_CAPTURED.store(false, std::sync::atomic::Ordering::Relaxed);
+                // SAFETY: null frees the cursor.
+                unsafe { ClipCursor(std::ptr::null()) };
+                tracing::info!("mouse look: the mouse is free");
+            }
+            self.look = MouseLook::default();
+            self.stick = (0.0, 0.0);
+        }
+
+        /// Takes the mouse on a click in the window, gives it back on Esc, a menu or focus loss, and while it is
+        /// held turns its motion (from the window's centre, where the cursor is put back each sample) into the
+        /// look stick. Returns the motion since the last sample when held.
+        fn capture(&mut self, window: Option<HWND>) -> Option<(i64, i64)> {
+            let left = down(VK_LBUTTON);
+            let clicked = left && !self.left_was;
+            self.left_was = left;
+            if self.swallow_left && !left {
+                self.swallow_left = false;
+            }
+            let menus = leonida_menu::is_open()
+                || leonida_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+            let Some(window) = window.filter(|_| look_enabled() && !menus) else {
+                self.release();
+                return None;
+            };
+            let Some(client) = client_on_screen(window) else {
+                self.release();
+                return None;
+            };
+            let mut point = POINT::default();
+            // SAFETY: output is local.
+            if unsafe { GetCursorPos(&mut point) } == 0 {
+                return None;
+            }
+            let just_taken = !self.captured;
+            if just_taken {
+                let inside = (client.left..client.right).contains(&point.x)
+                    && (client.top..client.bottom).contains(&point.y);
+                if !(clicked && inside) {
+                    return None;
+                }
+                self.captured = true;
+                self.swallow_left = true;
+                leonida_gpu::MOUSE_CAPTURED.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!("mouse look: the window holds the mouse (Esc frees it)");
+            } else if down(VK_ESCAPE) {
+                self.release();
+                return None;
+            }
+            let centre = ((client.left + client.right) / 2, (client.top + client.bottom) / 2);
+            // The cursor is put at the centre after each sample, so its distance from there is the motion; the
+            // first sample after the click starts from wherever the click was.
+            let motion = if just_taken {
+                (0, 0)
+            } else {
+                (i64::from(point.x - centre.0), i64::from(point.y - centre.1))
+            };
+            // SAFETY: a point and a rectangle on screen.
+            unsafe {
+                ClipCursor(&client);
+                SetCursorPos(centre.0, centre.1);
+            }
+            Some(motion)
+        }
     }
 
     impl Source for Host {
@@ -1311,9 +1494,13 @@ mod host {
                     .collect();
                 down.extend(held);
                 // Leonida: the mouse buttons are the stand-in pad's triggers (right button LT, left button RT);
-                // not while the trainer menu is open (the F1 menu returned above).
-                if !leonida_menu::is_open() {
+                // not while the trainer menu is open (the F1 menu returned above). With mouse look on, only while
+                // the window holds the mouse, and not the click that took it.
+                if !leonida_menu::is_open() && (!look_enabled() || self.captured) {
                     for (vk, host_vk) in [(VK_MOUSE_LEFT, VK_LBUTTON), (VK_MOUSE_RIGHT, VK_RBUTTON)] {
+                        if vk == VK_MOUSE_LEFT && self.swallow_left {
+                            continue;
+                        }
                         // SAFETY: plain query.
                         if unsafe { GetAsyncKeyState(i32::from(host_vk)) } < 0 {
                             down.push(vk);
@@ -1336,11 +1523,36 @@ mod host {
         fn mouse(&mut self) -> Option<MouseState> {
             static ENABLED: LazyLock<bool> =
                 LazyLock::new(|| std::env::var_os("LEONIDA_GAMEPAD_MOUSE").is_none_or(|v| v != "0"));
+            let window = focused_window();
+            // Leonida mouse look, whether or not the title also gets the mouse as a device.
+            let now = Instant::now();
+            let dt = self.sampled.map_or(0.008, |at| (now - at).as_secs_f32());
+            self.sampled = Some(now);
+            let held = self.capture(window);
+            if let Some((dx, dy)) = held {
+                self.stick = self.look.step(dx, dy, dt, look_tune());
+            } else {
+                self.look = MouseLook::default();
+                self.stick = (0.0, 0.0);
+            }
             if !*ENABLED {
                 return None;
             }
+            if let Some((dx, dy)) = held {
+                // Held: the cursor stays at the centre, so the motion is the sample's distance from it.
+                self.previous_cursor = None;
+                self.mouse.position_x += dx;
+                self.mouse.position_y += dy;
+                self.mouse.buttons = 0;
+                for (bit, vk) in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].into_iter().enumerate() {
+                    if down(vk) && !(bit == 0 && self.swallow_left) {
+                        self.mouse.buttons |= 1 << bit;
+                    }
+                }
+                return Some(self.mouse);
+            }
             let (mut point, mut rect) = (POINT::default(), RECT::default());
-            let position = focused_window().and_then(|window| {
+            let position = window.and_then(|window| {
                 // SAFETY: all outputs are local and all coordinates use the same window.
                 let sampled = unsafe {
                     GetCursorPos(&mut point) != 0
@@ -1367,6 +1579,10 @@ mod host {
                 }
             }
             Some(self.mouse)
+        }
+
+        fn look(&mut self) -> (f32, f32) {
+            self.stick
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1430,6 +1646,11 @@ mod host {
     /// test script writes `W D`, then an empty line). Names as in
     /// `LEONIDA_KEYS`, plus `Shift` (left shift) and `Space`. Read again at
     /// most every 50 ms.
+    #[cfg(not(feature = "diagnostics"))]
+    fn held_from_file() -> Vec<u8> {
+        Vec::new()
+    }
+
     #[cfg(feature = "diagnostics")]
     fn held_from_file() -> Vec<u8> {
         use std::sync::Mutex;
@@ -1662,6 +1883,38 @@ mod tests {
             Some(Provenance::Hle)
         );
         assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
+    }
+
+    #[test]
+    fn mouse_look_turns_speed_into_a_stick_past_the_dead_zone() {
+        let tune = LookTune { full_speed: 1600.0, dead: 0.24, curve: 0.6, tau: 0.04, invert_y: false };
+        let mut look = MouseLook::default();
+        // Still: centred.
+        assert_eq!(look.step(0, 0, 0.008, &tune), (0.0, 0.0));
+        // A steady 800 px/s to the right and up settles at half speed: right and up, past the dead zone.
+        let mut stick = (0.0, 0.0);
+        for _ in 0..40 {
+            stick = look.step(4, -4, 0.005, &tune);
+        }
+        assert!(stick.0 > 0.24 && stick.1 > 0.24 && stick.0 < 1.0, "{stick:?}");
+        assert!((stick.0 - stick.1).abs() < 1e-4, "diagonal stays diagonal: {stick:?}");
+        // A fast flick saturates at a full push.
+        for _ in 0..40 {
+            stick = look.step(100, 0, 0.008, &tune);
+        }
+        assert!((stick.0 - 1.0).abs() < 1e-3 && stick.1.abs() < 0.05, "{stick:?}");
+        // Stopping lets go within about a tenth of a second.
+        for _ in 0..15 {
+            stick = look.step(0, 0, 0.008, &tune);
+        }
+        assert_eq!(stick, (0.0, 0.0));
+        // Inverted y: moving the mouse up looks down.
+        let inverted = LookTune { invert_y: true, ..tune };
+        let mut look = MouseLook::default();
+        for _ in 0..40 {
+            stick = look.step(0, -6, 0.008, &inverted);
+        }
+        assert!(stick.1 < -0.24, "{stick:?}");
     }
 
     #[test]

@@ -261,6 +261,15 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // Leonida: mouse look holds the mouse (gameinput): no cursor over the picture.
+    if message == wm::WM_SETCURSOR
+        && (lparam & 0xFFFF) as u32 == wm::HTCLIENT
+        && leonida_gpu::MOUSE_CAPTURED.load(Ordering::Relaxed)
+    {
+        // SAFETY: a null cursor hides it while it is over this window.
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);

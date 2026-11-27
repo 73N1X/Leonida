@@ -10617,6 +10617,15 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Leonida: mouse look holds the mouse (leonida-hle gameinput): no cursor over the picture.
+    if message == WM_SETCURSOR
+        && (lparam.0 & 0xFFFF) as u32 == HTCLIENT
+        && crate::MOUSE_CAPTURED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        // SAFETY: a null cursor hides it while it is over this window.
+        unsafe { SetCursor(None) };
+        return LRESULT(1);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
