@@ -961,3 +961,72 @@ fn log_misc_and_time_work() {
     assert_eq!(log[2], "time number true 0");
     assert_eq!(log[3], "shot shot.png");
 }
+
+#[test]
+fn the_example_mod_ships_disabled_and_runs_when_enabled() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../mods/example_lua");
+    let manifest = std::fs::read_to_string(source.join("mod.json")).unwrap();
+    assert!(
+        !crate::manifest::parse("example_lua", &manifest)
+            .unwrap()
+            .enabled
+    );
+    // Enabled, in a folder of its own.
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("example_lua");
+    std::fs::create_dir_all(&at).unwrap();
+    std::fs::write(at.join("mod.json"), manifest.replace("false", "true")).unwrap();
+    std::fs::copy(source.join("main.lua"), at.join("main.lua")).unwrap();
+    let fake = Fake::new();
+    let mut rt = Runtime::new(fake.clone(), Config::default()).unwrap();
+    let report = rt.load_dir(dir.path());
+    assert_eq!(report, [("Example Lua mod".to_owned(), Status::Running)]);
+    // Its page: a toggle, a number and two actions.
+    let pages = fake.pages.borrow().last().unwrap().clone();
+    assert_eq!(pages.len(), 1);
+    let labels: Vec<_> = pages[0].items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Show the line",
+            "Line size",
+            "Take a screenshot",
+            "Log the image base"
+        ]
+    );
+    // A frame draws the line; F9 turns it off; the actions and events run.
+    pass(&mut rt, 1);
+    let drawn = fake.overlay.borrow().last().unwrap().clone();
+    assert!(
+        matches!(&drawn[1], Cmd::Text { text, .. } if text.starts_with("Lua example")),
+        "{drawn:?}"
+    );
+    fake.keys.borrow_mut().insert(0x78);
+    pass(&mut rt, 2);
+    fake.keys.borrow_mut().clear();
+    pass(&mut rt, 3);
+    assert!(fake.overlay.borrow().last().unwrap().is_empty());
+    *fake.events.borrow_mut() = vec![
+        Event {
+            page: 0,
+            item: 2,
+            value: MenuValue::None,
+        },
+        Event {
+            page: 0,
+            item: 3,
+            value: MenuValue::None,
+        },
+    ];
+    fake.menu_open.set(true);
+    pass(&mut rt, 4);
+    let log = fake.of("Example Lua mod");
+    assert!(log.iter().any(|l| l == "screenshot: shot.png"), "{log:?}");
+    assert!(
+        log.iter()
+            .any(|l| l.contains("the title's image:") && l.contains("4096 bytes")),
+        "{log:?}"
+    );
+    assert!(log.iter().any(|l| l == "the F4 menu was opened"), "{log:?}");
+    assert_eq!(status(&rt, "Example Lua mod"), Status::Running);
+}

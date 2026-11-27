@@ -17,7 +17,7 @@ menu, and checked reads and writes of the title's memory with a byte-pattern sca
 here touches anything online. The code is `d3d12/crates/leonida-lua`, `d3d12/crates/leonida-menu/src/overlay.rs` and
 `mods.rs`, and `d3d12/crates/leonida-gpu/src/host/trainer.rs` (where the overlay is drawn).
 
-Status: built and unit-tested (`cargo test -p leonida-lua --lib`, 34 tests, and the menu crate's); **not yet tried in
+Status: built and unit-tested (`cargo test -p leonida-lua --lib`, 35 tests, and the menu crate's); **not yet tried in
 the running title**. What that leaves open is listed at the end.
 
 ## Trying it
