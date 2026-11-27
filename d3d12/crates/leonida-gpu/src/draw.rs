@@ -2407,7 +2407,7 @@ impl State {
                 }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
-                for &(slot, param) in views {
+                for (at, &(slot, param)) in views.iter().enumerate() {
                     if srv && slot == leonida_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -2450,12 +2450,10 @@ impl State {
                         }
                         continue;
                     };
-                    // The shader adds the bytes a raw view begins early by.
-                    let biased = srv
-                        && t.host.user_data.iter().any(|u| {
-                            u.slot == slot
-                                && u.root == RootType::Other(leonida_shader::emit::USER_VIEW_BIAS)
-                        });
+                    // The shader adds the bytes a raw view begins early by
+                    // (known with the pipeline, not asked of its user data
+                    // at every draw).
+                    let biased = srv && stage.root_srv_biased(at);
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
