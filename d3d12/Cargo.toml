@@ -22,6 +22,7 @@ leonida-shader = { path = "crates/leonida-shader" }
 leonida-formats = { path = "crates/leonida-formats" }
 leonida-pipeline = { path = "crates/leonida-pipeline" }
 leonida-game = { path = "crates/leonida-game" }
+leonida-menu = { path = "crates/leonida-menu" }
 
 # External crates
 anyhow = "1.0.104"
