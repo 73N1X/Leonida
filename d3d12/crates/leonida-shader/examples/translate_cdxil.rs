@@ -3,6 +3,9 @@
 //! NVIDIA run: waves of 32, a view heap of 2^21 slots with raw twins, no
 //! RDNA shortcuts.
 //!
+//! (`TRANSLATE_VALIDATE=1` with `--census` runs each translation through dxil.dll's validator and
+//! prints `INVALID` lines for the ones it refuses.)
+//!
 //! `translate_cdxil <out dir> <file.cdxil>...` writes `<stem>.dxil` (the
 //! translation) and `<stem>.s` (the console code in SP3 text, with the
 //! program's wave size, threads and LDS in a header) and prints a line of
@@ -22,6 +25,11 @@ fn main() {
         unsafe { std::env::set_var("LEONIDA_SHADER_CENSUS", "1") };
     }
     let out = std::path::PathBuf::from(args.next().expect("out dir"));
+    // `--validate` (with `--census`): each translation also goes through dxil.dll's validator
+    let validate = std::env::var_os("TRANSLATE_VALIDATE").is_some();
+    #[cfg(windows)]
+    let mut validator = validate
+        .then(|| emit::validator::Validator::load(emit::validator::Validator::default_path().as_deref()).expect("dxil.dll"));
     std::fs::create_dir_all(&out).unwrap();
     emit::set_host_max_wave(32);
     emit::set_raw_views(1 << 21);
@@ -61,6 +69,14 @@ fn main() {
         let t = std::time::Instant::now();
         match emit::translate(&bytes) {
             Ok(h) if census_only => {
+                #[cfg(windows)]
+                if let Some(v) = validator.as_mut() {
+                    let mut copy = h.dxil.clone();
+                    if let Err(e) = v.validate(&mut copy) {
+                        println!("{stem}	INVALID	{}", e.lines().next().unwrap_or(""));
+                        continue;
+                    }
+                }
                 let c = emit::census::take(&h.dxil).unwrap_or_default();
                 let counts: Vec<String> = c.counts.iter().map(|n| n.to_string()).collect();
                 println!("{stem}	{}	{native_insts}	{}	{}", head.replace(' ', ","), h.dxil.len(), counts.join("	"));
