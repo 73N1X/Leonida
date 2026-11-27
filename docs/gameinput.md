@@ -143,6 +143,27 @@ stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focu
 
 To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
 
+## The keyboard-and-mouse pad of the D3D12 runtime
+
+The D3D12 runtime (`d3d12/`) has its own GameInput module (`d3d12/crates/leonida-hle/src/modules/gameinput.rs`)
+with a stand-in pad made from the keyboard and mouse, present while no host pad is connected (or beside one, with
+`LEONIDA_ONE_PAD`, the default). Keys and mouse buttons count only while a window of the runtime has focus.
+
+| input | pad |
+|---|---|
+| W A S D / I J K L | left / right stick |
+| arrows | d-pad |
+| Space or Enter, F or Y, R or Backspace, X | A, Y, B, X |
+| Q / E | shoulders |
+| Left Shift or Left Ctrl / C or H | left / right stick click |
+| Z or right mouse button | left trigger (LT, aim) |
+| V or left mouse button | right trigger (RT, fire) |
+| Esc, Tab | Menu, View |
+
+The mouse buttons pull the triggers fully while held. They are not passed to the title while the F1 settings menu or
+the F4 trainer menu is open, and they never reach the title as keyboard keys. Mouse movement still turns the camera
+(the title reads the mouse itself).
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on

@@ -54,6 +54,11 @@ const RIGHT_STICK: u32 = 0x2000;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, keyboard and mouse.
 const PADS: usize = 4;
+
+/// The mouse buttons as the stand-in pad sees them: pseudo keys (virtual keys 1 and 2), put in the key list by the
+/// host source while the title is focused, and taken out again before the keyboard device reports its keys.
+const VK_MOUSE_LEFT: u8 = 0x01;
+const VK_MOUSE_RIGHT: u8 = 0x02;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const MOUSE: usize = PADS + 2;
@@ -67,7 +72,8 @@ const POLL: Duration = Duration::from_millis(8);
 /// gameinput shim has): the pad-named keys, and PC-style ones beside them: Space confirms/jumps (A), F interacts (Y),
 /// R goes back/reloads (B), Left Shift and C click the sticks. H stays a second right-stick click.
 /// Sticks: W/A/S/D left, I/J/K/L right (the mouse also turns the camera: the title reads it directly);
-/// triggers Z (left) and V (right).
+/// triggers Z (left) and V (right), and the mouse: the right button is the left trigger (aim), the left button the
+/// right trigger (fire); both only while a window of the runtime has focus and neither menu is open.
 const FALLBACK_BUTTONS: [(u8, u32); 19] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -172,8 +178,8 @@ fn fallback(keys: &[KeyState]) -> PadState {
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'V'),
+        left_trigger: f32::max(on(b'Z'), on(VK_MOUSE_RIGHT)),
+        right_trigger: f32::max(on(b'V'), on(VK_MOUSE_LEFT)),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -532,10 +538,16 @@ impl State {
         mouse: Option<MouseState>,
     ) -> Vec<Event> {
         let now = now();
+        let pad_keys = keys;
+        let keys: Vec<KeyState> = pad_keys
+            .iter()
+            .copied()
+            .filter(|k| k.virtual_key != VK_MOUSE_LEFT && k.virtual_key != VK_MOUSE_RIGHT)
+            .collect();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(fallback(&pad_keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -544,7 +556,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&pad_keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1298,6 +1310,16 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+                // Leonida: the mouse buttons are the stand-in pad's triggers (right button LT, left button RT);
+                // not while the trainer menu is open (the F1 menu returned above).
+                if !leonida_menu::is_open() {
+                    for (vk, host_vk) in [(VK_MOUSE_LEFT, VK_LBUTTON), (VK_MOUSE_RIGHT, VK_RBUTTON)] {
+                        // SAFETY: plain query.
+                        if unsafe { GetAsyncKeyState(i32::from(host_vk)) } < 0 {
+                            down.push(vk);
+                        }
+                    }
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1791,6 +1813,34 @@ mod tests {
         assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
         // C no longer pulls a trigger.
         assert_eq!(fallback(&[key(b'C')]).right_trigger, 0.0);
+    }
+
+    #[test]
+    fn mouse_buttons_pull_the_triggers_and_stay_off_the_keyboard() {
+        // Right button aims (LT), left button fires (RT); Z and V still work.
+        let pad = fallback(&[key(VK_MOUSE_RIGHT)]);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 0.0));
+        let pad = fallback(&[key(VK_MOUSE_LEFT)]);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
+        let pad = fallback(&[key(VK_MOUSE_LEFT), key(VK_MOUSE_RIGHT), key(b'Z')]);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
+        assert_eq!(fallback(&[key(b'V')]).right_trigger, 1.0);
+        assert_eq!(fallback(&[]).right_trigger, 0.0);
+        // The pseudo keys feed the pad only: the keyboard device never lists them.
+        let (hub, host) = fake_with(false);
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        host.lock().unwrap().keys = vec![key(VK_MOUSE_LEFT), key(b'D')];
+        hub.poll();
+        let state = hub.state();
+        match &state.slots[FALLBACK].history.back().unwrap().value {
+            Value::Pad(p) => assert_eq!((p.right_trigger, p.left_x), (1.0, 1.0)),
+            _ => unreachable!(),
+        }
+        match &state.slots[KEYBOARD].history.back().map(|r| &r.value) {
+            Some(Value::Keys(k)) => assert!(k.iter().all(|k| k.virtual_key == b'D')),
+            _ => {}
+        }
     }
 
     #[test]
