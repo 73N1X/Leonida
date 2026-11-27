@@ -153,6 +153,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// A compute program translated to run several console groups to a host group
+    /// (`LEONIDA_GROUP_PACK`): where its console grid goes (`crate::draw::pack_of`).
+    pub(crate) pack: Option<crate::draw::PackWords>,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -241,6 +244,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .map(|p| p.used)
         .unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let pack = crate::draw::pack_in(&host.user_data);
     Ok(Translated {
         host,
         threads,
@@ -248,6 +252,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        pack,
         picks: Default::default(),
     })
 }

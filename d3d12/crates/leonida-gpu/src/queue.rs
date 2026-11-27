@@ -1090,24 +1090,30 @@ extern "system" fn present(
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
-        let (drawn, dispatched) = {
+        let (drawn, dispatched, packed) = {
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+            static PACKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
             let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
+            let packed = crate::draw::packed();
             (
                 since(&DRAWN, crate::draw::drawn()),
                 since(&DISPATCHED, crate::draw::dispatched()),
+                [since(&PACKED[0], packed[0]), since(&PACKED[1], packed[1])],
             )
         };
         #[cfg(not(windows))]
-        let (drawn, dispatched) = (0, 0);
+        let (drawn, dispatched, packed) = (0, 0, [0, 0]);
         tracing::info!(
             frame,
             draws,
             drawn,
             dispatches,
             dispatched,
-            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+            packed_direct = packed[0],
+            packed_indirect = packed[1],
+            "frame presented (since the last line: draws and dispatches, those run on the host, and \
+             those of programs run several console groups to a host group, direct and indirect)"
         );
         #[cfg(windows)]
         if frame >= 256 {

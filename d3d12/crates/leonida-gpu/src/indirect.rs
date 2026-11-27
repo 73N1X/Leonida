@@ -43,7 +43,7 @@ use crate::host::{HostList, host, transition};
 pub(crate) mod batch;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -54,6 +54,13 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // Dispatches only. Over 1: a program that runs this many console groups to a host group
+    // (`leonida_shader::emit::pack_grid`): the record is written as the three dwords of the
+    // console's grid (X, Y, groups in all) and the host grid, 24 bytes (`dst_stride`) whatever
+    // the stride of the title's: root constants and a dispatch of a command signature.
+    uint pack;
+    // The bytes between the clamped records, `stride` but for a packed dispatch.
+    uint dst_stride;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -89,7 +96,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = id.x * dst_stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -223,9 +230,19 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        if (kind == 2 && pack > 1) {
+            // (at most 2^20 groups in all, as above)
+            uint total = groups.x * groups.y * groups.z;
+            uint n = (total + pack - 1) / pack;
+            uint hx = min(n, 65535u);
+            uint hy = hx == 0 ? 1u : (n + hx - 1) / hx;
+            dst_args.Store3(dst_at, uint3(groups.x, groups.y, total));
+            dst_args.Store3(dst_at + 12, uint3(hx, hy, 1));
+        } else {
+            dst_args.Store3(dst_at, groups);
+            for (uint off = 12; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
         }
     }
 }
@@ -399,9 +416,43 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    bound_packed(list, src, count, spec, 0)
+}
+
+/// The bytes of a record the clamp writes for a dispatch of a program run `pack` console groups to
+/// a host group: the console's grid in three dwords, then the host's grid.
+pub(crate) const PACKED: u32 = 24;
+
+/// [`bound`] for a dispatch (`spec`'s kind 2) of a program that runs `pack` (over 1) console
+/// groups to a host group: the records come out of 24 bytes ([`PACKED`]), three root constants
+/// (the console's grid X and Y and its groups in all) and the groups of the host's dispatch
+/// (`leonida_shader::emit::pack_grid` as the clamp makes it), for a command signature of those
+/// two arguments.
+pub(crate) fn bound_packed(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    pack: u32,
+) -> Option<ID3D12Resource> {
+    let bytes = scratch_bytes(spec, src.1, count.map(|(_, off)| off), pack)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, false, pack).then_some(dst)
+}
+
+/// The scratch bytes the clamp's records take: [`validate_layout`]'s, or the packed records'.
+fn scratch_bytes(
+    spec: (u32, u32, u32),
+    src_offset: u64,
+    count_offset: Option<u64>,
+    pack: u32,
+) -> Option<u64> {
+    let bytes = validate_layout(spec, src_offset, count_offset)?;
+    if pack < 2 {
+        return Some(bytes);
+    }
+    // (a dispatch alone)
+    (spec.0 == 2).then(|| u64::from(PACKED) * u64::from(spec.2))
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -421,7 +472,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, true, 0).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -437,9 +488,10 @@ fn clamp_into(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
+    pack: u32,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_packed(c, &list.list, (dst, before), budget, src, count, spec, ahead, pack);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -455,13 +507,31 @@ fn clamp_into(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    to: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_packed(c, l, to, budget, src, count, spec, ahead, 0)
+}
+
+/// [`record_clamp_as`] for dispatches run `pack` console groups to a host group (over 1; see
+/// [`bound_packed`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_packed(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    pack: u32,
 ) -> bool {
+    let pack = if kind == 2 && pack > 1 { pack } else { 0 };
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,
@@ -505,7 +575,17 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let dst_stride = if pack > 1 { PACKED } else { stride };
+    let constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1),
+        count_offset,
+        pack,
+        dst_stride,
+    ];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -539,7 +619,7 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
@@ -3061,6 +3141,198 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         assert_eq!(t.place(7, 1024, 1), None, "full");
         assert_eq!(t.place(7, 1024 + 16 * 5, 0), Some(4096 + 5 * u64::from(SLOT)));
         assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
+    }
+
+    /// A worker of one thread to a group that notes the console grid its root constants hold
+    /// (X, Y, groups in all) and the largest group number it ran in.
+    const GRID_WORKER_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), UAV(u0)"
+cbuffer Grid : register(b0) {
+    uint gx;
+    uint gy;
+    uint total;
+};
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    uint was;
+    hits.InterlockedAdd(0, 1, was);
+    hits.InterlockedMax(4, gx, was);
+    hits.InterlockedMax(8, gy, was);
+    hits.InterlockedMax(12, total, was);
+    hits.InterlockedMax(16, g.x, was);
+    hits.InterlockedMax(20, g.y, was);
+    hits.InterlockedMax(24, g.z, was);
+}
+"#;
+
+    /// The command signature of a packed dispatch for the worker's root signature (as
+    /// `crate::draw` makes it): the grid's three dwords from root parameter 0, then the dispatch.
+    fn packed_signature(warp: &WarpHarness, root: &ID3D12RootSignature) -> ID3D12CommandSignature {
+        let arguments = [
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: 0,
+                        DestOffsetIn32BitValues: 0,
+                        Num32BitValuesToSet: 3,
+                    },
+                },
+            },
+            D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
+        ];
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: PACKED,
+            NumArgumentDescs: 2,
+            pArgumentDescs: arguments.as_ptr(),
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: two arguments that outlive the call; the worker's root signature.
+        unsafe { warp.device.CreateCommandSignature(&desc, root, &mut signature).unwrap() };
+        signature.unwrap()
+    }
+
+    /// What the worker saw of a dispatch: the groups it ran, the console grid it was told and
+    /// the largest group number it ran in.
+    type Seen = [u32; 7];
+
+    /// A dispatch of the console `grid` by a program run `pack` console groups to a host group:
+    /// clamped alone (`batched` false) or by a batch's pass, then executed with the command
+    /// signature of the root constants and the dispatch, as `crate::draw` does it.
+    fn packed_dispatch(warp: &mut WarpHarness, grid: [u32; 3], pack: u32, batched: bool) -> Seen {
+        let worker = compile_cs(&warp.device, GRID_WORKER_CS).expect("the grid worker must compile");
+        let sig = packed_signature(warp, &worker.root);
+        let (src, src_ptr, src_gpu) = warp.shared_buffer(256);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(64 << 10);
+        // a record of 16 bytes at 32, as the title's
+        // SAFETY: mapped buffers, which the list has not read yet.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+            for (w, word) in [grid[0], grid[1], grid[2], 0x1234].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(8 + w).write_volatile(word);
+            }
+        }
+        // (alive until the list has run)
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let at = if batched {
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            // SAFETY: the mapped table; the list has not run.
+            let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
+            table.place_packed(1, 32, 2, pack).expect("a place")
+        } else {
+            assert!(record_clamp_packed(
+                &warp.clamp,
+                &warp.list,
+                (&dst, D3D12_RESOURCE_STATE_COMMON),
+                budget_gpu,
+                (&src, 32),
+                None,
+                (2, 16, 1),
+                false,
+                pack,
+            ));
+            0
+        };
+        // SAFETY: an open list; the worker's root signature and pipeline, live buffers; the
+        // clamp left the records readable as arguments.
+        unsafe {
+            warp.list.SetComputeRootSignature(&worker.root);
+            warp.list.SetPipelineState(&worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+            warp.list.ExecuteIndirect(&sig, 1, &dst, at, None, 0);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped words.
+        let seen: Vec<u32> = (0..7).map(|w| unsafe { hits_ptr.cast::<u32>().add(w).read_volatile() }).collect();
+        seen.try_into().unwrap()
+    }
+
+    /// A dispatch of a packed program, clamped alone and by a batch: the console's grid arrives
+    /// as root constants, the host's dispatch is the grid's groups divided, and the clamp's
+    /// bounds are those of any dispatch.
+    #[test]
+    fn a_packed_dispatch_brings_the_console_grid_in_root_constants() {
+        // on the software adapter and on the hardware one, where there is one
+        for software in [true, false] {
+            if let Some(mut warp) = WarpHarness::on(software) {
+                packed_dispatch_cases(&mut warp);
+            }
+        }
+    }
+
+    fn packed_dispatch_cases(warp: &mut WarpHarness) {
+        for (grid, pack) in [
+            ([1, 1, 1], 2),
+            ([3, 5, 2], 4),
+            ([7, 1, 1], 4),
+            ([1000, 3, 1], 8),
+            // a second row of the host grid: 131,070 groups of the 524,280
+            ([65_535, 8, 1], 4),
+            ([0, 4, 1], 4),
+        ] {
+            for batched in [false, true] {
+                let (host, words) = leonida_shader::emit::pack_grid(grid, pack);
+                let seen = packed_dispatch(warp, grid, pack, batched);
+                let ran = host[0] * host[1] * host[2];
+                let max_group = if ran == 0 { [0; 3] } else { [host[0] - 1, host[1] - 1, 0] };
+                let at = format!("{grid:?} packed {pack}, batched {batched}");
+                assert_eq!(seen[0], ran, "groups run, {at}");
+                if ran > 0 {
+                    assert_eq!(seen[1..4], words, "console grid, {at}");
+                    assert_eq!(seen[4..7], max_group, "last host group, {at}");
+                }
+            }
+        }
+        // a program that is not packed gets the record as it was
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(256);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let dst = warp.default_uav(64 << 10);
+        let (back, back_ptr, _) = warp.shared_buffer(256);
+        // SAFETY: mapped buffers, which the list has not read yet.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            for (w, word) in [5u32, 6, 7, 0x1234].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(w).write_volatile(word);
+            }
+        }
+        assert!(record_clamp_packed(&warp.clamp, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, (&_src, 0), None, (2, 16, 1), false, 0));
+        // SAFETY: an open list; the record is readable as arguments.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, 16);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped words.
+        let words: Vec<u32> = (0..4).map(|w| unsafe { back_ptr.cast::<u32>().add(w).read_volatile() }).collect();
+        assert_eq!(words, [5, 6, 7, 0x1234]);
+    }
+
+    /// A batch gives a packed program's dispatch of a record a place of its own: not the one the
+    /// same record has for a program that is not packed, nor for another packing.
+    #[test]
+    fn a_batch_keeps_packed_dispatches_apart() {
+        use batch::{SLOT, TABLE, Table, job};
+        let mut memory = vec![0u32; TABLE as usize / 4 + 1];
+        // SAFETY: the vector holds the table and outlives its use.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 0, [7, 0, 0, 0]) };
+        assert_eq!(t.place(7, 64, 2), Some(0));
+        assert_eq!(t.place_packed(7, 64, 2, 4), Some(u64::from(SLOT)));
+        assert_eq!(t.place_packed(7, 64, 2, 2), Some(2 * u64::from(SLOT)));
+        assert_eq!(t.place_packed(7, 64, 2, 4), Some(u64::from(SLOT)), "the same again: the same place");
+        // (only a dispatch is packed)
+        assert_eq!(t.place_packed(7, 64, 10, 4), Some(3 * u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 10), Some(3 * u64::from(SLOT)));
+        assert_eq!(memory[4..8], [job(0, 2, 1), 64, 0, 0]);
+        assert_eq!(memory[8..12], [job(0, 2, 2), 64, SLOT, 4]);
+        assert_eq!(memory[12..16], [job(0, 2, 1), 64, 2 * SLOT, 2]);
+        assert_eq!(memory[16..20][3], 0);
     }
 
     /// A batch clamps records exactly as the clamp of one execution does, of

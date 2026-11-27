@@ -1348,6 +1348,14 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Dispatches of packed programs run on the host so far (`LEONIDA_GROUP_PACK`): direct ones,
+/// then indirect ones.
+static PACKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(crate) fn packed() -> [u64; 2] {
+    [PACKED[0].load(Ordering::Relaxed), PACKED[1].load(Ordering::Relaxed)]
+}
+
 /// What a render target or depth view of the host is made from: the host
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
@@ -1872,6 +1880,10 @@ impl State {
         }
         // All of every group, unless the dispatch says otherwise.
         if kind == leonida_shader::emit::USER_DISPATCH_THREADS_X {
+            return 0;
+        }
+        // The console grid of a packed program: the dispatch sets it (`pack_of`).
+        if is_pack_word(kind) {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -3737,6 +3749,22 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // A program translated to run several console groups to a host group (`LEONIDA_GROUP_PACK`):
+        // the host runs the groups in fewer, told the console's grid.
+        let [x, y, z] = match pack_of(p) {
+            Some(pack) => {
+                let (host, words) = leonida_shader::emit::pack_grid([x, y, z], pack.k);
+                for (word, value) in pack.words.into_iter().zip(words) {
+                    // SAFETY: an open list; the root signature has the word.
+                    unsafe { list.list.SetComputeRoot32BitConstant(pack.param, value, word) };
+                }
+                // (Words of a parameter's constants: the cache has them whole.)
+                self.cache.constant_set(true, pack.param);
+                PACKED[0].fetch_add(1, Ordering::Relaxed);
+                host
+            }
+            None => [x, y, z],
+        };
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -4877,6 +4905,7 @@ impl State {
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         kind: u32,
+        pack: u32,
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -4890,7 +4919,7 @@ impl State {
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch
-            && let Some(at) = b.table.place(id, offset, kind)
+            && let Some(at) = b.table.place_packed(id, offset, kind, pack)
         {
             return Some((b.scratch.clone(), at));
         }
@@ -4898,7 +4927,7 @@ impl State {
         let opened = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args));
         self.clamped();
         let (mut table, scratch) = opened?;
-        let at = table.place(id, offset, kind)?;
+        let at = table.place_packed(id, offset, kind, pack)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -4968,6 +4997,10 @@ impl State {
             ));
             return false;
         }
+        // A program run several console groups to a host group takes the console's grid from
+        // root constants the records carry (`crate::indirect::bound_packed`).
+        let pack = if kind == DISPATCH { pack_of(p) } else { None };
+        let pack_k = pack.map_or(0, |pack| pack.k);
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
@@ -4984,7 +5017,10 @@ impl State {
             None => None,
         };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| match pack {
+                Some(pack) => pack_signature(&p.root, pack),
+                None => host_signature(kind, stride),
+            })
             .flatten()
         else {
             why("no host signature");
@@ -4997,7 +5033,7 @@ impl State {
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, kind, pack_k)
         } else {
             None
         };
@@ -5064,7 +5100,7 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound_packed(list, (&args.buffer, offset), count_arg, (kind, step, records), pack_k)
                 };
                 // (A clamp that gave up may have set its root signature too.)
                 self.clamped();
@@ -5119,6 +5155,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        if let Some(pack) = pack {
+            // The records set three words of its user data.
+            self.cache.constant_set(true, pack.param);
+            PACKED[1].fetch_add(1, Ordering::Relaxed);
+        }
         if kind == DISPATCH {
             self.dispatched(p);
         } else {
@@ -5153,6 +5194,47 @@ fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
 }
 
+/// Whether `kind` is one of the three dwords of a packed program's console grid.
+fn is_pack_word(kind: u32) -> bool {
+    use leonida_shader::emit::{USER_PACK_GROUPS, USER_PACK_X, USER_PACK_Y};
+    kind == USER_PACK_X || kind == USER_PACK_Y || kind == USER_PACK_GROUPS
+}
+
+/// A compute program translated to run `k` console groups to a host group
+/// (`leonida_shader::emit::USER_PACK_X`): where its console grid goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackWords {
+    pub k: u32,
+    /// The root parameter of the user data.
+    pub param: u32,
+    /// The dwords in it of the grid's X, Y and groups in all.
+    pub words: [u32; 3],
+}
+
+/// The packing of the compute pipeline `p`'s program, if it has one.
+pub(crate) fn pack_of(p: &HostPipeline) -> Option<PackWords> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let pack = stage.translated().pack?;
+    Some(PackWords { param, ..pack })
+}
+
+/// The packing of a program with these user-data words, found once (its parameter is the
+/// pipeline's: [`pack_of`]).
+pub(crate) fn pack_in(user_data: &[leonida_shader::emit::UserData]) -> Option<PackWords> {
+    use leonida_shader::emit::{USER_PACK_GROUPS, USER_PACK_X, USER_PACK_Y};
+    pack_words(user_data, 0, [USER_PACK_X, USER_PACK_Y, USER_PACK_GROUPS])
+}
+
+/// [`pack_of`] for a program's user-data words (`kinds`: the three codes, in the order of
+/// [`PackWords::words`]); `k` is the metadata `dword` all three carry. Pure.
+fn pack_words(user_data: &[leonida_shader::emit::UserData], param: u32, kinds: [u32; 3]) -> Option<PackWords> {
+    let find = |kind: u32| user_data.iter().find(|u| u.root == RootType::Other(kind));
+    let [x, y, all] = kinds.map(find);
+    let (x, y, all) = (x?, y?, all?);
+    (all.dword >= 2).then_some(PackWords { k: all.dword, param, words: [x.index, y.index, all.index] })
+}
+
 /// Where a compute pipeline's user data has a word the host computes: the
 /// root parameter and the dword in it.
 fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
@@ -5172,6 +5254,44 @@ mod thread_tests {
         assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+    use leonida_shader::emit::{USER_PACK_GROUPS, USER_PACK_X, USER_PACK_Y, UserData, pack_grid};
+
+    fn word(kind: u32, index: u32, k: u32) -> UserData {
+        UserData { index, slot: 0, root: RootType::Other(kind), dword: k }
+    }
+
+    const KINDS: [u32; 3] = [USER_PACK_X, USER_PACK_Y, USER_PACK_GROUPS];
+
+    #[test]
+    fn a_packed_programs_grid_words_are_found_in_its_user_data() {
+        let words = [
+            UserData { index: 0, slot: 0, root: RootType::Constants, dword: 0 },
+            word(USER_PACK_X, 5, 4),
+            word(USER_PACK_Y, 6, 4),
+            word(USER_PACK_GROUPS, 7, 4),
+        ];
+        assert_eq!(pack_words(&words, 3, KINDS), Some(PackWords { k: 4, param: 3, words: [5, 6, 7] }));
+        // one of them missing, or no packing in it: not packed
+        assert_eq!(pack_words(&words[..3], 3, KINDS), None);
+        assert_eq!(pack_words(&words[..1], 3, KINDS), None);
+        assert_eq!(pack_words(&[word(USER_PACK_X, 5, 1), word(USER_PACK_Y, 6, 1), word(USER_PACK_GROUPS, 7, 1)], 3, KINDS), None);
+        assert!(KINDS.into_iter().all(is_pack_word));
+        assert!(!is_pack_word(leonida_shader::emit::USER_DISPATCH_THREADS_X));
+    }
+
+    #[test]
+    fn a_direct_dispatch_runs_the_groups_divided_and_names_the_console_grid() {
+        // what the direct dispatch sets and runs for a packed program
+        assert_eq!(pack_grid([57_600, 1, 1], 4), ([14_400, 1, 1], [57_600, 1, 57_600]));
+        assert_eq!(pack_grid([240, 135, 1], 2), ([16_200, 1, 1], [240, 135, 32_400]));
+        assert_eq!(pack_grid([3, 1, 1], 4), ([1, 1, 1], [3, 1, 3]));
+        assert_eq!(pack_grid([0, 1, 1], 4), ([0, 1, 1], [0, 1, 0]));
     }
 }
 
@@ -5293,6 +5413,58 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     }
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+/// The host command signature of an indirect dispatch of a program run `pack.k` console groups
+/// to a host group: the three dwords of the console's grid set as root constants (`pack.words`,
+/// consecutive in the program's user data: the translator makes them so), then the dispatch,
+/// [`crate::indirect::PACKED`] bytes a record. One for each root signature and place of the
+/// words, made once; `None` where they are not consecutive or the host refuses it.
+fn pack_signature(root: &ID3D12RootSignature, pack: PackWords) -> Option<ID3D12CommandSignature> {
+    static MADE: std::sync::Mutex<Vec<((usize, u32, u32), ID3D12RootSignature, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let [x, y, all] = pack.words;
+    if y != x + 1 || all != y + 1 {
+        once!(?pack, "the words of a packed program's console grid are not consecutive: its indirect dispatches are dropped");
+        return None;
+    }
+    use windows::core::Interface;
+    let key = (root.as_raw() as usize, pack.param, x);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, s)) = made.iter().find(|(k, ..)| *k == key) {
+        return Some(s.clone());
+    }
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: pack.param,
+                    DestOffsetIn32BitValues: x,
+                    Num32BitValuesToSet: 3,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: crate::indirect::PACKED,
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of two arguments that outlives the call; the root signature is the
+    // pipeline's, which the root constants named are a parameter of.
+    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, root, &mut signature) };
+    if let Err(e) = result {
+        once!(error = %e, ?pack, "host command signature of a packed dispatch refused");
+        return None;
+    }
+    let signature = signature?;
+    // (the root signature is kept: the key is its address)
+    made.push((key, root.clone(), signature.clone()));
     Some(signature)
 }
 

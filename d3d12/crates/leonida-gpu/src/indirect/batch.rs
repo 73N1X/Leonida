@@ -37,7 +37,8 @@ ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// record's offset in the source; its place in the scratch buffer; for a
+// dispatch, the console groups a host group runs of a packed program (0: one).
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -173,6 +174,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[2] = 0;
         }
     }
+    if (kind == 2 && job.w > 1) {
+        // A packed program's dispatch (as the clamp of one execution writes it): the console's
+        // grid in three dwords, then the host's (at most 2^20 groups in all).
+        uint total = record[0] * record[1] * record[2];
+        uint n = (total + job.w - 1) / job.w;
+        uint hx = min(n, 65535u);
+        uint hy = hx == 0 ? 1u : (n + hx - 1) / hx;
+        dst_args.Store3(job.z, uint3(record[0], record[1], total));
+        dst_args.Store3(job.z + 12, uint3(hx, hy, 1));
+        return;
+    }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
@@ -202,8 +214,9 @@ pub(crate) struct Table {
     sources: [u64; SOURCES],
     /// How many executions each job is charged for so far.
     times: Vec<u32>,
-    /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// The job of a record (source, offset, kind, the console groups to a host group of a packed
+    /// program, 0: none).
+    known: std::collections::HashMap<(u32, u32, u32, u32), u32>,
 }
 
 impl Table {
@@ -224,10 +237,19 @@ impl Table {
     /// there is none. `None` if the pass cannot read that copy or has no
     /// room for another job.
     pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+        self.place_packed(id, offset, kind, 0)
+    }
+
+    /// [`Table::place`] for a dispatch of a program that runs `pack` console groups to a host
+    /// group (over 1): the place of the 24 bytes the pass writes for it (`super::PACKED`), which
+    /// another program's dispatch of the same record, or of the same program not packed, does
+    /// not share.
+    pub(crate) fn place_packed(&mut self, id: u64, offset: u64, kind: u32, pack: u32) -> Option<u64> {
+        let pack = if kind == 2 && pack > 1 { pack } else { 0 };
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
+        let key = (source, offset, kind, pack);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
@@ -250,7 +272,7 @@ impl Table {
             to.write_volatile(job(source, kind, 1));
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
-            to.add(3).write_volatile(0);
+            to.add(3).write_volatile(pack);
             table.write_volatile(i + 1);
         }
         Some(place(i))
