@@ -3936,6 +3936,10 @@ if(TARGET Vulkan::Headers)
       # the title's pages at the next refresh, and the title's own newer words still win (#1537, WRITE_INVALID).
       add_test(NAME d3d12_title_window_write_back COMMAND d3d12_title_va_test --window-writeback)
       set_tests_properties(d3d12_title_window_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # A write-back copy that faults on a page another guard (a geometry watch cell) keeps read-only: the fault
+      # handler asks the tracker whose copy faulted too, which must not take its lock again on that thread (#2418).
+      add_test(NAME d3d12_title_window_write_back_fault COMMAND d3d12_title_va_test --window-writeback-fault)
+      set_tests_properties(d3d12_title_window_write_back_fault PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)
