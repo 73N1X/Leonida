@@ -1632,3 +1632,77 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+/// The 32 x 2 test of the group counter for other group shapes (8 x 8 is what a tile pass
+/// has): thread (x, y) of a w x h group stores 1 at dword w y + x and every dword must be
+/// written. The count the old rounding writes is printed for each shape, not
+/// checked: it depends on how the card fills its waves. Not from a fork.
+#[test]
+fn the_console_threads_of_groups_of_other_shapes_are_each_given_once() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false);
+    // (the last four are the one-row groups the title's programs of this kind have)
+    let shapes = [(8u32, 8u32), (16, 4), (4, 16), (2, 32), (64, 2), (16, 16), (32, 32), (64, 1), (128, 1), (160, 1), (256, 1)];
+    for (w, h) in shapes {
+        let words = [
+            0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+            0x0001_007E,
+            0x3408_0280 | w.trailing_zeros(), // v_lshlrev_b32 v4, log2(w), v1
+            0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+            0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x38 << 26 | 0x1C << 18 | 1 << 12,
+            0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+        ];
+        let mut native = native_of(&words, false, 64);
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+            threads: [w, h, 1],
+        });
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let lower_with = |ticket: bool| {
+            let was = lower::TEST_THREAD_TICKET.replace(Some(ticket));
+            let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+            lower::TEST_THREAD_TICKET.set(was);
+            shader.expect("lower")
+        };
+        let (shader, old) = (lower_with(true), lower_with(false));
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Ok(host) = &host else {
+            eprintln!("no SM 6.6 hardware device; {w} x {h} not run");
+            continue;
+        };
+        let threads = (w * h) as usize;
+        let run = |shader: &HostShader| -> Option<Vec<u32>> {
+            let (root, pso) = match host.compute_pipeline(shader) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("the hardware device does not take this program: {e}; not run");
+                    return None;
+                }
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(threads as u32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            Some(out[0][..threads].to_vec())
+        };
+        let Some(got) = run(&shader) else { continue };
+        let missing: Vec<usize> = (0..threads).filter(|&i| got[i] != 1).collect();
+        assert!(missing.is_empty(), "{w} x {h}: dwords not written once: {missing:?}");
+        let before = run(&old).map(|d| d.iter().filter(|&&d| d == 1).count());
+        eprintln!("{w} x {h} on the hardware device: all {threads} console threads once; the old rounding: {before:?}");
+    }
+}

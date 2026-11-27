@@ -1813,6 +1813,9 @@ impl<'a> Lower<'a> {
                 // the flat id rounded down is not a host wave's base on every host (#1243)
                 ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+                if std::env::var_os("LEONIDA_WAVE_WHY").is_some() {
+                    eprintln!("WAVE-TICKET threads={:?} in waves of {wave}", cs.threads);
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
