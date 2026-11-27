@@ -45,7 +45,7 @@ fn native(body: &[u32]) -> NativeProgram {
 }
 
 /// The same for a console of 32-lane waves when `wave64` is not set, with `threads` threads.
-fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
@@ -592,7 +592,7 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
 }
 
 /// As [`on_the_card`], and gives the first `dwords` dwords of the UAV.
-fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Vec<u32>> {
+pub(super) fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Vec<u32>> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;

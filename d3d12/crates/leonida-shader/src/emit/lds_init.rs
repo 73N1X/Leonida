@@ -31,8 +31,18 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 /// Whether the hoists are made (`LEONIDA_LDS_INIT_HOIST`, on unless `0`). Part of the
 /// translation: the shader cache keys on every `LEONIDA_*` switch the source reads.
 pub(super) fn on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HOIST.get() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEONIDA_LDS_INIT_HOIST").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`on`], for its thread only.
+    pub(super) static TEST_HOIST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The value an LDS dword must start with for the atomic `name` to accumulate into it (`min` of
