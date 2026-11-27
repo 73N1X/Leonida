@@ -1221,12 +1221,18 @@ int check_retired_window_write_back(Context& c) {
     WriteBack next{&c, allocators[1].p, lists[1].p, out.p, heap.p, gpu};
     const std::uint64_t arena_va = out->GetGPUVirtualAddress();  // not the title's memory: nothing to copy back
     // Pages no range answers for yet: a range of a buffer the tests before this one placed can outlive the buffer at
-    // an address the ring might get again, so such pages are kept aside until the end.
+    // an address the ring might get again, so such pages are kept aside until the end. Write-combined, so the buffer
+    // placed over them is a copy refreshed before each submission on every driver (one that imports read-write pages
+    // would read the pages themselves).
     constexpr UINT64 ring_bytes = 128 * 1024;
+    // The held submission's words: 256 bytes from here, through the window. Half of them share a 256-byte piece with
+    // the words a later submission writes through the buffer placed over the ring.
+    constexpr UINT64 held_at = 384;
     std::vector<void*> taken;
     std::uint32_t* ring = nullptr;
     for (int tries = 0; tries < 32 && !ring; ++tries) {
-        void* pages = VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        void* pages = VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT,
+                                   PAGE_READWRITE | PAGE_WRITECOMBINE);
         EXPECT(pages);
         const auto at = reinterpret_cast<std::uint64_t>(pages);
         if (aliases.shader_va(at) == at && aliases.shader_va(at + ring_bytes - 1) == at + ring_bytes - 1)
@@ -1242,7 +1248,7 @@ int check_retired_window_write_back(Context& c) {
     // Held on the GPU: it writes the ring's window once the gate opens.
     const auto empty = rt::d3d12::title_windows(c.inner);
     EXPECT(SUCCEEDED(gated->Wait(gate.p, 1)));
-    EXPECT(submit_write(held, ring_va, false) == 0);
+    EXPECT(submit_write(held, ring_va + held_at, false) == 0);
     EXPECT(SUCCEEDED(gated->Signal(held_done.p, 1)));
     const std::uint64_t window = aliases.shader_va(ring_va);
     const auto before = rt::d3d12::title_windows(c.inner);
@@ -1262,6 +1268,9 @@ int check_retired_window_write_back(Context& c) {
     EXPECT(kept.waiting == retired.waiting);
     EXPECT(SUCCEEDED(gate->Signal(1)));
     EXPECT(SUCCEEDED(held_done->SetEventOnCompletion(1, nullptr)));
+    // A shader writes through the buffer the 256 bytes before the held words: the buffer's copy changed the first
+    // half of the 256-byte piece [256, 512) whose second half only the window wrote. Both go back, each its own bytes.
+    EXPECT(submit_write(next, ring_va + held_at - 256) == 0);
     // The title resets the list it recorded (a list may be executed again until then); then the window goes, and
     // what the held submission wrote in it reaches the title's pages first.
     EXPECT(allocators[0]->Reset() == S_OK);
@@ -1274,13 +1283,18 @@ int check_retired_window_write_back(Context& c) {
         if (!freed.waiting) break;
     }
     UINT written = 0;
-    for (UINT i = 0; i < kElements; ++i) written += ring[i] != 0;
+    for (UINT i = 0; i < kElements; ++i) written += ring[held_at / 4 + i] != 0;
     std::printf("retired window write back: kept while a held batch named it (%llu waiting); %u of %u words the held "
                 "submission wrote reached the title's pages, %llu retired windows wait for the GPU\n",
                 static_cast<unsigned long long>(kept.waiting), written, kElements,
                 static_cast<unsigned long long>(freed.waiting));
     EXPECT(freed.waiting == 0);
     EXPECT(written == kElements);
+    // The buffer's own words go back with its submission's batch (none with LEONIDA_TITLE_WRITEBACK=0).
+    const char* write_back = std::getenv("LEONIDA_TITLE_WRITEBACK");
+    UINT buffer_words = 0;
+    for (UINT i = 0; i < kElements; ++i) buffer_words += ring[(held_at - 256) / 4 + i] != 0;
+    EXPECT(buffer_words == ((write_back && write_back[0] == '0') ? 0 : kElements));
 
     placed.reset();
     aliases.remove_title_memory(ring_va);

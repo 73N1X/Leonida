@@ -3949,6 +3949,11 @@ if(TARGET Vulkan::Headers)
       # slot-133 buffer replaced is retired at the next submission, its bytes returned and its memory freed.
       add_test(NAME d3d12_title_window_orphans COMMAND d3d12_title_va_test --window-orphans)
       set_tests_properties(d3d12_title_window_orphans PROPERTIES SKIP_RETURN_CODE 77)
+      # The same with no per-submission copy back: a retired window's GPU writes reach the title's pages only when it
+      # is freed, on the bytes no live copy changed (a buffer over the same 256-byte piece wrote the others).
+      add_test(NAME d3d12_title_window_orphans_free COMMAND d3d12_title_va_test --window-orphans)
+      set_tests_properties(d3d12_title_window_orphans_free PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_TITLE_WRITEBACK=0")
       # A write-back copy that faults on a page another guard (a geometry watch cell) keeps read-only: the fault
       # handler asks the tracker whose copy faulted too, which must not take its lock again on that thread (#2418).
       add_test(NAME d3d12_title_window_write_back_fault COMMAND d3d12_title_va_test --window-writeback-fault)

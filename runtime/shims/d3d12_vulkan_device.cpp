@@ -466,15 +466,18 @@ public:
                 Vector<const Target*> over;    // the targets with bytes in [a, b)
                 for (const Target& t : targets_)
                     if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
-                // Piece by piece, against the title's bytes as they were before any copy went back here: a copy that
-                // still holds them is not written over another's result. A retired window's copy (retire_target)
-                // goes back only where no live copy changed the piece: what a submission wrote in it is older than
-                // what a live copy holds (the range that replaced it serves every submission recorded since).
+                // Piece by piece, against the title's bytes as they were before any copy went back here: a copy goes
+                // back on the bytes it holds differently from those, so one that still holds them is not written over
+                // another's result. A retired window's copy (retire_target) goes back only on bytes no live copy
+                // changed: what a submission wrote in it is older than what a live copy holds (the range that
+                // replaced it serves every submission recorded since). Byte by byte, as two copies can share a piece
+                // with disjoint bytes each.
                 for (std::uintptr_t c = a; c < b && !over.empty();) {
                     const std::uintptr_t e = std::min(b, (c + kPiece) & ~(kPiece - 1));
                     std::uint8_t before[kPiece];
-                    bool saved = false, live = false;
-                    for (int pass = 0; pass < 2 && !live; ++pass)
+                    bool live[kPiece];  // the bytes a live copy changed, once `saved`
+                    bool saved = false;
+                    for (int pass = 0; pass < 2; ++pass)
                         for (const Target* t : over) {
                             if (t->retired != (pass == 1) || (only && pass == 1 && t->shadow != only)) continue;
                             const std::uintptr_t x = std::max(c, t->begin), y = std::min(e, t->end);
@@ -483,21 +486,32 @@ public:
                             const void* now = saved ? static_cast<const void*>(before + (x - c))
                                                     : reinterpret_cast<const void*>(x);
                             if (std::memcmp(now, copy, y - x) == 0) continue;
-                            if (only && pass == 0) {  // a live copy changed it: the retired one stays out
-                                live = true;
-                                continue;
-                            }
                             if (!saved) {
                                 std::memcpy(before, reinterpret_cast<const void*>(c), e - c);
+                                std::fill_n(live, e - c, false);
                                 saved = true;
                             }
-                            if (!opened) {
-                                reopen_locked(at, at + pages * kPage);
-                                opened = true;
+                            const auto goes = [&](std::uintptr_t v) {
+                                return copy[v - x] != before[v - c] && !(pass == 1 && live[v - c]);
+                            };
+                            for (std::uintptr_t i = x; i < y;) {
+                                if (!goes(i)) {
+                                    ++i;
+                                    continue;
+                                }
+                                std::uintptr_t j = i + 1;
+                                while (j < y && goes(j)) ++j;
+                                if (pass == 0) std::fill(live + (i - c), live + (j - c), true);
+                                if (pass == 1 || !only) {  // `only`: the live copies' results wait for their batches
+                                    if (!opened) {
+                                        reopen_locked(at, at + pages * kPage);
+                                        opened = true;
+                                    }
+                                    std::memcpy(reinterpret_cast<void*>(i), copy + (i - x), j - i);
+                                    written += j - i;
+                                }
+                                i = j;
                             }
-                            std::memcpy(reinterpret_cast<void*>(x), copy, y - x);
-                            written += y - x;
-                            live = live || pass == 0;
                         }
                     c = e;
                 }

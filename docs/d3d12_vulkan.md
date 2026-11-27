@@ -1722,7 +1722,8 @@ The copies:
   (`src/command_list_epochs.h`). Until then its copy stays a target of its pages' tracker, refreshed like the others,
   and what the GPU wrote in it goes back to the title's pages: with its submissions' write-back, and once more when it
   is freed (a range noted when a list was recorded can be copied back before a held batch has run). A retired copy goes
-  back only where no live copy over the same bytes changed them, and every copy is compared with the title's bytes as
+  back only on the bytes no live copy over them changed, byte by byte (the window and the buffer that replaced it can
+  each have written their own bytes of one 256-byte piece), and every copy is compared with the title's bytes as
   they were before any copy went back. `d3d12_title_window_orphans` covers it, with a writing batch held on a fence
   while the next submission's refresh retires its window. A window is
   not retired when its pages are released or remapped: a retail run measured no release at all of the pages windows
@@ -1740,7 +1741,7 @@ The copies:
   title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. The copy back asks the
   write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
   over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
-  writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
+  writes only the bytes where the copy differs from the title's (compared in 256-byte pieces): a read-only view writes nothing and
   its pages stay guarded. The copy runs under the tracker's lock and can still fault on a page another guard keeps
   read-only (the geometry watch, another view's shadow): the fault handler asks every tracker over the address, this
   one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
