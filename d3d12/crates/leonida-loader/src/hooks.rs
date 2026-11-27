@@ -73,6 +73,8 @@ pub(crate) const OWN_UPSCALER_ENV: &str = "LEONIDA_OWN_UPSCALER";
 
 /// Leonida: environment variable that tops the title's output modes at 2560x1440 (Series X: the 3840x2160 row
 /// of its mode table becomes 2560x1440, so it never finds a 4K mode and presents 1440p).
+/// NOT USABLE YET: with it the title makes a 2560x1440 window, then stops at its own check at rva 0x247af2d (a
+/// size against 0x1fffff, `int3` when over) a second later, at render scale 0.75 and 1.0 alike (2026-11-27 runs).
 pub(crate) const OUTPUT_1440_ENV: &str = "LEONIDA_OUTPUT_1440";
 
 /// The title's table of output modes in `.rdata` (width, height, refresh, 1 per row: 720p, 936p, 1080p, 1440p,
