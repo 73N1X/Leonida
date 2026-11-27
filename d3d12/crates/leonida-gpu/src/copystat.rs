@@ -1236,9 +1236,12 @@ pub(crate) fn log(frames: f64) {
     );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
+    let [runs, runs_failed] = [0, 1].map(|n| crate::watch::UNGUARD_RUNS[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped; \
+         runs of guarded blocks opened by one change of protection: {runs}, and {runs_failed} it failed for \
+         (LEONIDA_UNGUARD_RUNS)"
     );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
