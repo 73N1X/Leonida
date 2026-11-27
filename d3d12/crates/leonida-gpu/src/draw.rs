@@ -855,36 +855,196 @@ fn heap_spread() -> bool {
 #[derive(Default)]
 struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 
+/// Whether the pass keeps, for each of its sixteen parts (`slot %
+/// HEAP_ROUND`), the span that each copy's views in the part cover, and
+/// joins those for the spans of a pass (`LEONIDA_SWEEP_SPANS=0`: the spans
+/// are made from every slot's range at every pass, as before, and a written
+/// slot that is also of the pass's part is looked at twice).
+///
+/// A pass looks at a sixteenth of the slots and the written ones, and then
+/// went through the ranges of all of them (72,000 slots) for the spans of
+/// some 4,400 copies. A part's spans change only with its slots: one whose
+/// slot shows another range inside the span it had, or shows something
+/// where it showed nothing, is put right in place; any other change has
+/// the part's spans made again from its slots, once, when they are asked
+/// for. The spans are the same either way (`heap_range_tests`). What is
+/// saved is the walk over the slots, not the making of the table: 0.5 ms a
+/// pass from every slot, 0.28 ms from the parts and 0.1 ms more to set a
+/// part's slots (`spans_of_a_pass`, an optimized build, 72,000 slots).
+/// (After XaviFortes/VIctory-RDNA f8eb38d.)
+fn sweep_spans() -> bool {
+    crate::toggled!("LEONIDA_SWEEP_SPANS")
+}
+
+/// The parts of a round.
+const PARTS: usize = HEAP_ROUND as usize;
+
+/// A copy and the span of it that ranges cover.
+type Span<T> = (std::sync::Arc<T>, u64, u64);
+
+/// [`HeapRanges`] of copies, with the spans of each part's ranges kept
+/// beside them ([`sweep_spans`]).
+struct SweepRanges<T> {
+    ranges: HeapRanges<std::sync::Arc<T>>,
+    /// Per part and copy (by its address): the copy and the span its views
+    /// in the part cover. Right for the parts that are not `stale`.
+    spans: [crate::host::ByCopy<Span<T>>; PARTS],
+    /// How many slots of each part show something.
+    views: [u32; PARTS],
+    /// The parts whose spans are to be made again from their slots, a bit
+    /// each.
+    stale: u16,
+}
+
+impl<T> Default for SweepRanges<T> {
+    fn default() -> Self {
+        Self {
+            ranges: HeapRanges(Vec::new()),
+            spans: std::array::from_fn(|_| Default::default()),
+            views: [0; PARTS],
+            stale: 0,
+        }
+    }
+}
+
+/// A copy's address, as [`crate::host::ByCopy`] wants it.
+fn copy_key<T>(copy: &std::sync::Arc<T>) -> usize {
+    std::sync::Arc::as_ptr(copy) as usize
+}
+
+/// Widens the span of `range`'s copy in `spans` by it.
+fn join_span<T>(spans: &mut crate::host::ByCopy<Span<T>>, (copy, from, to): &Span<T>) {
+    let span = spans.entry(copy_key(copy)).or_insert_with(|| (copy.clone(), *from, *to));
+    span.1 = span.1.min(*from);
+    span.2 = span.2.max(*to);
+}
+
+impl<T> SweepRanges<T> {
+    fn clear(&mut self) {
+        self.ranges.0.clear();
+        for spans in &mut self.spans {
+            spans.clear();
+        }
+        self.views = [0; PARTS];
+        self.stale = 0;
+    }
+
+    /// Forgets the slots of one part (`HostHeap::buffer_slots_of`).
+    fn forget_part(&mut self, part: u32) {
+        self.ranges.forget_part(part, PARTS as u32);
+        let p = part as usize % PARTS;
+        self.spans[p].clear();
+        self.views[p] = 0;
+        self.stale &= !(1 << p);
+    }
+
+    fn set(&mut self, slot: u32, range: Option<Span<T>>) {
+        let p = slot as usize % PARTS;
+        let now = range.is_some();
+        if self.stale >> p & 1 != 0 || !sweep_spans() {
+            // Not kept, or made again anyway.
+            let was = self.ranges.replace(slot, range).is_some();
+            self.views[p] = (self.views[p] + u32::from(now)).saturating_sub(u32::from(was));
+            self.stale |= 1 << p;
+            return;
+        }
+        let old = self.ranges.replace(slot, range.clone());
+        self.views[p] = (self.views[p] + u32::from(now)).saturating_sub(u32::from(old.is_some()));
+        match (old, range) {
+            (None, None) => {}
+            // One more range of the copy's.
+            (None, Some(new)) => join_span(&mut self.spans[p], &new),
+            (Some(old), Some(new)) if copy_key(&old.0) == copy_key(&new.0) => {
+                if (old.1, old.2) == (new.1, new.2) {
+                    return;
+                }
+                // The span did not end where the old range did: without it
+                // the span is as it was.
+                match self.spans[p].get_mut(&copy_key(&old.0)) {
+                    Some(span) if span.1 < old.1 && old.2 < span.2 => {
+                        span.1 = span.1.min(new.1);
+                        span.2 = span.2.max(new.2);
+                    }
+                    _ => self.stale |= 1 << p,
+                }
+            }
+            // A range gone, or another copy's now: what the others of the
+            // old copy cover is not known here.
+            _ => self.stale |= 1 << p,
+        }
+    }
+
+    /// Per copy (by its address), the span its ranges cover; and how many
+    /// slots show something.
+    fn spans(&mut self) -> (crate::host::ByCopy<Span<T>>, u32) {
+        let mut all: crate::host::ByCopy<Span<T>> = Default::default();
+        if !sweep_spans() {
+            // From every slot, as before. (The parts set meanwhile are
+            // stale, so their spans are made again once the switch is on.)
+            let mut views = 0;
+            for range in self.ranges.ranges() {
+                views += 1;
+                join_span(&mut all, range);
+            }
+            return (all, views);
+        }
+        for p in (0..PARTS).filter(|p| self.stale >> p & 1 != 0) {
+            let part = &mut self.spans[p];
+            part.clear();
+            let mut views = 0;
+            for range in self.ranges.part_ranges(p as u32, PARTS as u32) {
+                views += 1;
+                join_span(part, range);
+            }
+            self.views[p] = views;
+        }
+        self.stale = 0;
+        // (As many as the part with the most, at least.)
+        all.reserve(self.spans.iter().map(|part| part.len()).max().unwrap_or(0));
+        for part in &self.spans {
+            for span in part.values() {
+                join_span(&mut all, span);
+            }
+        }
+        (all, self.views.iter().sum())
+    }
+}
+
 /// Descriptor-derived references belong to the heap that produced them.
+#[derive(Default)]
 pub(crate) struct BufferSweep {
     passes: u64,
-    ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    ranges: SweepRanges<crate::shadow::Shadow>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
-impl Default for BufferSweep {
-    fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
-    }
-}
-
 impl<T> HeapRanges<T> {
+    #[cfg(test)]
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
+        let _ = self.replace(slot, range);
+    }
+
+    /// What the slot showed before.
+    fn replace(&mut self, slot: u32, range: Option<(T, u64, u64)>) -> Option<(T, u64, u64)> {
         let slot = slot as usize;
         if range.is_none() && slot >= self.0.len() {
-            return;
+            return None;
         }
         if slot >= self.0.len() {
             self.0.resize_with(slot + 1, || None);
         }
-        self.0[slot] = range;
+        std::mem::replace(&mut self.0[slot], range)
     }
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+    }
+
+    fn part_ranges(&self, part: u32, parts: u32) -> impl Iterator<Item = &(T, u64, u64)> {
+        self.0.iter().skip(part as usize).step_by(parts as usize).flatten()
     }
 
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
@@ -894,8 +1054,7 @@ impl<T> HeapRanges<T> {
 
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
-
+    use super::{HEAP_ROUND, HeapRanges, PARTS, SweepRanges};
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
     #[test]
@@ -920,6 +1079,75 @@ mod heap_range_tests {
         assert!(ranges.ranges().all(|r| r.1 != 0), "a slot not looked at in a round");
         ranges.set(3, None);
         assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
+    }
+
+    /// The spans kept part by part are those of all the slots' ranges,
+    /// whatever was set, taken away and forgotten since they were last asked
+    /// for.
+    #[test]
+    fn spans_kept_by_part_are_those_of_every_slot() {
+        use std::sync::Arc;
+        const SLOTS: usize = 400;
+        let copies: Vec<Arc<u64>> = (0..24).map(Arc::new).collect();
+        let mut kept = SweepRanges::<u64>::default();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as usize % below
+        };
+        // Whether the kept spans were ever right without being made again.
+        let mut in_place = 0;
+        for round in 0..600 {
+            match random(40) {
+                0 => kept.clear(),
+                1..=4 => kept.forget_part(random(PARTS) as u32),
+                _ => {}
+            }
+            for _ in 0..random(30) {
+                let slot = random(SLOTS) as u32;
+                let range = match random(8) {
+                    0 | 1 => None,
+                    // The range the slot shows, or one of its copy's.
+                    2 | 3 => kept.ranges.0.get(slot as usize).cloned().flatten().map(|(copy, from, to)| match random(3) {
+                        0 => (copy, from, to),
+                        1 => (copy, from + random(3) as u64, to + random(3) as u64),
+                        _ => (copy, from.saturating_sub(random(50) as u64), to + random(50) as u64),
+                    }),
+                    _ => {
+                        let from = random(1000) as u64;
+                        Some((copies[random(copies.len())].clone(), from, from + 1 + random(200) as u64))
+                    }
+                };
+                kept.set(slot, range);
+            }
+            in_place += u32::from(kept.stale == 0);
+            let (spans, views) = kept.spans();
+            assert_eq!(kept.stale, 0);
+            let mut slow: std::collections::BTreeMap<usize, (u64, u64)> = Default::default();
+            for (copy, from, to) in kept.ranges.ranges() {
+                let span = slow.entry(Arc::as_ptr(copy) as usize).or_insert((*from, *to));
+                *span = (span.0.min(*from), span.1.max(*to));
+            }
+            assert_eq!(views as usize, kept.ranges.ranges().count(), "round {round}");
+            let fast: std::collections::BTreeMap<usize, (u64, u64)> = spans
+                .iter()
+                .map(|(&key, (copy, from, to))| {
+                    assert_eq!(key, Arc::as_ptr(copy) as usize);
+                    (key, (*from, *to))
+                })
+                .collect();
+            assert_eq!(fast, slow, "round {round}");
+            // (A part's own spans are those of its slots.)
+            for p in 0..PARTS {
+                assert_eq!(kept.views[p] as usize, kept.ranges.part_ranges(p as u32, PARTS as u32).count(), "round {round}, part {p}");
+            }
+        }
+        assert!(in_place > 10, "the spans were made again every time: {in_place}");
+        // Nothing of a copy is kept once no slot shows it.
+        kept.clear();
+        assert!(copies.iter().all(|copy| Arc::strong_count(copy) == 1));
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
@@ -960,6 +1188,48 @@ mod heap_range_tests {
             best(&mut || join::<std::hash::RandomState>(&mut table.values())),
             best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
         );
+        // Kept by part (`sweep_spans`), with a sixteenth of the slots set
+        // again as a pass does: each copy's views in one part (as the slots
+        // above lie: 4,400 is 16 times 275), and each copy's in many.
+        for (what, spread) in [("in many parts", true), ("in one part", false)] {
+            let mut kept = SweepRanges::<u64>::default();
+            let copy_of = |slot: u32| &copies[slot as usize * 7919 % if spread { 4399 } else { 4400 }];
+            for slot in 0..72_000u32 {
+                kept.set(slot, Some((copy_of(slot).clone(), u64::from(slot), u64::from(slot) + 64)));
+            }
+            // A pass's part forgotten and set again (beside it, the same into
+            // the slots alone, as before), then the spans.
+            let mut plain = HeapRanges(Vec::new());
+            for slot in 0..72_000u32 {
+                plain.set(slot, Some((copy_of(slot).clone(), u64::from(slot), u64::from(slot) + 64)));
+            }
+            let mut ms = [f64::MAX; 3];
+            for pass in 1..=30u32 {
+                let part = pass % PARTS as u32;
+                let t = std::time::Instant::now();
+                plain.forget_part(part, PARTS as u32);
+                for slot in (part..72_000).step_by(PARTS) {
+                    plain.set(slot, Some((copy_of(slot).clone(), u64::from(slot), u64::from(slot) + 64)));
+                }
+                ms[0] = ms[0].min(t.elapsed().as_secs_f64() * 1e3);
+                let t = std::time::Instant::now();
+                kept.forget_part(part);
+                for slot in (part..72_000).step_by(PARTS) {
+                    kept.set(slot, Some((copy_of(slot).clone(), u64::from(slot), u64::from(slot) + 64)));
+                }
+                ms[1] = ms[1].min(t.elapsed().as_secs_f64() * 1e3);
+                let t = std::time::Instant::now();
+                assert_eq!(kept.spans().0.len(), if spread { 4399 } else { 4400 });
+                ms[2] = ms[2].min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "a copy's views {what} ({} spans in the parts): a part set again {:.2} ms (into the slots alone {:.2} ms),                  the spans from the parts {:.2} ms",
+                kept.spans.iter().map(|part| part.len()).sum::<usize>(),
+                ms[1],
+                ms[0],
+                ms[2]
+            );
+        }
     }
 }
 
@@ -1128,23 +1398,29 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        kept.ranges.clear();
         host.buffer_slots()
     } else if heap_spread() {
-        // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
+        // The written ones, and this pass's part of the others (each once:
+        // a written slot of the part was looked at twice).
+        let (part, parts) = ((kept.passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
+        kept.ranges.forget_part(part);
         let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
+        if !changed.is_empty() {
+            slots.extend(changed);
+            if sweep_spans() {
+                slots.sort_unstable();
+                slots.dedup();
+            }
+        }
         slots
     } else {
         changed
     };
-    *passes += 1;
+    kept.passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1207,23 +1483,15 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             range
         });
-        ranges.set(index, range);
+        kept.ranges.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
+    // Per host copy, the span its picked views cover ([`sweep_spans`]).
+    let (spans, views) = kept.ranges.spans();
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1241,7 +1509,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     for (shadow, from, to) in spans.values() {
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
+            if let Some(&(last, low, high)) = kept.unwatched.get(&id)
                 && frame >= last && frame - last < every && low <= *from && *to <= high
             {
                 next_unwatched.insert(id, (last, low, high));
@@ -1251,7 +1519,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
-    *unwatched = next_unwatched;
+    kept.unwatched = next_unwatched;
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
