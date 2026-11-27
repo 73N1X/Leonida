@@ -1285,8 +1285,19 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 /// a copy of its own bytes ([`crate::shadow::exact`]). (A typed view of
 /// 12-byte elements at a multiple of 16 that is none of 12 is one of them: it
 /// was passed over, and stayed null.)
-fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
-    if raw {
+///
+/// `raw_twins`: whether the host keeps a raw twin of every buffer view
+/// (`leonida_shader::emit::raw_views`). Where it does not (a heap capped at
+/// 1,000,000 views: NVIDIA), shaders read a structured buffer as raw bytes
+/// through the title's slot itself, so that slot's view must be raw
+/// ([`raw_window`]) and begin on 16 bytes: a structured view on one of its
+/// elements but off 16 bytes (56-byte elements at 56, 456-byte ones at 456)
+/// stayed structured, and a raw read through a structured view gives zeros
+/// there. It gets a copy of its own bytes too, which begins on 16.
+fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, raw_twins: bool) -> bool {
+    // (A stride the host takes no structured view of is refused either way.)
+    let read_raw_in_place = stride > 0 && stride.is_multiple_of(4) && !raw_twins;
+    if raw || read_raw_in_place {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
         !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
@@ -1308,6 +1319,15 @@ fn view_bytes() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_VIEW_BYTES").is_none_or(|v| v != "0"))
 }
 
+/// Whether, on a host without raw twins, a structured view that begins on
+/// one of its elements but off 16 bytes gets a copy of its own bytes as well
+/// ([`off_elements`]). On by default; `LEONIDA_STRUCTURED_BYTES=0` leaves it
+/// structured on its buffer's copy, as before.
+fn structured_bytes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_STRUCTURED_BYTES").is_none_or(|v| v != "0"))
+}
+
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
 /// its buffer has, or one of the view's own bytes ([`off_elements`]).
 fn view_home(
@@ -1323,7 +1343,15 @@ fn view_home(
         return shadow;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
-    if !off_elements(offset, stride, raw, element) {
+    // Whether the host has raw twins is known once the view heap's size is
+    // picked: asked for here, so that the copy is the same one when the
+    // descriptor is made and whenever it is brought up to date, even where
+    // that comes before the title makes its view heap.
+    if stride > 0 {
+        probe_view_limit();
+    }
+    let raw_twins = leonida_shader::emit::raw_views() != 0 || !structured_bytes();
+    if !off_elements(offset, stride, raw, element, raw_twins) {
         return shadow;
     }
     crate::shadow::exact(start, len).unwrap_or(shadow)
@@ -5710,18 +5738,30 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn views_off_their_elements_are_told() {
         // the colour table bakes' parameter block: raw, 8 bytes into its window
-        assert!(off_elements(8, 0, true, 4));
-        assert!(!off_elements(0, 0, true, 4));
-        assert!(!off_elements(48, 0, true, 4));
+        assert!(off_elements(8, 0, true, 4, true));
+        assert!(!off_elements(0, 0, true, 4, true));
+        assert!(!off_elements(48, 0, true, 4, true));
         // 456-byte elements: at one of them, on 16 bytes, at neither
-        assert!(!off_elements(456, 456, false, 0));
-        assert!(!off_elements(32, 456, false, 0));
-        assert!(off_elements(100, 456, false, 0));
+        assert!(!off_elements(456, 456, false, 0, true));
+        assert!(!off_elements(32, 456, false, 0, true));
+        assert!(off_elements(100, 456, false, 0, true));
         // A typed view of 12-byte elements on 16 bytes and not on an element.
-        assert!(off_elements(23_702_896, 0, false, 12));
-        assert!(!off_elements(48, 0, false, 12));
-        assert!(!off_elements(12, 0, false, 4));
-        assert!(off_elements(12, 0, false, 8));
+        assert!(off_elements(23_702_896, 0, false, 12, true));
+        assert!(!off_elements(48, 0, false, 12, true));
+        assert!(!off_elements(12, 0, false, 4, true));
+        assert!(off_elements(12, 0, false, 8, true));
+        // With no raw twin, a structured view is read as raw bytes at its own
+        // slot: on one of its elements and off 16 bytes is off, too.
+        assert!(off_elements(56, 56, false, 0, false));
+        assert!(!off_elements(56, 56, false, 0, true));
+        assert!(!off_elements(112, 56, false, 0, false));
+        assert!(off_elements(456, 456, false, 0, false));
+        // Raw and typed views are told as with twins.
+        assert!(off_elements(8, 0, true, 4, false));
+        assert!(!off_elements(48, 0, true, 4, false));
+        assert!(!off_elements(48, 0, false, 12, false));
+        // A stride no structured view has (not whole dwords) is not made raw.
+        assert!(!off_elements(18, 6, false, 0, false));
     }
 
     /// Such a view is made on a copy of its own bytes, and that copy is the one
@@ -5768,6 +5808,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             assert_eq!(width(&v), len.next_multiple_of(256));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
+        }
+        // 456 bytes in: on a structured element, eight bytes past where a raw
+        // view begins. Without raw twins the slot itself must show a raw view,
+        // so the view gets its own bytes; with them it stays on its buffer's.
+        let v = view(start + 456, false);
+        let (copy, address, bytes) = buffer_copy(&v).unwrap();
+        assert_eq!((address, bytes), (start + 456, 4 * 456));
+        if leonida_shader::emit::raw_views() == 0 && structured_bytes() {
+            assert_eq!(copy.span(), (address, bytes));
+            assert_eq!(width(&v), bytes.next_multiple_of(256));
+        } else {
+            assert_ne!(copy.span().0, address, "its buffer's copy");
         }
         for (off, raw) in [(16, true), (32, false)] {
             let v = view(start + off, raw);
