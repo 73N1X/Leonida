@@ -3,7 +3,9 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\play-d3d12.ps1 -Game <folder with game_scarlett_master.exe>
 #
-# By default the game renders its own 720p picture on the Series S profile and DLSS takes it to 1080p. DLSS and DLSS
+# By default the game runs as on an Xbox Series X, rendering 2560x1440 (render scale 2/3 of its 3840x2160 output)
+# with its own temporal upscaler; -SeriesS runs the lighter Series S profile instead, where the game renders its own
+# 720p picture and DLSS takes it to 1080p. -Resolution sets the rendered height (Series X: 1080 or 1440). DLSS and DLSS
 # frame generation need a few of NVIDIA's own files that no repository may carry: d3d12\Get-NVIDIA-DLSS.cmd fetches
 # them from NVIDIA's GitHub once (about 70 MB). Without them the picture is stretched to the screen instead.
 # In the game: F1 = settings (frame generation, frame-rate cap, DLSS preset ...), F3 = the numbers panel.
@@ -25,6 +27,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Data = (Join-Path $env:LOCALAPPDATA "Leonida\d3d12"),
     [switch]$SeriesX,
+    [switch]$SeriesS,
     [switch]$Quality,
     [ValidateSet('', '2160', '1440', '1080', '720', '540', '480')][string]$Resolution = '',
     [string]$Adapter = '',
@@ -55,7 +58,12 @@ $env:LEONIDA_CACHE_DIR = Join-Path $Data "cache-2"
 $env:LEONIDA_DATA_DIR = Join-Path $Data "data"
 
 $launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = (-not $SmoothMotion); More = $More }
-foreach ($switch in 'SeriesX', 'Quality', 'NoDlss', 'RayTracing', 'Capture', 'NoPrecompile', 'Log') {
+# Leonida: the Series X profile is the default (the user's call: 1080p-1440p as on the bigger consoles).
+if (-not $SeriesS) {
+    $launch.SeriesX = $true
+    if (-not $Resolution) { $Resolution = '1440' }
+}
+foreach ($switch in 'Quality', 'NoDlss', 'RayTracing', 'Capture', 'NoPrecompile', 'Log') {
     if ($PSBoundParameters[$switch]) { $launch[$switch] = $true }
 }
 if ($Resolution) { $launch.Resolution = $Resolution }
