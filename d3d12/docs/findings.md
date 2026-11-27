@@ -79,6 +79,31 @@ in that order of size:
 - An on-screen panel of numbers (`LEONIDA_PANEL`): it helps finding where a frame goes but
   costs some, so it is off and F3 shows it.
 
+## Translated compute programs on an RTX 4060 Ti (2026-11-27)
+
+Counted offline over the 2,703 compute programs of the title that translate (the
+`translate_cdxil` example: `--census`, the NVIDIA host settings, every translation also
+through `dxil.dll`'s validator). The card time of a frame barely moves between 1080p and
+1440p, so what counts is per group and per command, not per pixel. What the clean-up and the
+wave64 forms took out, as instructions of the written module and group barriers:
+
+- Exchanges of a console wave64 program in two host waves of 32 that run once
+  (`LEONIDA_EXCHANGE_SITES`, dwords of their own, one barrier): barriers 10,643 -> 9,156.
+- A first-lane read of a load from a read-only view at a lane-uniform address needs no exchange
+  (`LEONIDA_UNIFORM_LOADS`): 9,156 -> 9,108.
+- `LEONIDA_SHADER_OPT` bit 128 (a value kept for the lanes a guard leaves out, read only where
+  the guard holds, is its new value): guard selects 488,284 -> 281,592, instructions -1.5 %.
+- `LEONIDA_SHADER_OPT` bit 256 (a conjunction of lane conditions with its terms in the order
+  they were made, so the enclosing branches' share is one value).
+
+What is left, by size: exchanges inside loops (two barriers each: about 110 of the 134 barriers
+of the 8 x 8 material program `1f1fbd86759b3da2` are in loops), the entry ticket of every
+console wave64 program with lane code (a group barrier and an LDS atomic, also for groups of
+one dimension, where the host's waves are runs of consecutive ids), descriptors made again in
+every branch of a program (`createHandleFromHeap` of an index that is a root constant plus an
+offset, behind a branch on a load), and reads of read-only views repeated in blocks that
+follow one another (70 of 118 in `922e1d0ee1e19a85`).
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask
