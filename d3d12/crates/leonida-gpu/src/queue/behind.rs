@@ -734,7 +734,16 @@ fn runs_most() -> usize {
 /// 0: both are).
 fn frames_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("LEONIDA_SUBMIT_FRAMES").unwrap_or(1))
+    let most = *MOST.get_or_init(|| number("LEONIDA_SUBMIT_FRAMES").unwrap_or(1));
+    // Leonida: `LEONIDA_AB=<s>,LEONIDA_SUBMIT_FRAMES` lets the title run two frames ahead of our
+    // thread and one by turns. Standing at the save the processor is not the wall (3.4 of 12
+    // threads busy, no thread of ours over a third; profile prof-fill, 2026-11-27), so how far
+    // the title may run ahead decides how much of its frame, ours and the card's overlap.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_SUBMIT_FRAMES") {
+        return if on { most.max(2) } else { most.min(1) };
+    }
+    most
 }
 
 fn number(name: &str) -> Option<usize> {
