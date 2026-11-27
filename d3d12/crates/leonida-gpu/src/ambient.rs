@@ -108,7 +108,9 @@ fn set() -> Set {
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    // Leonida: `LEONIDA_AB=<s>,LEONIDA_AMBIENT_ON` measures what the passes cost on the card in one run
+    // (off: the title's shading as it is with the rays off); unset, as `LEONIDA_AMBIENT` says.
+    set() != Set::Off && !crate::pipeline::builder_runs() && crate::toggled!("LEONIDA_AMBIENT_ON")
 }
 
 /// The most the air scatters, as a multiple of the light around
