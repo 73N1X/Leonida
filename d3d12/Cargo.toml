@@ -23,6 +23,7 @@ leonida-formats = { path = "crates/leonida-formats" }
 leonida-pipeline = { path = "crates/leonida-pipeline" }
 leonida-game = { path = "crates/leonida-game" }
 leonida-menu = { path = "crates/leonida-menu" }
+leonida-lua = { path = "crates/leonida-lua" }
 
 # External crates
 anyhow = "1.0.104"
@@ -44,6 +45,8 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# The Lua modding API (`crates/leonida-lua`): Lua 5.4 built from source (MIT).
+mlua = { version = "0.12.3", features = ["lua54", "vendored"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
