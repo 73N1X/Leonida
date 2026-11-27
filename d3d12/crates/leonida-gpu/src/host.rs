@@ -2820,6 +2820,15 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
+    /// A removed device's fence value is not a value reached.
+    #[test]
+    fn a_removed_devices_fence_value_is_not_reached() {
+        assert!(!super::fence_reached(u64::MAX, 1));
+        assert!(!super::fence_reached(6, 7));
+        assert!(super::fence_reached(7, 7));
+        assert!(super::fence_reached(8, 7));
+    }
+
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
     /// before the flight.
@@ -3677,6 +3686,55 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether the fence's completed value says the card ran up to `target`:
+/// `u64::MAX` is what a removed device reports, not a value reached.
+///
+/// From aki-gta6/aki-runtime d9d1341 (Aki-Developer; their port of
+/// fxceless/victory-fork d036cea, pull request 1366), GPL-3.0.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Whether a background thread that waits on the host's fence stops the run
+/// with a report when the wait fails or the fence did not reach its value
+/// (a removed device): one that went on landed flights the card never ran,
+/// and what their shaders "wrote" went into title memory before the run
+/// ended elsewhere. On by default; `LEONIDA_FENCE_CHECK=0`: goes on, as
+/// before.
+fn fence_checked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_FENCE_CHECK").is_none_or(|v| v != "0"))
+}
+
+/// Waits on the fence for a background thread ([`fence_checked`]). Whether
+/// the wait was made (without the check a failed one is not).
+///
+/// # Safety
+/// The event is private to the waiting thread and the fence remains alive.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) -> bool {
+    // SAFETY: the caller owns the event and fence for the whole wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        if fence_checked() {
+            fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
+        }
+        return false;
+    }
+    // SAFETY: as above.
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if !fence_checked() {
+        return true;
+    }
+    if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    // SAFETY: a plain query.
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
+    }
+    true
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3744,11 +3802,9 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3880,6 +3936,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX && fence_checked() {
+                    drop(line);
+                    fail(format_args!("relay: the fence reports the device removed"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -3907,12 +3967,8 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
+                let waited = unsafe { wait_host_fence(&host.fence, target, event, "relay") };
+                if !waited {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -7274,10 +7330,16 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        let existing = deferred.back_wanted.iter_mut().find(|target| target.owner() == resource as usize);
+        let renew = crate::toggled!("LEONIDA_BACK_RENEW");
+        match crate::texback::again(existing.as_ref().map(|target| target.fresh()), renew) {
+            crate::texback::Again::Keep => {}
+            crate::texback::Again::Renew => {
+                if let (Some(entry), Some(target)) = (existing, crate::texback::Target::new(resource)) {
+                    *entry = target;
+                }
+            }
+            crate::texback::Again::Add => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
         }
     }
 

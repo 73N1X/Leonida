@@ -122,6 +122,41 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the ticket is still valid: the texture's memory has not been
+    /// reused or remapped since it was registered.
+    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
+}
+
+/// What a list does with a texture its shaders write again
+/// ([`crate::host::HostList::texture_written`]), given whether it has a
+/// read-back registered for the texture and whether that one's ticket is
+/// still valid ([`Target::fresh`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Again {
+    /// Registered and valid: nothing to do.
+    Keep,
+    /// Registered, but its ticket went stale (the title reused or remapped
+    /// the memory the texture tiles into): registered anew, or the
+    /// read-back would be dropped as one of memory the texture no longer
+    /// holds, and the title would read what was there before (the sea's
+    /// height under a boat).
+    Renew,
+    /// Not registered yet.
+    Add,
+}
+
+/// [`Again`] for a texture with a registered read-back (`Some(fresh)`) or
+/// none. `LEONIDA_BACK_RENEW=0`: a stale one is kept, as before.
+///
+/// From aki-gta6/aki-runtime d9d1341 (Aki-Developer; their port of
+/// fxceless/victory-fork 86d446b, pull request 1376), GPL-3.0.
+pub(crate) fn again(registered: Option<bool>, renew: bool) -> Again {
+    match registered {
+        None => Again::Add,
+        Some(false) if renew => Again::Renew,
+        Some(_) => Again::Keep,
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -466,6 +501,23 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    /// A list that writes a texture again registers its read-back anew only
+    /// when the one it has went stale.
+    #[test]
+    fn a_stale_readback_is_registered_again() {
+        assert_eq!(again(None, true), Again::Add);
+        assert_eq!(again(Some(true), true), Again::Keep);
+        assert_eq!(again(Some(false), true), Again::Renew);
+        // The switch off: a stale one stays, as before.
+        assert_eq!(again(Some(false), false), Again::Keep);
+        assert_eq!(again(None, false), Again::Add);
+        // What makes one stale: its memory mapped anew.
+        let ticket = track(95, 0x9000, 0xa000);
+        assert!(ticket.valid.load(Ordering::Acquire));
+        remapped(0x9800, 0x100);
+        assert!(!ticket.valid.load(Ordering::Acquire));
     }
 
     /// Of a list's read-backs of one texture the last is landed, the others
