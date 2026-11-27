@@ -4768,12 +4768,14 @@ struct DeviceState {
         return VsharpResult::rebased;
     }
 
-    // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
-    // the device's VkQueue and waited for. Created on first use.
+    // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to a
+    // VkQueue the game's first queues do not use and waited for (review D9): the copy family's for colour textures,
+    // the graphics family's for the rest (staged_copy). Created on first use.
     rt::d3d12::TitleImageUpload title_upload;  // accessed with title_upload_mutex held
     std::mutex title_upload_mutex;  // after title_texture_mutex when both are taken (the fill worker takes it alone)
     std::mutex staging_mutex;
     std::unique_ptr<leonida::VulkanQueue> staging_queue;
+    std::unique_ptr<leonida::VulkanQueue> staging_copy_queue;
 
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
@@ -10635,15 +10637,34 @@ private:
         leonida::ReplayResult result = leonida::ReplayResult::unsupported;
         {
             std::lock_guard lock(device_.staging_mutex);
-            if (!device_.staging_queue) {
-                device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
-                                                                               device_.info.queue_family);
-                device_.staging_queue->make_synchronous();  // waited for at once (idle below)
+            // Review D9: a VkQueue the game's direct queue is not on. CreateCommandQueue hands each family's VkQueues
+            // out from the first, so the last one. A colour copy goes to the copy family, whose engine runs beside
+            // queued graphics work (a second graphics VkQueue may be time-sliced behind it, as on NVIDIA); a depth
+            // or stencil copy may convert D24, and an rgb96 one is repacked, by a compute shader, so they stay on
+            // the graphics family.
+            const bool copy_family =
+                !device_.info.copy_queues.empty() && aspects_ == VK_IMAGE_ASPECT_COLOR_BIT && !rgb96_;
+            auto& staging_queue = copy_family ? device_.staging_copy_queue : device_.staging_queue;
+            if (!staging_queue) {
+                if (copy_family) {
+                    staging_queue = std::make_unique<leonida::VulkanQueue>(
+                        *device_.context, device_.info.copy_queues.back(), device_.info.copy_family,
+                        leonida::VulkanQueue::QueueKind::copy);
+                } else {
+                    const auto& queues = device_.info.command_queues;
+                    const VkQueue own = queues.size() > 1 ? queues.back() : device_.info.queue;
+                    staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, own,
+                                                                           device_.info.queue_family);
+                }
+                staging_queue->make_synchronous();  // submitted inline, then waited for (wait_submitted below)
             }
-            if (device_.staging_queue->ok()) {
+            if (staging_queue->ok()) {
                 const leonida::CommandList* lists[] = {&list};
-                result = device_.staging_queue->execute(lists);
-                if (result == leonida::ReplayResult::success && !device_.staging_queue->idle())
+                result = staging_queue->execute(lists);
+                // Only this copy's own submission (review D9: was vkQueueWaitIdle under the submit lock). Other
+                // queues need no wait: D3D12 asks the application to have seen the texture's GPU work complete before
+                // a CPU copy, and that host wait, then this submission, orders it before the copy.
+                if (result == leonida::ReplayResult::success && !staging_queue->wait_submitted())
                     result = leonida::ReplayResult::unsupported;
             }
         }
@@ -16030,7 +16051,8 @@ public:
             std::lock_guard upload(state_.title_upload_mutex);
             state_.title_upload.release(state_);
         }
-        state_.staging_queue.reset();  // it uses the context
+        state_.staging_queue.reset();  // they use the context
+        state_.staging_copy_queue.reset();
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);
