@@ -91,6 +91,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lds_flags;
+mod lds_init;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -679,6 +680,40 @@ pub fn emit(
                 report("loose LDS and local waves (APPROXIMATE, any mask)", &both);
                 if done(&both) {
                     return both.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all, for a program no form above took: the per-lane branches around the code
+        // that needs both host waves taken wave-wide ([`widen`]), as `LEONIDA_WAVE_WIDE=1` does
+        // from the start. Exact (every lane of the console wave answers each of those branches,
+        // the halves exchanging their answers), so it is tried after the other forms have said
+        // no and changes no program they translate (the retired runs 121-124 lost the card with
+        // it on for the others). The water's `CS_TransmissionVolumetrics` programs
+        // (`5dc3b25986622949`, `6f225b641c5b0708`, `926c46bab3b86bd6`) are translated here, with
+        // the starting values of their LDS minima and maxima stored by every thread
+        // ([`lds_init`]). Only for the 2-D tile groups of one console wave (8 x 8: the water's
+        // seven programs) until the others it would take (1-D groups of 64 with up to 30 KiB of
+        // LDS, 18 of the title's) have run on a card: `LEONIDA_WAVE_WIDE_LAST=all` takes every
+        // group [`widen`] does, `0` none; `LEONIDA_WAVE_WIDE=0` turns the form off everywhere.
+        let last = std::env::var("LEONIDA_WAVE_WIDE_LAST").ok();
+        let tile = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads[0] > 1 && cs.threads[1] > 1);
+        if wide_option.is_none() && !wide_on && !driver_loop && (last.as_deref() == Some("all") || tile && last.as_deref() != Some("0")) {
+            let deep = if std::env::var_os("LEONIDA_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0") {
+                form("without skips, scalars followed", ir::without_skips(p, true))
+            } else {
+                None
+            };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches (last of all)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }

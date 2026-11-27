@@ -2969,6 +2969,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -4917,6 +4918,34 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// The LDS dwords a compute program initialises for accumulation
+    /// ([`super::lds_init::init_hoists`]), stored with their starting values by every thread
+    /// first thing, then a group barrier (not for a group of one host wave): every thread of the
+    /// group is still here, before any other LDS access, so the dwords hold their starting value
+    /// whether or not the thread that stores them in the program gets there.
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || self.pack.is_some() || !super::lds_init::on() {
+            return;
+        }
+        let inits = super::lds_init::init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        if cs.threads.iter().product::<u32>() > 32 {
+            self.group_sync(e);
+        }
     }
 
     /// A group barrier with an LDS fence in `block`.
