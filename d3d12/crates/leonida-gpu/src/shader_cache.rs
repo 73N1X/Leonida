@@ -82,6 +82,7 @@ fn build() -> [u8; 32] {
             "LEONIDA_MESH_OUTPUT_STRICT",
             "LEONIDA_BVH_FENCES",
             "LEONIDA_BVH_BOUNDS",
+            "LEONIDA_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
