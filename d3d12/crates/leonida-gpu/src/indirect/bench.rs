@@ -63,7 +63,7 @@ fn compile(entry: &str, target: &str) -> Vec<u8> {
 /// (record by record, every thread racing for the budget word), kept
 /// here to measure against.
 const OLD_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
 uint kind;
 uint stride;
@@ -74,6 +74,9 @@ uint args_offset;
 // run is left empty and costs nothing.
 uint has_count;
 uint count_offset;
+// (the current clamp's packed dispatches: not here)
+uint pack;
+uint dst_stride;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);

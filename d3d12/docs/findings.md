@@ -104,6 +104,54 @@ every branch of a program (`createHandleFromHeap` of an index that is a root con
 offset, behind a branch on a load), and reads of read-only views repeated in blocks that
 follow one another (70 of 118 in `922e1d0ee1e19a85`).
 
+## Group packing (`LEONIDA_GROUP_PACK`, off by default)
+
+The card's time barely moves between 1080p and 1440p and is far above what the instructions of
+its programs cost (`ffdb43445541c981`: about 0.08 ms of arithmetic, 2.9 ms measured), so the
+suspect is launch and occupancy: 1,558 of the 2,703 compute programs use groups of 32 threads or
+fewer (1,460 of exactly 32), some with 57,600 groups to a dispatch, and an Ada multiprocessor
+holds 24 groups, which are 24 of its 48 warps when a group is one.
+
+`LEONIDA_GROUP_PACK=<K>` (2, 4 or 8; the largest of them not above the number; 0 or unset: off)
+translates a program of one console wave of 32 lanes with no group barrier to a host group of
+`K` such waves (`numthreads(32 * K, 1, 1)`):
+
+- host thread `t` is console thread `t % 32` of slot `t / 32`; the console thread's x, y, z are
+  taken from the console group's shape; each slot is a host wave of its own (a one-dimensional
+  group on a host of 32-lane waves: `lower::Pack`);
+- the console group number is `(x + 65535 * y) * K + slot` of the host group (X, Y), taken apart by
+  the console's grid, which the host puts in three root constants (`USER_PACK_X`, `USER_PACK_Y`,
+  `USER_PACK_GROUPS` of `shader.rs`; their metadata `dword` is `K`, so a cached translation says
+  it is packed). A thread whose number is not below the groups in all leaves at once, which is
+  right because there is no barrier;
+- group-shared memory is a slice for each slot (`slot * L` dwords added to every LDS address,
+  `K * L` dwords in all, at most D3D12's 8,192); `K` comes down until it fits, and until
+  `K * 32 * vgprs` is 32 K registers or less;
+- the host runs `pack_grid(groups, K)`: the console's groups in all divided by `K`, rounded up,
+  as `(min(n, 65535), ceil(n / 65535), 1)`. Direct dispatches do it in `State::dispatch`; indirect
+  ones in the clamp (`indirect::bound_packed`, the batched clamp's job word 3), which writes the
+  console's grid and the host's dispatch as one 24-byte record, executed with a command
+  signature of three root constants and a dispatch (`draw::pack_signature`).
+
+Not packed, with the counts over the 2,703 (`translate_cdxil --census` prints `pack K` or `pack 0
+<why>`): 1,237 groups of other than 32 threads, 41 dispatches counted in threads (the structure
+builder's), 28 console wave64 programs. **1,396 are packed** with `LEONIDA_GROUP_PACK=4` (1,395 at
+4, one at 2 for its group-shared memory): 1,229 of 32 x 1 x 1, 146 of 8 x 4, 15 of 4 x 8, 5 of
+4 x 4 x 2, one of 2 x 2 x 8; 77 use group-shared memory, 554 use over 128 registers. With `LEONIDA_GROUP_PACK=8`: 837 at 8, 558 at 4
+(the registers), one at 2, none refused by the validator. The programs
+`ffdb43445541c981`, `cb6adcc6da2613ff`, `5cf00dc39042edaf` and the tile lists'
+`2dc364df5d3278b8` and `940c2635dc1312f4` are among them. All of the packed translations pass
+`dxil.dll`'s validator.
+
+What it does not do, and what to look at: a program with a group barrier is not packed (the
+slices would have to meet at it, and the tail of the grid would have to wait there); groups of
+fewer than 32 threads are not (a wave would hold several groups); wave64 programs are not.
+Shaders with lane operations are packed (each host wave is one console group where the host has
+waves of 32 lanes, as it does here): that rests on a 1-D host group giving a wave a run of 32
+consecutive thread ids, which `LEONIDA_GROUP_PACK=0` takes away again if a program misbehaves.
+The translator already takes a console group-shared memory address as in bounds (a shortcut);
+packed, an address past the group's memory reaches the next slot's instead of the host's end.
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask

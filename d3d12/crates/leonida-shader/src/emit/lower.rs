@@ -147,7 +147,7 @@ fn counted_in_threads(parts: &Parts) -> bool {
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, counted).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -445,6 +445,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Console groups run `k` to a host group ([`group_pack`]).
+    pack: Option<Pack>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1546,6 +1548,69 @@ fn in_cycle(p: &Program) -> Vec<bool> {
     cyclic
 }
 
+/// `LEONIDA_GROUP_PACK=<K>`: the most console groups of 32 threads a host group runs (2, 4 or 8;
+/// 0, 1 or unset: one to a group, as the console does). A program of one console wave of 32
+/// lanes with no group barrier is translated to a host group of `K` such waves, each wave
+/// one console group (`Pack`): the host launches a group per 32 threads otherwise, and a
+/// multiprocessor holds at most 24 of them (Ada) - half its warps with one warp to a group.
+/// Part of the translation (the shader cache keys on it, as on every `LEONIDA_*` switch the
+/// translator reads), and the host divides its dispatches by it ([`super::shader::pack_grid`]).
+pub(crate) fn group_pack() -> u32 {
+    #[cfg(test)]
+    if let Some(k) = TEST_GROUP_PACK.get() {
+        return k;
+    }
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| parse_group_pack(std::env::var("LEONIDA_GROUP_PACK").ok().as_deref()))
+}
+
+/// [`group_pack`]'s value: the largest of 8, 4 and 2 not above the number given, else 0. Pure,
+/// for testing.
+pub(super) fn parse_group_pack(value: Option<&str>) -> u32 {
+    let n: u32 = value.and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    [8, 4, 2].into_iter().find(|&k| n >= k).unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`group_pack`], for its thread only.
+    pub(super) static TEST_GROUP_PACK: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Why the last lowering on this thread did not pack its program (see [`take_pack_why`]).
+    static PACK_WHY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Why the last program lowered on this thread was not packed (`LEONIDA_GROUP_PACK` set), which
+/// it forgets; `None` when it was, or the switch is off. For the census of the offline tool.
+pub fn take_pack_why() -> Option<&'static str> {
+    PACK_WHY.take()
+}
+
+/// The console groups of a program run in the host groups of `Pack::k` of them (see
+/// [`group_pack`]); the host thread `t` of a group is the console thread `t % 32` of the group
+/// slot `t / 32`, and the group's number is the host group's, times `k`, plus the slot.
+struct Pack {
+    k: u32,
+    /// The console group's shape (its product is 32).
+    console: [u32; 3],
+    /// Dwords of group-shared memory of one console group: slot `s` has the dwords from `s` times
+    /// this.
+    lds: u32,
+    /// The host thread's flat id in the group, once asked for.
+    flat: Option<V>,
+    /// The thread's component ids in its console group.
+    thread: [Option<V>; 3],
+    /// The console grid's X and Y (dwords the host sets) and this thread's group's number in
+    /// the grid: all made in the block the thread enters.
+    grid: Option<(V, V, V)>,
+    /// The console group's component ids.
+    group: [Option<V>; 3],
+    /// Where this thread's slice of group-shared memory begins.
+    base: Option<V>,
+}
+
 /// Whether programs with console lanes in groups of several host waves take their console
 /// threads from a group counter (`ticket`, issue #1243). `LEONIDA_THREAD_TICKET=0`: the flat id
 /// of the wave's first lane rounded down, as before.
@@ -1781,7 +1846,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, counted: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1964,6 +2029,63 @@ impl<'a> Lower<'a> {
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+        }
+        // Console groups of 32 threads run several to a host group (`group_pack`), where nothing
+        // of the group is shared with another wave: no group barrier (the slices would have to
+        // meet in step, and the tail of the grid leaves before any barrier), and no console
+        // wave of 64 (`halves`, `ticket` and `exchange` are for those). A 1-D host group on a
+        // host of 32-lane waves gives every wave a run of 32 consecutive ids.
+        let mut pack = None;
+        PACK_WHY.set(None);
+        if let StageIo::Cs(cs) = x.native.io
+            && group_pack() >= 2
+        {
+            let found: Result<u32, &'static str> = (|| {
+                if counted {
+                    return Err("a dispatch counted in threads");
+                }
+                if cs.threads.iter().product::<u32>() != 32 {
+                    return Err("a group of other than 32 threads");
+                }
+                if x.native.wave64 {
+                    return Err("a console wave64 program");
+                }
+                if host_max_wave() != 32 {
+                    return Err("a host whose waves are not 32 lanes");
+                }
+                if insts().any(|i| i.name() == "s_barrier") {
+                    return Err("a group barrier");
+                }
+                if halves.is_some() || ticket.is_some() || exchange.is_some() || split_lds || lds_meet.is_some() {
+                    return Err("group-shared memory of the translation's own");
+                }
+                let mut k = group_pack();
+                // D3D12's 32 KiB of group-shared memory, and 64 K registers a group
+                while k > 1 && (k * s.lds_dwords > 8192 || k * 32 * u32::from(x.native.vgprs).max(1) > 32768) {
+                    k /= 2;
+                }
+                if k < 2 {
+                    return Err("group-shared memory or registers for no more than one group");
+                }
+                Ok(k)
+            })();
+            match found {
+                Ok(k) => {
+                    pack = Some(Pack {
+                        k,
+                        console: cs.threads,
+                        lds: s.lds_dwords,
+                        flat: None,
+                        thread: [None; 3],
+                        grid: None,
+                        group: [None; 3],
+                        base: None,
+                    });
+                    s.threads = Some([32 * k, 1, 1]);
+                    s.lds_dwords *= k;
+                }
+                Err(why) => PACK_WHY.set(Some(why)),
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -2164,6 +2286,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            pack,
         };
         if let Some((_, false, all)) = &this.exchange
             && !LOCAL_WAVES.get()
@@ -2817,6 +2940,9 @@ impl<'a> Lower<'a> {
                 self.s.entry = body;
             }
         }
+        if self.pack.is_some() {
+            self.pack_prelude();
+        }
         self.find_coherent();
         self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3022,6 +3148,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(c) if self.pack.is_some() => return Val::I32(self.pack_group(c)),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -3085,6 +3212,126 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// A packed program's first code (`Pack`): the host thread's console group, found from the
+    /// host group and the slot, and the tail of the grid leaving at once. The console's grid
+    /// comes in three dwords the host sets (`USER_PACK_X`, `USER_PACK_Y`, `USER_PACK_GROUPS`,
+    /// whose metadata `dword` is `k`). Nothing of the group waits for another thread (no
+    /// barrier), so whole waves may leave.
+    fn pack_prelude(&mut self) {
+        use super::shader::{PACK_FOLD, USER_PACK_GROUPS, USER_PACK_X, USER_PACK_Y};
+        let k = self.pack.as_ref().expect("packed").k;
+        let original = self.s.entry;
+        let gx = self.host_word(RootType::Other(USER_PACK_X), 0, k);
+        let gy = self.host_word(RootType::Other(USER_PACK_Y), 0, k);
+        let total = self.host_word(RootType::Other(USER_PACK_GROUPS), 0, k);
+        let (Val::I32(hx), Val::I32(hy)) = (self.compute_id("groupId.i32", 94, 0), self.compute_id("groupId.i32", 94, 1))
+        else {
+            unreachable!()
+        };
+        let flat = self.pack_flat();
+        let m = &mut self.s.m;
+        let fold = m.i32(PACK_FOLD);
+        let rows = m.bin(original, Bin::Mul, hy, fold);
+        let number = m.bin(original, Bin::Add, hx, rows);
+        let shift = m.i32(k.trailing_zeros());
+        let first = m.bin(original, Bin::Shl, number, shift);
+        let five = m.i32(5);
+        let slot = m.bin(original, Bin::LShr, flat, five);
+        let lin = m.bin(original, Bin::Add, first, slot);
+        let runs = m.cmp(original, pred::IULT, lin, total);
+        let (body, done) = (m.new_block(), m.new_block());
+        m.terminate(original, Term::CondBr(runs, body, done));
+        m.terminate(done, Term::Ret);
+        self.s.entry = body;
+        self.pack.as_mut().expect("packed").grid = Some((gx, gy, lin));
+    }
+
+    /// The thread's flat id in its host group.
+    fn pack_flat(&mut self) -> V {
+        if let Some(f) = self.pack.as_ref().and_then(|p| p.flat) {
+            return f;
+        }
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let f = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        self.pack.as_mut().expect("packed").flat = Some(f);
+        f
+    }
+
+    /// Component `c` of the thread's id in its console group: the low five bits of the host
+    /// thread's flat id, taken apart by the console group's shape.
+    fn pack_thread(&mut self, c: u8) -> V {
+        let c = usize::from(c).min(2);
+        if let Some(v) = self.pack.as_ref().and_then(|p| p.thread[c]) {
+            return v;
+        }
+        let console = self.pack.as_ref().expect("packed").console;
+        let flat = self.pack_flat();
+        let e = self.s.entry;
+        let (k31, zero) = (self.s.m.i32(31), self.s.m.i32(0));
+        let local = self.s.m.bin(e, Bin::And, flat, k31);
+        // (every side divides 32: a power of two)
+        let below: u32 = console[..c].iter().product();
+        let v = if console[c] == 1 {
+            zero
+        } else {
+            let shifted = if below > 1 {
+                let s = self.s.m.i32(below.trailing_zeros());
+                self.s.m.bin(e, Bin::LShr, local, s)
+            } else {
+                local
+            };
+            if below * console[c] >= 32 {
+                shifted
+            } else {
+                let mask = self.s.m.i32(console[c] - 1);
+                self.s.m.bin(e, Bin::And, shifted, mask)
+            }
+        };
+        self.pack.as_mut().expect("packed").thread[c] = Some(v);
+        v
+    }
+
+    /// Component `c` of the console group's id: the group's number along X, Y, Z in turn
+    /// taken apart by the console's grid.
+    fn pack_group(&mut self, c: u8) -> V {
+        let c = usize::from(c).min(2);
+        if let Some(v) = self.pack.as_ref().and_then(|p| p.group[c]) {
+            return v;
+        }
+        let (gx, gy, lin) = self.pack.as_ref().and_then(|p| p.grid).expect("the prelude ran");
+        let e = self.s.entry;
+        let v = match c {
+            0 => self.s.m.bin(e, Bin::URem, lin, gx),
+            1 => {
+                let row = self.s.m.bin(e, Bin::UDiv, lin, gx);
+                self.s.m.bin(e, Bin::URem, row, gy)
+            }
+            _ => {
+                let row = self.s.m.bin(e, Bin::UDiv, lin, gx);
+                self.s.m.bin(e, Bin::UDiv, row, gy)
+            }
+        };
+        self.pack.as_mut().expect("packed").group[c] = Some(v);
+        v
+    }
+
+    /// A packed program: the dword where this thread's console group's group-shared memory
+    /// begins (its slot, a host wave, times the console group's dwords).
+    fn pack_lds_base(&mut self) -> Option<V> {
+        let (lds, base) = self.pack.as_ref().map(|p| (p.lds, p.base))?;
+        if let Some(b) = base {
+            return Some(b);
+        }
+        let flat = self.pack_flat();
+        let e = self.s.entry;
+        let five = self.s.m.i32(5);
+        let slot = self.s.m.bin(e, Bin::LShr, flat, five);
+        let width = self.s.m.i32(lds);
+        let b = self.s.m.bin(e, Bin::Mul, slot, width);
+        self.pack.as_mut().expect("packed").base = Some(b);
+        Some(b)
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -5151,6 +5398,9 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
+        if self.pack.is_some() {
+            return Val::I32(self.pack_thread(c));
+        }
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
@@ -5629,6 +5879,11 @@ impl<'a> Lower<'a> {
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            // (packed: this console group's slice)
+            let index = match l.pack_lds_base() {
+                Some(base) => l.s.m.bin(c, Bin::Add, index, base),
+                None => index,
+            };
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };

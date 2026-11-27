@@ -79,7 +79,13 @@ fn main() {
                 }
                 let c = emit::census::take(&h.dxil).unwrap_or_default();
                 let counts: Vec<String> = c.counts.iter().map(|n| n.to_string()).collect();
-                println!("{stem}	{}	{native_insts}	{}	{}", head.replace(' ', ","), h.dxil.len(), counts.join("	"));
+                // (with LEONIDA_GROUP_PACK: the packing of the program, or why not)
+                let packed = h
+                    .user_data
+                    .iter()
+                    .find(|u| u.root == leonida_shader::native::RootType::Other(emit::USER_PACK_GROUPS))
+                    .map_or_else(|| format!("0 {}", emit::take_pack_why().unwrap_or("").replace(' ', "_")), |u| format!("{} -", u.dword));
+                println!("{stem}	{}	{native_insts}	{}	{}	pack	{packed}", head.replace(' ', ","), h.dxil.len(), counts.join("	"));
             }
             Ok(h) => {
                 std::fs::write(out.join(format!("{stem}.dxil")), &h.dxil).unwrap();
