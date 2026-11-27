@@ -139,6 +139,9 @@ $settings = @{
     # longer write depth and motion for the wall's pixels. On since 2026-11-27 (a start with it: the picture as
     # before at the dock; the glass door's squares not looked at yet). '0' in -More: the late test, as before.
     LEONIDA_EARLY_DEPTH = '1'
+    # A copy at its place in a list into bytes no shader wrote lately is the title's own: what reads it in the same
+    # submission does not wait for every flight to land (host.rs, placed_is_titles). '0' in -More: waited for.
+    LEONIDA_PLACED_TITLE = '1'
     # Wait for new shaders rather than skip their draws (each pipeline is waited for at most once). The F1 menu's
     # SHADER WAIT MS changes it: 0 never waits, things then show up as their shaders are done.
     LEONIDA_PIPELINE_WAIT_MS = '10000'
@@ -171,6 +174,14 @@ if ($DlssDir) { $settings.LEONIDA_DLSS_DIR = $DlssDir }
 if ($Resolution) {
     # The older path: a render scale and the title's own upscaler (rendered height over output height).
     $outHeight = if ($SeriesX) { 2160 } else { 1080 }
+    # Series X at 1440 lines or fewer: the title's own output is 2560x1440 (LEONIDA_OUTPUT, the loader's hooks.rs),
+    # not 3840x2160 shrunk into the window afterwards. The frame takes as long (it is not the pixels': 2026-11-27),
+    # the picture was the same in the runs of that day, and the card and the PC hold about 1.5 GB less.
+    # -More @{LEONIDA_OUTPUT='3840x2160'} is the 4K output as before.
+    if ($SeriesX -and [int]$Resolution -le 1440 -and -not $More.ContainsKey('LEONIDA_OUTPUT')) {
+        $settings.LEONIDA_OUTPUT = '2560x1440'
+        $outHeight = 1440
+    }
     if ([int]$Resolution -gt $outHeight) { Write-Host "That console outputs ${outHeight}p: ${Resolution}p is above it."; return }
     $settings.LEONIDA_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
     $settings.LEONIDA_OWN_UPSCALER = '1'
@@ -232,8 +243,11 @@ if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
     # Without -WindowsBarMB, PCs with under 24 GB of RAM get 3072 (PR #6). Windows lets a card share at most half
     # the RAM, and the windows filled that on a 16 GB PC (RTX 3060) about a minute into the world (0x8007000E, then
     # a driver fault). 32 GB and more never got there, so they keep the runtime default (0, off).
+    # Under 48 GB since 2026-11-27: on a 32 GB PC the layer held 28 GB (19 of it in memory), the PC had 745 MB
+    # free and read 100-200 pages a second from the page file; with the windows in the card's memory it held 24.7
+    # GB and the PC had 3 GB free. The frame took as long either way.
     $ram = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { 0 }
-    if ($ram -gt 0 -and $ram -lt 24GB) {
+    if ($ram -gt 0 -and $ram -lt 48GB) {
         $settings.LEONIDA_WINDOWS_BAR_MB = '3072'
         Write-Host "$([math]::Round($ram / 1GB)) GB of RAM: title memory windows in the card's memory the CPU maps, up to 3 GB (-WindowsBarMB 0 turns this off)"
     }
