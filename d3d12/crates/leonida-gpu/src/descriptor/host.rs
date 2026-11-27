@@ -2194,6 +2194,18 @@ impl HostHeap {
         self.count
     }
 
+    /// Why a table of `n` dynamic slots that [`HostHeap::dynamic`] just
+    /// refused found none, for the drop counters (`crate::drops`): read
+    /// after the refusal and without the lock, so another thread's release
+    /// in between can name the wrong cause for one table in many.
+    pub(crate) fn refusal(&self, n: u32) -> crate::drops::Why {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler {
+            return crate::drops::Why::TableOther;
+        }
+        crate::drops::table_refusal(n, self.dynamic, self.free.load(Relaxed), self.too_long.load(Relaxed))
+    }
+
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {

@@ -14,6 +14,7 @@ use leonida_shader::resource::RootIndexedView;
 use leonida_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::drops::{Kind, Why};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -920,14 +921,9 @@ pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// The draws dropped since [`take_dropped`].
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-pub(crate) fn dropped_now() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
-}
-
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
+/// since the last call, whatever the reason (`crate::drops` counts them by
+/// reason: most are left out on purpose).
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
@@ -2131,11 +2127,15 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        // Why it does not run, if it does not (`crate::drops`).
+        crate::drops::begin();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::drops::note(Why::SkipList);
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
+            crate::drops::note(crate::pipeline::why_gone(self.pipeline as This));
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -2147,6 +2147,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
         }
         if !self.bind(list, p, false) {
+            crate::drops::note(Why::BindFailed);
             return false;
         }
         let l = &list.list;
@@ -2630,6 +2631,7 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
+                    crate::drops::note(host.refusal(1));
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2698,6 +2700,7 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
+                    crate::drops::note(host.refusal(1));
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -3849,6 +3852,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count(Kind::Dispatch, Why::SkipList);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3860,6 +3864,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count(Kind::Dispatch, Why::BuilderOff);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3873,6 +3878,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count(Kind::Dispatch, crate::pipeline::why_gone(self.pipeline as This));
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3884,8 +3890,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        crate::drops::begin();
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count_noted(Kind::Dispatch, Why::BindFailed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3910,6 +3918,7 @@ impl State {
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
         if pack_broken(p) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count(Kind::Dispatch, Why::Other);
             return;
         }
         // A program translated to run several console groups to a host group (`LEONIDA_GROUP_PACK`):
@@ -4289,8 +4298,13 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
-            && mesh_kept(self.pipeline)
+        // (A test of the mesh programs leaves some out on purpose.)
+        let held = mesh_test() == 1 || !mesh_kept(self.pipeline);
+        if held {
+            crate::drops::begin();
+            crate::drops::note(Why::SkipList);
+        }
+        let ran = !held
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -4317,6 +4331,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count_noted(Kind::Draw, Why::Other);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4664,6 +4679,7 @@ impl State {
             }) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
+                crate::drops::note(host.refusal(n));
                 made.push((slot, u32::MAX));
                 continue;
             };
@@ -4912,6 +4928,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count_noted(Kind::Draw, Why::Other);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5004,6 +5021,7 @@ impl State {
         let lost = self.topology == RECTANGLES && !self.completes_rects();
         if lost {
             once!("indexed rectangles not drawn");
+            crate::drops::begin();
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
@@ -5019,6 +5037,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drops::count_noted(Kind::Draw, Why::Other);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5146,13 +5165,18 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Why it does not run, if it does not: counted by the caller
+        // (`crate::drops`, the row of indirect executions).
+        crate::drops::begin();
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::drops::note(Why::SkipList);
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::drops::note(Why::BuilderOff);
             return false;
         }
         const DRAW: u32 = 0;
@@ -5164,6 +5188,7 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::drops::note(crate::pipeline::why_gone(self.pipeline as This));
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -5232,6 +5257,7 @@ impl State {
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            crate::drops::note(Why::SkipList);
             why("mesh draws are switched off (LEONIDA_MESH_TEST=skip)");
             return false;
         }
@@ -5343,6 +5369,8 @@ impl State {
             _ => false,
         };
         if !ran {
+            // (What `prepare` or a table noted stays.)
+            crate::drops::note(Why::BindFailed);
             why("prepare failed");
             return false;
         }

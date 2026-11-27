@@ -184,6 +184,30 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Why a pipeline has no host pipeline, for the drop counters
+/// (`crate::drops`). From aki-gta6/aki-runtime d9d1341 (Aki-Developer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Gone {
+    /// Left out on purpose (`left_out`).
+    LeftOut,
+    /// Not made yet (queued or compiling), or, for a draw into formats other
+    /// than the title's, the pipeline made again for them is not.
+    Making,
+    /// Made, and there is none: a shader does not translate or the host
+    /// refused it.
+    Refused,
+}
+
+pub(crate) fn gone(p: &Pending) -> Gone {
+    if p.left_out.is_some() {
+        Gone::LeftOut
+    } else if matches!(p.made.get(), Some(None)) {
+        Gone::Refused
+    } else {
+        Gone::Making
+    }
+}
+
 /// The hashes of the shaders `p` is made of.
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();

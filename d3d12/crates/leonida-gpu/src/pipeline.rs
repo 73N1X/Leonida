@@ -525,6 +525,21 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
     make::ready(p)
 }
 
+/// Why the title pipeline `this` has no host pipeline now, for the drop
+/// counters (`crate::drops`): on a skip list, not made yet, or refused.
+#[cfg(windows)]
+pub(crate) fn why_gone(this: This) -> crate::drops::Why {
+    use crate::drops::Why;
+    if this.is_null() {
+        return Why::Other;
+    }
+    match make::gone(&pipeline(this).host) {
+        make::Gone::LeftOut => Why::SkipList,
+        make::Gone::Making => Why::NotMade,
+        make::Gone::Refused => Why::Refused,
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
