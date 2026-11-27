@@ -92,6 +92,21 @@ impl Default for GraphicsState {
 }
 
 /// Integer render target formats: D3D12 cannot blend into them.
+/// Diagnostic, `LEONIDA_STATIC_SAMPLERS_LINEAR=1`: every immediate sampler of
+/// the title's shaders filters linearly in minification, magnification and
+/// mips (anisotropic ones and the reduction and comparison bits stay). A
+/// posterized picture is a table of colours read without filtering; if it
+/// stays posterized with this set, no sampler a shader carries is the cause.
+fn static_filter(filter: u32) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("LEONIDA_STATIC_SAMPLERS_LINEAR").is_some_and(|v| v == "1"));
+    if on && filter & 0x7f != 0x54 && filter & 0x7f != 0x55 {
+        filter & 0x180 | 0x15
+    } else {
+        filter
+    }
+}
+
 fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(
         f,
@@ -642,7 +657,7 @@ impl HostPipeline {
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
+                    Filter: D3D12_FILTER(static_filter(s.filter_for_host(aniso_point_mip_supported)) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),

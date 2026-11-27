@@ -4784,6 +4784,7 @@ fn make_twinned(
                         at,
                     )
                 };
+                note_volume_view(texture, desc.as_ref());
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -4911,6 +4912,52 @@ fn make_twinned(
             }
         }
     }
+}
+
+/// Names, once each, the shader views the title makes of volumes (3D
+/// textures, as the title's description says) or of textures the host made
+/// a volume: the host texture's dimension, size, levels and format against
+/// the view's. The title's 33- and 64-entry colour-grading tables are read
+/// through such views by the tonemap pass (`PS_CompositeNMB`), and a
+/// posterized picture is those tables read without filtering: if the host
+/// texture and its view disagree here (a 2D array read as a volume, levels
+/// that are not there), this says so. `LEONIDA_VOLUME_VIEWS=0`: not.
+fn note_volume_view(texture: &ID3D12Resource, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) {
+    static SEEN: Mutex<Vec<(i32, u64, u32, u16, i32, i32)>> = Mutex::new(Vec::new());
+    // SAFETY: a live resource.
+    let own = unsafe { texture.GetDesc() };
+    let view_dimension = desc.map_or(-1, |d| d.ViewDimension.0);
+    let volume = own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || view_dimension == D3D12_SRV_DIMENSION_TEXTURE3D.0;
+    if !volume || std::env::var_os("LEONIDA_VOLUME_VIEWS").is_some_and(|v| v == "0") {
+        return;
+    }
+    let key = (own.Dimension.0, own.Width, own.Height, own.DepthOrArraySize, own.Format.0, view_dimension);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 64 || seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    let (most, levels, clamp) = match desc {
+        // SAFETY: the member the dimension names.
+        Some(d) if d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D => {
+            let t = unsafe { d.Anonymous.Texture3D };
+            (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
+        }
+        _ => (u32::MAX, u32::MAX, f32::NAN),
+    };
+    tracing::info!(
+        host_dimension = own.Dimension.0,
+        host_size = format_args!("{}x{}x{}", own.Width, own.Height, own.DepthOrArraySize),
+        host_levels = own.MipLevels,
+        host_format = own.Format.0,
+        host_flags = format_args!("{:#x}", own.Flags.0),
+        view_dimension,
+        view_format = desc.map_or(0, |d| d.Format.0),
+        view_most_detailed = most as i32,
+        view_levels = levels as i32,
+        view_min_lod_clamp = clamp,
+        "shader view of a volume"
+    );
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
