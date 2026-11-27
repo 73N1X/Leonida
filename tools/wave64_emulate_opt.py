@@ -1194,6 +1194,10 @@ def _one_lane_step(ins, st):
         val = is_one(a[1]) or (op == "s_and_b64" and len(a) > 2 and is_one(a[2]))
         dest = _one_key(a[0])
         exec_val = val
+    if any(x.get("k") == "special" and x.get("t") in ("exec_lo", "exec_hi") for x in a[:2]):
+        # One half of EXEC (a compare into exec_lo, s_mov_b32 exec_hi, a carry out): the other half keeps its lanes,
+        # so EXEC stays at most one lane only if it already was and the half written is within it (a compare).
+        exec_val = exec_val and "exec" in one
     out = {k for k in one if k != "exec" and not may_w & (1 << _BIT_VCC if k == "vcc" else 3 << k)}
     if not writes_exec and "exec" in one:
         out.add("exec")
@@ -1464,8 +1468,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         break
         if not ok:
             continue
-        # Build local sub-CFG and verify reducibility (multi-block regions use cfg_structure.structure).
-        if len(region) == 1:
+        # Build local sub-CFG and verify reducibility (multi-block regions and a one-block loop use
+        # cfg_structure.structure; emitted straight, a block that branches back to itself would run once).
+        if len(region) == 1 and run not in succ[run]:
             order = [run]
             sub_tree = None
         else:
