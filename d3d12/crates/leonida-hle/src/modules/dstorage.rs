@@ -150,7 +150,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, name: kept.clone() });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -278,6 +278,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// The path the title opened it by (Leonida: the button prompt movie is found by archive and offset).
+    name: String,
 }
 
 /// How files are read (`LEONIDA_DSTORAGE_IO`).
@@ -1398,6 +1400,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
+    // Leonida: the button prompt movie, while a PlayStation pad is in use (`glyphs`).
+    if options & (ZLIB | BCPACK | MEMORY_SOURCE) == ZLIB
+        && let Some(movie) = glyph_movie(request)
+    {
+        return into_destination(request, size, |out| {
+            let n = movie.len().min(out.len());
+            out[..n].copy_from_slice(&movie[..n]);
+            out[n..].fill(0);
+            Ok(out.len())
+        });
+    }
     if options & (ZLIB | BCPACK) == 0 {
         if request.source_size > request.destination_size {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
@@ -1430,6 +1443,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// The replacement for the title's button prompt movie, when this request reads it.
+fn glyph_movie(request: &Request) -> Option<&'static [u8]> {
+    // SAFETY: a file object we created; the title keeps it open.
+    let file = unsafe { &*request.source.cast::<Instance<File>>() };
+    super::glyphs::replacement(&file.state.name, request.offset, request.destination_size, super::gameinput::active_family)
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream

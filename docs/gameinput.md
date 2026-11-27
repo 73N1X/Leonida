@@ -174,6 +174,41 @@ gives the mouse back. Settings: `LEONIDA_MOUSE_SENSITIVITY` (1, 0.1..10), `LEONI
 whenever the window has focus). Unit-tested (`mouse_look_turns_speed_into_a_stick_past_the_dead_zone`); the dead zone
 and curve are first guesses at the title's own stick response, not measured.
 
+## PlayStation pads and the active input of the D3D12 runtime
+
+The D3D12 runtime has no SDL. Besides XInput it reads Sony pads (vendor `054C`: DualSense `0CE6`, DualSense Edge `0DF2`,
+DualShock 4 `05C4`, `09CC`, USB adapter `0BA0`) over Windows HID directly (`gameinput/hid.rs`), on USB and Bluetooth,
+written from the public report layouts (the Linux `hid-playstation` driver documents them). One thread per pad reads
+input reports; a rescan every 2 s finds pads that came or went. A Bluetooth pad is moved to its full report by reading
+calibration feature report `0x05`.
+
+| | USB input | Bluetooth input | USB output | Bluetooth output |
+|---|---|---|---|---|
+| DualSense | `0x01`, 64 bytes, data from byte 1 | `0x31`, 78 bytes, data from byte 2 | `0x02`, 63 | `0x31`, 78, CRC-32 last |
+| DualShock 4 | `0x01`, 64 bytes, data from byte 1 | `0x11`, data from byte 3 | `0x05`, 32 | `0x11`, 78, CRC-32 last |
+
+Buttons: Cross, Circle, Square, Triangle are A, B, X, Y; L1/R1 the shoulders; L2/R2 the triggers (analog byte, the
+digital bit is ignored); L3/R3 the stick clicks; Options is Menu; Create (Share) and the touchpad click are View;
+the PS and mute buttons are not passed. Sticks are 0..255, centre 128. Rumble: the big motor of the title's
+`SetRumbleState` goes to the pad's left motor, the small one to its right (`rumble_report`; on Bluetooth the CRC is
+seeded with `0xA2`). Trigger effects and the lightbar are not driven. A Sony pad takes the first slot XInput leaves
+empty (all pads are one pad for the title anyway, `LEONIDA_ONE_PAD`).
+
+A pad that Steam Input or DS4Windows already shows through XInput is not read twice: when input comes on an XInput pad and
+on a readable Sony pad within 150 ms of each other, they are one controller for the next 10 s, and the Sony pad's own
+reading is left out of what the title sees. A Sony pad present but not openable (hidden by HidHide, held exclusively)
+counts the same way: input on XInput is then PlayStation input.
+
+**Active input.** `gameinput::active_family()` (`leonida-hle`, readable from any thread, lock-free) says which kind of
+device was used last: `Family::Xbox`, `Family::PlayStation` or `Family::KeyboardMouse`; `family_generation()` goes up by one
+with each change. It follows the rules of [Active input](#active-input) above (an edge counts, the first reading of a
+device is its baseline, a change waits `LEONIDA_PROMPTS_SWITCH_MS` = 300 ms), with the keyboard and mouse as a third
+family (a key going down, or mouse look pushing the stick past 0.35). Before the first input it is PlayStation if a Sony pad is
+present and Xbox otherwise. One line is logged on each change (`input in use: PlayStation (Sony pad input)`).
+`LEONIDA_PROMPTS=xbox|playstation|keyboard|auto` forces it. The button prompts follow it: see
+[prompt_glyphs.md](prompt_glyphs.md). Unit-tested on hand-made report bytes and the family rules; not run against a
+real pad yet.
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on
