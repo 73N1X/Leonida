@@ -201,6 +201,27 @@ pub fn run(
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { leonida_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
+    // Renderer port #2 (LEONIDA_PORT_DESCRIPTORS=1): the title's stores of descriptor records tell the layer their
+    // slots. Only the 1.0.2.1 executable, each store's bytes checked as well.
+    #[cfg(windows)]
+    if execute && leonida_gpu::port_descriptors::wanted() {
+        use leonida_loader::descriptor_sites::{Hooked, SITES, apply};
+        if image.is_build_1_0_2_1() {
+            let size = image.info().size_of_image as usize;
+            // SAFETY: the image stays mapped, nothing of it has run yet, and the marks are a static.
+            let done = unsafe { apply(image.base(), size, leonida_gpu::port_descriptors::marks_address(), &SITES) };
+            let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+            println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
+            // A store left unpatched is a writer nothing tells of: then the page route stays, as before.
+            if patched == SITES.len() {
+                leonida_gpu::port_descriptors::hooked(image.base(), size, patched);
+            } else {
+                println!("renderer port 2: not every store was patched; the heap's changed pages are looked at as before");
+            }
+        } else {
+            println!("renderer port 2: not the 1.0.2.1 executable; no descriptor record store patched");
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

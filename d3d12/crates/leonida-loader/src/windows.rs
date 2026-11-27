@@ -26,6 +26,8 @@ pub struct LoadedImage {
     module: HMODULE,
     path: PathBuf,
     info: ImageInfo,
+    /// Whether the original image is the Series X 1.0.2.1 executable (`hooks::BUILD_1_0_2_1`).
+    build_1_0_2_1: bool,
 }
 
 // SAFETY: HMODULE is a process-wide handle (the base address); using it from
@@ -78,6 +80,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         module,
         path,
         info: prepared.info.clone(),
+        build_1_0_2_1: crate::hooks::is_build_1_0_2_1(&prepared.original_hash),
     };
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
@@ -204,6 +207,12 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 impl LoadedImage {
+    /// Whether this is the 1.0.2.1 executable, whose offsets the title patches (`hooks.rs`,
+    /// `descriptor_sites`) are for.
+    pub fn is_build_1_0_2_1(&self) -> bool {
+        self.build_1_0_2_1
+    }
+
     pub fn base(&self) -> usize {
         self.module as usize
     }

@@ -13,6 +13,11 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 /// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
 const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
 
+/// Whether `hash` is the 1.0.2.1 executable's.
+pub(crate) fn is_build_1_0_2_1(hash: &blake3::Hash) -> bool {
+    hash.to_hex().starts_with(BUILD_1_0_2_1)
+}
+
 /// Environment variable that turns the watchdog hook on.
 pub(crate) const NO_WATCHDOG_ENV: &str = "LEONIDA_NO_WATCHDOG";
 

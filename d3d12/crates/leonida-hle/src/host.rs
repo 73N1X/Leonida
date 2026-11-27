@@ -83,6 +83,8 @@ impl HostPolicy {
         #[cfg(windows)]
         if let ImportSymbol::Name { name, .. } = symbol {
             let ours = leonida_gpu::titlewrite::import(name, address);
+            // Renderer port #2 (`LEONIDA_PORT_DESCRIPTORS`): copies into the heap mark the view records they hold.
+            let ours = leonida_gpu::port_descriptors::import(name, ours);
             if ours != address {
                 return Some(ours);
             }
