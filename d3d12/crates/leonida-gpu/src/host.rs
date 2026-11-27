@@ -2253,6 +2253,110 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
     }
 }
 
+/// Whether the compares of ranges of one copy in the card's memory whose
+/// pieces and result places follow each other go in one pass
+/// (`LEONIDA_CARD_COMPARE_JOIN=0`: a pass each, as before).
+///
+/// The compare ran a pass per declared range after the lists of every
+/// submission, each a dispatch with its constants and two root views set:
+/// some 390 a frame in the fork's count (walking in the prison). Joined, the
+/// same pieces are hashed and flagged at the same places: a pass takes its
+/// pieces from `first` on and writes piece `i`'s flag at dword `at + i`, and
+/// two passes are joined only where the second goes on at both.
+/// (After edsuuu/VI-BR-PORT 2f59f1d.)
+fn compare_join() -> bool {
+    crate::toggled!("LEONIDA_CARD_COMPARE_JOIN")
+}
+
+/// A pass of [`CARD_COMPARE`] after a submission's lists: the copy's card
+/// side and its hashes (where the card has them), the bytes hashed of a
+/// piece, the pieces, the first's place in the flags, the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComparePass {
+    buffer: u64,
+    hashes: u64,
+    size: u32,
+    span: crate::shadow::CardSpan,
+    at: u32,
+    mode: u32,
+}
+
+/// `passes` in order, with those joined that go on where the one before
+/// them ends ([`compare_join`]): the same copy, piece size, mode and skew,
+/// the next piece and the next place.
+fn joined_compares(passes: impl Iterator<Item = ComparePass>, join: bool) -> Vec<ComparePass> {
+    let mut out: Vec<ComparePass> = Vec::new();
+    for pass in passes {
+        match out.last_mut() {
+            Some(last)
+                if join
+                    && (last.buffer, last.hashes, last.size, last.mode, last.span.skew)
+                        == (pass.buffer, pass.hashes, pass.size, pass.mode, pass.span.skew)
+                    && last.span.first + last.span.pieces == pass.span.first
+                    && last.at + last.span.pieces == pass.at =>
+            {
+                last.span.pieces += pass.span.pieces;
+                last.span.to = pass.span.to;
+            }
+            _ => out.push(pass),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod compare_join_tests {
+    use super::{ComparePass, joined_compares};
+    use crate::shadow::CardSpan;
+
+    /// Joined, the passes hash the same pieces into the same places, in the
+    /// same order; only what goes on at both is joined.
+    #[test]
+    fn joined_compares_hash_the_same_pieces_into_the_same_places() {
+        const PIECE: u32 = 64 << 10;
+        let pass = |buffer: u64, first: u32, pieces: u32, at: u32, mode: u32| ComparePass {
+            buffer,
+            hashes: buffer + 1,
+            size: PIECE,
+            span: CardSpan { from: first * PIECE, to: (first + pieces) * PIECE, first, pieces, skew: 0 },
+            at,
+            mode,
+        };
+        let skewed = |mut p: ComparePass| {
+            p.span.skew = 4096;
+            p
+        };
+        let all = [
+            pass(100, 0, 2, 0, 1),
+            pass(100, 2, 3, 2, 1),  // goes on: joined
+            pass(100, 5, 1, 5, 1),  // and again
+            pass(100, 6, 1, 6, 2),  // another mode
+            pass(100, 7, 1, 9, 2),  // not the next place
+            pass(100, 9, 1, 10, 2), // not the next piece
+            pass(200, 10, 1, 11, 2), // another copy
+            pass(200, 11, 2, 12, 2), // goes on
+            skewed(pass(200, 13, 1, 14, 2)), // another skew
+            pass(200, 13, 1, 15, 2), // a piece again (two ranges in it)
+        ];
+        // Each pass as (copy, mode, skew, piece, place) for every piece.
+        let pieces = |passes: &[ComparePass]| -> Vec<(u64, u32, u32, u32, u32)> {
+            passes
+                .iter()
+                .flat_map(|p| (0..p.span.pieces).map(move |i| (p.buffer, p.mode, p.span.skew, p.span.first + i, p.at + i)))
+                .collect()
+        };
+        let joined = joined_compares(all.into_iter(), true);
+        assert_eq!(pieces(&joined), pieces(&all));
+        assert_eq!(joined.len(), 7);
+        assert_eq!(joined[0], pass(100, 0, 6, 0, 1));
+        assert_eq!((joined[0].span.from, joined[0].span.to), (0, 6 * PIECE));
+        assert_eq!(joined[4], pass(200, 10, 3, 11, 2));
+        // Not asked for: as they came.
+        assert_eq!(joined_compares(all.into_iter(), false), all);
+        assert!(joined_compares(std::iter::empty(), true).is_empty());
+    }
+}
+
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
 /// once (`LEONIDA_CARD_REHASH_RUNS=1`; off by default), and not in a pass
@@ -4698,15 +4802,25 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    let passes = plan.ranges.iter().filter(|r| r.compared).filter_map(|r| {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
+                            return None;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        Some(ComparePass {
+                            buffer: r.shadow.buffer.GetGPUVirtualAddress(),
+                            hashes: before.GetGPUVirtualAddress(),
+                            size: size as u32,
+                            span: r.span,
+                            at: r.at,
+                            // (What is only looked at keeps its hashes: what
+                            // changed there is the next declared range's to land.)
+                            mode: if flown && !r.picked { 2 } else { 1 },
+                        })
+                    });
+                    for pass in joined_compares(passes, compare_join()) {
+                        list.SetComputeRootShaderResourceView(1, pass.buffer);
+                        list.SetComputeRootUnorderedAccessView(2, pass.hashes);
+                        card_pass(list, &pass.span, pass.size, pass.at, pass.mode);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
