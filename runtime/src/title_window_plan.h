@@ -86,27 +86,31 @@ inline bool clip_title_pool_extent(TitleWindowRange& extent, std::uint64_t sourc
 // end. A range entered over it replaces those ranges whole (TitleVaAliases::replace_twin), so none of their bytes is
 // left unanswered and no view reaches past the copy it was given. `owned(shader_va)` says the caller can retire the
 // copy a range answers from (a title window); any other range in the way (a slot-133 buffer, a geometry copy) makes
-// it false, as does a mapping past `most` bytes or outside [pool_lo, pool_hi). `out` is unchanged on false.
+// it false, as does a mapping past `most` bytes or outside [pool_lo, pool_hi) in its own view. The pool's other view
+// is [twin_lo, twin_hi), `twin` being va's byte there; one that would not fit in 64 bits makes it false too, so no
+// address is ever taken modulo 2^64. `out` is unchanged on false.
 template <class Owned>
 inline bool title_pool_cover(const TitleVaAliases& aliases, std::uint64_t pool_lo, std::uint64_t pool_hi,
                              std::uint64_t va, std::uint64_t twin, std::uint64_t start, std::uint64_t end,
                              std::uint64_t align, std::uint64_t most, Owned&& owned, TitleWindowRange& out) {
     if (!align || (align & (align - 1)) != 0 || start > va || va >= end || start < pool_lo || end > pool_hi)
         return false;
+    if (twin < va - pool_lo || pool_hi - va > UINT64_MAX - twin) return false;
     const auto aligned_end = [&](std::uint64_t e) {
         return e > pool_hi - (align - 1) ? pool_hi : (std::min)(pool_hi, (e + align - 1) & ~(align - 1));
     };
-    const std::uint64_t shift = twin - va;  // a range at x in the other view is at x - shift in va's (modulo 2^64)
+    // Each view's bounds: a range at x in the twin view is at x - twin_lo + pool_lo in va's.
+    const std::uint64_t base[2] = {pool_lo, twin - (va - pool_lo)}, top[2] = {pool_hi, twin + (pool_hi - va)};
     std::uint64_t lo = start, hi = aligned_end(end);
     std::vector<TitleVaAliases::Mapping> hits;
     for (bool grew = true; grew;) {
         grew = false;
-        for (int view = 0; view < (shift ? 2 : 1); ++view) {
-            const std::uint64_t by = view ? shift : 0;
-            aliases.overlapping(lo + by, hi + by, hits);
+        for (int view = 0; view < (twin != va ? 2 : 1); ++view) {
+            aliases.overlapping(lo - pool_lo + base[view], hi - pool_lo + base[view], hits);
             for (const TitleVaAliases::Mapping& m : hits) {
-                const std::uint64_t b = m.title_va - by, e = m.end - by;
-                if (!owned(m.shader_va) || b < pool_lo || e > pool_hi) return false;  // not ours, or not coverable
+                // Not ours, or not coverable: reaching past the pool in its own view.
+                if (!owned(m.shader_va) || m.title_va < base[view] || m.end > top[view]) return false;
+                const std::uint64_t b = m.title_va - base[view] + pool_lo, e = m.end - base[view] + pool_lo;
                 if (b < lo) lo = b, grew = true;
                 if (e > hi) hi = aligned_end(e), grew = true;
             }
