@@ -571,6 +571,25 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `LEONIDA_PORT_CONSTANTS=1`) are
+/// clamped alone, right before they run (`LEONIDA_PORT_CONSTANTS_ORDER`; `=0`:
+/// in batches and windows as any other; it matters only with port 1 on).
+///
+/// A batch or a window clamps records ahead, in the pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine, its bytes are the title's of
+/// the submission. Where the card reads the title's memory in place, the
+/// records the title's culling passes write between the two are read before
+/// they are written: the execution draws the records of an earlier frame,
+/// or none (palms and trees missing for runs of frames while the camera
+/// moves).
+///
+/// Ported from Belobug/VIctory-Belobug-AMD 631400f (Renderer port 1 ordering).
+fn in_place_order() -> bool {
+    crate::toggled!("LEONIDA_PORT_CONSTANTS_ORDER")
+}
+
 /// Whether indirect executions of one record are clamped in batches
 /// (`crate::indirect::batch`; `LEONIDA_INDIRECT_BATCH=0`: each on its own,
 /// or in windows ([`windows`])).
@@ -5052,8 +5071,17 @@ impl State {
             why("mesh draws are switched off (LEONIDA_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped alone, right before their
+        // execution, never ahead in a batch or window.
+        // Ported from Belobug/VIctory-Belobug-AMD 631400f.
+        let alone = (args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place())) && in_place_order();
+        if alone {
+            self.batch = None;
+            self.window = None;
+        }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind, pack_k)
         } else {
@@ -5069,6 +5097,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !alone
             && kind != DISPATCH
             && max == 1
             && count.is_none()
