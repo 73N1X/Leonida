@@ -621,6 +621,7 @@ fn lane_uniform(
     all: &[bool],
     stable_lds: &[bool],
     wave_tid: Option<Value>,
+    srv_loads: &HashSet<Site>,
 ) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let order = crate::ir::reverse_postorder(&p.blocks);
@@ -708,6 +709,28 @@ fn lane_uniform(
                         ..
                     } if stable_lds.get(b).copied().unwrap_or(false) && name == "ds_read_b32" => {
                         if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
+                            next.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                        }
+                        continue;
+                    }
+                    // a load from a view the dispatch only reads, at an address every lane
+                    // holds alike (or none), reads one value in every lane
+                    Fields::Buffer {
+                        addr,
+                        offen,
+                        idxen,
+                        lds: false,
+                        tfe: false,
+                        ..
+                    } if srv_loads.contains(&(b, i)) => {
+                        let wanted = u8::from(*offen) + u8::from(*idxen);
+                        let alike = match addr {
+                            Operand::Vector { reg, .. } => (0..wanted).all(|k| {
+                                inst.read(Reg::V(reg + k)).is_some_and(|a| known(&next, &a))
+                            }),
+                            _ => wanted == 0,
+                        };
+                        if alike {
                             next.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
                         }
                         continue;
@@ -1441,6 +1464,24 @@ thread_local! {
     pub(super) static TEST_EXCHANGE_SITES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether buffer loads of read-only views at an address the lanes hold alike count as the same
+/// in every lane (`LEONIDA_UNIFORM_LOADS`, on unless `0`): a first-lane read of such a value then
+/// needs nothing from the other host wave of a console wave64 program.
+fn uniform_loads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_UNIFORM_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_UNIFORM_LOADS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`uniform_loads_on`], for its thread only.
+    pub(super) static TEST_UNIFORM_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Per block, whether it lies on a cycle of the program's flow: whether a thread can run it
 /// more than once.
 fn in_cycle(p: &Program) -> Vec<bool> {
@@ -2004,7 +2045,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        let mut this = Lower {
             s,
             x,
             bad,
@@ -2076,13 +2117,7 @@ impl<'a> Lower<'a> {
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
-            uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    let stable = stable_lds_reads(p, x.st, all, split_lds && super::group_sync() != 0);
-                    lane_uniform(p, x.st, all, &stable, wave_tid(x))
-                }
-                _ => HashSet::new(),
-            },
+            uniform: HashSet::new(),
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("LEONIDA_WAVE_WHY").is_some())
@@ -2129,7 +2164,39 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+        };
+        if let Some((_, false, all)) = &this.exchange
+            && !LOCAL_WAVES.get()
+        {
+            let all = all.clone();
+            let stable = stable_lds_reads(p, x.st, &all, this.split_lds && super::group_sync() != 0);
+            let srv_loads = if uniform_loads_on() { this.srv_loads() } else { HashSet::new() };
+            this.uniform = lane_uniform(p, x.st, &all, &stable, wave_tid(x), &srv_loads);
         }
+        this
+    }
+
+    /// The buffer loads whose view is one the dispatch only reads (a shader resource view in
+    /// the root signature, or a root SRV): where such a load has an address every lane holds
+    /// alike (or none) every lane gets the same value ([`lane_uniform`]). A view the program
+    /// may write is left out: another lane's store may fall between two lanes' loads.
+    fn srv_loads(&self) -> HashSet<Site> {
+        let p = self.x.p;
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| {
+                let inst = &p.blocks[d.site.0].insts[d.site.1];
+                let name = inst.name();
+                d.role == Role::Resource
+                    && matches!(inst.fields, Fields::Buffer { .. })
+                    && (name.starts_with("buffer_load") || name.starts_with("tbuffer_load"))
+                    && matches!(d.source, Source::Loaded { .. } | Source::Built { .. })
+                    && self.used_kind(&d.source).is_some_and(|u| u.kind == ResourceType::Srv)
+            })
+            .map(|d| d.site)
+            .collect()
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -13519,7 +13586,7 @@ mod tests {
             let inst = &p.blocks[0].insts[0];
             let tid = inst.read(Reg::V(0)).unwrap();
             let shifted = inst.writes.iter().find(|w| w.0 == Reg::V(7)).unwrap().1;
-            let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(tid));
+            let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(tid), &std::collections::HashSet::new());
             let expected = (0..64u32).all(|lane| lane.wrapping_shr(shift) == 0);
             assert_eq!(uniform.contains(&shifted), expected, "inline shift {shift}");
         }
@@ -13540,7 +13607,7 @@ mod tests {
         assert_eq!(swap.name(), "v_swap_b32");
         let old_v0 = swap.read(Reg::V(0)).unwrap();
         let new_v1 = swap.write(Reg::V(1)).unwrap();
-        let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(old_v0));
+        let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(old_v0), &std::collections::HashSet::new());
         assert!(!uniform.contains(&new_v1));
     }
 

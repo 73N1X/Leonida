@@ -1783,3 +1783,58 @@ fn exchanges_that_run_once_meet_once() {
         assert_eq!(out[0][..2], [63, u32::MAX], "{name}");
     }
 }
+
+/// A first-lane read of a value loaded from a shader resource view at an address that no lane
+/// differs in (the load names no vector address) is the same in every lane, so the halves of
+/// the console wave need not meet for it; the same read of a value from a view the program
+/// writes (a UAV) still does.
+#[test]
+fn a_first_lane_read_of_a_uniform_srv_load_needs_no_exchange() {
+    let build = |srv: bool| {
+        let words = [
+            0x3D << 26 | 0x02 << 18 | 12 << 6 | 2,
+            125 << 25 | 0x10, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (a lane read: the console wave is two host waves)
+            0xD766_0001,
+            0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+            0x38 << 26 | 0x0C << 18 | 4,
+            0x80 << 24 | 3 << 16 | 8 << 8, // buffer_load_dword v8, off, s[12:15], 0 offset:4
+            0x7E0E_0508, // v_readfirstlane_b32 s7, v8
+            0x7E00_0207, // v_mov_b32 v0, s7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ];
+        let mut native = native(&words);
+        // the descriptor at table byte 16 is the loaded view: a read-only one, or a second UAV
+        native.used.push(UsedResource {
+            kind: if srv { ResourceType::Srv } else { ResourceType::Uav },
+            root: RootType::Table,
+            table_offset_dwords: 4,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        });
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let lower_with = |on: bool| {
+            let was = lower::TEST_UNIFORM_LOADS.replace(Some(on));
+            lower::TEST_GROUP_SYNCS.set(0);
+            let shader = lowered(&native, &p, &HashSet::new());
+            let syncs = lower::TEST_GROUP_SYNCS.get();
+            lower::TEST_UNIFORM_LOADS.set(was);
+            (syncs, shader.expect("lower"))
+        };
+        (lower_with(true), lower_with(false))
+    };
+    let ((srv_on, shader), (srv_off, _)) = build(true);
+    assert!(srv_on < srv_off, "group barriers: {srv_on} with the rule, {srv_off} without it");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let ((uav_on, _), (uav_off, _)) = build(false);
+    assert_eq!(uav_on, uav_off, "a view the program may write is not one value in every lane");
+    eprintln!("group barriers: {srv_on} against {srv_off} for a view only read; {uav_on} either way for a UAV");
+}
