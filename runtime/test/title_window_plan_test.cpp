@@ -166,7 +166,19 @@ int check_pool_cover() {
     // add_twin refuses to enter it over the first extent; replace_twin replaces that one's ranges whole, and every
     // byte they answered for is answered again.
     EXPECT(!table.add_twin(cover.start, gpu + 0x80000, cover.size, 0x200000));
-    EXPECT(table.replace_twin(cover.start, gpu + 0x80000, cover.size, 0x200000));
+    // A buffer the title places in the cover's span in either view after the plan (slot 133 takes no lock of the
+    // planner's) is not erased with the windows: replace_twin refuses and leaves every range as it was.
+    for (const std::uint64_t placed : {cpu + 0xC0000, gpu + 0xC8000}) {
+        leonida::TitleVaAliases raced;
+        EXPECT(raced.add_twin(cpu + 0x80000, gpu + 0x80000, 0x40000, 0x100000));
+        EXPECT(leonida::title_pool_cover(raced, cpu, cpu + pool, cpu + 0xB0000, gpu + 0xB0000, cpu + 0xB0000,
+                                         cpu + 0xD0010, kAlign, kMiB, window, cover));
+        EXPECT(raced.add(placed, 0x4000, 0x900000));
+        EXPECT(!raced.replace_twin(cover.start, gpu + 0x80000, cover.size, 0x200000, window));
+        EXPECT(raced.size() == 3 && raced.shader_va(placed + 0x10) == 0x900010);
+        EXPECT(raced.shader_va(cpu + 0x80000) == 0x100000 && raced.shader_va(gpu + 0xBFFFF) == 0x13FFFF);
+    }
+    EXPECT(table.replace_twin(cover.start, gpu + 0x80000, cover.size, 0x200000, window));
     EXPECT(table.size() == 2);
     EXPECT(table.shader_va(cpu + 0xBFFFF) == 0x23FFFF && table.shader_va(gpu + 0xD000F) == 0x25000F);
     // Past `most`, or into a range that is not a window (a buffer placed in the GPU-only view), there is no cover.

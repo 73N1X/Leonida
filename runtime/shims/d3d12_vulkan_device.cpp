@@ -3502,6 +3502,24 @@ struct DeviceState {
                          static_cast<unsigned long long>(title_window_bytes >> 10));
         return offset;
     }
+    // Undoes make_title_window for a window no range was entered for (the table refused the mapping): nothing has
+    // answered from it, so no submission names it and its memory goes at once. title_window_mutex held.
+    void drop_title_window(std::uint64_t shader_va) {
+        const auto it = std::find_if(title_windows.begin(), title_windows.end(),
+                                     [&](const TitleWindow& window) { return window.shader_va == shader_va; });
+        if (it == title_windows.end()) return;
+        const TitleWindow window = *it;
+        title_windows.erase(it);
+        title_window_count.store(title_windows.size(), std::memory_order_relaxed);
+        title_window_bytes -= window.size;
+        remove_shadow(window.mapped);
+        if (window.shader_va < arena.size) {
+            arena_release(window.shader_va, window.size, arena_buffer);
+        } else {
+            backing(arena.address + window.shader_va, window.size, window.start, false);
+            external_windows.free(*this, window.shader_va, window.size);
+        }
+    }
 
     // A binding of the title's memory reached for the coming submission: keep its range for the copy back after it.
     // Over-inclusive on purpose (a read-only view costs a copy, a write is never missed: a V# has no read/write bit).
@@ -3651,8 +3669,11 @@ struct DeviceState {
             shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
         const bool geometry_copy = shader != 0;
         if (!shader) shader = make_title_window(extent.start, extent.size);
-        if (!shader || !aliases.add_twin(extent.start, twin_start, extent.size, shader))
+        if (!shader) return reuse() || unbacked();
+        if (!aliases.add_twin(extent.start, twin_start, extent.size, shader)) {
+            if (!geometry_copy) drop_title_window(shader);
             return reuse() || unbacked();
+        }
         pool_spans.push_back({extent.start, twin_start, shader, extent.size, geometry_copy});
         pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
         pool_span_bytes += extent.size;
@@ -3678,14 +3699,22 @@ struct DeviceState {
     bool cover_pool_request(std::uint64_t source, std::uint64_t twin_view, std::uint64_t start, std::uint64_t end,
                             std::uint64_t pool_lo, std::uint64_t pool_end, std::uint64_t& out) {
         std::vector<std::size_t> replaced;  // title_windows entries the ranges in the way answer from
+        const auto window_of = [&](std::uint64_t shader_va) {
+            std::size_t i = 0;
+            for (; i < title_windows.size(); ++i)
+                if (shader_va - title_windows[i].shader_va < title_windows[i].size) break;
+            return i;
+        };
         const auto owned = [&](std::uint64_t shader_va) {
-            for (std::size_t i = 0; i < title_windows.size(); ++i) {
-                const TitleWindow& window = title_windows[i];
-                if (shader_va < window.shader_va || shader_va - window.shader_va >= window.size) continue;
-                if (std::find(replaced.begin(), replaced.end(), i) == replaced.end()) replaced.push_back(i);
-                return true;
-            }
-            return false;
+            const std::size_t i = window_of(shader_va);
+            if (i == title_windows.size()) return false;
+            if (std::find(replaced.begin(), replaced.end(), i) == replaced.end()) replaced.push_back(i);
+            return true;
+        };
+        // What replace_twin may erase: only those windows. A slot-133 buffer is entered without title_window_mutex,
+        // so one may have been placed over the cover's span (in either view) since it was planned.
+        const auto planned = [&](std::uint64_t shader_va) {
+            return std::find(replaced.begin(), replaced.end(), window_of(shader_va)) != replaced.end();
         };
         auto& aliases = leonida::title_va_aliases();
         leonida::TitleWindowRange cover{};
@@ -3704,7 +3733,10 @@ struct DeviceState {
         const bool geometry_copy = shader != 0;
         if (!shader) shader = make_title_window(cover.start, cover.size, credit);
         if (!shader) return false;
-        aliases.replace_twin(cover.start, twin_start, cover.size, shader);
+        if (!aliases.replace_twin(cover.start, twin_start, cover.size, shader, planned)) {
+            if (!geometry_copy) drop_title_window(shader);
+            return false;
+        }
         pool_spans.push_back({cover.start, twin_start, shader, cover.size, geometry_copy});
         pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
         pool_span_bytes += cover.size;

@@ -81,10 +81,23 @@ public:
     // add_twin over live ranges: every range either address's bytes overlap is replaced whole (each is told as a
     // removal), then both are entered under one lock. For a stream-pool request that runs into the windows next to it
     // (title_pool_cover): the new range covers each of them whole, so none of their bytes is left unanswered.
-    bool replace_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va) {
+    // `replaces(shader_va)` names the ranges the caller planned to replace; one it does not (a slot-133 buffer
+    // entered since the plan, which takes no lock of the caller's) makes it false with nothing changed, checked
+    // under the same lock as the replacement.
+    template <class Replaces>
+    bool replace_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va,
+                      Replaces&& replaces) {
         if (!bytes || va > UINT64_MAX - bytes || twin > UINT64_MAX - bytes) return false;
         if (va != twin && va < twin + bytes && twin < va + bytes) return false;
         std::unique_lock lock(mutex_);
+        const auto planned = [&](std::uint64_t begin, std::uint64_t end) {
+            auto it = ranges_.lower_bound(begin);
+            if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+            for (; it != ranges_.end() && it->first < end; ++it)
+                if (!replaces(it->second.shader_va)) return false;
+            return true;
+        };
+        if (!planned(va, va + bytes) || (va != twin && !planned(twin, twin + bytes))) return false;
         erase_overlapping(va, va + bytes);
         if (va != twin) erase_overlapping(twin, twin + bytes);
         decltype(ranges_) pending;

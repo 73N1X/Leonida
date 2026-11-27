@@ -1763,7 +1763,10 @@ The copies:
   other view is entered as far as that mapping reaches. A request never gets a mapping shorter than its bytes (a V#'s
   size, 64 KiB for a root view): one that runs into the next mapping, or past the end of the one holding its first
   byte, gets one mapping over itself and every window it reaches, each whole, in both views (`title_pool_cover`,
-  `TitleVaAliases::replace_twin`), and those windows are retired at the next submission. Only with a range in the way
+  `TitleVaAliases::replace_twin`), and those windows are retired at the next submission. `replace_twin` checks, under
+  the lock it replaces them under, that every range it would erase is one of those windows: a slot-133 buffer is
+  entered without the window lock, so one placed in the span after the plan makes it refuse, the new window is dropped
+  and the request falls back as below. Only with a range in the way
   that is not a window (a slot-133 buffer, a geometry copy) or that reaches past the pool in its view, or pages that are
   not readable, does it get a zero-size
   view: a refusal there would also have the root views a title rings through a pool read zeros where it served them
