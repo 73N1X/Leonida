@@ -586,6 +586,9 @@ impl Notes {
     }
 }
 
+/// Pieces whose differing bytes title memory held already ([`piece_at`]), since the start.
+pub(crate) static SAME: AtomicU64 = AtomicU64::new(0);
+
 /// Lands one piece: `parts` (offsets from and to) of the bytes at `now`,
 /// which the card wrote, go into title memory from `title` on and into
 /// `held` ([`crate::safecopy::merge`] says how, and what `take` is). The
@@ -649,6 +652,34 @@ unsafe fn piece_at(
             for_pages(title, parts, |_, _| count(stat::PAGES, 1));
             return 0;
         };
+        // What differs from the reference but is in title memory already: a copy at its place in a list that
+        // title memory took when it was submitted (`crate::host::placed_is_titles`). Nothing goes in, so no
+        // guard is opened and no shader's write is noted for the pages (the note made every such copy look
+        // like a shader's write to its page for 600 frames, which is what the rule asks about); the reference
+        // takes the bytes. `LEONIDA_LAND_SAME=0`: put and noted as before.
+        if crate::toggled!("LEONIDA_LAND_SAME") {
+            let mut same = true;
+            let mut there = [0u8; PAGE];
+            for_pages(title, parts, |from, n| {
+                if same && differing[(title + from) / PAGE - base] {
+                    let there = &mut there[..n];
+                    // SAFETY: the caller's: `now` is ours for the part's bytes.
+                    let card = unsafe { std::slice::from_raw_parts(now.add(from), n) };
+                    same = crate::host::read_into((title + from) as *const u8, there) && there == card;
+                }
+            });
+            if same {
+                for_pages(title, parts, |from, n| {
+                    count(stat::PAGES, 1);
+                    if differing[(title + from) / PAGE - base] {
+                        // SAFETY: the caller's: both are ours for the part's bytes, and nothing else writes `held`.
+                        unsafe { std::ptr::copy_nonoverlapping(now.add(from), held.add(from), n) };
+                    }
+                });
+                SAME.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+        }
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();

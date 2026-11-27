@@ -8032,6 +8032,7 @@ impl HostList {
                                 dst = format_args!("{:#x}", p.dst),
                                 src = format_args!("{:#x}", p.src),
                                 len = p.len,
+                                landed_same = crate::land::SAME.load(Ordering::Relaxed),
                                 "a copy at its place taken for the title's own under flights' declared writes: what reads it on the CPU does not wait for them (LEONIDA_PLACED_TITLE)"
                             );
                         }

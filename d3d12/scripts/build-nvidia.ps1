@@ -11,10 +11,12 @@ param(
 )
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $DlssSdk) { $DlssSdk = Join-Path $root 'nvidia-sdk\DLSS' }
-$features = 'diagnostics'
+# mimalloc is the process allocator: with the system heap a quarter of the submitting thread's running time was
+# in the heap (profile of 2026-11-27), and the same view took 95 ms a frame against 78 with it.
+$features = 'diagnostics,mimalloc'
 if (-not $NoDlss -and (Test-Path (Join-Path $DlssSdk 'lib\Windows_x86_64\x64\nvsdk_ngx_d.lib'))) {
     $env:LEONIDA_DLSS_SDK = (Resolve-Path $DlssSdk).Path
-    $features = 'diagnostics,dlss'
+    $features = 'diagnostics,dlss,mimalloc'
     Write-Host "Building with DLSS (SDK: $env:LEONIDA_DLSS_SDK)"
 } else {
     Write-Host 'Building without DLSS (Get-NVIDIA-DLSS.cmd fetches its files; without them the picture is stretched to the screen)'

@@ -8,7 +8,8 @@
 //! The file: `thread <id> <start> <cpu ms> <samples> <name>`, then
 //! `stack <thread> <phase> <count> <frame>;<frame>;...` (innermost first, as
 //! `module+rva`), where the phase is what the caller's function says of the
-//! frame at that moment.
+//! frame at that moment. `LEONIDA_PROFILE_ONLY=<name>[,<name>..]` samples only
+//! the threads with such a name, which makes the rounds short.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -137,7 +138,21 @@ fn choose(threads: &mut HashMap<u32, Thread>, chosen: &mut Vec<u32>) {
         t.last = t.now;
     }
     ran.sort_unstable_by(|a, b| b.cmp(a));
-    *chosen = ran.into_iter().take(BUSIEST).map(|(_, id)| id).collect();
+    // `LEONIDA_PROFILE_ONLY=<name>[,<name>..]`: only the threads whose name holds one of these are sampled.
+    // A round over the 28 busiest takes some 160 ms of stack walks (a 20 s profile at "4 ms" came to 125
+    // rounds, 2026-11-27); one or two threads are walked a few hundred times a second.
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("LEONIDA_PROFILE_ONLY")
+            .map(|v| v.split(',').map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    *chosen = ran
+        .into_iter()
+        .map(|(_, id)| id)
+        .filter(|id| only.is_empty() || threads.get(id).is_some_and(|t| only.iter().any(|n| t.name.contains(n.as_str()))))
+        .take(BUSIEST)
+        .collect();
 }
 
 fn write(
