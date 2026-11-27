@@ -90,6 +90,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lds_exact;
 mod lds_flags;
 mod lds_init;
 mod lower;
@@ -716,6 +717,33 @@ pub fn emit(
                 report("wave-wide branches (last of all)", &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // And after that: the lane-branch regions of LDS that need no order between the halves
+        // ([`lds_exact`]), in the forms above that translated them whole, each also as the
+        // allocation idiom's local waves. Only here, so that a program that translates without
+        // them keeps its form.
+        if lds_exact::switch() {
+            let mut bases: Vec<(&str, &ir::Program, &structure::Structured, &io::Io, &resource::Resources)> = Vec::new();
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    bases.push((name, p, st, io, res));
+                }
+            }
+            bases.push(("as it is", p, st, io, res));
+            for (name, p, st, io, res) in bases {
+                let whole = lds_exact::with_exact(|| emit_program(c, native, p, st, io, res));
+                report(&format!("exact LDS regions, {name}"), &whole);
+                if done(&whole) {
+                    return whole.map(|(shader, _)| shader);
+                }
+                if local_on && !exact_only && lds_exact::with_exact(|| idiom(p, st)) {
+                    let local = lds_exact::with_exact(|| lower::with_local_waves(|| emit_program(c, native, p, st, io, res)));
+                    report(&format!("exact LDS regions, local waves (idiom), {name}"), &local);
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
                 }
             }
         }
