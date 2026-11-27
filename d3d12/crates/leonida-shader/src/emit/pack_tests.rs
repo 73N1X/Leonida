@@ -447,6 +447,47 @@ fn a_grid_past_what_one_dimension_holds_is_folded_and_run_once() {
     assert_eq!(bad, None, "the first record that differs, in dwords");
 }
 
+/// A program that reads another lane of its console wave: the group's number plus the thread's
+/// index, of lane 5, which every thread of the group stores as the third dword.
+fn lane_five() -> Vec<u32> {
+    vec![
+        vop2(0x25, 4, 0, vgpr(3)), // v_add_nc_u32 v4, v3, v0
+        0xD760_0015,
+        vgpr(4) | inline(5) << 9, // v_readlane_b32 s21, v4, 5
+        0x7E00_0200 | 2 << 17 | 21, // v_mov_b32 v2, s21
+    ]
+}
+
+#[test]
+fn a_packed_program_reads_the_lanes_of_its_own_console_group() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let native = program([32, 1, 1], 0, &lane_five());
+    let names: Vec<String> = crate::gfx10::decode(&native.code)
+        .unwrap()
+        .iter()
+        .map(|i| i.name().unwrap_or("?").to_string())
+        .collect();
+    assert!(names.iter().any(|n| n == "v_readlane_b32"), "{names:?}");
+    let plain = translate(&native, 0).expect("translated");
+    let want = |grid: [u32; 3]| {
+        let mut out = expected([32, 1, 1], grid, 32, false);
+        // (the third dword: the group's number of lane 5)
+        for record in out.chunks_mut(4).take((grid[0] * grid[1] * grid[2]) as usize * 32) {
+            record[2] = record[3] + 5;
+        }
+        out
+    };
+    for k in [2, 4, 8] {
+        let packed = translate(&native, k).expect("translated");
+        assert_eq!(packed_by(&packed), Some(k));
+        for grid in [[1, 1, 1], [5, 1, 1], [4, 3, 1], [9, 1, 2]] {
+            assert_eq!(run(&host, &plain, grid, 32), want(grid), "unpacked, grid {grid:?}");
+            assert_eq!(run(&host, &packed, grid, 32), want(grid), "packed {k}, grid {grid:?}");
+        }
+    }
+}
+
 #[test]
 fn the_grid_of_a_dispatch_is_divided_and_the_threads_find_their_groups() {
     assert_eq!(pack_grid([1, 1, 1], 4), ([1, 1, 1], [1, 1, 1]));
