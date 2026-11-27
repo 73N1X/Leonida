@@ -135,6 +135,10 @@ $settings = @{
     # light rim around trees, wires and signs in fog, not confirmed in a run yet). -More
     # @{LEONIDA_STATIC_SAMPLERS_LINEAR='1'} is the setting from before, '0' none at all.
     LEONIDA_STATIC_SAMPLERS_LINEAR = 'PS_Composite'
+    # Pixel programs keep the console's early depth test (emit/mod.rs): transparent surfaces behind a wall no
+    # longer write depth and motion for the wall's pixels. On since 2026-11-27 (a start with it: the picture as
+    # before at the dock; the glass door's squares not looked at yet). '0' in -More: the late test, as before.
+    LEONIDA_EARLY_DEPTH = '1'
     # Wait for new shaders rather than skip their draws (each pipeline is waited for at most once). The F1 menu's
     # SHADER WAIT MS changes it: 0 never waits, things then show up as their shaders are done.
     LEONIDA_PIPELINE_WAIT_MS = '10000'
