@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+mimalloc = { workspace = true, optional = true }
 zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
@@ -30,6 +31,8 @@ diagnostics = []
 # NVIDIA DLSS for the title's upscale (`LEONIDA_UPSCALE=dlss`); needs the DLSS
 # SDK (NVIDIA/DLSS: include, lib/Windows_x86_64) at `LEONIDA_DLSS_SDK`.
 dlss = []
+# mimalloc as the process allocator (off by default: the system allocator).
+mimalloc = ["dep:mimalloc"]
 
 [lints]
 workspace = true
