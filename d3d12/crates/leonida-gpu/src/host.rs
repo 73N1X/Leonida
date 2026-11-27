@@ -3300,6 +3300,14 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    stale_of(spans)
+}
+
+/// Of `spans` (a copy shaders may be writing, and the span of what a
+/// submission refreshes of it), those [`stale_under_flights`] answers.
+fn stale_of(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5913,7 +5921,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        // (`LEONIDA_BATCH_KEPT`: read once, so that the whole submission goes
+        // one way while `LEONIDA_AB` flips it.)
+        let kept = batch_kept();
+        let mut batch = if kept { Batch::reused() } else { Batch::default() };
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -5923,20 +5934,30 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`LEONIDA_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            let ranges: Vec<(usize, usize)> = if kept {
+                // One walk for the asking, the stale check and the refreshes
+                // in front ([`batch_kept`]), into the kept room.
+                batch.copy_spans(runs);
+                let mut ranges = std::mem::take(&mut batch.ranges);
+                ranges.clear();
+                ranges.extend(batch.spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+                ranges
+            } else {
+                let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && shadow.asked_ahead()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                spans.into_values().collect()
+            };
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -5954,7 +5975,11 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = match (behind, kept) {
+                (false, _) => Vec::new(),
+                (true, true) => batch.stale_under_flights(),
+                (true, false) => stale_under_flights(runs),
+            };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &ranges);
@@ -5968,6 +5993,10 @@ impl Host {
                 self.settle(&mut submitted, WHY_STALE);
                 crate::watch::ask_once(&ranges);
                 settled += settling.elapsed();
+            }
+            if kept {
+                // (Its room, for the next submission.)
+                batch.ranges = ranges;
             }
         } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
@@ -6143,6 +6172,9 @@ impl Host {
                 texture_back_ranges,
                 writes,
             };
+            if kept {
+                batch.give_back();
+            }
             working(was_working);
             return Some((submitted, sent));
         }
@@ -6296,6 +6328,9 @@ impl Host {
         // their notes can go.
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        if kept {
+            batch.give_back();
         }
         working(was_working);
         None
@@ -8183,6 +8218,54 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// With [`batch_kept`]: per copy the submission refreshes, the span of all
+    /// its refreshes, in the order the copies first come ([`Batch::copy_spans`]);
+    /// where each copy (by address) is in it.
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    spans_at: ByCopy<usize>,
+    /// With [`batch_kept`]: room for the submission's one asking's ranges, and
+    /// for [`Batch::refresh_front`]'s walk over the steps.
+    ranges: Vec<(usize, usize)>,
+    touches: Vec<Touch>,
+    /// Made by [`Batch::reused`] ([`batch_kept`]): the walks above are used.
+    kept: bool,
+}
+
+/// Whether a submission's [`Batch`] is kept, emptied with its room, for the
+/// thread's next submission, and one walk over the steps finds the spans of
+/// the copies refreshed for the write-watch asking, the stale check behind
+/// flights and [`Batch::refresh_front`] (`LEONIDA_BATCH_KEPT=1`; off by
+/// default; `LEONIDA_AB=<s>,LEONIDA_BATCH_KEPT` turns it on and off while the
+/// title runs, a submission at a time).
+///
+/// Ported from trustno1-coder/VIctory-NVIDIA 19720fe (readmet3xt-lab, the
+/// foxhound base; GPL-3.0, as this). Every submission (28 a frame there) made
+/// its Batch anew, and three walks over its steps each built a hash table of
+/// the copies from nothing: hash tables growing and inserting under
+/// `Host::submit` were 2.4 % of the submitting thread in that fork's profile
+/// (reserve_rehash and HashMap::insert), heap allocation and freeing more.
+/// Measured there by profile only, not by frame time; here the submitting
+/// thread spends 15 % in the allocator's realloc and 9 % waiting for it.
+/// Behaviour-neutral: the same ranges are asked about (in another order, which
+/// the asking never kept), the same spans looked at, the same refreshes made.
+fn batch_kept() -> bool {
+    const SWITCH: &str = "LEONIDA_BATCH_KEPT";
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if crate::ab::bit(SWITCH).is_some() {
+            return true;
+        }
+        crate::switch::on(SWITCH)
+    });
+    // (On unless `0` once asked for; `LEONIDA_AB` decides it when it names it.)
+    asked && crate::toggled!("LEONIDA_BATCH_KEPT")
+}
+
+thread_local! {
+    /// With [`batch_kept`]: the last submission's [`Batch`] on this thread,
+    /// emptied, with the room its tables and lists grew to.
+    static SPARE_BATCH: std::cell::Cell<Option<Batch>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8573,6 +8656,76 @@ fn wide_textures() -> bool {
 }
 
 impl Batch {
+    /// With [`batch_kept`]: this thread's last one, emptied ([`SPARE_BATCH`]),
+    /// or a new one.
+    fn reused() -> Batch {
+        let mut batch = SPARE_BATCH.take().unwrap_or_default();
+        batch.kept = true;
+        batch
+    }
+
+    /// With [`batch_kept`]: emptied (the room kept) for the thread's next
+    /// submission.
+    fn give_back(mut self) {
+        self.refreshes.clear();
+        self.index.clear();
+        self.textures.clear();
+        self.due.clear();
+        self.placed.clear();
+        self.fills.clear();
+        self.ahead.clear();
+        self.front = false;
+        self.spans.clear();
+        self.spans_at.clear();
+        self.ranges.clear();
+        self.touches.clear();
+        SPARE_BATCH.set(Some(self));
+    }
+
+    /// Per copy that `runs` refresh, the span of all its refreshes, into
+    /// [`Batch::spans`] ([`batch_kept`]): the submission's one asking asks about
+    /// those ([`crate::watch::ask_once`]), and behind flights those of copies
+    /// shaders may be writing are looked at ([`Batch::stale_under_flights`]).
+    /// One walk over the steps for both, where there were two, each with a
+    /// table of its own.
+    fn copy_spans(&mut self, runs: &[&HostList]) {
+        self.spans.clear();
+        self.spans_at.clear();
+        // (Most come several times on end.)
+        let mut last = (0, 0);
+        for list in runs {
+            for step in &list.deferred().copies {
+                let Step::Refresh(shadow, address, len) = step else {
+                    continue;
+                };
+                let (from, to) = (*address, *address + *len);
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let at = if last.0 == key && key != 0 {
+                    last.1
+                } else {
+                    match self.spans_at.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(at) => *at.get(),
+                        std::collections::hash_map::Entry::Vacant(place) => {
+                            place.insert(self.spans.len());
+                            self.spans.push((shadow.clone(), from, to));
+                            self.spans.len() - 1
+                        }
+                    }
+                };
+                last = (key, at);
+                let span = &mut self.spans[at];
+                (span.1, span.2) = (span.1.min(from), span.2.max(to));
+            }
+        }
+    }
+
+    /// [`stale_under_flights`] of the submission's refreshes, from
+    /// [`Batch::copy_spans`]: the copies shaders may be writing now, in the
+    /// order they first come, with the span of all their refreshes.
+    fn stale_under_flights(&self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        stale_of(self.spans.iter().filter(|s| s.0.writes_pending()).cloned().collect())
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -8688,6 +8841,42 @@ impl Batch {
                 }
             }
             let spans = join_fronts(&fronts, parts);
+            self.refresh_spans(spans, due, planning);
+            return;
+        }
+        if self.kept {
+            // The copies refreshed, by address: as the submission's one asking
+            // found them, or found here ([`batch_kept`]); the touches in the
+            // kept room.
+            if self.spans.is_empty() {
+                self.copy_spans(runs);
+            }
+            self.touches.clear();
+            for (n, list) in runs.iter().enumerate() {
+                if parts.contains(&n) {
+                    self.touches.push(Touch::Part);
+                }
+                for step in &list.deferred().copies {
+                    match step {
+                        Step::Refresh(shadow, at, len) => {
+                            self.touches.push(Touch::Refresh(std::sync::Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                        }
+                        Step::GpuWrite(shadow, ..) => self.touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
+                        Step::Texture(staging) if wide_textures() => {
+                            if self.texture_due(staging) {
+                                due.push(staging.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            planning.next("refreshes in front: the spans");
+            let found = front_spans(self.touches.drain(..));
+            let spans: Vec<_> = found
+                .into_iter()
+                .filter_map(|(key, from, to)| Some((self.spans.get(*self.spans_at.get(&key)?)?.0.clone(), from, to)))
+                .collect();
             self.refresh_spans(spans, due, planning);
             return;
         }
@@ -11446,6 +11635,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// `LEONIDA_BATCH_KEPT`: a batch given back comes back on the same thread
+    /// empty, with its room, and marked kept; another thread gets its own.
+    #[test]
+    fn a_kept_batch_comes_back_empty_with_its_room() {
+        std::thread::spawn(|| {
+            let mut batch = Batch::reused();
+            assert!(batch.kept);
+            let a = Arc::new(1u32);
+            assert!(batch.texture_due(&a));
+            batch.ranges.extend((0..1000).map(|i| (i, i + 1)));
+            batch.fills.push((1, 2, 3));
+            batch.front = true;
+            let room = batch.ranges.capacity();
+            batch.give_back();
+            let mut again = Batch::reused();
+            assert!(again.kept && !again.front);
+            assert!(again.ranges.is_empty() && again.fills.is_empty() && again.spans.is_empty());
+            assert_eq!(again.ranges.capacity(), room);
+            assert!(again.texture_due(&a), "a new submission checks its textures again");
+            std::thread::spawn(|| assert!(Batch::reused().ranges.capacity() == 0)).join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     /// The hashing a submission does for textures in physical-page memory,
