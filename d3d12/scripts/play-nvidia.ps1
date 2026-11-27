@@ -113,7 +113,10 @@ $settings = @{
     # are dropped (descriptor/host.rs dynamic_slots).
     LEONIDA_DYNAMIC_SLOTS = '524288'
     # Memory compares on the card instead of the CPU.
-    LEONIDA_CARD_BUFFERS_MIN_MB = '1'; LEONIDA_CARD_BUFFERS_MB = '1536'
+    # Leonida: every title buffer of 64 KiB and more gets its copy in the card's memory (not only those of 1 MiB and
+    # more): the frame is GPU-bound, and shaders read the small ones over the bus otherwise. Static scene, Series X
+    # 1440p: 120.7 -> 94.7 ms a frame, the card's time 64.1 -> 33.9 ms (2026-11-27, two runs each way).
+    LEONIDA_CARD_BUFFERS_MIN_MB = '1'; LEONIDA_CARD_BUFFERS_MIN_KB = '64'; LEONIDA_CARD_BUFFERS_MB = '1536'
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 if ($Resolution) {
