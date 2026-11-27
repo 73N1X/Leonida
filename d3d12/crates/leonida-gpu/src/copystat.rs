@@ -1225,7 +1225,7 @@ pub(crate) fn log(frames: f64) {
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
-         {:.0} steps {:.1} MB left out",
+         {:.0} steps {:.1} MB left out; heap-id guard: {} dynamic-slot releases refused",
         c[C::RecordCalls as usize],
         c[C::RecordNs as usize] / 1e6,
         ms(c[C::PipelineWaitUs as usize]),
@@ -1244,6 +1244,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
+        crate::descriptor::host::stale_releases(),
     );
     // The calls the host lists were given and the ones left out because the
     // list had that value already (`rootcache`, `LEONIDA_STATE_CACHE`). The

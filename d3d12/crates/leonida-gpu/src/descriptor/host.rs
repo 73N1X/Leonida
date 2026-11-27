@@ -2011,6 +2011,17 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 /// Leonida: dynamic slots a thread leases at once, and the largest table
 /// served from a lease ([`HostHeap::dynamic`]).
+/// Leonida: runs of dynamic slots refused because the heap they were to go
+/// back to was not the one that gave them ([`HostHeap::release_many_for`]),
+/// since the last [`stale_releases`] call.
+static STALE_RELEASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Runs of dynamic slots a release refused since the last call
+/// (`LEONIDA_HEAP_ID_GUARD`), logged with the recording line.
+pub(crate) fn stale_releases() -> u64 {
+    STALE_RELEASES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 const LEASE: u32 = 512;
 const LEASE_MOST: u32 = 128;
 
@@ -3134,6 +3145,38 @@ impl HostHeap {
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
         self.release_many(&[(first, n)]);
+    }
+
+    /// This heap's own number (`lease_id`), never given to another heap:
+    /// what a list notes where it takes dynamic slots, to give them back only
+    /// to this heap ([`HostHeap::release_many_for`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.lease_id
+    }
+
+    /// [`HostHeap::release_many`] of runs that heap number `id` gave: refused
+    /// (and counted in [`stale_releases`]) when this is another heap, one made
+    /// where the first lay after it was dropped. The registry knows heaps by
+    /// address, so it would take the slots for this heap's own and free
+    /// ones in use by its draws (black or blocky patches in the picture).
+    /// `LEONIDA_HEAP_ID_GUARD=0`: given back without the check, as before.
+    /// Returns whether they were given back.
+    ///
+    /// Ported from LoverCatys/ruff-lab d843417 (`HostHeap::id`, which
+    /// they took from kitty-core/Kitty6 aca0877); `lease_id` serves as the id.
+    pub(crate) fn release_many_for(&self, id: u64, runs: &[(u32, u32)]) -> bool {
+        if id != self.lease_id && crate::toggled!("LEONIDA_HEAP_ID_GUARD") {
+            STALE_RELEASES.fetch_add(runs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "dynamic slots given back to a heap other than the one that gave them (an address reused): dropped"
+                )
+            });
+            return false;
+        }
+        self.release_many(runs);
+        true
     }
 
     /// [`HostHeap::release`] of several runs (first, how many) with the lock
@@ -6724,6 +6767,43 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(a, 50);
         assert_eq!(heap.dynamic_locked(50), Some(4));
         assert_eq!(heap.dynamic_locked(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let free = |h: &HostHeap| h.free.load(std::sync::atomic::Ordering::Relaxed);
+        let first = a.dynamic_locked(2).expect("two dynamic slots");
+        let after = free(&a);
+        // Another heap's id (a heap made where this one lay): refused.
+        if crate::toggled!("LEONIDA_HEAP_ID_GUARD") {
+            let before = STALE_RELEASES.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(!a.release_many_for(b.id(), &[(first, 2)]));
+            assert_eq!(free(&a), after);
+            assert!(STALE_RELEASES.load(std::sync::atomic::Ordering::Relaxed) > before);
+        }
+        // Its own: given back.
+        assert!(a.release_many_for(a.id(), &[(first, 2)]));
+        assert_eq!(free(&a), after + 2);
+    }
+
+    #[test]
+    fn heap_ids_are_never_given_twice() {
+        let Some(a) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let id = a.id();
+        drop(a);
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(b.id(), id);
     }
 
     /// Leonida: tables come out of a thread's lease one after the other;
