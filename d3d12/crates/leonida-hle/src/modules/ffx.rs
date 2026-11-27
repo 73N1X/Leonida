@@ -199,6 +199,86 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
     }
 }
 
+static REAL_CREATE: AtomicUsize = AtomicUsize::new(0);
+
+/// The title's own `ffxCreateContext`, which [`create`] calls.
+pub fn set_real_create(address: usize) {
+    REAL_CREATE.store(address, Ordering::Relaxed);
+}
+
+/// `ffxCreateContextDescUpscale` (`ffx_upscale.h`), up to its sizes.
+#[repr(C)]
+struct CreateUpscale {
+    header: Header,
+    flags: u32,
+    max_render: [u32; 2],
+    max_upscale: [u32; 2],
+}
+
+/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE`.
+const CREATE_UPSCALE: u64 = 0x0001_0000;
+
+/// The one pair of sizes (render, upscale) the console's upscaler makes a context for: it
+/// ships the tables of its fixed 1.5x mode only, and says so of any other ("Shipping FSR4
+/// configuration mismatch: maxUpscaleSize must be 1920x1080; received 3840x2160", run of
+/// 2026-11-27 with `LEONIDA_FSR_UPSCALER=1` on the Series X profile).
+const SHIPPED: ([u32; 2], [u32; 2]) = ([1280, 720], [1920, 1080]);
+
+type Create = extern "system" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
+
+/// The sizes a context is made with, where they are not [`SHIPPED`]: `None` for those the
+/// DLL takes as they are, and for what does not read as two sizes.
+fn sizes_to_stand_in(render: [u32; 2], upscale: [u32; 2]) -> Option<([u32; 2], [u32; 2])> {
+    let size = |s: [u32; 2]| (1..=16384).contains(&s[0]) && (1..=16384).contains(&s[1]);
+    (size(render) && size(upscale) && upscale != SHIPPED.1).then_some(SHIPPED)
+}
+
+/// `ffxCreateContext` while the dispatch is ours ([`dispatch`]: DLSS or the stretch).
+///
+/// On the Series X profile the title asks for a context of 2560x1440 to 3840x2160; the DLL
+/// refuses it, the title goes on without one, its query of the jitter phase count answers
+/// nothing, and its frame counter is divided by that zero right after the first upscale
+/// (0xC0000094 at title+0x28f03e8). The context passes are never run here, only its queries
+/// (the jitter sequence, which is arithmetic on the sizes each query names), so the DLL is
+/// asked for the context it does make and the description of the title is put back.
+extern "system" fn create(context: *mut *mut c_void, desc: *mut Header, memory: *const c_void) -> u32 {
+    let real = match REAL_CREATE.load(Ordering::Relaxed) {
+        0 => return ERROR,
+        // SAFETY: the title's own `ffxCreateContext`, set from its DLL's export.
+        real => unsafe { std::mem::transmute::<usize, Create>(real) },
+    };
+    // SAFETY: the title passes a creation description, whose header says what follows it.
+    if let Some(header) = unsafe { desc.as_ref() }
+        && header.kind == CREATE_UPSCALE
+    {
+        // SAFETY: an upscale context's description, by its type; the title's own memory,
+        // which nothing else reads during its call.
+        let d = unsafe { &mut *desc.cast::<CreateUpscale>() };
+        let asked = (d.max_render, d.max_upscale);
+        if let Some(stand_in) = sizes_to_stand_in(asked.0, asked.1) {
+            (d.max_render, d.max_upscale) = stand_in;
+            let result = real(context, desc, memory);
+            (d.max_render, d.max_upscale) = asked;
+            tracing::info!(
+                render = ?asked.0,
+                upscale = ?asked.1,
+                made_for = ?stand_in,
+                flags = format_args!("{:#x}", d.flags),
+                result,
+                "upscale context: the title's upscaler makes one of its own sizes; the upscale itself is ours"
+            );
+            return result;
+        }
+        tracing::info!(render = ?asked.0, upscale = ?asked.1, flags = format_args!("{:#x}", d.flags), "upscale context");
+    }
+    real(context, desc, memory)
+}
+
+/// What the title's import of `ffxCreateContext` is bound to while its dispatch is ours.
+pub fn create_address() -> usize {
+    create as *const () as usize
+}
+
 /// What the title's import of `ffxDispatch` is bound to. The DLL is not an
 /// HLE module: the title's own must load, for its other entry points and
 /// for the dispatches passed on.
@@ -232,6 +312,21 @@ mod tests {
         assert_eq!(offset_of!(Upscale, flags), 0x1ac);
         assert_eq!(offset_of!(Resource, description), 8);
         assert_eq!(offset_of!(Resource, state), 40);
+    }
+
+    /// The sizes sit where the public API has them, and only a context the DLL would refuse
+    /// is made with other sizes.
+    #[test]
+    fn a_context_of_other_sizes_is_made_with_the_shipped_ones() {
+        assert_eq!(offset_of!(CreateUpscale, flags), 16);
+        assert_eq!(offset_of!(CreateUpscale, max_render), 20);
+        assert_eq!(offset_of!(CreateUpscale, max_upscale), 28);
+        assert_eq!(sizes_to_stand_in([2560, 1440], [3840, 2160]), Some(SHIPPED));
+        assert_eq!(sizes_to_stand_in([1280, 720], [1920, 1080]), None);
+        assert_eq!(sizes_to_stand_in([960, 540], [1920, 1080]), None);
+        // not sizes: left as it is
+        assert_eq!(sizes_to_stand_in([0, 0], [3840, 2160]), None);
+        assert_eq!(sizes_to_stand_in([2560, 1440], [0x7fff_0000, 2160]), None);
     }
 
     /// A dispatch that is not an upscale, with no DLL of the title's to

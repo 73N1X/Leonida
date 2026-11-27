@@ -117,6 +117,11 @@ pub fn run(
         {
             leonida_hle::modules::ffx::set_real_dispatch(real);
         }
+        if name.eq_ignore_ascii_case(leonida_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxCreateContext")
+        {
+            leonida_hle::modules::ffx::set_real_create(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         leonida_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
@@ -177,15 +182,24 @@ pub fn run(
     // rest of that DLL stays the title's. Unset: the title's own, as before.
     // The title upscales with FidelityFX on Series S, and on the other consoles
     // when the loader makes it (`LEONIDA_FSR_UPSCALER=1`, leonida-loader's hooks.rs).
-    struct TakeDispatch<'a>(&'a dyn leonida_loader::ImportResolver, bool);
+    struct TakeDispatch<'a>(&'a dyn leonida_loader::ImportResolver, bool, bool);
     impl leonida_loader::ImportResolver for TakeDispatch<'_> {
         fn resolve(&self, dll: &str, symbol: &leonida_pe::ImportSymbol) -> leonida_loader::Resolution {
-            let ours = self.1
-                && dll.eq_ignore_ascii_case(leonida_hle::modules::ffx::LOADER)
-                && matches!(symbol, leonida_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
-            if ours {
+            let named = |wanted: &str| {
+                dll.eq_ignore_ascii_case(leonida_hle::modules::ffx::LOADER)
+                    && matches!(symbol, leonida_pe::ImportSymbol::Name { name, .. } if name == wanted)
+            };
+            if self.1 && named("ffxDispatch") {
                 return leonida_loader::Resolution::Found {
                     address: leonida_hle::modules::ffx::dispatch_address(),
+                    provenance: leonida_loader::Provenance::Hle,
+                };
+            }
+            // With the dispatch ours, the context is only asked its queries: made of the sizes
+            // the title's upscaler ships (`ffx::create`).
+            if self.1 && self.2 && named("ffxCreateContext") {
+                return leonida_loader::Resolution::Found {
+                    address: leonida_hle::modules::ffx::create_address(),
                     provenance: leonida_loader::Provenance::Hle,
                 };
             }
@@ -199,7 +213,10 @@ pub fn run(
     if take {
         println!("upscale        the title's ffxDispatch is ours (LEONIDA_UPSCALE=stretch|dlss)");
     }
-    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
+    let has_create = dlls.iter().any(|(name, dll)| {
+        name.eq_ignore_ascii_case(leonida_hle::modules::ffx::LOADER) && dll.export("ffxCreateContext").is_some()
+    });
+    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take, has_create), policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
