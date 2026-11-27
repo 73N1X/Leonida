@@ -99,18 +99,29 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 
 /// LOCAL: `LEONIDA_NAN_SCRUB=1` (off by default): see `Lower::scrub_nan`.
 pub(crate) fn nan_scrub() -> bool {
+    nan_scrub_mode() != 0
+}
+
+/// `LEONIDA_NAN_SCRUB`: 0 (unset or anything else), 1, or 2. With 2 every image store is
+/// scrubbed as a float, as 1 did before integer bits were kept (`Lower::scrub_nan_bits`):
+/// for a run that tells whether a fault comes from what 1 now lets through.
+fn nan_scrub_mode() -> u8 {
     #[cfg(test)]
-    if let Some(on) = TEST_NAN_SCRUB.get() {
-        return on;
+    if let Some(mode) = TEST_NAN_SCRUB.get() {
+        return mode;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_NAN_SCRUB").is_some_and(|v| v == "1"))
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("LEONIDA_NAN_SCRUB").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 #[cfg(test)]
 thread_local! {
-    /// A test's choice for [`nan_scrub`], for its thread only.
-    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`nan_scrub_mode`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the title dispatches the program by a count of threads whose last
@@ -12627,17 +12638,20 @@ impl<'a> Lower<'a> {
     /// integer's, as the console converts by the view's format, which is not known here, and
     /// the store passes the bits as they are. All-ones and the other patterns with the
     /// exponent bits set are common integers (a mask with every bit set, small negative
-    /// numbers): made 0 they left a tile's mask empty. So only the bits a GPU's arithmetic
-    /// gives for "no number" and for an infinity are taken: 0x7FFFFFFF (NVIDIA, measured on
-    /// this tree's test host: every NaN its float operations make or pass on), 0x7FC00000 of
-    /// either sign (AMD, x86), and the two infinities.
+    /// numbers): made 0, a mask with every bit set comes out empty. So only the bits a GPU's
+    /// arithmetic gives for "no number" and for an infinity are taken: 0x7FFFFFFF (NVIDIA,
+    /// measured on this tree's test host: every NaN its float operations make or pass on),
+    /// 0x7FC00000 of either sign (AMD, x86), and the two infinities.
+    /// `LEONIDA_NAN_SCRUB=2`: every NaN and infinity, as before this was told apart.
     // shortcut: an integer that is one of those five patterns is still made 0, and a NaN
     // with other bits (negated last, or loaded and stored without arithmetic) is stored.
     // Exact needs the view's format: the host could mark texture views of integer formats
     // in the stride table as it does buffer views (`integer_view`).
     fn scrub_nan_bits(&mut self, f: V) -> V {
-        if !nan_scrub() {
-            return f;
+        match nan_scrub_mode() {
+            0 => return f,
+            2 => return self.scrub_nan(f),
+            _ => {}
         }
         let c = self.cur;
         let bits = self.as_int(f);

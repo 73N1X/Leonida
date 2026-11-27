@@ -401,7 +401,7 @@ fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
     };
     let moved = |bits: u32| [0x7E04_02FF, bits]; // v_mov_b32 v2, bits
     let texel = [[0.0; 4]; 1];
-    let was = lower::TEST_NAN_SCRUB.replace(Some(true));
+    let was = lower::TEST_NAN_SCRUB.replace(Some(1));
     // an R32_UINT image: (the bits moved in, what the texel holds)
     let integers = [
         (0xFFFF_FFFFu32, 0xFFFF_FFFFu32),
@@ -421,6 +421,9 @@ fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
         0x7F80_0000,
         0x1004_0F06, // v_mul_f32 v2, v6, v7
     ]);
+    // `LEONIDA_NAN_SCRUB=2`: every image store as a float, all-ones too
+    lower::TEST_NAN_SCRUB.set(Some(2));
+    let all = program(&moved(0xFFFF_FFFF));
     lower::TEST_NAN_SCRUB.set(was);
     let unscrubbed = program(&moved(0x7F80_0000));
     for (shader, (bits, want)) in shaders.iter().zip(integers) {
@@ -428,6 +431,10 @@ fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
         for (label, got) in run(shader, &views) {
             assert_eq!(got[0], want, "{label}: {bits:#010x} stored to an R32_UINT image");
         }
+    }
+    let views = [View::UintTextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
+    for (label, got) in run(&all, &views) {
+        assert_eq!(got[0], 0, "{label}: all-ones stored to an R32_UINT image, every store scrubbed");
     }
     let views = [View::TextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
     for (label, got) in run(&product, &views) {
