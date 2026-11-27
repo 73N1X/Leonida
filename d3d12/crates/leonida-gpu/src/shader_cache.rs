@@ -86,6 +86,9 @@ fn build() -> [u8; 32] {
             "LEONIDA_LDS_FLAGS",
             "LEONIDA_EXCHANGE_SITES",
             "LEONIDA_UNIFORM_LOADS",
+            // Leonida: group packing changes the program's group size and words (emit/lower.rs group_pack);
+            // without it here a run with it set was served the unpacked translations of an earlier run.
+            "LEONIDA_GROUP_PACK",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -96,6 +99,9 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&leonida_shader::emit::shader_opt().to_le_bytes());
+        // Leonida: and every `LEONIDA_*` switch the translator itself reads (its build script lists them), so a
+        // switch added there without a line above cannot be served a translation made with another value.
+        bytes.extend_from_slice(&leonida_shader::emit::translation_fingerprint());
         bytes
     });
     let mut hash = blake3::Hasher::new();
