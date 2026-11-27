@@ -214,7 +214,10 @@ if ($RayTracing) {
 # screenshot, 2026-11-27), as if everything under a water line were inside the volume. LEONIDA_WATER_TRANSMISSION=1
 # runs it.
 if ($env:LEONIDA_WATER_TRANSMISSION -ne '1') {
-    $skip = @('6f225b641c5b0708')
+    # The whole family (the water's CS_TransmissionVolumetrics, findings.md): another configuration binds another
+    # variant (1440p output with render scale 1.0: 5dc3b25986622949, whose paired form left a band of blocks over the
+    # lower fifth of the picture, 2026-11-27).
+    $skip = @('6f225b641c5b0708', '5dc3b25986622949', '926c46bab3b86bd6', '2889c21328c69e58', '6871d6e4b3ac9a10', '888af37a584acf98', 'a10179ab7eda0dc3')
     if ($settings.LEONIDA_SKIP_PIPELINES) { $skip = @($settings.LEONIDA_SKIP_PIPELINES) + $skip }
     $settings.LEONIDA_SKIP_PIPELINES = $skip -join ','
 }
