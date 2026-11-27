@@ -18844,7 +18844,11 @@ def _translate(path):
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
         threads = size[0] * size[1] * size[2]
         if (MESH_SERIAL_WAVES and stage == "ms" and not MESH_COMPUTE and threads > 64 and threads % 64 == 0
-                and not any(i["op"].startswith("ds_") for i in insns)):
+                and not any(i["op"].startswith("ds_") or "store" in i["op"] or "atomic" in i["op"] for i in insns)):
+            # The waves of such a program cannot pass each other anything: no LDS, and no store or atomic to
+            # memory another wave could read (ms_wave_info_s3 counts lanes in LDS across an s_barrier and keeps
+            # the side-by-side form). What is left between them is the allocation request and the exports, which
+            # assemble() orders itself. The order of the waves is then not observable.
             g.ms_serial = threads // 64      # passes; every pass is one whole wave
             g.x_lanes = 64
             for k in range(g.ms_serial + 1):
