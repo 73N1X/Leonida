@@ -340,6 +340,117 @@ targets of `PS_AlphaVelocityDepthResolve` in a dump (`LEONIDA_DUMP_TARGETS=1`): 
 depth at an opaque edge in front of glass. Not ported: trustno1's stand-in for reflections
 after `CS_RayMiss` (2db59d4 and five more), which is where the blue comes from.
 
+## Static samplers and the pipeline library on NVIDIA (2026-11-27)
+
+RTX 4060 Ti, driver 616.64, without the game: `pipeline/places/tests.rs` runs the test
+program again as processes of their own that share a cache folder, as runs of the title
+do, with hand-written programs that read back which sampler they sampled through.
+
+    cargo test -p leonida-gpu --features diagnostics --lib pipeline::places -- --ignored --nocapture --test-threads=1
+
+**The fault reproduces, every time.** A run stores three pipelines with static samplers in
+the library (compute by its description, graphics, compute by a stream; root signatures
+with the flags the title's have). The next run makes ten other static samplers first and
+loads them: all three load, and each of their seven samplers is another one, exactly the
+one now at the place its own had in the first run (the first run's had places 0 to 6, the
+ten others now have 0 to 9: read back 40, 41, 42 / 43, 44 / 45, 46 for 1, 2, 3 / 4, 5 /
+6, 7). Made by the driver in that run instead they are right. So what
+trustno1-coder/VIctory-NVIDIA 7fa0e95 found on a 4070 SUPER holds here, and it is not
+rare: any other order of static samplers gives it.
+
+**What the driver does** (`the_table_of_static_samplers`: a stored pipeline whose sixteen
+samplers had places 0 to 15 is loaded in runs that did other things first, and reads
+whatever is at those places):
+
+- A device has one table of static samplers, and a process one device for a card: what
+  another handle of the device made before is in it.
+- `CreateRootSignature` gives each static sampler it has not seen the lowest free place,
+  in the order of the root signature's array. A pipeline's root signature and one that no
+  pipeline uses count alike. The sampler's register, space and visibility are not part
+  of it: one place however often and wherever it stands. (With a throwaway probe: neither
+  is the comparison function of a sampler whose filter does not compare; the border
+  colour and the maximum anisotropy are, even where the sampler does not use them.)
+- A place is free again when the last root signature with its sampler is released, and
+  is the next one given.
+- Samplers in descriptor heaps have no place.
+- A compiled pipeline holds the places. The driver's own cache on disk knows that
+  (`the_drivers_own_cache_knows_the_places`: a compute and a graphics pipeline made by
+  the driver took 12.5 and 4.3 ms, 0.7 and 0.5 ms in the next run, 9.6 and 4.9 ms in a
+  run that made one other static sampler first, 0.9 and 0.6 ms in the next such run). A
+  pipeline library does not: the blob is taken as it was stored.
+- So it is the same for `LoadGraphicsPipeline`, `LoadComputePipeline` and `LoadPipeline`,
+  for programs compiled by FXC (5.1) and, with the probe, by DXC (6.6, both heaps
+  directly indexed).
+- Within a process the first of two equal pipelines wins (probe): made, then loaded by
+  the same description, the loaded one is the made one and right; loaded first, the one
+  made afterwards is the stale one too. A pipeline to hold a loaded one against must
+  differ in its code.
+- The blob of `GetCachedBlob` differs from process to process in 17 or 18 bytes (16 in
+  one run and one or two elsewhere) with the places the same, and in some 420 with them
+  different: no plain way to read the places from it. Not used.
+
+**That is where the five minutes went.** Which sampler a title pipeline needs first
+differs from run to run (eight workers make them), so the places did, so the driver's
+cache missed nearly every pipeline with static samplers at every start, and since
+f0606a744 the library was not asked. A sample of the work cache's translations (8 of its
+256 folders, some 16,600 programs) has 25 different static samplers (22 in half of it), 9
+at most in a program: a short list.
+
+**What is done** (`pipeline/places.rs`; on NVIDIA only, the other drivers' pipelines keep
+their names):
+
+1. The samplers seen are listed in `static-samplers.txt` beside the library, in the order
+   first seen; the file only grows. When the host device is made, before anything else,
+   a root signature is made for a sampler of ours, each listed one in order, 64 more of
+   ours and a last one of ours, and all are kept. A listed sampler's place then follows
+   from the list up to it.
+2. A pipeline whose static samplers were all in the list at the start is in the library
+   under a name that also holds the list up to its last sampler (and the list's own name,
+   new when the file is begun anew). One with a sampler first met in this run is made by
+   the driver, as before, and the sampler is written to the file. It is made at the place
+   it will have in the next run (one of the 64 is let go just before, and the lowest free
+   place is given next), so that the driver's cache has its pipelines then; nothing rests
+   on that (`a_sampler_met_in_a_run_has_the_place_of_the_next` shows it holds).
+3. Before the first such pipeline is looked up, every place is looked at on the card: for
+   each sampler made at the start a small pipeline, stored in the library by the first
+   run that had it there, is loaded and must write bit for bit what the same pipeline
+   made now writes (19 samples that tell the bias and level bounds, the anisotropy, the
+   three filters, each address mode and the border; 8 for a comparing sampler: its
+   function, filter and address modes). If one differs, pipelines with static samplers
+   are made by the driver for that run and the log says so. Found in the tests: two
+   samplers made on the device before the host had it, and one that is also in the list
+   (then only the places before its own are other ones).
+
+`pipelines_with_static_samplers_come_from_the_library` runs it: a first run meets seven
+samplers (its pipelines made by the driver in 6 to 34 ms each), the second stores (made
+again, about 1 ms each: the driver's cache had them), the third makes ten other static
+samplers and a sampler heap first and the pipelines in another order: all loaded, all
+right. A pipeline with two new samplers is the driver's in the run that meets them,
+stored in the next, loaded from then on, while the others stay loaded.
+
+`LEONIDA_LIBRARY_STATIC_SAMPLERS=0`: none of it, such pipelines are made by the driver
+every run as before. `=1`: under their plain names with no care for the places, which in
+the same test reads wrong through every sampler.
+
+Costs: the look takes 95 to 155 ms with nine places (two programs compiled, four small
+textures). With 320 listed it took 7.6 s in the run that stores the small pipelines and
+8.4 s in the first that holds them against new ones (each once: 23 ms a pipeline the
+driver has never compiled), then 0.4 to 1.1 s. With some 30 samplers that is about a
+second twice, then about 0.2 s, once a run, on the worker that asks first (an estimate
+from those figures).
+
+**Not shown here.** That the title's pipelines load in seconds: it needs three starts
+(the first lists the samplers and is as slow as before, the second stores and should be
+quick if the driver's cache holds 1,650 large pipelines as it held the tests' small ones,
+the third loads). The look at the places tells samplers apart by what they do, not by
+where they are: two that sample alike in every way it tries would pass for each other
+(and would sample alike in a pipeline in those ways too). The debug layer is not
+installed on this PC, so the tests did not run under it. The table's size (2,032 on the
+4070 SUPER, where the next sampler removed the device) was not measured again; the list
+stops at 1,000. If something makes static samplers on the device before the list in some
+runs and not in others, those runs fall back to the driver; the log then names the file
+to delete to begin anew.
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask
