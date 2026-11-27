@@ -788,7 +788,11 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // The heaps are made without their sharing flags (`DROP`): a buffer that was shared across adapters
+            // (one in a heap opened from existing memory) is refused in such a heap with its own flag kept
+            // (2,438 buffers of a Series X frame, and the device was lost at the first use of one).
+            desc.Flags.0 &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER.0;
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.
