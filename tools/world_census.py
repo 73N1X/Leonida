@@ -111,13 +111,7 @@ def _staged_json(path, doc, **options):
         else:
             if stat.S_ISREG(mode):
                 os.chmod(tmp, mode & 0o777)
-        try:
-            yield tmp
-        finally:
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
+        yield tmp
 
 
 def _publish_reports(archive, source_id, summary_tmp, summary_path, maps_tmp, maps_path):

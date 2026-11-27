@@ -39,9 +39,6 @@ import tempfile
 import zlib
 from contextlib import contextmanager
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode
-
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
@@ -797,22 +794,15 @@ def _staged_entity_report(path):
     try:
         with open(staged, "w", encoding="utf-8", newline="\n") as handle:
             yield EntityRows(handle)
-        try:
-            os.chmod(staged, published_mode(destination))
-        except OSError:
-            pass
+        if mode is not None:
+            os.chmod(staged, mode & 0o777)
         os.replace(staged, destination)
     finally:
         if os.path.exists(staged):
-            try:
-                os.chmod(staged, 0o600)
-            except OSError:
-                pass
+            if os.name == "nt":
+                os.chmod(staged, stat.S_IWRITE)
             os.unlink(staged)
-        try:
-            os.rmdir(directory)
-        except OSError:
-            pass
+        os.rmdir(directory)
 
 
 def main(argv=None):

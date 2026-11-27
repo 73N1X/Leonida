@@ -68,14 +68,9 @@ def publish(path, data):
     try:
         with f:
             f.write(data)
-        tmp.chmod(published_mode(path))
+        if os.name != "nt":
+            tmp.chmod(published_mode(path))
         os.replace(tmp, path)
-    except BaseException:
-        try:
-            tmp.chmod(0o600)
-        except OSError:
-            pass
-        raise
     finally:
         tmp.unlink(missing_ok=True)
 

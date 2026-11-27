@@ -1736,11 +1736,7 @@ def main(argv: list[str] | None = None) -> int:
                 f.write(png)
             if os.path.isfile(output):
                 shutil.copymode(output, pending)
-            try:
-                os.replace(pending, output)
-            except BaseException:
-                os.chmod(pending, 0o600)
-                raise
+            os.replace(pending, output)
     except (DdsError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

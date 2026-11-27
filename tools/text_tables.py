@@ -59,7 +59,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from file_mode import published_mode  # noqa: E402
 from hashdict import joaat  # noqa: E402
-from report_paths import same_report_path  # noqa: E402
 
 RESOURCE_MAGIC = b"0DRP"
 RPF9_MAGIC = b"9FPR"
@@ -427,6 +426,15 @@ def _write_csv(path, fields, rows):
     return n
 
 
+def _same_output_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("sources", nargs="+", help="rpf9_carve.py directory, .rpf archive, or resource files/dirs")
@@ -440,7 +448,7 @@ def main(argv=None) -> int:
     outs = [path for _, path in out_flags]
     seen = []
     for flag, p in out_flags:
-        if any(same_report_path(p, prev) for prev in seen):
+        if any(_same_output_path(p, prev) for prev in seen):
             ap.error("outputs must be distinct files")
         seen.append(p)
         parent = os.path.dirname(os.path.abspath(p))
@@ -450,11 +458,11 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"text_tables: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-        if any(same_report_path(path, o) for o in outs):
+        if any(os.path.exists(o) and os.path.samefile(path, o) for o in outs):
             ap.error("an output must not overwrite an input")
     for source in a.sources:
         index = os.path.join(source, "index.json")
-        if os.path.isdir(source) and os.path.isfile(index) and any(same_report_path(index, o) for o in outs):
+        if os.path.isdir(source) and os.path.isfile(index) and any(_same_output_path(index, o) for o in outs):
             ap.error(f"an output must not overwrite an input: {index}")
 
     scan = Scan()
@@ -533,7 +541,6 @@ def main(argv=None) -> int:
                 pass
         for tmp, _ in staged:
             try:
-                os.chmod(tmp, 0o600)
                 os.remove(tmp)
             except OSError:
                 pass
@@ -542,7 +549,6 @@ def main(argv=None) -> int:
     for backup in originals.values():
         if backup is not None:
             try:
-                os.chmod(backup, 0o600)
                 os.remove(backup)
             except OSError:
                 pass

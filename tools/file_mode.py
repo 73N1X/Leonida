@@ -27,7 +27,6 @@ def new_file_mode(directory):
         finally:
             os.close(fd)
             try:
-                os.chmod(probe, 0o600)
                 os.remove(probe)
             except OSError:
                 pass

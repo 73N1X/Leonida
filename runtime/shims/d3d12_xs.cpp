@@ -19,9 +19,6 @@
 
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"
-#include "xbox_display.h"
-#include "xbox_window.h"
-#include "../src/pipeline_queue.h"
 #endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -223,16 +220,6 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             return result(method, vhr);
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
-        // A title (its device created as ID3D12Device11, the console layouts): the console's DXGI adapter and output,
-        // whose display mode it reads (xbox_display.h), and PresentX in a window (xbox_window.h).
-        if (rt::d3d12_xs::device_proxy_console_layout(*out)) {
-            rt::d3d12_xs::set_device_adapter_provider(*out, &rt::d3d12::console_adapter_provider);
-            rt::d3d12::attach_title_presentation(*out);
-            // Pipelines (src/pipeline_queue.h): a bind's wait is bounded from now on, before the frame clock's first
-            // frame too (VIctory's frame 0); the translator's index is read while the title sets up.
-            leonida::pipelines::title_running().store(true, std::memory_order_relaxed);
-            rt::d3d12::prefetch_shader_library(vulkan);
-        }
         if (!tracing)
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
                          static_cast<void*>(vulkan));
@@ -271,45 +258,11 @@ static_assert(std::is_same_v<decltype(&create_versioned_root_signature_deseriali
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
-// dword at +4 it sets (a count), and checks the result for failure. The PC/Vulkan side owns virtual memory, so the
-// inputs are only logged. The block's second half is an output, the range graphics addresses fall in (ported from
-// VIctory, victory-gpu device.rs:184-226, GPL-3.0-or-later): GPU addresses are the title's CPU addresses here (title
-// memory is mapped at the address the title gave it), so the range is all of user space, as VIctory answers. A null
-// block is E_INVALIDARG, as there.
-HRESULT WINAPI configure_virtual_memory(void* desc) {
-    auto* config = static_cast<rt::d3d12_xs::VirtualMemoryConfig*>(desc);
-    if (!config) return E_INVALIDARG;
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX flags 0x%x, page table %u x 4 MiB pages, %u bytes "
-                     "preserved\n",
-                     config->flags, config->page_table_pages, config->preserved_bytes);
-    rt::d3d12_xs::user_address_range(config->lowest, config->highest);
-    return S_OK;
-}
-
-// The interface id a title imports as data (d3d12_xs.dll!IID_ID3D12Device): it reads the 16 bytes at the import's
-// address. The PC id, as on the console (VIctory victory-hle d3d12x.rs:80-84 binds the same import to its id).
-const GUID kIidD3D12Device = __uuidof(ID3D12Device);
+// dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
+// so the policy is accepted and ignored.
+HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
 
 }  // namespace
-
-namespace rt::d3d12_xs {
-
-void user_address_range(std::uint64_t& lowest, std::uint64_t& highest) {
-#ifdef _WIN32
-    SYSTEM_INFO info{};
-    GetSystemInfo(&info);
-    lowest = reinterpret_cast<std::uint64_t>(info.lpMinimumApplicationAddress);
-    highest = reinterpret_cast<std::uint64_t>(info.lpMaximumApplicationAddress);
-#else
-    lowest = 0x10000;  // V device.rs:224: the x64 user half below the last 64 KiB
-    highest = 0x7ffffffeffffull;
-#endif
-}
-
-}  // namespace rt::d3d12_xs
 
 SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
@@ -321,6 +274,4 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "#7", reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
-    // A data import: the entry is the address of the id, not of a function.
-    {"d3d12_xs.dll", "IID_ID3D12Device", const_cast<GUID*>(&kIidD3D12Device)},
 );

@@ -21,7 +21,6 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode
 import bvh_geometry_check as C
 import bvh_index as I
 import bvh_match as M
@@ -230,15 +229,9 @@ def save_evidence(path, record):
     try:
         with f:
             json.dump(record, f)
-        os.chmod(temporary, published_mode(path))
         os.replace(temporary, path)
     finally:
-        if temporary.exists():
-            try:
-                os.chmod(temporary, 0o600)
-            except OSError:
-                pass
-            temporary.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
 
 def census(archive, index, manifests, prior=(), save=None):

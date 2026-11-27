@@ -70,7 +70,6 @@ class ModInfo:
     swaps: list[Swap] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
-    script: str = ""
 
 
 def joaat(name: str) -> int:
@@ -103,20 +102,6 @@ def parse_model_id(text: str) -> int:
     return joaat(text)
 
 
-def check_script(script: object, folder: str, path: str, warnings: list[str]) -> str:
-    """The "script" of a Lua mod: a .lua file inside the mod's folder (read by leonida.exe, docs/lua-modding.md)."""
-    if not isinstance(script, str) or not script:
-        raise ModsError(f'{folder}: "script" must be a file name such as "main.lua"')
-    parts = PurePosixPath(script).parts
-    if "\\" in script or ":" in script or not parts or parts[0] == "/" or ".." in parts or "." in parts:
-        raise ModsError(f'{folder}: "script" must stay inside the mod folder')
-    if not script.lower().endswith(".lua"):
-        raise ModsError(f'{folder}: "script" must be a .lua file')
-    if path and not os.path.isfile(os.path.join(os.path.dirname(path), *parts)):
-        warnings.append(f'script {script} is not in the mod folder')
-    return script
-
-
 def validate_manifest(data: object, folder: str, path: str = "") -> ModInfo:
     if not isinstance(data, dict):
         raise ModsError(f"{folder}: {MANIFEST} is not a JSON object")
@@ -135,14 +120,9 @@ def validate_manifest(data: object, folder: str, path: str = "") -> ModInfo:
     if not isinstance(enabled, bool):
         raise ModsError(f'{folder}: "enabled" must be true or false')
     mod.enabled = enabled
-    script = data.get("script")
-    if script is not None:
-        mod.script = check_script(script, folder, path, mod.warnings)
     swaps = data.get("archetype_swaps")
     if swaps is None:
-        # A Lua mod (docs/lua-modding.md) changes things with its script, not with swaps.
-        if not mod.script:
-            mod.warnings.append("no archetype_swaps; this mod currently changes nothing")
+        mod.warnings.append("no archetype_swaps; this mod currently changes nothing")
         return mod
     if not isinstance(swaps, list):
         raise ModsError(f'{folder}: "archetype_swaps" must be a list')
@@ -168,7 +148,7 @@ def validate_manifest(data: object, folder: str, path: str = "") -> ModInfo:
             mod.warnings.append(f'{label} repeats {seen[swap.from_id]}; the later swap wins')
         seen[swap.from_id] = label
         mod.swaps.append(swap)
-    if not mod.swaps and not mod.script:
+    if not mod.swaps:
         mod.warnings.append("archetype_swaps is empty; this mod currently changes nothing")
     return mod
 
@@ -610,8 +590,6 @@ def print_report(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> None:
         state = "enabled" if mod.enabled else "disabled"
         version = f", game {mod.game_version}" if mod.game_version else ""
         swaps = f"{len(mod.swaps)} swap" + ("" if len(mod.swaps) == 1 else "s")
-        if mod.script:
-            swaps = f"Lua {mod.script}" + (f", {swaps}" if mod.swaps else "")
         print(f"{mod.folder}: {mod.name} [{state}; {swaps}{version}]")
         for warning in mod.warnings:
             print(f"  warning: {warning}")
@@ -645,7 +623,6 @@ def report_json(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> str:
             "name": m.name,
             "enabled": m.enabled,
             "game_version": m.game_version,
-            "script": m.script,
             "warnings": m.warnings,
             "archetype_swaps": [swap_entry(m, idx, s) for idx, s in enumerate(m.swaps)],
         } for m in mods],
@@ -873,8 +850,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
                 self.mods[mod.folder] = mod
                 self.tree.insert("", "end", iid=mod.folder,
                                  values=(mod.folder, mod.name, "enabled" if mod.enabled else "disabled",
-                                        "Lua" if mod.script and not mod.swaps else len(mod.swaps),
-                                        mod.game_version))
+                                        len(mod.swaps), mod.game_version))
             active = len(active_swaps(self.mods_list))
             self.status(f"{len(self.mods_list)} mod(s), {active} active swap(s), "
                         f"{len(self.errors)} manifest error(s)")
