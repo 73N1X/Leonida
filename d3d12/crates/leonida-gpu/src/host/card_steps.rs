@@ -654,7 +654,9 @@ impl Host {
     /// ([`stage`]), the list that does them. `None` if nothing is in the
     /// way or the old wait is due. Under the submission lock.
     pub(super) fn card_steps(&self, runs: &[&HostList]) -> Option<Taken> {
-        if stage() == 0 || !relay_exact() {
+        // Leonida: `LEONIDA_AB=<s>,LEONIDA_CARD_STEPS_ON` measures what the planning costs against what it saves
+        // (off: no plan, the old wait for the flights where a step reads what they write).
+        if stage() == 0 || !relay_exact() || !crate::toggled!("LEONIDA_CARD_STEPS_ON") {
             return None;
         }
         let (written, copies) = {
