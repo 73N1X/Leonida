@@ -4768,11 +4768,11 @@ struct DeviceState {
         return VsharpResult::rebased;
     }
 
+    rt::d3d12::TitleImageUpload title_upload;  // accessed with title_upload_mutex held
+    std::mutex title_upload_mutex;  // after title_texture_mutex when both are taken (the fill worker takes it alone)
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to a
     // VkQueue the game's first queues do not use and waited for (review D9): the copy family's for colour textures,
     // the graphics family's for the rest (staged_copy). Created on first use.
-    rt::d3d12::TitleImageUpload title_upload;  // accessed with title_upload_mutex held
-    std::mutex title_upload_mutex;  // after title_texture_mutex when both are taken (the fill worker takes it alone)
     std::mutex staging_mutex;
     std::unique_ptr<leonida::VulkanQueue> staging_queue;
     std::unique_ptr<leonida::VulkanQueue> staging_copy_queue;
