@@ -395,6 +395,11 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`: how many pairs of dwords past the shared one the program set aside for
+    /// exchanges of their own ([`exchange_sites`]), how many are taken, the console waves of a
+    /// group, and per IR block whether a thread can run it more than once ([`in_cycle`]).
+    fresh_pairs: (u32, u32, u32),
+    cyclic: Vec<bool>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -616,6 +621,7 @@ fn lane_uniform(
     all: &[bool],
     stable_lds: &[bool],
     wave_tid: Option<Value>,
+    srv_loads: &HashSet<Site>,
 ) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let order = crate::ir::reverse_postorder(&p.blocks);
@@ -703,6 +709,28 @@ fn lane_uniform(
                         ..
                     } if stable_lds.get(b).copied().unwrap_or(false) && name == "ds_read_b32" => {
                         if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
+                            next.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                        }
+                        continue;
+                    }
+                    // a load from a view the dispatch only reads, at an address every lane
+                    // holds alike (or none), reads one value in every lane
+                    Fields::Buffer {
+                        addr,
+                        offen,
+                        idxen,
+                        lds: false,
+                        tfe: false,
+                        ..
+                    } if srv_loads.contains(&(b, i)) => {
+                        let wanted = u8::from(*offen) + u8::from(*idxen);
+                        let alike = match addr {
+                            Operand::Vector { reg, .. } => (0..wanted).all(|k| {
+                                inst.read(Reg::V(reg + k)).is_some_and(|a| known(&next, &a))
+                            }),
+                            _ => wanted == 0,
+                        };
+                        if alike {
                             next.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
                         }
                         continue;
@@ -1411,6 +1439,113 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// How many exchanges of a console wave64 program in two host waves get dwords of their own
+/// (`LEONIDA_EXCHANGE_SITES`, 24 unless set; 0: all share one pair, as before). An exchange
+/// that runs once per thread (no loop around it) needs one group barrier, after the stores
+/// (`Lower::exchange_halves`); one that shares the pair with the others, or runs again in a
+/// loop, needs a second, after the loads, so that the next store does not overtake a slow
+/// reader. Each such exchange costs `2 * console waves` LDS dwords.
+fn exchange_sites() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = TEST_EXCHANGE_SITES.get() {
+        return n;
+    }
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LEONIDA_EXCHANGE_SITES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24).min(64)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many group barriers lowerings on this thread wrote ([`Lower::group_sync`]).
+    pub(super) static TEST_GROUP_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A test's choice for [`exchange_sites`], for its thread only.
+    pub(super) static TEST_EXCHANGE_SITES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether buffer loads of read-only views at an address the lanes hold alike count as the same
+/// in every lane (`LEONIDA_UNIFORM_LOADS`, on unless `0`): a first-lane read of such a value then
+/// needs nothing from the other host wave of a console wave64 program.
+fn uniform_loads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_UNIFORM_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_UNIFORM_LOADS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`uniform_loads_on`], for its thread only.
+    pub(super) static TEST_UNIFORM_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Per block, whether it lies on a cycle of the program's flow: whether a thread can run it
+/// more than once.
+fn in_cycle(p: &Program) -> Vec<bool> {
+    let n = p.blocks.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for &q in &block.preds {
+            succ[q].push(b);
+        }
+    }
+    // Tarjan's strongly connected components, iteratively
+    let (mut index, mut low) = (vec![usize::MAX; n], vec![0usize; n]);
+    let (mut on, mut stack, mut next) = (vec![false; n], Vec::new(), 0usize);
+    let mut cyclic = vec![false; n];
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut work = vec![(root, 0usize)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = work.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    low[parent] = low[parent].min(low[v]);
+                }
+                if low[v] == index[v] {
+                    let mut members = Vec::new();
+                    loop {
+                        let w = stack.pop().expect("on the stack");
+                        on[w] = false;
+                        members.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    if members.len() > 1 || succ[v].contains(&v) {
+                        for w in members {
+                            cyclic[w] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cyclic
+}
+
 /// Whether programs with console lanes in groups of several host waves take their console
 /// threads from a group counter (`ticket`, issue #1243). `LEONIDA_THREAD_TICKET=0`: the flat id
 /// of the wave's first lane rounded down, as before.
@@ -1670,6 +1805,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut fresh_pairs = (0u32, 0u32, 0u32);
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
@@ -1752,7 +1888,16 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                let waves = group.div_ceil(64);
+                                s.lds_dwords += 2 * waves;
+                                if group > 32 {
+                                    // pairs of their own, as far as D3D12's 32 KiB of group
+                                    // memory and the dword a ticket may still take allow
+                                    let room = 8192u32.saturating_sub(s.lds_dwords + 2) / (2 * waves);
+                                    let n = exchange_sites().min(room);
+                                    fresh_pairs = (n, 0, waves);
+                                    s.lds_dwords += 2 * waves * n;
+                                }
                             }
                         }
                     }
@@ -1900,7 +2045,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        let mut this = Lower {
             s,
             x,
             bad,
@@ -1972,13 +2117,7 @@ impl<'a> Lower<'a> {
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
-            uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    let stable = stable_lds_reads(p, x.st, all, split_lds && super::group_sync() != 0);
-                    lane_uniform(p, x.st, all, &stable, wave_tid(x))
-                }
-                _ => HashSet::new(),
-            },
+            uniform: HashSet::new(),
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("LEONIDA_WAVE_WHY").is_some())
@@ -1988,6 +2127,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            fresh_pairs,
+            cyclic: if fresh_pairs.0 > 0 { in_cycle(p) } else { Vec::new() },
             halves,
             ticket,
             partial_active: None,
@@ -2023,7 +2164,39 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+        };
+        if let Some((_, false, all)) = &this.exchange
+            && !LOCAL_WAVES.get()
+        {
+            let all = all.clone();
+            let stable = stable_lds_reads(p, x.st, &all, this.split_lds && super::group_sync() != 0);
+            let srv_loads = if uniform_loads_on() { this.srv_loads() } else { HashSet::new() };
+            this.uniform = lane_uniform(p, x.st, &all, &stable, wave_tid(x), &srv_loads);
         }
+        this
+    }
+
+    /// The buffer loads whose view is one the dispatch only reads (a shader resource view in
+    /// the root signature, or a root SRV): where such a load has an address every lane holds
+    /// alike (or none) every lane gets the same value ([`lane_uniform`]). A view the program
+    /// may write is left out: another lane's store may fall between two lanes' loads.
+    fn srv_loads(&self) -> HashSet<Site> {
+        let p = self.x.p;
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| {
+                let inst = &p.blocks[d.site.0].insts[d.site.1];
+                let name = inst.name();
+                d.role == Role::Resource
+                    && matches!(inst.fields, Fields::Buffer { .. })
+                    && (name.starts_with("buffer_load") || name.starts_with("tbuffer_load"))
+                    && matches!(d.source, Source::Loaded { .. } | Source::Built { .. })
+                    && self.used_kind(&d.source).is_some_and(|u| u.kind == ResourceType::Srv)
+            })
+            .map(|d| d.site)
+            .collect()
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -2481,8 +2654,8 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let both = self.exchange_many(self.cur, &[r_lo, r_hi]);
+            let ((lo0, lo1), (hi0, hi1)) = (both[0], both[1]);
             let c = self.cur;
             let d0 = self
                 .s
@@ -4501,6 +4674,8 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        #[cfg(test)]
+        TEST_GROUP_SYNCS.set(TEST_GROUP_SYNCS.get() + 1);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4509,42 +4684,98 @@ impl<'a> Lower<'a> {
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
+        self.exchange_many(at, &[mine])[0]
+    }
+
+    /// [`Self::exchange_halves`] of several values at one place: with dwords of their own for
+    /// each ([`Self::fresh_pairs_for`]) the halves meet once for all of them, else one
+    /// after another through the shared pair.
+    fn exchange_many(&mut self, at: usize, mine: &[V]) -> Vec<(V, V)> {
         let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.iter().map(|&m| (m, z)).collect();
         };
         if small {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.iter().map(|&m| (m, z)).collect();
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
             let cl = self.console_lane();
             let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
             let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
-            let lo = self.s.m.select(at, upper, z, mine);
-            let hi = self.s.m.select(at, upper, mine, z);
-            return (lo, hi);
+            return mine
+                .iter()
+                .map(|&m| (self.s.m.select(at, upper, z, m), self.s.m.select(at, upper, m, z)))
+                .collect();
         }
-        // the pair of dwords of this thread's console wave: its half's, then both
-        let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
-        let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
-        self.group_sync(at);
         let one = self.s.m.i32(1);
-        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at, lds, pair);
-        let p1 = self.s.m.element(at, lds, k1);
-        let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.group_sync(at);
-        (lo, hi)
+        if let Some(pairs) = self.fresh_pairs_for(at, mine.len() as u32) {
+            // dwords no other exchange uses, written once: one meeting after the stores
+            for (&m, &pair) in mine.iter().zip(&pairs) {
+                let index = self.s.m.bin(at, Bin::Add, pair, half);
+                let ptr = self.s.m.element(at, lds, index);
+                self.s.m.store(at, ptr, m);
+            }
+            self.group_sync(at);
+            return pairs
+                .iter()
+                .map(|&pair| {
+                    let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+                    let p0 = self.s.m.element(at, lds, pair);
+                    let p1 = self.s.m.element(at, lds, k1);
+                    (self.s.m.load(at, p0), self.s.m.load(at, p1))
+                })
+                .collect();
+        }
+        mine.iter()
+            .map(|&m| {
+                // the pair of dwords of this thread's console wave: its half's, then both
+                let pair = self.exchange_pair(slot);
+                let index = self.s.m.bin(at, Bin::Add, pair, half);
+                let ptr = self.s.m.element(at, lds, index);
+                self.s.m.store(at, ptr, m);
+                self.group_sync(at);
+                let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+                let p0 = self.s.m.element(at, lds, pair);
+                let p1 = self.s.m.element(at, lds, k1);
+                let lo = self.s.m.load(at, p0);
+                let hi = self.s.m.load(at, p1);
+                // the slots are written again only after every thread read them
+                self.group_sync(at);
+                (lo, hi)
+            })
+            .collect()
+    }
+
+    /// `n` pairs of exchange dwords that no other exchange of the program uses, for exchanges
+    /// at `at` that a thread runs once (the IR block holds no cycle): the halves then need
+    /// no meeting after the loads, as nothing is stored over what they read. None when the
+    /// block is on a cycle, or the dwords set aside ([`exchange_sites`]) are used up.
+    fn fresh_pairs_for(&mut self, at: usize, n: u32) -> Option<Vec<V>> {
+        let (reserve, taken, waves) = self.fresh_pairs;
+        if n == 0 || taken + n > reserve {
+            return None;
+        }
+        let ir = if at == self.cur { self.cur_ir } else { self.tail.iter().position(|t| *t == Some(at))? };
+        if self.cyclic.get(ir).copied().unwrap_or(true) {
+            return None;
+        }
+        let slot = self.exchange.as_ref()?.0;
+        let pair = self.exchange_pair(slot);
+        self.fresh_pairs.1 += n;
+        Some(
+            (0..n)
+                .map(|k| {
+                    let off = self.s.m.i32(2 * waves * (taken + k + 1));
+                    self.s.m.bin(at, Bin::Add, pair, off)
+                })
+                .collect(),
+        )
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -9211,7 +9442,13 @@ impl<'a> Lower<'a> {
                     }
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
-                    let k = self.exchange_pair(slot);
+                    let here = self.cur;
+                    let fresh = self.fresh_pairs_for(here, 1);
+                    let k = match &fresh {
+                        // (the dword a lane gives is the pair's first: both halves read it)
+                        Some(pairs) => pairs[0],
+                        None => self.exchange_pair(slot),
+                    };
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -9221,7 +9458,9 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    if fresh.is_none() {
+                        self.group_sync(c2);
+                    }
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -9302,8 +9541,8 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let both = self.exchange_many(c, &[has, mine]);
+                        let ((lo_has, hi_has), (lo, hi)) = (both[0], both[1]);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -13347,7 +13586,7 @@ mod tests {
             let inst = &p.blocks[0].insts[0];
             let tid = inst.read(Reg::V(0)).unwrap();
             let shifted = inst.writes.iter().find(|w| w.0 == Reg::V(7)).unwrap().1;
-            let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(tid));
+            let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(tid), &std::collections::HashSet::new());
             let expected = (0..64u32).all(|lane| lane.wrapping_shr(shift) == 0);
             assert_eq!(uniform.contains(&shifted), expected, "inline shift {shift}");
         }
@@ -13368,7 +13607,7 @@ mod tests {
         assert_eq!(swap.name(), "v_swap_b32");
         let old_v0 = swap.read(Reg::V(0)).unwrap();
         let new_v1 = swap.write(Reg::V(1)).unwrap();
-        let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(old_v0));
+        let uniform = super::lane_uniform(&p, &st, &[true], &[false], Some(old_v0), &std::collections::HashSet::new());
         assert!(!uniform.contains(&new_v1));
     }
 
