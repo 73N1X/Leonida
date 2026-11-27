@@ -97,3 +97,8 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `leonida translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+A compute program of one console wave of 32 lanes and no group barrier can be translated to a host
+group of several console groups (`LEONIDA_GROUP_PACK`; see `findings.md`, "Group packing"). The
+host divides its dispatches by the packing, direct and indirect, and tells the program the
+console's grid in root constants.
