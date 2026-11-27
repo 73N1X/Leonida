@@ -15,14 +15,27 @@ Thanks for helping. A few rules keep the project safe to host:
 Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
 moves to a new issue when the thread gets long, so the link searches for it). Check its tables and the open pull
 requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID in
-your pull request. Found something that needs doing but won't do it yourself? Post `finding: <one line>` there, with
-where it is and why it matters, and it goes on the list for others. When two pull requests overlap anyway, the one
-that lands first is merged and the other is asked to rebase or close. GPU test results go in
-[#166](https://github.com/ItsNotRexed/Leonida/issues/166). Work on the D3D12 → Vulkan layer has its own page,
-[#313](https://github.com/ItsNotRexed/Leonida/issues/313): the critical path, who builds what, and which D3D12
-methods are still open.
+your pull request. When the pull request is open, post `done: <ID> -> #<PR>` there. Found something that needs doing
+but won't do it yourself? Post `finding: <one line>` there, with where it is and why it matters, and it goes on the
+list for others. When two pull requests overlap anyway, the one that lands first is merged and the other is asked to
+rebase or close. Pull requests target `main`.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+The original repository (`ItsNotRexed/Leonida`) went private on 23 November 2026, and its issues and pull requests
+went with it. A `#N` in the docs, in a code comment or in a commit message from before that date is an **old**
+number and links nowhere now, including the two this page used to send you to: #166 (GPU test results) and #313
+(the D3D12 → Vulkan page).
+
+- The titles of the issues that were open there are indexed in
+  [#18](https://github.com/ubiquitarianism/leonida/issues/18). To carry one on, open it again here and link the
+  index.
+- The pull requests that were open there are kept as `old-pr/<old number>` branches, listed in
+  [#17](https://github.com/ubiquitarianism/leonida/issues/17). To carry one on, rebase it on `main`, keep its
+  author's commits and open a pull request here.
+- A GPU test result is a pull request that adds a file to [`gpu-test-results/`](gpu-test-results) in the format of
+  the files there; [docs/testing.md](docs/testing.md) has how to run the tests.
+- The plan and status of the D3D12 → Vulkan layer are in [docs/d3d12_vulkan.md](docs/d3d12_vulkan.md).
+
+[claims]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## Working on the code
 
@@ -60,3 +73,46 @@ methods are still open.
 - Say what you tested and on which GPU in the pull request.
 - Run the translator tests with `python -I scripts/run_semantic_tests.py tests/semantic` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.
+
+## Pull requests
+
+- One topic per pull request, based on current `main`. Follow-up work goes in a new pull request, not into an open
+  one.
+- Fill in the [template](.github/pull_request_template.md): the claim, `Depends on:`, `Fixes: #N` for an issue it
+  closes, what you tested, `GPUs tested:` (vendor, model, driver and OS) and whether it was AI-assisted.
+- A pull request that conflicts with `main` is labeled `needs rebase` (`tools/pr_conflict_label.py`, run on every
+  push to `main` and hourly). Rebase it on `main` yourself; the label goes within the hour once it merges cleanly. Reviews start with the pull requests that do.
+
+## Maintainer quick guide
+
+How maintainers review and merge pull requests.
+
+**Before you start**
+
+- Read every comment on the pull request first. An open request from a maintainer means waiting for the author.
+- Check the pull request's head right before you act: authors often push while you review.
+
+**Is it mergeable?**
+
+- It is claimed in [the coordination issue][claims] by the pull request's author.
+- One topic, not a duplicate of another open pull request. If two fix the same thing, the better one wins.
+- A new test that fails on `main` and passes with the pull request.
+- No game data: `python -I scripts/check_no_game_data.py <files>`.
+
+**Test it yourself**
+
+- Merge `main` into the branch. Never rebase, never force-push.
+- Run the pull request's own tests, then the full suite once, and compare with plain `main`.
+- Don't wait for GitHub CI: the queue takes hours.
+
+**Then**
+
+- Ready: merge it (one pull request at a time) with a short comment saying what you tested and on which GPU.
+- Not ready: comment with each blocker, one line each.
+- A duplicate, or already in `main`: close it with a kind comment that links what landed.
+
+**Don't**
+
+- Merge your own pull request (exceptions: a fix for a regression a merge just caused, or something important).
+- Post game content (logs, screenshots, shader dumps).
+- Forget to say you used AI.

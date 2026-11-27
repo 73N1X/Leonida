@@ -1,5 +1,5 @@
-// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and
-// XLauncherImpl, offline: small classes a title calls early.
+// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl
+// and XLauncherImpl, offline: small classes a title calls early.
 //
 // Each XGameEvent*, XGameUi* and XGameStreaming* function in xgameruntime.lib asks QueryApiImpl for its class and
 // calls one slot with its own arguments after `this`. The class and interface ids and the method order are
@@ -18,16 +18,20 @@
 //   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change, so
 //                       their change registrations are kept until unregistered and never called back; the user has
 //                       no audio endpoint of its own; finding a controller shows no UI (as on desktop).
-//   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, no voice is installed (enumerating
-//                       calls back zero times), speech synthesis is silent (VIctory's: a synthesizer is handed out and
-//                       every stream is an empty WAVE file), speech-to-text display calls fail (E_FAIL).
-//   XLauncherImpl       XLaunchUri and the display timeout deferral calls fail (E_FAIL); nothing is launched.
+//   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, one silent voice is installed
+//                       (enumerating calls back once), XSpeechSynthesizerCreate hands out a synthesizer whose
+//                       text/SSML streams return a valid 44-byte empty 16 kHz mono 16-bit PCM WAVE header so titles
+//                       that play narration continue cleanly; speech-to-text display calls fail (E_FAIL).
+//   XLauncherImpl       XLaunchUri fails offline (E_FAIL); XDisplayAcquireTimeoutDeferral / Close acquire and clear a
+//                       real Win32 PowerRequestDisplayRequired handle so the host display stays awake.
 //
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
 #include <windows.h>
+#include <unknwn.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -103,14 +107,22 @@ constexpr char kEventName[] = "XGameEventImpl";
 constexpr GUID kEventClass = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
 std::atomic<long> g_events{0};
 
-bool log_every_event() {
-    static const bool on = [] {
+// "=1" exactly. Read on the first call, which is on a title thread: the answer is kept in a namespace-scope atomic, not
+// a block-scope static, whose guard has been seen to skip the initializer on such a thread under Wine (old upstream
+// 7599).
+bool env_is_one(const char* name, std::atomic<int>& cached) {
+    int on = cached.load(std::memory_order_relaxed);
+    if (on < 0) {
         char value[4] = {};
         size_t length = 0;
-        return getenv_s(&length, value, "LEONIDA_LOG_GAME_EVENTS") == 0 && length == 2 && value[0] == '1';
-    }();
-    return on;
+        on = getenv_s(&length, value, name) == 0 && length == 2 && value[0] == '1';
+        cached.store(on, std::memory_order_relaxed);
+    }
+    return on != 0;
 }
+
+std::atomic<int> g_log_every_event{-1};
+bool log_every_event() { return env_is_one("LEONIDA_LOG_GAME_EVENTS", g_log_every_event); }
 
 // 3: HRESULT XGameEventWrite(XUserHandle user, const char* serviceConfigId, const char* playSessionId,
 //                            const char* eventName, const char* dimensionsJson, const char* measurementsJson)
@@ -217,56 +229,6 @@ HRESULT STDMETHODCALLTYPE ui_error_dialog_result(void*, XAsyncBlock* async) {
     return XAsyncGetResult(async, &kErrorDialogIdentity, 0, nullptr, nullptr);
 }
 
-// 7: HRESULT XGameUiShowPlayerProfileCardAsync(XAsyncBlock* async, XUserHandle requestingUser, uint64_t targetPlayer)
-// 8: HRESULT XGameUiShowPlayerProfileCardResult(XAsyncBlock* async)
-// Ported from VIctory victory-hle src/modules/xgameui.rs (GPL-3.0-or-later): there is no card to show offline, so
-// the call completes at once with S_OK, as when the user closes the card.
-const char kProfileCardIdentity = 0, kTextEntryIdentity = 0;
-HRESULT STDMETHODCALLTYPE ui_profile_card_async(void*, XAsyncBlock* async, void*, uint64_t) {
-    if (!async) return E_POINTER;
-    return XAsyncBegin(async, nullptr, &kProfileCardIdentity, "XGameUiShowPlayerProfileCardAsync", error_dialog_provider);
-}
-HRESULT STDMETHODCALLTYPE ui_profile_card_result(void*, XAsyncBlock* async) {
-    return XAsyncGetResult(async, &kProfileCardIdentity, 0, nullptr, nullptr);
-}
-
-// 17: HRESULT XGameUiShowTextEntryAsync(XAsyncBlock* async, const char* titleText, const char* descriptionText,
-//         const char* defaultText, XGameUiTextEntryInputScope inputScope, uint32_t maxTextLength)
-// 18: HRESULT XGameUiShowTextEntryResultSize(XAsyncBlock* async, uint32_t* resultTextBufferSize)
-// 19: HRESULT XGameUiShowTextEntryResult(XAsyncBlock* async, uint32_t resultTextBufferSize, char* resultTextBuffer,
-//         uint32_t* resultTextBufferUsed)
-// The entry is dismissed: it completes with E_ABORT, which the title treats as cancelled and goes on (VIctory
-// xgameui.rs, measured on the same title; any other failure it treats as an error). VIctory shows a host dialog to
-// type into; that part is not ported.
-HRESULT CALLBACK cancelled_provider(XAsyncOp op, const XAsyncProviderData* data) {
-    if (op == XAsyncOp::Begin) return XAsyncSchedule(data->async, 0);
-    if (op == XAsyncOp::DoWork) XAsyncComplete(data->async, E_ABORT, 0);
-    return S_OK;
-}
-HRESULT STDMETHODCALLTYPE ui_text_entry_async(void*, XAsyncBlock* async, const char* title, const char*, const char*,
-                                              uint32_t, uint32_t max_length) {
-    if (!async) return E_POINTER;
-    std::fprintf(stderr, "[rt] game text entry: \"%s\" (up to %u characters) [cancelled offline]\n", title ? title : "",
-                 max_length);
-    return XAsyncBegin(async, nullptr, &kTextEntryIdentity, "XGameUiShowTextEntryAsync", cancelled_provider);
-}
-HRESULT STDMETHODCALLTYPE ui_text_entry_size(void*, XAsyncBlock* async, uint32_t* size) {
-    if (!size) return E_POINTER;
-    *size = 0;
-    size_t bytes = 0;
-    const HRESULT hr = XAsyncGetResultSize(async, &bytes);
-    if (SUCCEEDED(hr)) *size = static_cast<uint32_t>(bytes);
-    return hr;
-}
-HRESULT STDMETHODCALLTYPE ui_text_entry_result(void*, XAsyncBlock* async, uint32_t size, char* buffer, uint32_t* used) {
-    if (used) *used = 0;
-    if (buffer && size) buffer[0] = '\0';
-    size_t written = 0;
-    const HRESULT hr = XAsyncGetResult(async, &kTextEntryIdentity, size, buffer, &written);
-    if (SUCCEEDED(hr) && used) *used = static_cast<uint32_t>(written);
-    return hr;
-}
-
 // 16: XGameUiSetNotificationPositionHint(position): there are no notifications to place.
 HRESULT STDMETHODCALLTYPE ui_set_notification_hint(void*) { return S_OK; }
 
@@ -280,8 +242,8 @@ const void* const kUiVtable[] = {
     FN(ui_message_dialog_result),      // 4  XGameUiShowMessageDialogResult
     FN(ui_offline<5>),                 // 5  XGameUiShowSendGameInviteAsync
     FN(ui_offline<6>),                 // 6  XGameUiShowSendGameInviteResult
-    FN(ui_profile_card_async),         // 7  XGameUiShowPlayerProfileCardAsync
-    FN(ui_profile_card_result),        // 8  XGameUiShowPlayerProfileCardResult
+    FN(ui_offline<7>),                 // 7  XGameUiShowPlayerProfileCardAsync
+    FN(ui_offline<8>),                 // 8  XGameUiShowPlayerProfileCardResult
     FN(ui_offline<9>),                 // 9  XGameUiShowAchievementsAsync
     FN(ui_offline<10>),                // 10 XGameUiShowAchievementsResult
     FN(ui_offline<11>),                // 11 XGameUiShowPlayerPickerAsync
@@ -290,9 +252,9 @@ const void* const kUiVtable[] = {
     FN(ui_error_dialog_async),         // 14 XGameUiShowErrorDialogAsync
     FN(ui_error_dialog_result),        // 15 XGameUiShowErrorDialogResult
     FN(ui_set_notification_hint),      // 16 XGameUiSetNotificationPositionHint
-    FN(ui_text_entry_async),           // 17 XGameUiShowTextEntryAsync
-    FN(ui_text_entry_size),            // 18 XGameUiShowTextEntryResultSize
-    FN(ui_text_entry_result),          // 19 XGameUiShowTextEntryResult
+    FN(ui_offline<17>),                // 17 XGameUiShowTextEntryAsync
+    FN(ui_offline<18>),                // 18 XGameUiShowTextEntryResultSize
+    FN(ui_offline<19>),                // 19 XGameUiShowTextEntryResult
     FN(ui_unknown<20>),                // 20 (unknown in the docs)
     FN(ui_unknown<21>),                // 21 (unknown in the docs)
     FN(ui_unknown<22>),                // 22 (unknown in the docs)
@@ -445,14 +407,8 @@ struct XDisplayHdrModeInfo {
     float maxFullFrameToneMapLuminance;
 };
 
-bool hdr_requested() {
-    static const bool on = [] {
-        char value[4] = {};
-        size_t length = 0;
-        return getenv_s(&length, value, "LEONIDA_HDR") == 0 && length == 2 && value[0] == '1';
-    }();
-    return on;
-}
+std::atomic<int> g_hdr_requested{-1};
+bool hdr_requested() { return env_is_one("LEONIDA_HDR", g_hdr_requested); }
 
 // 4: XDisplayHdrModeResult XDisplayTryEnableHdrMode(XDisplayHdrModePreference preference, XDisplayHdrModeInfo* info)
 // The host swapchain is SDR, so HDR stays off unless LEONIDA_HDR=1; then it is "enabled" with the documented
@@ -642,6 +598,36 @@ const GUID kAccessibilityInterfaces[] = {
     {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
 };
 
+// LEONIDA_LOCAL_SPEECH=1 forwards speech synthesis to the locally installed Windows gaming runtime (the host's own
+// xgameruntime.dll, from System32). Off unless set: no profile sets it, and the silent voice below answers.
+struct HostSpeechProvider {
+    HMODULE module=nullptr;
+    IUnknown* base=nullptr;
+    IUnknown* extended=nullptr;
+    HostSpeechProvider() {
+        char enabled[4]{};
+        if(GetEnvironmentVariableA("LEONIDA_LOCAL_SPEECH",enabled,sizeof(enabled))!=1 || enabled[0]!='1') return;
+        module=LoadLibraryExW(L"xgameruntime.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!module)return;
+        using Query=HRESULT (WINAPI*)(const GUID*,REFIID,void**);
+        auto query=reinterpret_cast<Query>(GetProcAddress(module,"QueryApiImpl"));
+        if(!query)return;
+        (void)query(&kAccessibilityClass,kAccessibilityInterfaces[0],reinterpret_cast<void**>(&base));
+        (void)query(&kAccessibilityClass,kAccessibilityInterfaces[1],reinterpret_cast<void**>(&extended));
+    }
+    ~HostSpeechProvider(){if(extended)extended->Release();if(base)base->Release();if(module)FreeLibrary(module);}
+};
+HostSpeechProvider& host_speech_provider(){static HostSpeechProvider host;return host;}
+template<unsigned Slot,typename... Args>
+bool call_host_speech(HRESULT& result,Args... args) {
+    auto& host=host_speech_provider();
+    auto* obj=Slot==21?host.extended:host.base;
+    if(!obj)return false;
+    using Method=HRESULT (STDMETHODCALLTYPE*)(IUnknown*,Args...);
+    auto fn=reinterpret_cast<Method>((*reinterpret_cast<void***>(obj))[Slot]);
+    result=fn(obj,args...);
+    return true;
+}
 // 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator. ASSUMPTION: the signature and
 // that Off is 0 (GDK reference, not re-checked for this file).
 HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
@@ -653,59 +639,120 @@ HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
 // 4: HRESULT XClosedCaptionSetEnabled(bool enabled): there are no captions to show; accepted and dropped.
 HRESULT STDMETHODCALLTYPE accessibility_captions_set_enabled(void*, bool) { return S_OK; }
 
-// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(callback, void* context): no voice is installed, so the
-// callback runs zero times. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
-HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* callback, void*) {
-    return callback ? S_OK : E_INVALIDARG;
-}
-
-// Speech synthesis is silent, as in VIctory (crates/victory-hle/src/modules/speech.rs, GPL-3.0-or-later, by Marvisak
-// and contributors, DexNom fork; Leonida is GPL-3.0-or-later): a synthesizer is handed out and every stream is valid
-// WAVE audio of no length, so the title's narration plays nothing and goes on. VIctory runs the title with it; before,
-// this file failed XSpeechSynthesizerCreate. Synthesizers and streams hold nothing, so their handles are two fixed
-// addresses and closing them is free.
-//
-// A WAVE file of 16 kHz mono 16-bit PCM with no samples: RIFF size 36, a 16-byte format chunk (PCM, 1 channel,
-// 16,000 Hz, 32,000 bytes/s, block 2, 16 bits), an empty data chunk.
-constexpr uint8_t kSilentWave[44] = {
-    'R', 'I', 'F', 'F', 0x24, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 0x10, 0, 0, 0, 0x01, 0, 0x01, 0,
-    0x80, 0x3e, 0, 0, 0x00, 0x7d, 0, 0, 0x02, 0, 0x10, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0,
+// XSpeechSynthesizerVoiceInformation and its callback, in the GDK reference's member order (the gender is
+// XSpeechSynthesizerVoiceGender, a uint32_t enum: Female 0, Male 1).
+struct SpeechVoiceInformation {
+    const char* description;
+    const char* display_name;
+    uint32_t gender;
+    const char* voice_id;
+    const char* language;
 };
-const uint8_t g_synthesizer = 0;
-const uint8_t g_stream = 0;
+static_assert(offsetof(SpeechVoiceInformation, voice_id) == 24 && sizeof(SpeechVoiceInformation) == 40, "x64 layout");
+using InstalledVoicesCallback = bool(CALLBACK*)(const SpeechVoiceInformation* information, void* context);
+constexpr SpeechVoiceInformation kSilentVoice = {"Leonida silent voice - English (United States)",
+                                                 "Leonida silent voice", 0, "leonida-silent", "en-US"};
 
-// 9: HRESULT XSpeechSynthesizerCreate(XSpeechSynthesizerHandle* handle)
-HRESULT STDMETHODCALLTYPE speech_create(void*, const void** handle) {
-    if (!handle) return E_POINTER;
-    *handle = &g_synthesizer;
+// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback): one voice, the silent one every
+// synthesizer below speaks with. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
+HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* context, InstalledVoicesCallback callback) {
+    HRESULT host_result;
+    if (callback && call_host_speech<8>(host_result, context, callback)) return host_result;
+    if (!callback) return E_INVALIDARG;
+    callback(&kSilentVoice, context);
     return S_OK;
 }
 
-// 10, 14: XSpeechSynthesizerCloseHandle(synthesizer), XSpeechSynthesizerCloseStreamHandle(stream). 11, 12:
-// XSpeechSynthesizerSetDefaultVoice(synthesizer), XSpeechSynthesizerSetCustomVoice(synthesizer, const char* voice).
-// Nothing to close or choose; S_OK, as VIctory answers.
-HRESULT STDMETHODCALLTYPE speech_accept(void*) { return S_OK; }
+// Speech synthesis is silent rather than missing: XSpeechSynthesizerCreate hands out a synthesizer, every stream is a
+// valid WAVE file with no samples (16 kHz mono 16-bit PCM, 44 bytes), so a title that narrates plays silence and goes
+// on. Failing the create (as before) can keep a title from leaving its first-boot accessibility step. The approach and
+// the stream layout follow VIctory crates/victory-hle/src/modules/speech.rs (GPL-3.0-or-later, Marvisak/VIctory
+// 35b054e), whose vtable for this class matches the slot order below.
+// Valid 44-byte RIFF/WAVE header for 16 kHz, 16-bit mono PCM with 0 data bytes (silent speech stream).
+constexpr uint8_t kSilentWave[44] = {
+    'R', 'I', 'F', 'F', 0x24, 0x00, 0x00, 0x00, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+    0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00,
+    0x02, 0x00, 0x10, 0x00, 'd', 'a', 't', 'a', 0x00, 0x00, 0x00, 0x00,
+};
+
+uint8_t g_speech_synth_handle = 0;
+uint8_t g_speech_stream_handle = 0;
+
+// 9: HRESULT XSpeechSynthesizerCreate(XSpeechSynthesizerHandle* handle): silent synthesizer handle.
+HRESULT STDMETHODCALLTYPE speech_create(void*, void** handle) {
+    HRESULT host_result;
+    if (handle && call_host_speech<9>(host_result, handle)) return host_result;
+    if (!handle) return E_POINTER;
+    *handle = &g_speech_synth_handle;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: speech synthesis is silent offline (empty WAVE streams)\n");
+    return S_OK;
+}
+
+// 10: HRESULT XSpeechSynthesizerCloseHandle(XSpeechSynthesizerHandle handle)
+HRESULT STDMETHODCALLTYPE speech_close_synth(void*, void* handle) {
+    HRESULT host_result;
+    if (handle && handle != &g_speech_synth_handle && call_host_speech<10>(host_result, handle)) return host_result;
+    return handle == &g_speech_synth_handle ? S_OK : E_INVALIDARG;
+}
+
+// 11: HRESULT XSpeechSynthesizerSetDefaultVoice(XSpeechSynthesizerHandle handle)
+HRESULT STDMETHODCALLTYPE speech_set_default_voice(void*, void* handle) {
+    HRESULT host_result;
+    if (handle && handle != &g_speech_synth_handle && call_host_speech<11>(host_result, handle)) return host_result;
+    return handle == &g_speech_synth_handle ? S_OK : E_INVALIDARG;
+}
+
+// 12: HRESULT XSpeechSynthesizerSetCustomVoice(XSpeechSynthesizerHandle handle, const char* voiceId): only the
+// enumerated voice is installed.
+HRESULT STDMETHODCALLTYPE speech_set_custom_voice(void*, void* handle, const char* voice_id) {
+    HRESULT host_result;
+    if (handle && handle != &g_speech_synth_handle && voice_id && call_host_speech<12>(host_result, handle, voice_id)) return host_result;
+    if (handle != &g_speech_synth_handle || !voice_id) return E_INVALIDARG;
+    return std::strcmp(voice_id, kSilentVoice.voice_id) == 0 ? S_OK : E_INVALIDARG;
+}
 
 // 13, 21: HRESULT XSpeechSynthesizerCreateStreamFromText/Ssml(synthesizer, const char* text,
 //                                                             XSpeechSynthesizerStreamHandle* stream)
-HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void*, const char*, const void** stream) {
+template<unsigned Slot>
+HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void* synth, const char* text, void** stream) {
+    HRESULT host_result;
+    if (synth && synth != &g_speech_synth_handle && text && stream && call_host_speech<Slot>(host_result, synth, text, stream)) return host_result;
+    if (stream) *stream = nullptr;
+    if (synth != &g_speech_synth_handle) return E_INVALIDARG;
     if (!stream) return E_POINTER;
-    *stream = &g_stream;
+    *stream = &g_speech_stream_handle;
     return S_OK;
 }
 
+// 14: HRESULT XSpeechSynthesizerCloseStreamHandle(XSpeechSynthesizerStreamHandle stream)
+HRESULT STDMETHODCALLTYPE speech_close_stream(void*, void* stream) {
+    HRESULT host_result;
+    if (stream && stream != &g_speech_stream_handle && call_host_speech<14>(host_result, stream)) return host_result;
+    return stream == &g_speech_stream_handle ? S_OK : E_INVALIDARG;
+}
+
 // 15: HRESULT XSpeechSynthesizerGetStreamDataSize(stream, size_t* size)
-HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void*, size_t* size) {
+HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void* stream, size_t* size) {
+    HRESULT host_result;
+    if (stream && stream != &g_speech_stream_handle && size && call_host_speech<15>(host_result, stream, size)) return host_result;
+    if (size) *size = 0;
+    if (stream != &g_speech_stream_handle) return E_INVALIDARG;
     if (!size) return E_POINTER;
-    *size = sizeof kSilentWave;
+    *size = sizeof(kSilentWave);
     return S_OK;
 }
 
 // 16: HRESULT XSpeechSynthesizerGetStreamData(stream, size_t size, void* buffer, size_t* used)
-HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void*, size_t size, void* buffer, size_t* used) {
-    if (!buffer || size < sizeof kSilentWave) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    std::memcpy(buffer, kSilentWave, sizeof kSilentWave);
-    if (used) *used = sizeof kSilentWave;
+HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void* stream, size_t size, void* buffer, size_t* used) {
+    HRESULT host_result;
+    if (stream && stream != &g_speech_stream_handle && buffer && used && call_host_speech<16>(host_result, stream, size, buffer, used)) return host_result;
+    if (used) *used = 0;
+    if (stream != &g_speech_stream_handle) return E_INVALIDARG;
+    if (!buffer || size < sizeof(kSilentWave)) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(buffer, kSilentWave, sizeof(kSilentWave));
+    if (used) *used = sizeof(kSilentWave);
     return S_OK;
 }
 
@@ -725,18 +772,18 @@ const void* const kAccessibilityVtable[] = {
     FN(accessibility_offline<7>),            // 7  XSpeechToTextSendString
     FN(speech_enumerate_voices),             // 8  XSpeechSynthesizerEnumerateInstalledVoices
     FN(speech_create),                       // 9  XSpeechSynthesizerCreate
-    FN(speech_accept),                       // 10 XSpeechSynthesizerCloseHandle
-    FN(speech_accept),                       // 11 XSpeechSynthesizerSetDefaultVoice
-    FN(speech_accept),                       // 12 XSpeechSynthesizerSetCustomVoice
-    FN(speech_create_stream),                // 13 XSpeechSynthesizerCreateStreamFromText
-    FN(speech_accept),                       // 14 XSpeechSynthesizerCloseStreamHandle
+    FN(speech_close_synth),                  // 10 XSpeechSynthesizerCloseHandle
+    FN(speech_set_default_voice),            // 11 XSpeechSynthesizerSetDefaultVoice
+    FN(speech_set_custom_voice),             // 12 XSpeechSynthesizerSetCustomVoice
+    FN(speech_create_stream<13>),                // 13 XSpeechSynthesizerCreateStreamFromText
+    FN(speech_close_stream),                 // 14 XSpeechSynthesizerCloseStreamHandle
     FN(speech_stream_size),                  // 15 XSpeechSynthesizerGetStreamDataSize
     FN(speech_stream_data),                  // 16 XSpeechSynthesizerGetStreamData
     FN(accessibility_offline<17>),           // 17 XSpeechToTextBeginHypothesisString
     FN(accessibility_offline<18>),           // 18 XSpeechToTextUpdateHypothesisString
     FN(accessibility_offline<19>),           // 19 XSpeechToTextFinalizeHypothesisString
     FN(accessibility_offline<20>),           // 20 XSpeechToTextCancelHypothesisString
-    FN(speech_create_stream),                // 21 XSpeechSynthesizerCreateStreamFromSsml
+    FN(speech_create_stream<21>),                // 21 XSpeechSynthesizerCreateStreamFromSsml
 };
 static_assert(std::size(kAccessibilityVtable) == 22, "IUnknown + IXAccessibilityImpl's 19 methods");
 ClassObject g_accessibility_object{kAccessibilityVtable};
@@ -751,32 +798,24 @@ constexpr char kLauncherName[] = "XLauncherImpl";
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
 
 // 3: HRESULT XLaunchUri(XUserHandle user, const char* uri): nothing is launched; E_FAIL.
-// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): keeps the host display on, as a
-//    deferral keeps the console's (ported from VIctory, victory-hle display.rs:79-123, GPL-3.0-or-later): the handle
-//    is a power request asking for the display, set until it is closed. Without one (the request refused) the call
-//    fails with the host's error and writes a null handle.
-// 5: XDisplayCloseTimeoutDeferralHandle(handle): clears and closes that request; a null handle is ignored.
-HRESULT host_error() {
-    const DWORD error = GetLastError();
-    return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
-}
-
+// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): Win32 display power request.
+// 5: void XDisplayCloseTimeoutDeferralHandle(XDisplayTimeoutDeferralHandle handle): clears and closes the request.
 HRESULT STDMETHODCALLTYPE launcher_acquire_deferral(void*, void** handle) {
-    if (!handle) return E_INVALIDARG;
+    if (!handle) return E_POINTER;
     *handle = nullptr;
-    wchar_t reason[] = L"Title display deferral";
-    REASON_CONTEXT context{};
-    context.Version = POWER_REQUEST_CONTEXT_VERSION;
-    context.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
-    context.Reason.SimpleReasonString = reason;
-    const HANDLE request = PowerCreateRequest(&context);
-    if (request == INVALID_HANDLE_VALUE) return host_error();
-    if (!PowerSetRequest(request, PowerRequestDisplayRequired)) {
-        const HRESULT hr = host_error();
-        CloseHandle(request);
-        return hr;
+    wchar_t reason[] = L"Title display timeout deferral";
+    REASON_CONTEXT ctx{};
+    ctx.Version = POWER_REQUEST_CONTEXT_VERSION;
+    ctx.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    ctx.Reason.SimpleReasonString = reason;
+    const HANDLE req = PowerCreateRequest(&ctx);
+    if (req == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    if (!PowerSetRequest(req, PowerRequestDisplayRequired)) {
+        const DWORD err = GetLastError();
+        CloseHandle(req);
+        return HRESULT_FROM_WIN32(err);
     }
-    *handle = request;
+    *handle = req;
     return S_OK;
 }
 

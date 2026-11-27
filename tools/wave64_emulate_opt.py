@@ -82,7 +82,7 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
 _MASK_WORD_READERS = frozenset({
     "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
     "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
-    "s_flbit_i32_b32", "s_flbit_i32",
+    "s_flbit_i32_b32", "s_flbit_i32_b64", "s_flbit_i32",
 })
 
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
@@ -138,8 +138,8 @@ _ALWAYS_BARRIER_OPS = frozenset({
     "s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
     "v_permlane16_b32", "v_permlanex16_b32",
     "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+    "ds_append", "ds_consume",
     "s_wqm_b32", "s_wqm_b64",
-    "ds_append", "ds_consume",      # two exchange rounds (rdna2spirv ds_append_wave64)
 })
 
 _VOTED_BRANCHES = frozenset({
@@ -680,6 +680,69 @@ def _scalar_liveness(active_blocks, succ):
     return _solve_scalar_liveness(use, kill, preds)
 
 
+def mark_vcc_data_moves(blocks, succ):
+    """Keep both words of scalar VCC copies used as data. Leave predicate copies in lane-mask form.
+
+    Look between full definitions. A predicate read, an uncertain partial write, or a live-out
+    at a block boundary prevents changing the producer. A wide SMEM load already writes both
+    physical words, so an ensuing scalar copy out of that tuple must also read both.
+    """
+    if not any(i["op"] == "s_mov_b64" and _lane_masks.wave32_vcc_pair_op(i["op"], i["args"])
+               for block in blocks for i in block):
+        return
+    vcc = 1 << _BIT_VCC
+    live = _scalar_liveness(blocks, succ)
+    for b, block in enumerate(blocks):
+        numeric_use = 0
+        unsafe = 3 if any(live[n] & vcc for n in succ[b]) else 0
+        for ins in reversed(block):
+            op, args = _lane_masks.base_op(ins["op"]), ins["args"]
+            rd, may_write, kill = _scalar_rw(ins)
+            if not (rd | may_write) & vcc:
+                continue
+            pair = op == "s_mov_b64" and _lane_masks.wave32_vcc_pair_op(op, args)
+            if pair and args[0].get("t") == "vcc" and numeric_use and not unsafe:
+                ins["vcc_data_pair"] = True
+            if kill & vcc:
+                unsafe = numeric_use = 0
+            elif may_write & vcc:
+                half = {"vcc_lo": 1, "vcc_hi": 2}.get(args[0].get("t")) if args else None
+                if half and op in ("s_mov_b32", "s_add_u32"):
+                    unsafe &= ~half
+                    numeric_use &= ~half
+                else:
+                    unsafe |= 3
+            if rd & vcc:
+                # The general liveness pass conservatively counts implicit VCC even with an
+                # explicit e64 predicate in another SGPR pair.
+                if op == "v_cndmask_b32" and len(args) == 4 and args[-1].get("t") != "vcc":
+                    if all(a.get("t") not in ("vcc_lo", "vcc_hi", "vcc") for a in args[1:]):
+                        continue
+                tuple_read = any(a["k"] == "slist" and "vcc_lo" in a["r"] and "vcc_hi" in a["r"]
+                                 for a in args[1:])
+                if tuple_read or (pair and args[1].get("t") == "vcc"):
+                    numeric_use |= 3
+                else:
+                    halves = {a.get("t") for a in args[1:]}
+                    words = (1 if "vcc_lo" in halves else 0) | (2 if "vcc_hi" in halves else 0)
+                    scalar_copy = op == "s_mov_b32" and args[0]["k"] == "sgpr"
+                    if words and (scalar_copy or op.startswith(("v_dot", "s_add_u32", "v_min_f32"))):
+                        numeric_use |= words
+                    else:
+                        unsafe |= 3
+
+        raw = False
+        for ins in block:
+            op, args = _lane_masks.base_op(ins["op"]), ins["args"]
+            _, may_write, kill = _scalar_rw(ins)
+            if raw and op == "s_mov_b64" and args[1].get("t") == "vcc" and args[0]["k"] == "sgpr":
+                ins["vcc_data_pair"] = True
+            if may_write & vcc:
+                raw = bool(kill & vcc and (
+                    ins.get("vcc_data_pair") or (op.startswith(("s_load_", "s_buffer_load_"))
+                                                 and (args[0]["k"] == "slist" or args[0].get("t") == "vcc"))))
+
+
 def _postdominators(succ):
     """Immediate post-dominator `ipdom[b]` (Cooper-Harvey-Kennedy on reversed CFG with virtual exit `n`)."""
     n = len(succ)
@@ -748,8 +811,19 @@ def _holds_lane_mask(ins, x, lm_map):
         t = x.get("t", "")
         return t.startswith("exec") or (t.startswith("vcc") and "vcc" in lm_map)
     if k == "sgpr":
-        return all(x["r"] + i in lm_map for i in range(x.get("n", 1)))
+        n = x.get("n", 1)
+        if n == 2:
+            # Gen.holds_lane_mask takes a pair as a mask when one word is a mask and the other a constant 0 / -1
+            # (s_mov_b32 s5, 0 after a v_cmp into s[4:5]). `lm_map` has no constants, so one mask word is enough
+            # here; a pair with a data word too is then over-approximated, which only costs a fold (old #4480).
+            return x["r"] in lm_map or x["r"] + 1 in lm_map
+        return all(x["r"] + i in lm_map for i in range(n))
     return False
+
+
+def _has_any_lane_mask_word(x, lm_map):
+    """True if `x` is an SGPR operand with at least one register holding a lane mask."""
+    return x.get("k") == "sgpr" and any(x["r"] + i in lm_map for i in range(x.get("n", 1)))
 
 
 def _is_mask_op(ins, x, lm_map):
@@ -786,6 +860,11 @@ def _x_memory_order_access(op):
     return kind, reads, writes
 
 
+def _vcc_pair_collects_mask(ins, masks):
+    return ins.get("vcc_data_pair") and any(
+        _holds_lane_mask(ins, x, masks.get(id(ins), {})) for x in ins["args"][1:])
+
+
 def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
     """Inspect non-terminator instructions of a block for lane-local region safety.
 
@@ -817,7 +896,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, _EMPTY_MEM_STATS, 0, (), ()
         flags = m[8]
         # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
-        if flags & _FLAG_FORBIDDEN_FOLD:
+        if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
             return False, _EMPTY_MEM_STATS, 0, (), ()
 
         acc = m[9]
@@ -863,7 +942,9 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
             else:  # _MASK_CHK_SCMP
                 lm = lane_masks.get(id(ins), {})
-                if any(_holds_lane_mask(ins, x, lm) for x in a):
+                if any(_holds_lane_mask(ins, x, lm) or
+                       (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                       for x in a):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
@@ -1024,70 +1105,8 @@ def _drop_tree_block(tree, b):
 
 
 def _unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
-    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths.
-
-    In `cfg_structure.structure`, every post-dominating join block `g` after a conditional diamond or loop is
-    still wrapped in `("guard", g, ...)`. Because `%pc` is a Function-scope variable in SPIR-V, LLVM/NVVM's
-    `SROA`/`Mem2Reg` promotes `%pc` at the same time as `%vgpr[0..255]` and `%sgpr[0..127]`, before `%pc == g`
-    can be constant-folded, forcing ~384 redundant Phi nodes at every spine guard merge block (and preventing
-    early block merging across convergent `OpControlBarrier`s).
-
-    Tracks the exact finite set `cur_pc` of values `%pc` can hold before each item in `tree`:
-      - `("block", b)` overwrites `%pc` with `out_pcs[b]`.
-      - `("guard", g, gbody)`: if `cur_pc == {g}`, `%pc == g` is tautologically true on every path reaching
-        this item, so the guard unwraps in place; otherwise `gbody` is processed starting from `{g}` and its
-        exit `%pc` set merges with the skip path `cur_pc - {g}`.
-      - `("loop", h, lbody)`: `lbody` is processed starting from `cur_pc | {h}`; exiting the loop proves
-        `%pc != h`, leaving `pc_after_lbody - {h}`.
-    """
-    root_out = []
-    stack = [[collections.deque(tree), root_out, {entry_pc}, None]]
-    while stack:
-        frame = stack[-1]
-        q, dst, cur_pc, tag = frame
-        if not q:
-            if len(stack) > 1 and tag[0] == "guard" and len(cur_pc) == 1:
-                nxt_g = next(iter(cur_pc))
-                skip_pc = tag[3]
-                parent_q = stack[-2][0]
-                if parent_q and parent_q[0][0] == "guard" and parent_q[0][1] == nxt_g and nxt_g not in skip_pc:
-                    for child in reversed(parent_q.popleft()[2]):
-                        q.appendleft(child)
-                    continue
-            stack.pop()
-            if not stack:
-                break
-            parent = stack[-1]
-            if tag[0] == "guard":
-                _, g, child_dst, skip_pc = tag
-                parent[1].append(("guard", g, child_dst))
-                parent[2] = skip_pc | cur_pc
-            else:
-                _, h, child_dst = tag
-                parent[1].append(("loop", h, child_dst))
-                parent[2] = cur_pc - {h}
-            continue
-        it = q.popleft()
-        kind = it[0]
-        if kind == "block":
-            b = it[1]
-            dst.append(it)
-            frame[2] = set(out_pcs[b])
-        elif kind == "guard":
-            g, gbody = it[1], it[2]
-            if cur_pc == {g}:
-                for child in reversed(gbody):
-                    q.appendleft(child)
-            else:
-                child_dst = []
-                skip_pc = set(cur_pc)
-                skip_pc.discard(g)
-                stack.append([collections.deque(gbody), child_dst, {g}, ("guard", g, child_dst, skip_pc)])
-        else:
-            h, lbody = it[1], it[2]
-            child_dst = []
-            stack.append([collections.deque(lbody), child_dst, set(cur_pc) | {h}, ("loop", h, child_dst)])
-    return root_out
+    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths."""
+    return cfg_structure.unwrap_known_pc_guards(tree, out_pcs, entry_pc=entry_pc)
 
 
 def _region_has_cycle(region, succ):
@@ -1116,18 +1135,12 @@ def _region_has_cycle(region, succ):
     return False
 
 
-def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset(), loops=None):
+def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset()):
     """Find safe lane-local `s_cbranch_execz`/`nz` regions to fold inline under --wave64-emulate.
 
     Allows read-only regions (including regions with internal scalar-counted loops) AND acyclic
     single-write-per-domain regions (at most one store/atomic touching `"mem"` or `"lds"` with no
     other access to that domain inside the region).
-
-    `loops` is rdna2spirv's --loop-limit state `(counted edge -> counter, block -> counters it resets, blocks that
-    leave the program at the cap)`. A fold runs only in the active lanes, with a block numbering of its own: a loop
-    inside the region keeps its counter (rdna2spirv counts its edges in that numbering), but no counted edge may
-    leave the head or the region, no block of it may leave the program at the cap, and a one-block region (emitted
-    without its branch) may not loop.
 
     Returns `(folds, fold_chain, absorbed)`:
       - `folds`: dict `head_block -> {"run": int, "skip": int, "region": frozenset[int],
@@ -1189,7 +1202,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 clean = False
                 continue
             flags = m[8]
-            if flags & _FLAG_FORBIDDEN_FOLD:
+            if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
                 clean = False
                 continue
             acc = m[9]
@@ -1238,7 +1251,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         continue
                 else:  # _MASK_CHK_SCMP
                     lm = lane_masks.get(id(ins), {})
-                    if any(_holds_lane_mask(ins, x, lm) for x in a):
+                    if any(_holds_lane_mask(ins, x, lm) or
+                           (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                           for x in a):
                         clean = False
                         continue
 
@@ -1280,7 +1295,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             u = work.pop()
             if u == skip or u in region:
                 continue
-            if u == b or u == 0 or not succ[u] or not blk_info[u][0]:
+            if (u == b or u == 0 or not succ[u] or not blk_info[u][0]
+                    or (len(raw_edges[u]) == 1 and terms[u][0] == "br" and terms[u][1] != "s_branch")):
                 ok = False
                 break
             region.add(u)
@@ -1326,20 +1342,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
 
     # Validate innermost regions first so nested s_cbranch_execz/nz inside an outer region are already verified.
     candidates.sort(key=lambda item: (item[0], item[1]))
-    loop_edges, _, loop_exits = loops if loops is not None else ({}, {}, frozenset())
-    counted_to = collections.defaultdict(set)
-    for u, w in loop_edges:
-        counted_to[u].add(w)
     valid = {}
     for _, b, run, skip, region, mem_stats in candidates:
-        # --loop-limit (see the docstring): a counted edge out of the region, or a lane leaving the program at the cap
-        # from inside it, needs the program's own block numbers and the scheduler.
-        if b in counted_to or not loop_exits.isdisjoint(region):
-            continue
-        if any(not counted_to[u] <= region for u in region if u in counted_to):
-            continue
-        if len(region) == 1 and run in counted_to:
-            continue
         ok = True
         for u in region:
             tkind, top = terms[u]
@@ -1466,7 +1470,7 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if meta[1]:
         return False
     flags = meta[8]
-    if flags & _FLAG_ALWAYS_BARRIER:
+    if flags & _FLAG_ALWAYS_BARRIER or _vcc_pair_collects_mask(ins, lane_masks):
         return True
     mask_chk = meta[11]
     if not mask_chk:
@@ -1484,7 +1488,9 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if mask_chk == _MASK_CHK_MBCNT:
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
     lm = lane_masks.get(id(ins), {})
-    return any(_holds_lane_mask(ins, x, lm) for x in a)
+    return any(_holds_lane_mask(ins, x, lm) or
+               (meta[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+               for x in a)
 
 
 def _insn_may_barrier(ins, lane_masks, scc_live):
@@ -1497,13 +1503,8 @@ def _dirty_conflicts(dirty, reads, writes):
             or any((k, "r") in dirty or (k, "w") in dirty for k in writes))
 
 
-def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes,
-                              exits=frozenset()):
+def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes):
     """Plan structured --wave64-emulate emission eliminating the giant global round-loop OpSwitch.
-
-    `exits` are the blocks that leave the program when a loop reaches --loop-limit (rdna2spirv's loop_exits): each
-    counts as an early `s_endpgm`, so a wave that stops there is left to a scheduler, which counts it done, instead
-    of skipping a barrier the other waves wait at, and `%pc` may hold the end (-1) after it.
 
     - Single-wave workgroups (`x_lanes == 64`): every reducible CFG emits 100% inline structured SPIR-V
       with direct workgroup barriers (`0` OpSwitch cases, `0` x_spill variables, `0` scheduler atomics).
@@ -1549,23 +1550,26 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         eff_succ[b] = nxt
         eff_succ_compact.append([eff_idx[s] for s in nxt])
 
-    compact_tree = cfg_structure.structure(eff_succ_compact)
-    if compact_tree is None:
-        return None
-    tree = _map_tree_ids(compact_tree, eff_blocks)
-
     out_pcs = {}
     for b in eff_blocks:
         tail = chain_of[b][-1]
         s = set(eff_succ[b])
-        if not s or tail in exits:
-            s.add(-1)
+        if not s:
+            s.add(cfg_structure.END)
         elif tail not in folds and len(raw_edges[tail]) == 1:
             last = active_blocks[tail][-1] if active_blocks[tail] else None
             op = base_op(last["op"]) if last is not None else None
             if op in BRANCHES and op != "s_branch":
-                s.add(-1)
+                s.add(cfg_structure.END)
         out_pcs[b] = frozenset(s)
+    compact_out_pcs = {
+        eff_idx[b]: frozenset(eff_idx[p] if p != cfg_structure.END else cfg_structure.END for p in pcs)
+        for b, pcs in out_pcs.items()
+    }
+    compact_tree = cfg_structure.structure(eff_succ_compact, out_pcs=compact_out_pcs)
+    if compact_tree is None:
+        return None
+    tree = _map_tree_ids(compact_tree, eff_blocks)
     tree = _unwrap_known_pc_guards(tree, out_pcs, eff_blocks[0])
 
     # Precompute per-superblock instruction summaries (for dirty transfer, sync-free check, s_barrier, s_endpgm).
@@ -1653,7 +1657,7 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
                 for k in fd["mem_writes"]:
                     gen_dirty |= _DIRTY_LDS_W if k == "lds" else _DIRTY_MEM_W
         sb_has_sbarrier[b] = has_sb
-        sb_has_endpgm[b] = has_end or any(cur in exits for cur in chain)
+        sb_has_endpgm[b] = has_end
         sb_may_barrier[b] = may_bar
         sb_mem_stats[b] = (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)
         sb_clears_dirty[b] = clears_dirty
@@ -1737,13 +1741,6 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         if any(sb_has_endpgm[u] for u in it_blocks):
             saw_endpgm = True
 
-    # Multi-wave soundness guard: any `s_barrier` inside a non-top-level guard/loop must stay in global x_scheduler
-    # so waves on different paths can meet at different s_barrier sites (cs_barrier_divergent).
-    for it in flat_top:
-        if it[0] != "block":
-            if any(sb_has_sbarrier[u] for u in _blocks_in_tree(it)):
-                return None
-
     def check_sync_free(it):
         sub_blocks = _blocks_in_tree(it)
         has_loop = _tree_has_loop([it])
@@ -1789,7 +1786,10 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
             cur_dirty = sb_gen_dirty[b] if sb_clears_dirty[b] else (cur_dirty | sb_gen_dirty[b])
             steps.append(("inline_block", b))
             continue
-        if has_end:
+        # An `s_barrier` under a guard or in a loop: waves on different paths meet at different sites
+        # (cs_barrier_divergent), which only the round scheduler models. Every wave enters the tail in the same
+        # round, and what ran before it has no `s_barrier` that is not reached by the whole workgroup.
+        if has_end or (it[0] != "block" and any(sb_has_sbarrier[u] for u in it_blocks)):
             # Early s_endpgm inside a wave-divergent guard/loop (or non-final block): hand remaining tail to x_scheduler.
             rem = set()
             for rem_it in flat_top[idx_it:]:

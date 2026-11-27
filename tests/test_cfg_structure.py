@@ -5,7 +5,6 @@
 Random graphs, random branch outcomes. For each graph the tree is interpreted and compared with a plain walk of
 the graph that makes the same choices. Irreducible graphs must be refused (None), reducible ones must not be.
 """
-import collections
 from functools import cache
 import os
 import random
@@ -147,10 +146,17 @@ def _check_random_graphs():
         loops += '"loop"' in repr(tree).replace("'", '"')
         placed = blocks_in(tree)
         assert len(placed) == len(set(placed)), f"a block is placed twice: {succ}"
+        out_pcs = {b: (set(succ[b]) if succ[b] else {S.END}) for b in range(len(succ))}
+        utree = S.unwrap_known_pc_guards(tree, out_pcs)
+        uplaced = blocks_in(utree)
+        assert len(uplaced) == len(set(uplaced)) and set(uplaced) == set(placed), (
+            f"unwrap changed block set for {succ}: {placed} vs {uplaced}")
         for seed in range(6):
             want = walk(succ, chooser(succ, seed), 200)
             got = S.run(tree, chooser(succ, seed), 200)
             assert got == want, f"graph {succ} seed {seed}: tree ran {got}, graph runs {want}"
+            ugot = S.run(utree, chooser(succ, seed), 200)
+            assert ugot == want, f"unwrapped graph {succ} seed {seed}: tree ran {ugot}, graph runs {want}"
     assert structured > 5000 and refused > 1000 and loops > 2000, (structured, refused, loops)
     assert split_ok > 1000 and split_ok + split_cap == refused, (split_ok, split_cap, refused)
     return structured, refused, loops, split_ok, split_cap
@@ -248,125 +254,42 @@ def test_deep_sequential_chains_stay_flat_and_iterative():
         assert got == want
 
 
-def capped_walk(succ, loops, choose, limit, max_steps):
-    """Walk the graph as rdna2spirv's --loop-limit runs it: a block resets the counters of the loops it enters, a
-    counted edge is taken only while its counter + 1 < limit (and counts), a blocked way takes the block's other
-    way, and a block with no way left ends the walk. Returns (blocks run, how it ended)."""
-    edge_loop = {e: k for k, (counted, _, _) in enumerate(loops) for e in counted}
-    resets = collections.defaultdict(list)
-    for k, (_, rs, _) in enumerate(loops):
-        for u in rs:
-            resets[u].append(k)
-    count = [0] * len(loops)
-    b, steps = 0, 0
-    while steps < max_steps:
-        steps += 1
-        for k in resets[b]:
-            count[k] = 0
-        if not succ[b]:
-            return steps, "end"
-        want = choose(b)
-        order = [want] + [w for w in succ[b] if w != want]
-        for w in order:
-            k = edge_loop.get((b, w))
-            if k is None:
-                break
-            if count[k] + 1 < limit:
-                count[k] += 1
-                break
-        else:
-            return steps, "cap"
-        b = w
-    return steps, "runaway"
+def test_unwrap_known_pc_guards():
+    def unwrap(succ, out_pcs=None):
+        if out_pcs is None:
+            out_pcs = {b: (set(succ[b]) if succ[b] else {S.END}) for b in range(len(succ))}
+        tree = S.structure(succ, out_pcs=out_pcs)
+        assert tree is not None
+        return S.unwrap_known_pc_guards(tree, out_pcs)
 
-
-def acyclic(succ, removed):
-    """Whether the blocks reachable from 0 form no cycle once the edges in `removed` are left out."""
-    state = {}
-    for start in [0]:
-        stack = [(start, iter(succ[start]))]
-        state[start] = 1
-        while stack:
-            v, it = stack[-1]
-            for w in it:
-                if (v, w) in removed:
-                    continue
-                if state.get(w) == 1:
-                    return False
-                if w not in state:
-                    state[w] = 1
-                    stack.append((w, iter(succ[w])))
-                    break
-            else:
-                state[v] = 2
-                stack.pop()
-    return True
-
-
-def test_loop_counters_bound_every_cycle():
-    """cfg_structure.loop_counters (--loop-limit): the counted edges cut every cycle, no block of a loop resets
-    its counter, every way into a loop passes a reset block, and in a reducible graph the counted edges are the
-    back edges. A walk that picks the looping way wherever it can then ends within a bound."""
-    rng = random.Random(20261125)
-    irreducible = 0
-    for case in range(6000):
-        succ = random_graph(rng)
-        loops = S.loop_counters(succ)
-        counted_all = set().union(*(c for c, _, _ in loops)) if loops else set()
-        assert acyclic(succ, counted_all), f"a cycle has no counted edge in {succ}"
-        reach, work = {0}, [0]
-        while work:
-            for w in succ[work.pop()]:
-                if w not in reach:
-                    reach.add(w)
-                    work.append(w)
-        for counted, resets, blocks in loops:
-            assert resets.isdisjoint(blocks), succ
-            assert all(u in blocks and w in blocks for u, w in counted), succ
-            for u in reach:
-                for w in succ[u]:
-                    if w in blocks and u not in blocks:
-                        assert u in resets, succ
-        if S.structure(succ) is not None:
-            _, back, _ = S._order(succ)
-            assert counted_all == set(back), f"counted edges are not the back edges of {succ}: {loops}"
-            for counted, _, _ in loops:
-                assert len({w for _, w in counted}) == 1, f"a natural loop has one header: {succ}"
-        else:
-            irreducible += 1
-        for seed in range(3):
-            pick = random.Random(f"{case}/{seed}")
-            steps, how = capped_walk(succ, loops, lambda b: pick.choice(succ[b]), 3, 200_000)
-            assert how != "runaway", f"capped walk did not end on {succ}"
-    assert irreducible > 100
-
-
-def test_loop_counters_shapes():
-    # nested natural loops: outer header 1 (back edge 4 -> 1), inner header 2 (back edge 3 -> 2)
-    loops = S.loop_counters([[1], [2], [3], [2, 4], [1, 5], []])
-    assert [(set(c), set(r)) for c, r, _ in loops] == [({(4, 1)}, {0}), ({(3, 2)}, {1})]
-    # a block that loops to itself, and the entry block as a loop header (nothing resets it: it starts at 0)
-    assert [(set(c), set(r)) for c, r, _ in S.loop_counters([[1], [1, 2], []])] == [({(1, 1)}, {0})]
-    assert [(set(c), set(r)) for c, r, _ in S.loop_counters([[0, 1], []])] == [({(0, 0)}, set())]
-    # a loop with two entries (1 and 2, both reached from 0): one counter, both edges into an entry counted
-    assert [(set(c), set(r)) for c, r, _ in S.loop_counters([[1, 2], [2], [1, 3], []])] == \
-        [({(1, 2), (2, 1)}, {0})]
-    assert S.loop_counters([[1], [2], []]) == []
-    # the walk: a loop that never exits by itself (1 -> 1 always) stops after limit - 1 back edges
-    steps, how = capped_walk([[1], [1, 2], []], S.loop_counters([[1], [1, 2], []]), lambda b: 1, 128, 10_000)
-    assert (steps, how) == (1 + 128 + 1, "end")
-    # a jump back with the exit elsewhere (1 -> 2 -> 1, 2's only way is back): at the cap the walk leaves
-    succ = [[1], [3, 2], [1], []]
-    steps, how = capped_walk(succ, S.loop_counters(succ), lambda b: 2 if b == 1 else succ[b][0], 4, 10_000)
-    assert how == "cap" and steps == 1 + 2 * 4
+    # Single-arm if-then (ms_wave_info_s3 shape: 0 -> {2, 1}, 1 -> {2}, 2 -> []): join block 2 unwraps to top level.
+    assert unwrap([[2, 1], [2], []]) == [("block", 0), ("guard", 1, [("block", 1)]), ("block", 2)]
+    # Diamond (0 -> {1, 2}, 1 -> {3}, 2 -> {3}, 3 -> []): join block 3 unwraps to top level.
+    assert unwrap([[1, 2], [3], [3], []]) == [("block", 0), ("guard", 2, [("block", 2)]),
+                                              ("guard", 1, [("block", 1)]), ("block", 3)]
+    # Loop exit (0 -> {0, 1}, 1 -> []): block 1 unwraps to top level because exiting loop 0 proves pc == 1.
+    assert unwrap([[0, 1], []]) == [("loop", 0, [("block", 0)]), ("block", 1)]
+    # Early exit in arm 1 (0 -> {1, 2}, 1 -> [], 2 -> []): both arms MUST remain guarded (pc may be END).
+    assert unwrap([[1, 2], [], []]) == [("block", 0), ("guard", 2, [("block", 2)]), ("guard", 1, [("block", 1)])]
+    # Conditional branch in the last block with no s_endpgm after it (fallthrough writes END):
+    # loop body block 2 has succ [0] but out_pcs {0, END}, so exiting loop 0 leaves pc in {1, END};
+    # guard 1 MUST stay so falling off the end does not execute block 1.
+    assert unwrap([[2, 1], [], [0]], out_pcs={0: {2, 1}, 1: {S.END}, 2: {0, S.END}}) == [
+        ("loop", 0, [("block", 0), ("guard", 2, [("block", 2)])]),
+        ("guard", 1, [("block", 1)]),
+    ]
+    # Non-loop conditional branch falling off the end whose single explicit target is immediately dominated by it:
+    # block 2 has succ [1] and out_pcs {1, END}, so structure() and unwrap MUST both keep guard 1.
+    assert unwrap([[2], [], [1]], out_pcs={0: {2}, 1: {S.END}, 2: {1, S.END}}) == [
+        ("block", 0), ("block", 2), ("guard", 1, [("block", 1)]),
+    ]
 
 
 if __name__ == "__main__":
     test_depth()
     test_shapes()
-    test_loop_counters_shapes()
-    test_loop_counters_bound_every_cycle()
     test_deep_sequential_chains_stay_flat_and_iterative()
+    test_unwrap_known_pc_guards()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
     print(f"ok: {structured} graphs structured and run, {refused} irreducible "
           f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")

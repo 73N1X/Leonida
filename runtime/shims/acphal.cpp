@@ -1,26 +1,17 @@
-// acphal.dll: Audio Control Processor HAL. Scalable Hardware Audio Processing Engine (SHAPE) and APU (Audio Processing
-// Unit) memory, and the audio coprocessor's command and message queues, for Xbox Series.
+// acphal.dll: Audio Control Processor HAL. Scalable Hardware Audio Processing Engine
+// (SHAPE) and APU (Audio Processing Unit) physical memory management for Xbox Series.
 //
-// On a PC there is no SHAPE/ACP hardware and APU physical memory does not exist. This shim creates the APU heap from
-// process memory and manages allocations within it; the SHAPE context arrays get device addresses of their own.
+// Provides:
+//   - A VirtualAlloc-backed APU heap (cached + non-cached) with 32-bit device addresses;
+//   - SHAPE context arrays sized to the documented GDK strides;
+//   - The IAcpHal command and message queue (registration, completion, disconnect,
+//     flowgraph acknowledgement, and APU notification word writes);
+//   - A background XMA2 decoder pumping enabled SHAPE_XMA_CONTEXT output rings.
 //
-// The coprocessor and the XMA decoder are ported from VIctory (crates/victory-hle/src/modules/audio.rs),
-// GPL-3.0-or-later, by Marvisak and contributors (DexNom fork); Leonida is GPL-3.0-or-later. VIctory ran the title with
-// them; its command ids, message layout and SHAPE_CONTEXTS size are kept:
-//   - IAcpHal (AcpHalCreate): every command completes at once and is acknowledged as the hardware would. Message
-//     registrations take effect, a flowgraph completes unprocessed, a command with an id posts COMMAND_COMPLETED, and
-//     its notification word is set. fmod's console build sets up the coprocessor inside System_Create and waits there
-//     for its first command to be acknowledged.
-//   - XMA: enabled XMA contexts are decoded on a thread of ours into their output rings, like the hardware does
-//     (src/xma_context.h, src/xma_decode.h); the title uses only XMA contexts.
-//   SHAPE's other units (rate conversion, EQ, filters, mixing through flowgraphs) are not emulated, so voices that need
-//   them stay silent: their commands are acknowledged, not carried out (each kind is logged once). Mixed audio leaves
-//   through the host's WASAPI, which the title's middleware reaches through COM like on PC (com_shim.cpp forwards
-//   CoCreateInstance to the host), as in VIctory.
-//
-// Signatures from the public GDK reference (devdocs.xbox.com): AcpHal, APU reference, SHAPE_CONTEXTS, APU_ADDRESS.
+// Signatures from the public GDK reference (devdocs.xbox.com):
+//   AcpHal, APU reference, SHAPE_CONTEXTS, APU_ADDRESS.
 // Measured call-site shapes and findings from the retail executable (1.0.2.1):
-//   - docs/audio_hal_exe_calls.md, docs/retail_boot_chain.md, docs/retail_boot_frame_loop.md (Stop 28)
+//   - docs/retail_boot_chain.md, docs/retail_boot_frame_loop.md (Stop 28)
 //   - PR #6885 (call sites and parameter analysis), PR #7009 (audio/HAL bring-up).
 
 #include <windows.h>
@@ -29,29 +20,50 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <optional>
 #include <set>
+#include <shared_mutex>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
-#include <utility>
+#include <vector>
 
-#include "../src/xma_context.h"
 #include "shims.h"
 #include "startup_trace.h"
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+#include "leonida_xma2_decoder.h"
+#endif
 
 namespace {
 
+// ---- APU_ADDRESS (from the GDK) ----
+
+// The console APU uses a 40-bit physical address space.
+// On PC we translate to a 32-bit APU address offset.
+struct APU_ADDRESS {
+    uint64_t value;  // 40-bit physical address
+};
+
 // ---- SHAPE context structures (from the public GDK documentation at devdocs.xbox.com) ----
 //
-// These structures are defined here with their documented GDK field layouts so that sizeof() returns the correct
-// per-context byte count: the stride of the arrays the title indexes.
+// These structures are defined here with their documented GDK field layouts so that
+// sizeof() returns the correct per-context byte count. Without the real layouts the
+// empty structs would be 1 byte each, and the title's writes (e.g. memset with the
+// real stride) would overflow the allocation.
 
 // UINT32 bitfields packed into 32-bit words
 struct SHAPE_SRC_CONTEXT {
@@ -130,31 +142,9 @@ struct SHAPE_DMA_CONTEXT {
 static_assert(sizeof(SHAPE_DMA_CONTEXT) == 16, "SHAPE_DMA_CONTEXT is 16 bytes per GDK");
 
 struct SHAPE_XMA_CONTEXT {
-    uint32_t sizeRead0 : 12;
-    uint32_t numLoops : 8;
-    uint32_t validBuffer : 2;
-    uint32_t sizeWrite : 5;
-    uint32_t offsetWrite : 5;
-    uint32_t sizeRead1 : 12;
-    uint32_t sequenceNumber : 12;
-    uint32_t stopSampleAddress : 8;
-    uint32_t subframeOffset : 4;
-    uint32_t reserved0 : 1;
-    uint32_t isLooping : 1;
-    uint32_t subframeSkip : 2;
-    uint32_t packetMetadata : 16;
-    uint32_t currentByteOffset : 26;
-    uint32_t reserved1 : 6;
-    uint32_t loopStartOffset : 26;
-    uint32_t loopEndOffset : 6;
-    // The bit fields above fill five dwords (the third holds 24 bits, so currentByteOffset starts a new one) = 20
-    // bytes. The GDK's size is 64, so 11 reserved dwords follow, not 10 (with 10 the struct was 60 bytes and the
-    // assert below failed on MSVC). Only the size (the array stride) is used here; the XMA decoder reads the words as
-    // VIctory documents them (src/xma_context.h), not these fields.
-    uint32_t reserved[11];
+    uint32_t words[16];  // See the shared word layout above the XMA engine.
 };
 static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
-static_assert(sizeof(SHAPE_XMA_CONTEXT) == rt::xma::kContextBytes);
 
 struct SHAPE_PCM_CONTEXT {
     uint32_t timestamp : 21;
@@ -173,19 +163,11 @@ struct SHAPE_PCM_CONTEXT {
     uint32_t reserved6 : 15;
     uint32_t format : 2;
     uint32_t reserved7 : 14;
-    // Six dwords of bit fields (24 bytes); the GDK's size is 32, so two reserved dwords, not one (28 bytes failed
-    // the assert below). As for SHAPE_XMA_CONTEXT, only the size (the array stride) is used.
-    uint32_t reserved[2];
+    uint32_t reserved[2];  // the GDK's 32-byte context: the published field list leaves one trailing word
 };
 static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE_PCM_CONTEXT is 32 bytes per GDK");
 
-// Device addresses are 32 bits: ApuAlloc gives one through a 32-bit out parameter, ApuMapVirtualAddress returns one
-// and ApuMapApuAddress takes one, and the executable stores and passes them as 32-bit values
-// (docs/audio_hal_exe_calls.md). VIctory measured SHAPE_CONTEXTS at 0x60 bytes (audio.rs ShapeContexts, asserted in
-// its startup_as_fmod_does_it test): six counts, six arrays, six 32-bit device addresses. With 64-bit addresses (120
-// bytes, as this file had them) the shim wrote 24 bytes past the title's structure.
-using APU_ADDRESS = uint32_t;
-
+// The SHAPE_CONTEXTS structure (from the GDK)
 struct SHAPE_CONTEXTS {
     uint32_t numSrcContexts;
     uint32_t numEqCompContexts;
@@ -206,47 +188,35 @@ struct SHAPE_CONTEXTS {
     APU_ADDRESS apuXmaContextArray;
     APU_ADDRESS apuPcmContextArray;
 };
-static_assert(sizeof(SHAPE_CONTEXTS) == 0x60, "SHAPE_CONTEXTS is 0x60 bytes (VIctory audio.rs)");
+
+static_assert(sizeof(SHAPE_CONTEXTS) == 120, "SHAPE_CONTEXTS is 120 bytes per GDK");
 static_assert(offsetof(SHAPE_CONTEXTS, xmaContextArray) == 0x38,
               "xmaContextArray is at offset +0x38 per retail binary measurement");
-static_assert(offsetof(SHAPE_CONTEXTS, apuSrcContextArray) == 0x48);
-
-// Bytes per context: the GDK sizes above, or VIctory's bounds where those are larger (audio.rs CONTEXT_BYTES: rate
-// conversion, DMA and XMA as fmod clears them, generous bounds for the units not seen yet). More than the stride only
-// leaves room at an array's end.
-constexpr std::array<size_t, 6> kContextBytes = {
-    std::max<size_t>(sizeof(SHAPE_SRC_CONTEXT), 32),    std::max<size_t>(sizeof(SHAPE_EQCOMP_CONTEXT), 256),
-    std::max<size_t>(sizeof(SHAPE_FILTVOL_CONTEXT), 256), std::max<size_t>(sizeof(SHAPE_DMA_CONTEXT), 16),
-    std::max<size_t>(sizeof(SHAPE_XMA_CONTEXT), 64),    std::max<size_t>(sizeof(SHAPE_PCM_CONTEXT), 256),
-};
 
 // ---- Startup trace helper ----
 
-void trace_call(const char* api, const std::string& detail) {
+void trace_call(const char* api, std::string_view detail = {}) noexcept try {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
     static std::set<std::string> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert(std::string(api) + detail).second) return;
+        if (!seen.insert(std::string(api).append(detail)).second) return;
     }
     rt::startup_trace::event("acphal",
-                             std::string("\"api\":\"") + api + "\"" + detail);
+                             (std::string("\"api\":\"") + api + "\"").append(detail));
+} catch (...) {
+    // Tracing cannot change the result of a guest-facing call.
 }
 
-// ---- The APU heap ----
-//
-// Device addresses: the cached heap from 0x40000000, the non-cached heap after it from the next 64 KiB boundary (so a
-// device address is aligned as its host address is), and the SHAPE context arrays from 0x10000000. Every buffer,
-// ring and array the title hands the coprocessor maps back (ApuMapApuAddress), and the XMA decoder reaches input and
-// output buffers by their device addresses.
+// ---- Genuine APU Heap Implementation ----
 
 constexpr uint32_t kApuBaseAddress = 0x40000000u;
-constexpr uint32_t kContextApuBase = 0x10000000u;
-constexpr uint64_t kContextApuSpan = kApuBaseAddress - kContextApuBase;
-constexpr uint64_t kApuRegionAlign = 0x10000;
+constexpr uint64_t kApuRegionAlignment = 0x10000u;
 
-constexpr uint64_t round_up(uint64_t v, uint64_t align) { return (v + align - 1) & ~(align - 1); }
+uint64_t align_apu_region(uint64_t size) {
+    return (size + kApuRegionAlignment - 1) & ~(kApuRegionAlignment - 1);
+}
 
 struct ApuRegion {
     void* base = nullptr;
@@ -274,17 +244,16 @@ struct ApuRegion {
                                      reinterpret_cast<uintptr_t>(base));
     }
 
-    void* from_offset(uint64_t offset) const {
+    void* from_offset(uint32_t offset) const {
         if (offset >= size) return nullptr;
         return static_cast<uint8_t*>(base) + offset;
     }
 
-    // Whether one live block holds all of [offset, offset + len).
-    bool holds(uint64_t offset, size_t len) const {
-        auto it = blocks.upper_bound(static_cast<uint32_t>(offset));
-        if (it == blocks.begin()) return false;
-        --it;
-        return offset + len <= static_cast<uint64_t>(it->first) + it->second;
+    uint8_t* span_from_offset(uint32_t offset, std::size_t len) const {
+        if (!base || len == 0 || offset >= size) return nullptr;
+        const uint64_t remaining = size - offset;
+        if (len > remaining) return nullptr;
+        return static_cast<uint8_t*>(base) + offset;
     }
 
     void* allocate(uint32_t alloc_size, uint32_t alignment, uint32_t* out_offset) {
@@ -321,382 +290,821 @@ struct ApuRegion {
     }
 };
 
-struct Heap {
-    std::mutex mutex;
-    bool created = false;
-    ApuRegion cached;
-    ApuRegion noncached;
-    ApuRegion contexts;  // the SHAPE context arrays, one block each
-    bool contexts_allocated = false;
+std::mutex g_apu_mutex;
+bool g_apu_heap_created = false;
+ApuRegion g_cached_heap;
+ApuRegion g_noncached_heap;
 
-    uint32_t noncached_apu() const {
-        return kApuBaseAddress + static_cast<uint32_t>(round_up(cached.size, kApuRegionAlign));
-    }
-
-    struct Mapped {
-        ApuRegion* region;
-        uint32_t apu;  // the device address of the region's first byte
-    };
-    std::array<Mapped, 3> regions() {
-        return {{{&cached, kApuBaseAddress}, {&noncached, noncached_apu()}, {&contexts, kContextApuBase}}};
-    }
+// Tracked SHAPE context arrays
+struct ShapeArrayFree {
+    void operator()(void* array) const noexcept { std::free(array); }
 };
 
-// Immortal: the XMA decoding thread reads it until the process ends, also while static destructors run.
-Heap& heap() {
-    static Heap* h = new Heap;
-    return *h;
-}
+using ShapeAllocation = std::array<std::unique_ptr<void, ShapeArrayFree>, 6>;
 
-// Serializes allocating and releasing the context arrays, which also attach and detach the XMA voices. Taken before
-// the heap's lock and the XMA engine's, never inside them.
-std::mutex& contexts_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+std::mutex g_shape_mutex;
+std::vector<ShapeAllocation> g_shape_allocations;
 
-// `len` bytes at a device address when one live block holds them all (VIctory's heap_bytes), else null.
-uint8_t* apu_bytes(uint32_t apu, size_t len) {
-    Heap& h = heap();
-    std::lock_guard lock(h.mutex);
-    for (const auto& m : h.regions()) {
-        const ApuRegion& r = *m.region;
-        if (!r.base || apu < m.apu || apu - m.apu >= r.size) continue;
-        const uint64_t offset = apu - m.apu;
-        return r.holds(offset, len) ? static_cast<uint8_t*>(r.base) + offset : nullptr;
+// Resolves a contiguous [apu, apu + len) byte range inside the APU heap.
+uint8_t* apu_span(uint32_t apu, std::size_t len) {
+    if (apu < kApuBaseAddress || len == 0) return nullptr;
+    std::lock_guard lock(g_apu_mutex);
+    const uint32_t offset = apu - kApuBaseAddress;
+    if (g_cached_heap.base && offset < g_cached_heap.size) {
+        return g_cached_heap.span_from_offset(offset, len);
+    }
+    if (g_noncached_heap.base) {
+        const uint64_t cached_span = align_apu_region(g_cached_heap.size);
+        if (offset >= cached_span && offset - cached_span < g_noncached_heap.size) {
+            return g_noncached_heap.span_from_offset(
+                static_cast<uint32_t>(offset - cached_span), len);
+        }
     }
     return nullptr;
 }
 
-// ---- The XMA decoder ----
+// ---- ACP Command / Message Protocol Constants ----
 
-void wake_decoder();
+constexpr uint32_t kCmdLoadFlowgraph = 1;
+constexpr uint32_t kCmdRegisterMessages = 2;
+constexpr uint32_t kCmdUnregisterMessages = 3;
+constexpr uint32_t kCmdEnableXma = 5;
+constexpr uint32_t kCmdEnableXmas = 6;
+constexpr uint32_t kCmdDisableXma = 7;
+constexpr uint32_t kCmdDisableXmas = 8;
+constexpr uint32_t kCmdAdvanceXmaRead = 18;
 
-// Immortal, for the same reason as the heap.
-rt::xma::Engine& xma_engine() {
-    static auto* engine = new rt::xma::Engine(&apu_bytes, &wake_decoder);
-    return *engine;
-}
+constexpr uint32_t kMsgFlowgraphCompleted = 0x02u;
+constexpr uint32_t kMsgCommandCompleted = 0x10u;
+constexpr uint32_t kMsgDisconnected = 0x80u;
 
-// Starts the decoding thread on the first enabled voice, and has it fill rings now: a voice just enabled or read from.
-// Otherwise it looks every 2 ms; a 256-byte output block lasts 2.7 ms at 48 kHz mono.
-void wake_decoder() {
-    static const HANDLE event = []() -> HANDLE {
-        const HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!e) {
-            std::fprintf(stderr, "[rt] acphal: no event for the XMA decoding thread (error %lu): XMA voices stay silent\n",
-                         GetLastError());
-            return nullptr;
+// 128 samples per audio frame at 48 kHz = 375 audio frames/second.
+constexpr uint64_t kAudioFramesPerSecond = 375;
+
+// ---- XMA2 Hardware Context Decoder Engine ----
+//
+// Each 64-byte SHAPE_XMA_CONTEXT holds 16 32-bit words shared with the title:
+//   Word 0: input 0 packets (0..11), loop count (12..19, 255 = forever),
+//           valid input bits (20..21), output ring blocks (22..26), write block (27..31).
+//   Word 1: input 1 packets (0..11), loop end subframe (12..13), loop start skip subframes
+//           (17..19), initial skip subframes (24..26), rate index (27..28: 24/32/44.1/48 kHz),
+//           stereo (29), output writable (31).
+//   Word 2: read bit offset (0..25), error status (26..30), error flag (31).
+//   Word 3: loop start bit offset (0..25).
+//   Word 4: loop end bit offset (0..25), current input buffer index (31).
+//   Word 5: input 0 APU address.
+//   Word 6: input 1 APU address.
+//   Word 7: output ring APU address.
+//   Word 8: overlap buffer APU address.
+//   Word 9: output read block index (0..4).
+//
+// Packets are decoded by the Rust decoder in runtime/xma_decoder when CMake found cargo (LEONIDA_HAVE_XMA2_DECODER);
+// otherwise each packet becomes silence for its frame count. The read offset (word 2) and the loop points (words 3
+// and 4) are used per 2048-byte packet, so the loop-end subframe (word 1 bits 12..13) is not applied.
+
+constexpr std::size_t kXmaBlockBytes = 256;
+constexpr std::size_t kXmaSamplesPerBlock = kXmaBlockBytes / 2;
+constexpr std::size_t kXmaPacketBytes = 2048;
+constexpr std::size_t kXmaPacketBits = kXmaPacketBytes * 8;
+constexpr std::size_t kXmaSubframeSamples = 128;
+constexpr std::size_t kXmaFrameSamples = 512;
+constexpr uint32_t kXmaErrorInputInvalid = 4;
+
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+constexpr uint32_t kXmaRates[4] = {24000, 32000, 44100, 48000};
+struct Xma2DecoderFree {
+    void operator()(LeonidaXma2Decoder* d) const noexcept { leonida_xma2_decoder_destroy(d); }
+};
+struct Xma2PcmFree {
+    void operator()(LeonidaXma2PcmBlock* b) const noexcept { leonida_xma2_pcm_destroy(b); }
+};
+#endif
+
+struct XmaContextView {
+    uint32_t* words = nullptr;
+
+    uint32_t get(std::size_t index) const { return std::atomic_ref(words[index]).load(); }
+
+    uint32_t field(std::size_t index, uint32_t shift, uint32_t bits) const {
+        const uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+        return (get(index) >> shift) & mask;
+    }
+
+    uint32_t set_field(std::size_t index, uint32_t shift, uint32_t bits, uint32_t value) const {
+        const uint32_t raw_mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+        const uint32_t mask = raw_mask << shift;
+        const uint32_t field_value = (value << shift) & mask;
+        std::atomic_ref word(words[index]);
+        uint32_t previous = word.load();
+        while (!word.compare_exchange_weak(previous, (previous & ~mask) | field_value)) {}
+        return previous;
+    }
+
+};
+
+struct XmaVoice {
+    explicit XmaVoice(uint32_t format_bits) : pcm(0), format(format_bits) {}
+    std::size_t channels() const { return 1u + (format >> 2); }
+    std::size_t queued_samples() const { return pcm.size() - pcm_read; }
+
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+    std::unique_ptr<LeonidaXma2Decoder, Xma2DecoderFree> decoder;
+#endif
+    std::vector<int16_t> pcm;
+    std::size_t pcm_read = 0;
+    std::size_t loop_skip = 0;  // samples per channel to drop after a rewind
+    uint32_t format;  // SHAPE word 1 bits 27..29, rate and channel layout
+    bool ended = false;
+};
+
+struct XmaVoiceSlot {
+    std::mutex mutex;
+    std::optional<XmaVoice> voice;
+};
+
+class XmaEngine {
+public:
+    ~XmaEngine() { unbind(); }
+
+    void bind(SHAPE_XMA_CONTEXT* array, uint32_t count) {
+        // Construct with a size so MSVC's Debug iterator allocations can also fail
+        // through this call instead of the noexcept default constructor.
+        std::vector<std::unique_ptr<XmaVoiceSlot>> slots(count);
+        for (auto& slot : slots) slot = std::make_unique<XmaVoiceSlot>();
+        unbind();
+        std::unique_lock lock(table_mutex_);
+        array_ = array;
+        voices_.swap(slots);
+    }
+
+    void unbind() {
+        {
+            std::unique_lock lock(table_mutex_);
+            array_ = nullptr;
+            voices_.clear();
+            active_count_.store(0, std::memory_order_relaxed);
         }
-        try {
-            std::thread([e] {
-                for (;;) {
-                    xma_engine().pump();
-                    WaitForSingleObject(e, 2);
+        // Once detached, commands cannot start a worker for this table.
+        stop_worker();
+    }
+
+    bool handle_command(uint32_t command, const void* config) {
+        auto read_word = [config](std::size_t index) -> uint32_t {
+            if (!config) return 0u;
+            uint32_t value = 0;
+            std::memcpy(&value, static_cast<const uint8_t*>(config) + index * sizeof(uint32_t),
+                        sizeof(uint32_t));
+            return value;
+        };
+
+        switch (command) {
+            case kCmdEnableXma:
+                if (config) enable(read_word(0));
+                return true;
+            case kCmdDisableXma:
+                if (config) disable(read_word(0));
+                return true;
+            case kCmdEnableXmas:
+            case kCmdDisableXmas: {
+                std::shared_lock lock(table_mutex_);
+                const std::size_t count = voices_.size();
+                lock.unlock();
+                if (!config) return true;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const uint32_t bits = read_word(i / 32);
+                    if ((bits & (1u << (i % 32))) != 0) {
+                        if (command == kCmdEnableXmas) {
+                            enable(static_cast<uint32_t>(i));
+                        } else {
+                            disable(static_cast<uint32_t>(i));
+                        }
+                    }
                 }
-            }).detach();
-        } catch (const std::system_error& error) {
-            std::fprintf(stderr, "[rt] acphal: the XMA decoding thread did not start (%s): XMA voices stay silent\n",
-                         error.what());
-            CloseHandle(e);
-            return nullptr;
+                return true;
+            }
+            case kCmdAdvanceXmaRead:
+                if (config) advance_read(read_word(0), read_word(1));
+                return true;
+            default:
+                return false;
         }
-        std::fprintf(stderr, "[rt] acphal: XMA decoding thread started\n");
-        return e;
-    }();
-    if (event) SetEvent(event);
-}
+    }
 
-// ---- The audio coprocessor (IAcpHal) ----
+    void enable(uint32_t index) {
+        std::shared_lock table_lock(table_mutex_);
+        XmaContextView ctx = context_locked(index);
+        if (!ctx.words) return;
 
-constexpr uint32_t kLoadFlowgraph = 1;
-constexpr uint32_t kRegisterMessages = 2;
-constexpr uint32_t kUnregisterMessages = 3;
+        {
+            std::lock_guard slot_lock(voices_[index]->mutex);
+            auto& voice = voices_[index]->voice;
+            const uint32_t format = ctx.field(1, 27, 3);
+            // The worker cannot access the voice until the slot is unlocked.
+            ensure_worker_and_wake();
+            if (!voice) {
+                voice.emplace(format);
+                active_count_.fetch_add(1, std::memory_order_relaxed);
+            } else if (voice->format != format) {
+                voice->pcm.clear();
+                voice->pcm_read = 0;
+                voice->loop_skip = 0;
+                voice->format = format;
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+                voice->decoder.reset();
+#endif
+            }
+            voice->ended = false;
+            ctx.set_field(2, 26, 6, 0);
+        }
+    }
 
-constexpr uint32_t kFlowgraphCompleted = 0x02;
-constexpr uint32_t kCommandCompleted = 0x10;
-constexpr uint32_t kDisconnected = 0x80;
+    void disable(uint32_t index) {
+        std::shared_lock table_lock(table_mutex_);
+        if (index >= voices_.size()) return;
+        std::lock_guard slot_lock(voices_[index]->mutex);
+        if (voices_[index]->voice.has_value()) {
+            voices_[index]->voice.reset();
+            active_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
 
-// Audio frames of 128 samples at 48 kHz.
-constexpr uint64_t kFramesPerSecond = 375;
+    void advance_read(uint32_t index, uint32_t blocks) {
+        std::shared_lock table_lock(table_mutex_);
+        XmaContextView ctx = context_locked(index);
+        if (!ctx.words) return;
+
+        bool wake = false;
+        {
+            std::lock_guard slot_lock(voices_[index]->mutex);
+            const uint32_t size = ctx.field(0, 22, 5);
+            if (size == 0) return;
+            const uint32_t read = (ctx.field(9, 0, 5) + blocks % size) % size;
+            ctx.set_field(9, 0, 5, read);
+            if (blocks > 0) {
+                ctx.set_field(1, 31, 1, 1);
+            }
+            wake = voices_[index]->voice.has_value();
+        }
+        if (wake) ensure_worker_and_wake();
+    }
+
+private:
+    XmaContextView context_locked(uint32_t index) const {
+        if (!array_ || index >= voices_.size()) return {};
+        return XmaContextView{array_[index].words};
+    }
+
+    // Appends interleaved s16 for one 2048-byte packet. Without the Rust decoder, or when it
+    // fails, the packet becomes silence for its frame count (header bits 26..31) so timing holds.
+    static void decode_packet(XmaVoice& voice, const uint8_t* bytes) {
+        const std::size_t channels = voice.channels();
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        if (!voice.decoder) {
+            LeonidaXma2Decoder* raw = nullptr;
+            if (leonida_xma2_decoder_create_hardware(kXmaRates[voice.format & 3u],
+                                                     static_cast<uint32_t>(channels), &raw) == LEONIDA_XMA2_OK) {
+                voice.decoder.reset(raw);
+            }
+        }
+        if (voice.decoder) {
+            LeonidaXma2PcmBlock* raw = nullptr;
+            if (leonida_xma2_decode_buffer(voice.decoder.get(), bytes, kXmaPacketBytes, &raw) == LEONIDA_XMA2_OK) {
+                const std::unique_ptr<LeonidaXma2PcmBlock, Xma2PcmFree> block(raw);
+                const int16_t* samples = leonida_xma2_pcm_data(block.get());
+                const std::size_t count = leonida_xma2_pcm_sample_count(block.get());
+                if (count != 0) voice.pcm.insert(voice.pcm.end(), samples, samples + count);
+                return;
+            }
+            voice.decoder.reset();  // Resume with a clean state after replacing a packet with silence.
+        }
+#endif
+        voice.pcm.resize(voice.pcm.size() + static_cast<std::size_t>(bytes[0] >> 2) * kXmaFrameSamples * channels);
+    }
+
+    // Decodes the packet at the read offset of the current input buffer and queues its PCM.
+    // Offsets and loop points are used per packet: a loop plays its end packet in full and
+    // restarts at the start of the packet holding the loop start.
+    static bool decode_one_packet(XmaContextView ctx, XmaVoice& voice) {
+        if (voice.ended) return false;
+
+        const std::size_t channels = voice.channels();
+        uint32_t current = ctx.field(4, 31, 1);
+        const uint32_t valid = ctx.field(0, 20, 2);
+
+        if (valid == 0) {
+            voice.ended = true;
+            ctx.set_field(2, 26, 6, kXmaErrorInputInvalid | 32u);
+            return voice.queued_samples() != 0;
+        }
+        if ((valid & (1u << current)) == 0) {
+            current ^= 1u;
+            ctx.set_field(4, 31, 1, current);
+        }
+
+        const uint32_t address = (current == 0) ? ctx.get(5) : ctx.get(6);
+        const std::size_t packets = (current == 0) ? ctx.field(0, 0, 12) : ctx.field(1, 0, 12);
+        const std::size_t packet = ctx.field(2, 0, 26) / kXmaPacketBits;
+        const uint8_t* data = apu_span(address & ~0x7FFu, packets * kXmaPacketBytes);
+        if (!data || packet >= packets) {
+            finish_input(ctx, current, packet >= packets ? packet - packets : 0);
+            return true;
+        }
+
+        const uint8_t* packet_data = data + packet * kXmaPacketBytes;
+        const uint8_t packet_skip = packet_data[3];
+        // Decoding is only requested when less than a ring block remains. Keep that
+        // tail and reuse the packet storage as the voice consumes subsequent packets.
+        voice.pcm.erase(voice.pcm.begin(), voice.pcm.begin() + static_cast<std::ptrdiff_t>(voice.pcm_read));
+        voice.pcm_read = 0;
+        const std::size_t packet_start = voice.pcm.size();
+        decode_packet(voice, packet_data);
+        const std::size_t packet_samples = voice.pcm.size() - packet_start;
+        const std::size_t subframe_samples = kXmaSubframeSamples * channels;
+        const std::size_t initial_skip = ctx.field(1, 24, 3);
+        const std::size_t skipped_subframes = std::min(initial_skip, packet_samples / subframe_samples);
+        const std::size_t initial_samples = skipped_subframes * subframe_samples;
+        const std::size_t loop_samples = std::min(voice.loop_skip * channels, packet_samples - initial_samples);
+        const std::size_t skip_samples = initial_samples + loop_samples;
+        if (skip_samples != 0) {
+            const auto first = voice.pcm.begin() + static_cast<std::ptrdiff_t>(packet_start);
+            voice.pcm.erase(first, first + static_cast<std::ptrdiff_t>(skip_samples));
+        }
+        // Update the context only after the PCM append succeeds.
+        if (skipped_subframes != 0) {
+            ctx.set_field(1, 24, 3, static_cast<uint32_t>(initial_skip - skipped_subframes));
+        }
+        voice.loop_skip -= loop_samples / channels;
+
+        // XMA2 packet headers link packets from the same stream; 0xff ends the chain.
+        std::size_t next = packet_skip == 0xFFu ? packets : packet + 1 + packet_skip;
+        const uint32_t loops = ctx.field(0, 12, 8);
+        const std::size_t loop_end = ctx.field(4, 0, 26);
+        if (loops > 0 && loop_end != 0 && packet == loop_end / kXmaPacketBits) {
+            next = ctx.field(3, 0, 26) / kXmaPacketBits;
+            voice.loop_skip = static_cast<std::size_t>(ctx.field(1, 17, 3)) * kXmaSubframeSamples;
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+            // A frame spilling out of the loop-end packet does not continue in the loop-start packet:
+            // start a fresh decoder there rather than decode the spliced bits.
+            voice.decoder.reset();
+#endif
+            if (loops != 255u) ctx.set_field(0, 12, 8, loops - 1u);
+        }
+        if (next >= packets) {
+            finish_input(ctx, current, next - packets);
+        } else {
+            ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits));
+        }
+        return true;
+    }
+
+    static void finish_input(XmaContextView ctx, uint32_t current,
+                             std::size_t skip_packets) {
+        // Publish the next offset before telling the title it can refill this input.
+        ctx.set_field(2, 0, 26, static_cast<uint32_t>(skip_packets * kXmaPacketBits));
+        const uint32_t other = 1u - current;
+        const uint32_t retired = ctx.set_field(0, 20 + current, 1, 0);
+        // Take the other input if it was queued at retirement. Otherwise a double
+        // refill of the empty pair starts at input 0. A lone input can still run.
+        ctx.set_field(4, 31, 1, (retired & (1u << (20 + other))) != 0 ? other : 0u);
+    }
+
+    static void pump_voice(XmaContextView ctx, XmaVoice& voice) {
+        const uint32_t size = ctx.field(0, 22, 5);
+        if (size == 0 || ctx.field(1, 31, 1) == 0) return;
+        auto* ring = apu_span(ctx.get(7), size * kXmaBlockBytes);
+        if (!ring) return;
+
+        for (uint32_t blocks = 0; blocks < size && ctx.field(1, 31, 1) == 1; ++blocks) {
+            int decode_guard = 0;
+            while (voice.queued_samples() < kXmaSamplesPerBlock && decode_guard++ < 16) {
+                if (!decode_one_packet(ctx, voice)) break;
+            }
+            if (voice.queued_samples() == 0) return;
+
+            const uint32_t write = ctx.field(0, 27, 5) % size;
+            uint8_t* out = ring + write * kXmaBlockBytes;
+
+            for (std::size_t i = 0; i < kXmaSamplesPerBlock; ++i) {
+                int16_t sample = 0;
+                if (voice.pcm_read != voice.pcm.size()) {
+                    sample = voice.pcm[voice.pcm_read++];
+                }
+                const uint16_t raw = static_cast<uint16_t>(sample);
+                out[2 * i] = static_cast<uint8_t>(raw & 0xFFu);
+                out[2 * i + 1] = static_cast<uint8_t>((raw >> 8) & 0xFFu);
+            }
+
+            const uint32_t next_write = (write + 1u) % size;
+            ctx.set_field(0, 27, 5, next_write);
+            if (next_write == ctx.field(9, 0, 5) % size) {
+                ctx.set_field(1, 31, 1, 0);
+            }
+        }
+    }
+
+    void pump_all() {
+        std::shared_lock table_lock(table_mutex_);
+        if (!array_) return;
+        for (std::size_t i = 0; i < voices_.size(); ++i) {
+            std::lock_guard slot_lock(voices_[i]->mutex);
+            auto& voice = voices_[i]->voice;
+            if (!voice) continue;
+            auto ctx = context_locked(static_cast<uint32_t>(i));
+            try {
+                pump_voice(ctx, *voice);
+            } catch (const std::bad_alloc&) {
+                // Only this voice failed. Retire it and allow the title to enable it again.
+                voice.reset();
+                active_count_.fetch_sub(1, std::memory_order_relaxed);
+                ctx.set_field(2, 26, 6, kXmaErrorInputInvalid | 32u);
+            }
+        }
+    }
+
+    void ensure_worker_and_wake() {
+        std::lock_guard lock(worker_mutex_);
+        if (!worker_.joinable()) {
+            worker_ = std::jthread([this](std::stop_token stop) { worker_loop(stop); });
+        }
+        wake_requested_ = true;
+        worker_cv_.notify_one();
+    }
+
+    // Each worker owns its stop_token, so a stop only ever reaches the thread it was
+    // sent to; a worker started after this call is unaffected by it.
+    void stop_worker() {
+        std::jthread to_join;
+        {
+            std::lock_guard lock(worker_mutex_);
+            if (!worker_.joinable()) return;
+            worker_.request_stop();
+            worker_cv_.notify_all();
+            to_join = std::move(worker_);
+        }
+        if (to_join.joinable()) to_join.join();
+    }
+
+    void worker_loop(std::stop_token stop) {
+        for (;;) {
+            {
+                std::unique_lock lock(worker_mutex_);
+                if (stop.stop_requested()) return;
+                if (active_count_.load(std::memory_order_relaxed) == 0 && !wake_requested_) {
+                    worker_cv_.wait(lock, stop, [this]() { return wake_requested_; });
+                    if (stop.stop_requested()) return;
+                }
+                wake_requested_ = false;
+            }
+
+            pump_all();
+
+            std::unique_lock lock(worker_mutex_);
+            if (stop.stop_requested()) return;
+            if (!wake_requested_ && active_count_.load(std::memory_order_relaxed) > 0) {
+                // One 256-byte output block lasts ~2.67 ms at 48 kHz mono.
+                worker_cv_.wait_for(lock, stop, std::chrono::milliseconds(2),
+                                    [this]() { return wake_requested_; });
+            }
+        }
+    }
+
+    mutable std::shared_mutex table_mutex_;
+    SHAPE_XMA_CONTEXT* array_ = nullptr;
+    std::vector<std::unique_ptr<XmaVoiceSlot>> voices_;
+    std::atomic<uint32_t> active_count_{0};
+
+    std::mutex worker_mutex_;
+    std::condition_variable_any worker_cv_;
+    std::jthread worker_;
+    bool wake_requested_ = false;
+};
+
+XmaEngine g_xma_engine;
+
+// ---- IAcpHal Interface Implementation ----
 
 #pragma pack(push, 1)
-struct Message {
-    uint32_t kind;
-    uint32_t dropped;
-    uint32_t usec;
-    uint8_t data[16];
+struct AcpMessage {
+    uint32_t kind = 0;
+    uint32_t dropped = 0;
+    uint32_t usec = 0;
+    uint8_t data[16]{};
 };
 #pragma pack(pop)
-static_assert(sizeof(Message) == 28, "a coprocessor message is 28 bytes (VIctory audio.rs)");
+static_assert(sizeof(AcpMessage) == 28, "AcpMessage is 28 bytes");
 
-// The interface object: its method table, then our state.
-struct Acp {
-    const void* const* vtable;
-    std::mutex mutex;
-    bool connected = false;
-    uint32_t mask = 0;  // message kinds the title registered for
-    std::deque<Message> messages;
-    size_t capacity = 0;   // queue size given to Connect
-    uint32_t dropped = 0;  // messages lost to a full queue since the last one queued
-    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+void write_u32_le(uint8_t* dst, uint32_t value) {
+    dst[0] = static_cast<uint8_t>(value & 0xFFu);
+    dst[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+    dst[2] = static_cast<uint8_t>((value >> 16) & 0xFFu);
+    dst[3] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+}
 
-    uint64_t usec() const {
-        return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count());
-    }
+void write_u64_le(uint8_t* dst, uint64_t value) {
+    write_u32_le(dst, static_cast<uint32_t>(value & 0xFFFFFFFFu));
+    write_u32_le(dst + 4, static_cast<uint32_t>(value >> 32));
+}
 
-    uint32_t frame() const { return static_cast<uint32_t>(usec() * kFramesPerSecond / 1'000'000); }
-
-    // Queues a registered message; a full queue drops it and counts it in the next one that fits.
-    void post(uint32_t kind, const void* data, size_t size) {
-        if ((mask & kind) == 0) return;
-        if (messages.size() >= capacity) {
-            if (dropped != UINT32_MAX) ++dropped;
-            return;
-        }
-        Message message{};
-        message.kind = kind;
-        message.dropped = std::exchange(dropped, 0);
-        message.usec = static_cast<uint32_t>(usec());
-        if (data) std::memcpy(message.data, data, std::min(size, sizeof message.data));
-        messages.push_back(message);
-    }
+struct IAcpHal {
+    virtual HRESULT __stdcall connect(uint32_t commands, uint32_t messages) = 0;
+    virtual HRESULT __stdcall disconnect() = 0;
+    virtual HRESULT __stdcall submit_command(uint32_t cmd, uint64_t id, uint32_t frame,
+                                             const void* config, uint32_t notification) = 0;
+    virtual uint32_t __stdcall pop_message(void* out) = 0;
+    virtual uint32_t __stdcall get_num_messages() = 0;
+    virtual HRESULT __stdcall release() = 0;
 };
 
-// Each command kind once: whether it was carried out or only acknowledged.
-void note_command(uint32_t command, bool carried_out) {
-    static std::atomic<uint64_t> seen{0};
-    if (command >= 64) return;
-    const uint64_t bit = uint64_t{1} << command;
-    if (seen.fetch_or(bit, std::memory_order_relaxed) & bit) return;
-    std::fprintf(stderr, "[rt] acphal: first coprocessor command %u: %s\n", command,
-                 carried_out ? "carried out" : "acknowledged, not carried out");
-    trace_call("AcpHal::SubmitCommand",
-               ",\"command\":" + std::to_string(command) + ",\"carried_out\":" + (carried_out ? "true" : "false"));
-}
+struct AcpHalImpl final : IAcpHal {
+    std::mutex mutex_;
+    bool connected_ = false;
+    uint32_t mask_ = 0;
+    std::deque<AcpMessage> messages_;
+    std::size_t capacity_ = 0;
+    uint32_t dropped_ = 0;
+    std::chrono::steady_clock::time_point since_ = std::chrono::steady_clock::now();
 
-// Slot 0. The title connects at boot with (0x1000, 0x1000) and checks the result.
-HRESULT __stdcall acp_connect(Acp* self, uint32_t commands, uint32_t messages) {
-    if (commands == 0) return E_INVALIDARG;
-    std::lock_guard lock(self->mutex);
-    self->connected = true;
-    self->capacity = messages;
-    trace_call("AcpHal::Connect", ",\"commands\":" + std::to_string(commands) +
-                                      ",\"messages\":" + std::to_string(messages));
-    return S_OK;
-}
+    uint64_t elapsed_usec_locked() const {
+        const auto dt = std::chrono::steady_clock::now() - since_;
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(dt).count());
+    }
 
-// Slot 1.
-HRESULT __stdcall acp_disconnect(Acp* self) {
-    std::lock_guard lock(self->mutex);
-    if (!self->connected) return E_FAIL;
-    self->post(kDisconnected, nullptr, 0);
-    self->connected = false;
-    trace_call("AcpHal::Disconnect", "");
-    return S_OK;
-}
+    uint32_t audio_frame_locked() const {
+        return static_cast<uint32_t>((elapsed_usec_locked() * kAudioFramesPerSecond) / 1000000ull);
+    }
 
-// Slot 2. Done at once: message registrations take effect, a flowgraph completes unprocessed, XMA commands drive the
-// decoder, a command with an id is acknowledged, and its notification word is set. The title's first call is
-// (2, 0xf0f0f0f0, -1, config, 0), and a negative result is fatal to it (an int3 at +0x43ad94e).
-HRESULT __stdcall acp_submit(Acp* self, uint32_t command, uint64_t id, uint32_t /*frame*/, const void* data,
-                             uint32_t notification) {
-    // The command's data starts with these 32-bit fields.
-    const auto word = [data](size_t at) -> uint32_t {
-        uint32_t v = 0;
-        if (data) std::memcpy(&v, static_cast<const uint8_t*>(data) + at * 4, sizeof v);
-        return v;
-    };
-    std::lock_guard lock(self->mutex);
-    bool carried_out = true;
-    switch (command) {
-        case kRegisterMessages: self->mask |= word(0); break;
-        case kUnregisterMessages: self->mask &= ~word(0); break;
-        case kLoadFlowgraph: {
-            const uint32_t flowgraph = word(1);
-            self->post(kFlowgraphCompleted, &flowgraph, sizeof flowgraph);
-            break;
+    void post_locked(uint32_t kind, const uint8_t* payload, std::size_t len) {
+        if ((mask_ & kind) == 0) return;
+        if (messages_.size() >= capacity_) {
+            if (dropped_ < UINT32_MAX) ++dropped_;
+            return;
         }
-        default:
-            // Context updates and the other SHAPE units' commands are acknowledged but not carried out.
-            carried_out = xma_engine().command(command, data);
-            break;
+        AcpMessage msg{};
+        msg.kind = kind;
+        msg.dropped = dropped_;
+        msg.usec = static_cast<uint32_t>(elapsed_usec_locked());
+        if (payload && len > 0) {
+            std::memcpy(msg.data, payload, std::min(len, sizeof(msg.data)));
+        }
+        try {
+            messages_.push_back(msg);
+            dropped_ = 0;
+        } catch (const std::bad_alloc&) {
+            if (dropped_ < UINT32_MAX) ++dropped_;
+        }
     }
-    note_command(command, carried_out);
-    if (id != 0) {
-        uint8_t done[16];
-        const uint32_t frame = self->frame();
-        std::memcpy(done, &command, 4);
-        std::memcpy(done + 4, &id, 8);
-        std::memcpy(done + 12, &frame, 4);
-        self->post(kCommandCompleted, done, sizeof done);
+
+    // Slot 0: Connect (called at boot with (0x1000, 0x1000), result checked)
+    HRESULT __stdcall connect(uint32_t commands, uint32_t messages) override {
+        trace_call("AcpHal::Connect", "");
+        if (commands == 0) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        connected_ = true;
+        capacity_ = messages;
+        return S_OK;
     }
-    if (notification != 0) {
-        // A 32-bit word in a heap block, which the title reads as volatile.
-        if (uint8_t* word_at = apu_bytes(notification, 4)) *reinterpret_cast<volatile uint32_t*>(word_at) = 1;
+
+    // Slot 1: Disconnect (called at shutdown)
+    HRESULT __stdcall disconnect() override {
+        trace_call("AcpHal::Disconnect", "");
+        std::lock_guard lock(mutex_);
+        if (!connected_) return E_FAIL;
+        post_locked(kMsgDisconnected, nullptr, 0);
+        connected_ = false;
+        return S_OK;
     }
-    return S_OK;
-}
 
-// Slot 3.
-bool __stdcall acp_pop_message(Acp* self, Message* out) {
-    std::lock_guard lock(self->mutex);
-    if (self->messages.empty()) return false;
-    const Message message = self->messages.front();
-    self->messages.pop_front();
-    if (out) std::memcpy(out, &message, sizeof message);  // the title passes room for one message
-    return true;
-}
+    // Slot 2: SubmitCommand
+    // Acknowledges command completion, updates registered message masks, dispatches
+    // XMA voice commands, and writes any requested APU notification word.
+    HRESULT __stdcall submit_command(uint32_t cmd, uint64_t id, uint32_t frame,
+                                     const void* config, uint32_t notification) override try {
+        (void)frame;
+        auto read_word = [config](std::size_t index) -> uint32_t {
+            if (!config) return 0u;
+            uint32_t value = 0;
+            std::memcpy(&value, static_cast<const uint8_t*>(config) + index * sizeof(uint32_t),
+                        sizeof(uint32_t));
+            return value;
+        };
 
-// Slot 4.
-uint32_t __stdcall acp_message_count(Acp* self) {
-    std::lock_guard lock(self->mutex);
-    return static_cast<uint32_t>(self->messages.size());
-}
+        const bool handled_xma = g_xma_engine.handle_command(cmd, config);
+        {
+            std::lock_guard lock(mutex_);
+            if (!handled_xma) {
+                switch (cmd) {
+                    case kCmdRegisterMessages:
+                        mask_ |= read_word(0);
+                        break;
+                    case kCmdUnregisterMessages:
+                        mask_ &= ~read_word(0);
+                        break;
+                    case kCmdLoadFlowgraph: {
+                        uint8_t payload[4];
+                        write_u32_le(payload, read_word(1));
+                        post_locked(kMsgFlowgraphCompleted, payload, sizeof(payload));
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+            if (id != 0) {
+                uint8_t done[16];
+                write_u32_le(done, cmd);
+                write_u64_le(done + 4, id);
+                write_u32_le(done + 12, audio_frame_locked());
+                post_locked(kMsgCommandCompleted, done, sizeof(done));
+            }
+        }
 
-// Slot 5. VIctory's returns nothing; S_OK is what a caller that reads rax anyway sees.
-HRESULT __stdcall acp_release(Acp* self) {
-    trace_call("AcpHal::Release", "");
-    delete self;
-    return S_OK;
-}
+        if (notification != 0) {
+            if (uint8_t* word_bytes = apu_span(notification, sizeof(uint32_t))) {
+                if ((reinterpret_cast<uintptr_t>(word_bytes) & 3u) == 0) {
+                    *reinterpret_cast<volatile uint32_t*>(word_bytes) = 1u;
+                } else {
+                    static constexpr uint8_t kOneLe[4] = {1, 0, 0, 0};
+                    volatile uint8_t* dst = word_bytes;
+                    for (std::size_t i = 0; i < 4; ++i) dst[i] = kOneLe[i];
+                }
+            }
+        }
 
-const void* const kAcpVtable[] = {
-    reinterpret_cast<const void*>(&acp_connect),     reinterpret_cast<const void*>(&acp_disconnect),
-    reinterpret_cast<const void*>(&acp_submit),      reinterpret_cast<const void*>(&acp_pop_message),
-    reinterpret_cast<const void*>(&acp_message_count), reinterpret_cast<const void*>(&acp_release),
+        trace_call("AcpHal::SubmitCommand", "");
+        return S_OK;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (const std::system_error&) {
+        return E_FAIL;
+    }
+
+    // Slot 3: PopMessage — returns 0 without touching `out` when the queue is empty.
+    uint32_t __stdcall pop_message(void* out) override {
+        std::lock_guard lock(mutex_);
+        if (messages_.empty()) return 0u;
+        const AcpMessage msg = messages_.front();
+        messages_.pop_front();
+        if (out) std::memcpy(out, &msg, sizeof(msg));
+        return 1u;
+    }
+
+    // Slot 4: GetNumMessages
+    uint32_t __stdcall get_num_messages() override {
+        std::lock_guard lock(mutex_);
+        return static_cast<uint32_t>(messages_.size());
+    }
+
+    // Slot 5: Release
+    HRESULT __stdcall release() override {
+        trace_call("AcpHal::Release", "");
+        delete this;
+        return S_OK;
+    }
 };
 
 // ---- AcpHalCreate ----
 
 HRESULT __stdcall AcpHalCreate(void** ppAcpHal) {
     if (!ppAcpHal) return E_POINTER;
-    *ppAcpHal = new Acp{kAcpVtable};
+    *ppAcpHal = nullptr;
+    try {
+        *ppAcpHal = new AcpHalImpl();
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
     trace_call("AcpHalCreate", "");
     return S_OK;
 }
 
 // ---- AcpHalAllocateShapeContexts ----
 
-// Once until released, as in VIctory: the XMA decoder works on the one XMA array.
 HRESULT __stdcall AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx) {
     if (!ctx) return E_POINTER;
-    const std::lock_guard serial(contexts_mutex());
-    Heap& h = heap();
-    const uint32_t counts[6] = {ctx->numSrcContexts, ctx->numEqCompContexts, ctx->numFiltVolContexts,
-                                ctx->numDmaContexts, ctx->numXmaContexts, ctx->numPcmContexts};
-    void* arrays[6] = {};
-    uint32_t apu[6] = {};
-    {
-        std::lock_guard lock(h.mutex);
-        if (h.contexts_allocated) return E_FAIL;
-        uint64_t offsets[6] = {};
-        uint64_t total = 0;
-        for (size_t i = 0; i < 6; ++i) {
-            offsets[i] = total;
-            total += round_up(uint64_t{counts[i]} * kContextBytes[i], 256);
-        }
-        if (total > kContextApuSpan) return E_OUTOFMEMORY;
-        if (total > 0) {
-            void* base = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (!base) return E_OUTOFMEMORY;  // zeroed
-            h.contexts.base = base;
-            h.contexts.size = total;
-            for (size_t i = 0; i < 6; ++i) {
-                if (counts[i] == 0) continue;
-                h.contexts.blocks.emplace(static_cast<uint32_t>(offsets[i]),
-                                          static_cast<uint32_t>(uint64_t{counts[i]} * kContextBytes[i]));
-                arrays[i] = static_cast<uint8_t*>(base) + offsets[i];
-                apu[i] = kContextApuBase + static_cast<uint32_t>(offsets[i]);
-            }
-        }
-        h.contexts_allocated = true;
-    }
-    ctx->srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(arrays[0]);
-    ctx->eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(arrays[1]);
-    ctx->filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(arrays[2]);
-    ctx->dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(arrays[3]);
-    ctx->xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(arrays[4]);
-    ctx->pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(arrays[5]);
-    ctx->apuSrcContextArray = apu[0];
-    ctx->apuEqCompContextArray = apu[1];
-    ctx->apuFiltVolContextArray = apu[2];
-    ctx->apuDmaContextArray = apu[3];
-    ctx->apuXmaContextArray = apu[4];
-    ctx->apuPcmContextArray = apu[5];
-    xma_engine().attach(static_cast<uint32_t*>(arrays[4]), counts[4]);
 
-    trace_call("AcpHalAllocateShapeContexts",
-               ",\"src\":" + std::to_string(counts[0]) + ",\"dma\":" + std::to_string(counts[3]) +
-                   ",\"xma\":" + std::to_string(counts[4]) + ",\"pcm\":" + std::to_string(counts[5]));
+    std::lock_guard lock(g_shape_mutex);
+
+    ShapeAllocation pending{};
+    std::size_t array_index = 0;
+    auto alloc_array = [&](uint32_t count, size_t elem_size) -> void* {
+        if (count == 0) return nullptr;
+        void* ptr = std::calloc(count, elem_size);
+        if (!ptr) throw std::bad_alloc();
+        pending[array_index++].reset(ptr);
+        return ptr;
+    };
+
+    SHAPE_CONTEXTS result{};
+    result.numSrcContexts = ctx->numSrcContexts;
+    result.numEqCompContexts = ctx->numEqCompContexts;
+    result.numFiltVolContexts = ctx->numFiltVolContexts;
+    result.numDmaContexts = ctx->numDmaContexts;
+    result.numXmaContexts = ctx->numXmaContexts;
+    result.numPcmContexts = ctx->numPcmContexts;
+    try {
+        result.srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(
+            alloc_array(result.numSrcContexts, sizeof(SHAPE_SRC_CONTEXT)));
+        result.eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(
+            alloc_array(result.numEqCompContexts, sizeof(SHAPE_EQCOMP_CONTEXT)));
+        result.filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(
+            alloc_array(result.numFiltVolContexts, sizeof(SHAPE_FILTVOL_CONTEXT)));
+        result.dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(
+            alloc_array(result.numDmaContexts, sizeof(SHAPE_DMA_CONTEXT)));
+        result.xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(
+            alloc_array(result.numXmaContexts, sizeof(SHAPE_XMA_CONTEXT)));
+        result.pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
+            alloc_array(result.numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
+
+        // Assign synthetic APU addresses to the host-side context arrays.
+        result.apuSrcContextArray = {result.srcContextArray ? kApuBaseAddress : 0};
+        result.apuEqCompContextArray = {result.eqCompContextArray ? kApuBaseAddress + 0x1000 : 0};
+        result.apuFiltVolContextArray = {result.filtVolContextArray ? kApuBaseAddress + 0x2000 : 0};
+        result.apuDmaContextArray = {result.dmaContextArray ? kApuBaseAddress + 0x3000 : 0};
+        result.apuXmaContextArray = {result.xmaContextArray ? kApuBaseAddress + 0x4000 : 0};
+        result.apuPcmContextArray = {result.pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
+
+        g_shape_allocations.reserve(g_shape_allocations.size() + 1);
+        if (result.xmaContextArray) g_xma_engine.bind(result.xmaContextArray, result.numXmaContexts);
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
+
+    // Both the backing arrays and the engine's slots are now fully allocated.
+    g_shape_allocations.push_back(std::move(pending));
+    *ctx = result;
+    if (rt::startup_trace::enabled()) {
+        try {
+            trace_call("AcpHalAllocateShapeContexts",
+                       ",\"src\":" + std::to_string(result.numSrcContexts) +
+                       ",\"xma\":" + std::to_string(result.numXmaContexts) +
+                       ",\"pcm\":" + std::to_string(result.numPcmContexts));
+        } catch (const std::bad_alloc&) {
+            // The allocation succeeded. A missing diagnostic does not invalidate it.
+        }
+    }
     return S_OK;
 }
 
 // ---- AcpHalReleaseShapeContexts ----
 
-// Takes no arguments, as in VIctory: the title passes a handle read from AcpHalCreate's global
-// (docs/audio_hal_exe_calls.md), which is not a SHAPE_CONTEXTS to write to.
-HRESULT __stdcall AcpHalReleaseShapeContexts() {
-    const std::lock_guard serial(contexts_mutex());
-    Heap& h = heap();
-    {
-        std::lock_guard lock(h.mutex);
-        if (!h.contexts_allocated) return E_FAIL;
-    }
-    xma_engine().detach();  // waits for a decoding pass that is under way
-    {
-        std::lock_guard lock(h.mutex);
-        h.contexts.release();
-        h.contexts_allocated = false;
-    }
+HRESULT __stdcall AcpHalReleaseShapeContexts(void* /*hal*/) {
+    std::lock_guard lock(g_shape_mutex);
+    // Stop and detach the XMA worker before freeing backing arrays.
+    g_xma_engine.unbind();
+
+    // The export releases the process-wide SHAPE arrays. The argument is an
+    // opaque HAL handle, and allocation descriptors are owned by the caller.
+    g_shape_allocations.clear();
+
     trace_call("AcpHalReleaseShapeContexts", "");
     return S_OK;
 }
 
 // ---- ApuCreateHeap ----
 
-// The console reserves both parts up front, and so does this shim. Fails once a heap exists, created here or by an
-// allocation before it (VIctory's ALREADY_ALLOCATED).
 HRESULT __stdcall ApuCreateHeap(uint32_t cachedSizeInBytes,
                                 uint32_t nonCachedSizeInBytes) {
-    constexpr HRESULT kAlreadyAllocated = static_cast<HRESULT>(0x8ACA0001u);
-    Heap& h = heap();
-    std::lock_guard lock(h.mutex);
-    if (h.created) return kAlreadyAllocated;
-    // Both parts' device addresses must fit in 32 bits from 0x40000000.
-    if (kApuBaseAddress + round_up(cachedSizeInBytes, kApuRegionAlign) + nonCachedSizeInBytes > (uint64_t{1} << 32))
-        return E_OUTOFMEMORY;
+    std::lock_guard lock(g_apu_mutex);
+    if (g_apu_heap_created) return E_FAIL;
+    const uint64_t address_bytes = (nonCachedSizeInBytes ? align_apu_region(cachedSizeInBytes)
+                                                       : cachedSizeInBytes) + nonCachedSizeInBytes;
+    if (address_bytes > static_cast<uint64_t>(UINT32_MAX) + 1 - kApuBaseAddress) return E_INVALIDARG;
 
     if (cachedSizeInBytes > 0) {
-        h.cached.base = VirtualAlloc(
+        g_cached_heap.base = VirtualAlloc(
             nullptr, cachedSizeInBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!h.cached.base) return E_OUTOFMEMORY;
-        h.cached.size = cachedSizeInBytes;
+        if (!g_cached_heap.base) return E_OUTOFMEMORY;
+        g_cached_heap.size = cachedSizeInBytes;
     }
 
     if (nonCachedSizeInBytes > 0) {
-        h.noncached.base = VirtualAlloc(
+        g_noncached_heap.base = VirtualAlloc(
             nullptr, nonCachedSizeInBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!h.noncached.base) {
-            h.cached.release();
+        if (!g_noncached_heap.base) {
+            g_cached_heap.release();
             return E_OUTOFMEMORY;
         }
-        h.noncached.size = nonCachedSizeInBytes;
+        g_noncached_heap.size = nonCachedSizeInBytes;
     }
 
-    h.created = true;
-    trace_call("ApuCreateHeap",
-               ",\"cachedSize\":" + std::to_string(cachedSizeInBytes) +
-               ",\"nonCachedSize\":" + std::to_string(nonCachedSizeInBytes));
+    g_apu_heap_created = true;
+    if (rt::startup_trace::enabled()) {
+        try {
+            trace_call("ApuCreateHeap",
+                       ",\"cachedSize\":" + std::to_string(cachedSizeInBytes) +
+                       ",\"nonCachedSize\":" + std::to_string(nonCachedSizeInBytes));
+        } catch (const std::bad_alloc&) {
+            // The heap is ready even if its diagnostic cannot be built.
+        }
+    }
     return S_OK;
 }
 
 // ---- ApuAlloc ----
 
 HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
-                            uint32_t sizeInBytes, uint32_t alignmentInBytes,
-                            uint32_t flags) {
+                           uint32_t sizeInBytes, uint32_t alignmentInBytes,
+                           uint32_t flags) try {
     if (!virtualAddress) return E_POINTER;
     *virtualAddress = nullptr;
     if (physicalAddress) *physicalAddress = 0;
@@ -705,36 +1113,36 @@ HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
     if (alignmentInBytes == 0) alignmentInBytes = 1;
     if ((alignmentInBytes & (alignmentInBytes - 1)) != 0) return E_INVALIDARG;
 
-    Heap& h = heap();
-    std::lock_guard lock(h.mutex);
+    std::lock_guard lock(g_apu_mutex);
 
     // Routing: flags=2 routes to non-cached heap; flags=0 or 1 routes to cached heap.
     // If non-cached heap wasn't created or has no room, fall back to cached heap
     // because PC memory is unified and cache-coherent.
     const bool prefer_noncached = (flags == 2);
-    ApuRegion* target = prefer_noncached ? &h.noncached : &h.cached;
+    ApuRegion* target = prefer_noncached ? &g_noncached_heap : &g_cached_heap;
 
     if (!target->base) {
         if (!prefer_noncached) {
+            if (g_apu_heap_created) return E_OUTOFMEMORY;
             // Lazy default cached heap if ApuCreateHeap wasn't called yet
             constexpr uint32_t kDefaultHeapSize = 64 * 1024 * 1024;
             target->base = VirtualAlloc(nullptr, kDefaultHeapSize,
                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             if (!target->base) return E_OUTOFMEMORY;
             target->size = kDefaultHeapSize;
-            h.created = true;
+            g_apu_heap_created = true;
         } else {
             // Fall back to cached heap
-            target = &h.cached;
+            target = &g_cached_heap;
             if (!target->base) return E_OUTOFMEMORY;
         }
     }
 
     uint32_t offset = 0;
     void* ptr = target->allocate(sizeInBytes, alignmentInBytes, &offset);
-    if (!ptr && prefer_noncached && h.cached.base) {
+    if (!ptr && prefer_noncached && g_cached_heap.base) {
         // Fall back to cached heap if non-cached heap is full
-        target = &h.cached;
+        target = &g_cached_heap;
         ptr = target->allocate(sizeInBytes, alignmentInBytes, &offset);
     }
 
@@ -742,23 +1150,26 @@ HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
 
     *virtualAddress = ptr;
     if (physicalAddress) {
-        // Disjoint device address ranges:
-        //   cached:     0x40000000 .. 0x40000000 + cached_size - 1
-        //   non-cached: from the next 64 KiB boundary after the cached range
-        *physicalAddress = (target == &h.noncached ? h.noncached_apu() : kApuBaseAddress) + offset;
+        // Leave alignment padding between the two synthetic address ranges.
+        uint32_t apu = kApuBaseAddress + offset;
+        if (target == &g_noncached_heap) {
+            apu += static_cast<uint32_t>(align_apu_region(g_cached_heap.size));
+        }
+        *physicalAddress = apu;
     }
 
     return S_OK;
+} catch (const std::bad_alloc&) {
+    return E_OUTOFMEMORY;
 }
 
 // ---- ApuFree ----
 
 void __stdcall ApuFree(void* virtualAddress) {
     if (!virtualAddress) return;
-    Heap& h = heap();
-    {
-        std::lock_guard lock(h.mutex);
-        if (!h.cached.free_block(virtualAddress)) h.noncached.free_block(virtualAddress);
+    std::lock_guard lock(g_apu_mutex);
+    if (!g_cached_heap.free_block(virtualAddress)) {
+        g_noncached_heap.free_block(virtualAddress);
     }
     trace_call("ApuFree", "");
 }
@@ -768,21 +1179,27 @@ void __stdcall ApuFree(void* virtualAddress) {
 BOOL __stdcall ApuIsVirtualAddressValid(void* virtualAddress, uint32_t alignment) {
     if (!virtualAddress) return FALSE;
     if (alignment == 0) alignment = 1;
-    Heap& h = heap();
-    std::lock_guard lock(h.mutex);
-    for (const auto& m : h.regions())
-        if (m.region->is_valid_address(virtualAddress, alignment)) return TRUE;
+    std::lock_guard lock(g_apu_mutex);
+    if (g_cached_heap.is_valid_address(virtualAddress, alignment)) return TRUE;
+    if (g_noncached_heap.is_valid_address(virtualAddress, alignment)) return TRUE;
     return FALSE;
 }
 
 // ---- ApuMapApuAddress ----
 
 void* __stdcall ApuMapApuAddress(uint32_t apu) {
-    if (apu == 0) return nullptr;
-    Heap& h = heap();
-    std::lock_guard lock(h.mutex);
-    for (const auto& m : h.regions())
-        if (m.region->base && apu >= m.apu && apu - m.apu < m.region->size) return m.region->from_offset(apu - m.apu);
+    if (apu == 0 || apu < kApuBaseAddress) return nullptr;
+    std::lock_guard lock(g_apu_mutex);
+    const uint32_t offset = apu - kApuBaseAddress;
+    if (g_cached_heap.base && offset < g_cached_heap.size) {
+        return g_cached_heap.from_offset(offset);
+    }
+    if (g_noncached_heap.base) {
+        const uint32_t cached_span = static_cast<uint32_t>(align_apu_region(g_cached_heap.size));
+        if (offset >= cached_span && offset - cached_span < g_noncached_heap.size) {
+            return g_noncached_heap.from_offset(offset - cached_span);
+        }
+    }
     return nullptr;
 }
 
@@ -790,10 +1207,14 @@ void* __stdcall ApuMapApuAddress(uint32_t apu) {
 
 uint32_t __stdcall ApuMapVirtualAddress(void* virtualAddress) {
     if (!virtualAddress) return 0;
-    Heap& h = heap();
-    std::lock_guard lock(h.mutex);
-    for (const auto& m : h.regions())
-        if (m.region->contains(virtualAddress)) return m.apu + m.region->to_offset(virtualAddress);
+    std::lock_guard lock(g_apu_mutex);
+    if (g_cached_heap.contains(virtualAddress)) {
+        return kApuBaseAddress + g_cached_heap.to_offset(virtualAddress);
+    }
+    if (g_noncached_heap.contains(virtualAddress)) {
+        return kApuBaseAddress + static_cast<uint32_t>(align_apu_region(g_cached_heap.size)) +
+               g_noncached_heap.to_offset(virtualAddress);
+    }
     return 0;
 }
 

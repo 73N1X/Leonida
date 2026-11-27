@@ -21,7 +21,6 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_wave64_compute_tiers as tiers  # noqa: E402  (puts tools/ on sys.path)
-import rdna2spirv  # noqa: E402
 
 BITREPLICATE = [
     "s_mov_b64 s[10:11], exec",
@@ -102,9 +101,14 @@ class AppendEmulated(unittest.TestCase):
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
 
-    def test_not_emulated_wave64_is_refused(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            tiers.translate("cs_append_w64", append_program("ds_append"), tiers=False, emulate=False)
+    def test_not_emulated_wave64_shuffles_within_the_subgroup(self):
+        # Upstream's ds_append (Gen.ds_append) also translates a wave64 that is not emulated: the old value reaches
+        # the other lanes by a subgroup shuffle from the first active lane, right in that lane's half on 32-wide
+        # subgroups (the cross-half approximation its docstring names). It was refused here before the two were merged.
+        spv, gen = tiers.translate("cs_append_w64", append_program("ds_append"), tiers=False, emulate=False)
+        self.assertTrue(gen.wave64 and not gen.emulate)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        self.assertEqual(spv.count("OpAtomicIAdd"), 1)
 
 
 if __name__ == "__main__":

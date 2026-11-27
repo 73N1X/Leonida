@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -309,7 +309,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                         with patch("make_game.shaders") as mock_shaders:
                             ret = make_game.main()
                             self.assertEqual(ret, 0)
-                            mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False)
+                            mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False, jobs=ANY)
                             mock_preflight.assert_not_called()
                             mock_shaders.assert_not_called()
 
@@ -353,7 +353,10 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "shaders", "--jobs", "6"]):
-                with patch("make_game.below_normal"):
+                # main() clamps --jobs to the machine's hardware threads; pin them so 6 is in range anywhere
+                # (the GitHub Windows runners have 4).
+                with patch("make_game.leonida_tui.os.cpu_count", return_value=16), \
+                        patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
@@ -380,7 +383,8 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
-                with patch("make_game.below_normal"):
+                # main() clamps --jobs to the machine's hardware threads; pin them so 10 is in range anywhere.
+                with patch("make_game.below_normal"), patch("make_game.leonida_tui.os.cpu_count", return_value=16):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):

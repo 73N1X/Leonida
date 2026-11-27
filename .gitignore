@@ -6,6 +6,8 @@ work/
 !/assets/logo.png
 !/assets/logo.svg
 carve/
+# rpf9-explorer's index cache (archive paths and entry names); see "Full-scan indexes" in docs/design.md
+RpfPreview/
 *.rpf
 *.ttpf
 *.xvd
@@ -22,8 +24,6 @@ carve/
 *.glb
 *.ogg
 *.wav
-# the BCPack format tables: supplied locally, not under this project's license (runtime/src/bcpack.h)
-bcpack-tables.bin
 
 # ---- build output and caches ----
 build/
@@ -42,5 +42,6 @@ __pycache__/
 *.log
 .vs/
 
-# Packages (scripts/fetch_vkd3d_proton.py and the like)
-/dist/
+# Predictor profiles are fitted from the user's own texture pools.
+*.bcph
+*.bcph.stamp

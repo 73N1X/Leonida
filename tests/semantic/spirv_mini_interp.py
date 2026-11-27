@@ -107,7 +107,7 @@ UNDEF = _Undef()
 # Operations whose result is undefined when an operand is (they have no side effect and no control).
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
-    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUDiv", "OpUMod", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUMod", "OpUConvert", "OpBitCount", "OpIEqual",
     "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
     "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
@@ -132,6 +132,25 @@ def ieee_nan(r, *operands):
     if r != r and not any(o != o for o in operands):
         return -math.nan
     return r
+
+
+def rsqrt_f64(x):
+    """1 / sqrt(x) for a finite binary64 x > 0, rounded once to nearest even (the result is always normal).
+
+    1.0 / math.sqrt(x) rounds the root and then the quotient, which can miss by one ulp. Here n = floor(r * 2^p),
+    with p chosen so n has about 64 bits, comes from an integer square root of the exact rational 4^p / x; the
+    remainder decides the rounding of n down to 53 bits."""
+    f = Fraction(x)
+    p = 64 - math.frexp(1.0 / math.sqrt(x))[1]
+    scaled = Fraction(4) ** p / f                    # (r * 2^p)^2, exactly
+    n = math.isqrt(scaled.numerator // scaled.denominator)
+    inexact = n * n != scaled
+    shift = n.bit_length() - 53
+    q, rem = divmod(n, 1 << shift)
+    half = 1 << (shift - 1)
+    if rem > half or (rem == half and (inexact or q & 1)):
+        q += 1
+    return math.ldexp(q, shift - p)
 
 
 class _F32(float):
@@ -189,6 +208,26 @@ def f32_bits(x):
 
 def bits_f32(b):
     return _F32(b & MASK)
+
+
+_HEX_FLOAT = re.compile(r"([+-]?)0[xX]([0-9a-fA-F]*)\.?([0-9a-fA-F]*)[pP]([+-]?\d+)")
+
+
+def f32_literal(tok):
+    """The value of a 32-bit OpConstant %float literal as spirv-as reads it: a decimal, or a hex-float, where exponent
+    +128 is the SPIRV-Tools spelling of an infinity (0x1p+128) or a NaN with its payload (0x1.8p+128, the quiet NaN),
+    as rdna2spirv.float_literal writes them."""
+    m = _HEX_FLOAT.fullmatch(tok)
+    if m is None:
+        return f32(float(tok))
+    sign, ipart, fpart, exp = m.groups()
+    sig = int(ipart + fpart or "0", 16)
+    top = sig.bit_length() - 1
+    if sig and int(exp) - 4 * len(fpart) + top == 128:
+        frac = sig & ((1 << top) - 1)
+        mant = frac << (23 - top) if top <= 23 else frac >> (top - 23)
+        return bits_f32((0x80000000 if sign == "-" else 0) | 0x7F800000 | mant)
+    return f32(float.fromhex(tok))
 
 
 def half_to_float(h):
@@ -381,8 +420,7 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=(),
-                  subgroup_order=None):
+                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=()):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
@@ -405,8 +443,6 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
       * OpGroupNonUniformAny / All: the predicate of any / every running lane.
       * OpGroupNonUniformBitwiseOr Reduce: the OR of every running lane's value.
       * OpGroupNonUniformBroadcastFirst: the value of the lowest running lane.
-      * OpGroupNonUniformQuadBroadcast / QuadSwap (Direction 0, 1, 2 = lane ^ 1, ^ 2, ^ 3): the value of the lane
-        of the caller's quad (lanes 4n..4n+3) at that index; undefined when no invocation takes that lane.
 
     With `return_outputs=True`, also return each invocation's Output variables in invocation order.
 
@@ -415,16 +451,9 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     lane with no covered sample, so a shuffle from it is undefined. The caller's `inputs_for` gives each
     invocation the %sg_lane that matches. `resources` binds descriptor-set variables (see _invocation).
 
-    `subgroup_order` (a list of subgroup numbers) drops the lockstep across subgroups: between two OpControlBarriers
-    the subgroups run one after another in that order (the others after them), each in lockstep within itself, so a
-    program that leaves two subgroups' accesses to Workgroup or buffer memory unordered shows it (the lanes of one
-    hardware wave64 split over two 32-wide subgroups, SHADER-10).
-
     `helpers` names invocations that run the shader but take no part in subgroup operations, as helper lanes a
     driver leaves out: their ballot bit is never set, they count for no vote or reduction, and a shuffle from their
-    lane is undefined. They still receive each operation's result over the others. Quad operations do include them:
-    Vulkan requires a helper that would be active if it were not a helper to be active for derivative and quad
-    group operations ("Helper Invocations").
+    lane is undefined. They still receive each operation's result over the others.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
@@ -449,103 +478,53 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
 
     for i in range(invocations):
         advance(i, None)
-    def result_of(i):
-        """The result of the subgroup operation (or barrier) invocation i waits at, over the running lanes of
-        its subgroup."""
-        kind, _, _value, ident = pending[i]
-        sub = slots[i] // subgroup_size
-        group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
-                 if slots[j] // subgroup_size == sub and j not in helpers}
-        if kind == "OpGroupNonUniformBallot":
-            # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
-            bits = sum(1 << l for l, req in group.items() if req[2])
-            return tuple((bits >> (32 * w)) & MASK for w in range(4))
-        elif kind == "OpGroupNonUniformAny":
-            return any(req[2] for req in group.values())
-        elif kind == "OpGroupNonUniformAll":
-            return all(req[2] for req in group.values())
-        elif kind == "OpGroupNonUniformBitwiseOr":
-            acc = 0
-            for req in group.values():
-                acc |= req[2]
-            return acc
-        elif kind == "OpControlBarrier":
-            return None           # everyone is here: the "same point" check is the barrier
-        elif kind == "OpGroupNonUniformBroadcastFirst":
-            return group[min(group)][2] if group else UNDEF   # the lowest running lane's value
-        elif kind == "OpGroupNonUniformShuffle":
-            if not 0 <= ident < subgroup_size:
-                if out_of_range == "raise":
-                    raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
-                                          f"{subgroup_size}-wide subgroup")
-                ident %= subgroup_size
-            return group[ident][2] if ident in group else UNDEF
-        elif kind in ("OpGroupNonUniformQuadBroadcast", "OpGroupNonUniformQuadSwap"):
-            # Helpers take part: Vulkan keeps a helper active for quad operations.
-            quad = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
-                    if slots[j] // subgroup_size == sub}
-            lane = slots[i] % subgroup_size
-            if kind == "OpGroupNonUniformQuadBroadcast":
-                if not 0 <= ident < 4:
-                    raise UnsupportedConstruct(f"OpGroupNonUniformQuadBroadcast index {ident}")
-                partner = (lane & ~3) | ident
-            else:
-                if ident not in (0, 1, 2):
-                    raise UnsupportedConstruct(f"OpGroupNonUniformQuadSwap direction {ident}")
-                partner = lane ^ (ident + 1)
-            return quad[partner][2] if partner in quad else UNDEF
-        else:
-            raise UnsupportedConstruct(kind)
-
-    def tick(members):
+    while True:
         # One instruction per invocation per round, in invocation order: invocations at the same instruction
         # execute it one after the other before any goes on, as the lanes of a SIMD wave do, so a load that
         # follows a store in program order sees every lane's store and none from a later instruction.
-        while any(pending[i] is not None and pending[i][0] == "tick" for i in members):
-            for i in members:
+        while any(req is not None and req[0] == "tick" for req in pending):
+            for i in range(invocations):
                 if pending[i] is not None and pending[i][0] == "tick":
                     advance(i, None)
-
-    if subgroup_order is None:
-        while True:
-            tick(range(invocations))
-            live = [i for i in range(invocations) if pending[i] is not None]
-            if not live:
-                break
-            if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
-                raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
-            results = [result_of(i) for i in range(invocations)]
-            for i in range(invocations):
-                advance(i, results[i])
-        return (memory, invocation_outputs) if return_outputs else memory
-    # One subgroup at a time: each runs, in lockstep within itself, until all its invocations wait at an
-    # OpControlBarrier or have returned; then the next. Only the barrier orders the subgroups (no lockstep across
-    # them), the weakest order Vulkan gives, to show what a program leaves unordered between its subgroups.
-    subs = sorted({s // subgroup_size for s in slots})
-    order = [s for s in subgroup_order if s in subs] + [s for s in subs if s not in subgroup_order]
-    members_of = {s: [i for i in range(invocations) if slots[i] // subgroup_size == s] for s in subs}
-    while True:
-        for s in order:
-            members = members_of[s]
-            while True:
-                tick(members)
-                live = [i for i in members if pending[i] is not None]
-                if not live or all(pending[i][0] == "OpControlBarrier" for i in live):
-                    break
-                if len(live) != len(members) or len({pending[i][1] for i in live}) != 1 or any(
-                        pending[i][0] == "OpControlBarrier" for i in live):
-                    raise UnsupportedConstruct("subgroup operation not reached by every invocation of the subgroup "
-                                               "at the same point")
-                results = [result_of(i) for i in members]
-                for i, r in zip(members, results):
-                    advance(i, r)
         live = [i for i in range(invocations) if pending[i] is not None]
         if not live:
             break
         if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
-            raise UnsupportedConstruct("OpControlBarrier not reached by every invocation at the same point")
-        for i in live:
-            advance(i, None)
+            raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
+        results = []
+        for i in range(invocations):
+            kind, _, _value, ident = pending[i]
+            sub = slots[i] // subgroup_size
+            group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
+                     if slots[j] // subgroup_size == sub and j not in helpers}
+            if kind == "OpGroupNonUniformBallot":
+                # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
+                bits = sum(1 << l for l, req in group.items() if req[2])
+                results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
+            elif kind == "OpGroupNonUniformAny":
+                results.append(any(req[2] for req in group.values()))
+            elif kind == "OpGroupNonUniformAll":
+                results.append(all(req[2] for req in group.values()))
+            elif kind == "OpGroupNonUniformBitwiseOr":
+                acc = 0
+                for req in group.values():
+                    acc |= req[2]
+                results.append(acc)
+            elif kind == "OpControlBarrier":
+                results.append(None)           # everyone is here: the "same point" check above is the barrier
+            elif kind == "OpGroupNonUniformBroadcastFirst":
+                results.append(group[min(group)][2] if group else UNDEF)   # the lowest running lane's value
+            elif kind == "OpGroupNonUniformShuffle":
+                if not 0 <= ident < subgroup_size:
+                    if out_of_range == "raise":
+                        raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
+                                              f"{subgroup_size}-wide subgroup")
+                    ident %= subgroup_size
+                results.append(group[ident][2] if ident in group else UNDEF)
+            else:
+                raise UnsupportedConstruct(kind)
+        for i in range(invocations):
+            advance(i, results[i])
     return (memory, invocation_outputs) if return_outputs else memory
 
 
@@ -665,7 +644,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op == "OpConstant":
             k = types.t[a[0]]
             if k[0] == "float":
-                constants[res] = values[res] = f32(float(a[1])) if k[1] == 32 else float(a[1])
+                constants[res] = values[res] = f32_literal(a[1]) if k[1] == 32 else float(a[1])
             elif k[0] == "int":
                 constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
                 id_type[res] = a[0]
@@ -797,6 +776,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         if op == "OpKill":
             killed = True
             break
+        if op == "OpSwitch":
+            key = val(a[0])
+            mask = wmask(id_type[a[0]])
+            target = next((label for literal, label in zip(a[2::2], a[3::2])
+                           if int(literal, 0) & mask == key & mask), a[1])
+            op, a = "OpBranch", [target]
         if op == "OpBranch":
             if a[0] not in labels:
                 raise UnsupportedConstruct(f"unknown branch target {a[0]}")
@@ -1029,14 +1014,11 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = (val(a[1]) + val(a[2])) & wmask(a[0])
         elif op == "OpISub":
             values[res] = (val(a[1]) - val(a[2])) & wmask(a[0])
+        elif op == "OpUMod":
+            divisor = val(a[2]) & wmask(a[0])
+            values[res] = (val(a[1]) & wmask(a[0])) % divisor if divisor else UNDEF
         elif op == "OpIMul":
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
-        elif op in ("OpUDiv", "OpUMod"):
-            # SPIR-V leaves division by zero undefined: refuse it instead of inventing a value
-            d = val(a[2])
-            if d == 0:
-                raise UnsupportedConstruct(f"{op} by zero")
-            values[res] = (val(a[1]) // d if op == "OpUDiv" else val(a[1]) % d) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
         elif op == "OpSConvert":
@@ -1110,11 +1092,6 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")
             values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
-        elif op in ("OpGroupNonUniformQuadBroadcast", "OpGroupNonUniformQuadSwap"):
-            # <type> <scope> <value> <index | direction>: the value of an invocation of this one's quad (run_workgroup).
-            if types.t[a[0]][0] != "int" or val(a[1]) != 3:
-                raise UnsupportedConstruct(f"{op} other than a Subgroup-scope integer")
-            values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
         elif op == "OpGroupNonUniformBallot":
             # OpGroupNonUniformBallot <uvec4 type> <scope> <bool predicate>
             k = types.t[a[0]]
@@ -1159,9 +1136,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
             if types.t[a[0]] == ("float", 64):
-                if op != "OpFMul":
-                    raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
+                # Python floats are binary64 with round to nearest even: the result needs no rounding of its own.
+                if op == "OpFMul":
+                    values[res] = x * y
+                elif op == "OpFDiv" and y == 0.0:
+                    raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")   # as for binary32
+                else:
+                    r = x + y if op == "OpFAdd" else x - y if op == "OpFSub" else (
+                        math.nan if math.isinf(x) and math.isinf(y) else x / y)
+                    values[res] = ieee_nan(r, x, y)
                 continue
 
             def _fdiv(p, q):
@@ -1331,6 +1314,10 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
                 elif name == "Log2":
                     values[res] = f32(math.log2(x))
+                elif types.t[a[0]] == ("float", 64):
+                    # A double result stays binary64: math.sqrt is correctly rounded, and 1.0 / math.sqrt(x)
+                    # would round twice, so the inverse root is rounded once from the exact value.
+                    values[res] = math.sqrt(x) if name == "Sqrt" else rsqrt_f64(x)
                 elif name == "Sqrt":
                     values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
                 else:

@@ -142,6 +142,156 @@ class VersionParsingAndMatchingTest(PreflightTestBase):
             for name in make_game.PROBES:
                 self.assertIn(f"Missing {name}.", err)
 
+    def test_a_probe_whose_name_differs_only_in_case_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = make_game.versions()[0]
+            for probe_name in make_game.PROBES:
+                with open(os.path.join(tmp, probe_name.lower()), "wb") as f:
+                    f.truncate(manifest["files"][probe_name]["size"])
+            if os.path.exists(os.path.join(tmp, "MicrosoftGame.Config")):
+                self.skipTest("case-insensitive file system: the lower-cased names open under the package's")
+            mismatches = make_game.probe_mismatches(tmp, manifest)
+        self.assertIn("Missing MicrosoftGame.Config: there is microsoftgame.config, but file names are "
+                      "case-sensitive", mismatches[0])
+        self.assertIn("Rename it to MicrosoftGame.Config", mismatches[0])
+        self.assertIn("Missing Catalog000.bin: there is catalog000.bin", mismatches[1])
+        self.assertEqual(len(mismatches), 2)   # appdata0.rpf is lower case in the package too: it matches
+
+    def test_other_case_ignores_the_exact_name_and_unrelated_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("Catalog000.bin.bak", "Catalog000.bin"):
+                open(os.path.join(tmp, name), "wb").close()
+            self.assertIsNone(make_game.other_case(tmp, "Catalog000.bin"))
+            self.assertIsNone(make_game.other_case(os.path.join(tmp, "absent"), "Catalog000.bin"))
+
+
+class PartialVersionMatchTest(PreflightTestBase):
+    """A copy that misses a probe file but holds most of one version's manifest is named as an incomplete copy of
+    that version, with what is missing (BUILD-2835). Synthetic manifests and empty files only."""
+
+    FILES = {
+        "MicrosoftGame.Config": 12, "Catalog000.bin": 8, "appdata0.rpf": 16, "a.dll": 3,
+        "b.dll": 4, "data/c.rpf": 5, "data/d.rpf": 6, "pack/e/f.rpf": 7,
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.manifests = os.path.join(self.tmp.name, "versions")
+        self.game = os.path.join(self.tmp.name, "game")
+        os.makedirs(self.manifests)
+        os.makedirs(self.game)
+        manifest = {"title": "Synthetic package", "version": "9.8.7.6", "expected_exe": "a.exe",
+                    "files": {name: {"size": size} for name, size in self.FILES.items()}}
+        with open(os.path.join(self.manifests, "synthetic.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f)
+        patcher = mock.patch.object(make_game, "VERSIONS", self.manifests)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, name, size=None):
+        path = os.path.join(self.game, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.truncate(self.FILES[name] if size is None else size)
+
+    def test_incomplete_copy_names_the_version_and_what_is_missing(self):
+        for name in self.FILES:
+            if name not in ("appdata0.rpf", "data/d.rpf"):
+                self.write(name, 1 if name == "b.dll" else None)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="incomplete copy of Synthetic package 9.8.7.6")
+        self.assertNotIn("doesn't look like a supported version", err)
+        self.assertIn("5 of 8 manifest files are present with matching sizes", err)
+        self.assertIn("2 file(s) missing (22 bytes)", err)
+        self.assertIn("  missing  appdata0.rpf", err)
+        self.assertIn("  missing  data/d.rpf", err)
+        self.assertIn("  wrong size  b.dll (expected 4 bytes)", err)
+        self.assertNotIn("missing  a.dll", err)
+
+    def test_copy_with_less_than_half_keeps_the_unsupported_message(self):
+        for name in ("MicrosoftGame.Config", "a.dll", "b.dll"):
+            self.write(name)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="This doesn't look like a supported version of the game")
+        self.assertNotIn("incomplete copy", err)
+        self.assertIn("Missing appdata0.rpf.", err)
+
+    def test_copy_matching_nothing_keeps_the_unsupported_message(self):
+        with open(os.path.join(self.game, "something_else.bin"), "wb") as f:
+            f.write(b"x")
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="This doesn't look like a supported version of the game")
+        self.assertNotIn("incomplete copy", err)
+
+    def test_a_folder_in_place_of_a_file_counts_as_missing(self):
+        for name in self.FILES:
+            if name != "appdata0.rpf":
+                self.write(name)
+        os.mkdir(os.path.join(self.game, "appdata0.rpf"))
+        err = self.assert_fails(make_game.load_version, self.game, match="7 of 8 manifest files")
+        self.assertIn("  missing  appdata0.rpf", err)
+
+    def test_a_probe_that_cannot_be_read_is_not_reported_as_missing(self):
+        # A file whose metadata can't be read exists: it is listed apart, as probe_mismatches() does, and the
+        # message does not say to finish a download that is not unfinished.
+        for name in self.FILES:
+            self.write(name)
+        blocked = os.path.join(self.game, "appdata0.rpf")
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == blocked:
+                raise PermissionError(13, "Permission denied", blocked)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(make_game.os, "stat", fake_stat):
+            err = self.assert_fails(make_game.load_version, self.game, match="7 of 8 manifest files")
+        self.assertIn("  cannot read  appdata0.rpf (Permission denied)", err)
+        self.assertNotIn("missing  appdata0.rpf", err)
+        self.assertNotIn("file(s) missing", err)
+        self.assertNotIn("incomplete copy", err)
+        self.assertNotIn("Finish the download", err)
+
+    def test_a_complete_copy_of_another_build_keeps_the_unsupported_message(self):
+        # Every file there, only the probes with other sizes: another package, not an unfinished download.
+        for name in self.FILES:
+            self.write(name, self.FILES[name] + 1 if name in make_game.PROBES else None)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="This doesn't look like a supported version of the game")
+        self.assertIn("Wrong size for MicrosoftGame.Config (13 bytes, expected 12).", err)
+        self.assertNotIn("incomplete copy", err)
+        self.assertNotIn("Finish the download", err)
+
+    def test_missing_files_with_matching_probes_still_name_the_incomplete_copy(self):
+        # The probes that are there have their sizes; appdata0.rpf and one archive are missing.
+        for name in self.FILES:
+            if name not in ("appdata0.rpf", "pack/e/f.rpf"):
+                self.write(name)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="incomplete copy of Synthetic package 9.8.7.6")
+        self.assertIn("  missing  appdata0.rpf", err)
+        self.assertIn("  missing  pack/e/f.rpf", err)
+        self.assertIn("Finish the download", err)
+
+    def test_missing_files_and_a_probe_with_another_size_keep_the_unsupported_message(self):
+        # Mixed: files missing, and MicrosoftGame.Config there with another size. The probe size says which package
+        # this is, so another size means another build, whatever else is missing: the old message, with the size.
+        for name in self.FILES:
+            if name not in ("appdata0.rpf", "data/d.rpf"):
+                self.write(name, 99 if name == "MicrosoftGame.Config" else None)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="This doesn't look like a supported version of the game")
+        self.assertIn("Wrong size for MicrosoftGame.Config (99 bytes, expected 12).", err)
+        self.assertIn("Missing appdata0.rpf.", err)
+        self.assertNotIn("incomplete copy", err)
+        self.assertNotIn("Finish the download", err)
+
+    def test_a_complete_copy_still_loads(self):
+        for name in self.FILES:
+            self.write(name)
+        self.assertEqual(make_game.load_version(self.game)["version"], "9.8.7.6")
+
 
 class GameCheckTest(PreflightTestBase):
     def test_check_nonexistent_directory_fails(self):
@@ -325,6 +475,19 @@ class ToolchainDetectionTest(PreflightTestBase):
         self.assertFalse(make_game.tool_available(""))
         self.assertFalse(make_game.tool_available("   "))
         self.assertFalse(make_game.tool_available('""'))
+
+    def test_tool_available_quoted_path_with_spaces_and_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "my tools", "tool.exe")
+            os.makedirs(os.path.dirname(exe))
+            with open(exe, "wb"):
+                pass
+            self.assertTrue(make_game.tool_available(exe))
+            self.assertTrue(make_game.tool_available(f'"{exe}"'))
+            self.assertTrue(make_game.tool_available(f'"{exe}" --version'))
+
+    def test_tool_available_unmatched_quote_returns_false(self):
+        self.assertFalse(make_game.tool_available('"unclosed path'))
 
     APPDATA_ENV = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "APPDATA": r"C:\Users\u\AppData\Roaming"}
 
@@ -651,7 +814,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                                  match="git clone --recursive https://github.com/ubiquitarianism/leonida")
 
     def test_ensure_submodule_zip_with_git_does_not_say_install_git(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -660,8 +823,20 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("shutil.which", return_value="/usr/bin/git"), \
                  mock.patch("subprocess.run", return_value=not_a_repo):
                 err = self.assert_fails(make_game.ensure_submodule,
-                                        match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                                        match="git clone --recursive https://github.com/ubiquitarianism/leonida")
                 self.assertNotIn("Install Git", err)
+
+    def test_ensure_submodule_names_the_clone_command_the_readme_gives(self):
+        # the hint once named a repository that had gone private; the README is where the address is kept current
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value=None):
+                err = self.assert_fails(make_game.ensure_submodule, match="git clone --recursive ")
+        clone = re.search(r"git clone --recursive https://github\.com/[\w.-]+/[\w.-]+", err)
+        self.assertIsNotNone(clone, err)
+        self.assertIn(f"`{clone.group(0)}`", readme)
 
     def test_ensure_submodule_failed_fetch_in_clone_names_the_fetch(self):
         with tempfile.TemporaryDirectory() as tmp:

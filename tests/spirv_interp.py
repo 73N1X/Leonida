@@ -15,6 +15,23 @@ import struct
 M32 = 0xFFFFFFFF
 
 
+def float_literal_bits(tok):
+    """The binary32 bits of an OpConstant %float literal as spirv-as reads it: a decimal, or a hex-float, where
+    exponent +128 is the SPIRV-Tools spelling of an infinity (0x1p+128) or a NaN with its payload (0x1.8p+128),
+    as tools/rdna2spirv.py's float_literal writes them. Raises ValueError for anything else."""
+    m = re.fullmatch(r"([+-]?)0[xX]([0-9a-fA-F]*)\.?([0-9a-fA-F]*)[pP]([+-]?\d+)", tok)
+    if m is None:
+        return struct.unpack("<I", struct.pack("<f", float(tok)))[0]
+    sign, ipart, fpart, exp = m.groups()
+    sig = int(ipart + fpart or "0", 16)
+    top = sig.bit_length() - 1
+    if sig and int(exp) - 4 * len(fpart) + top == 128:
+        frac = sig & ((1 << top) - 1)
+        mant = frac << (23 - top) if top <= 23 else frac >> (top - 23)
+        return (0x80000000 if sign == "-" else 0) | 0x7F800000 | mant
+    return struct.unpack("<I", struct.pack("<f", float.fromhex(tok)))[0]
+
+
 def f32(x):
     try:
         return struct.unpack("<f", struct.pack("<f", x))[0]
@@ -152,7 +169,8 @@ def run(spvasm):
         elif op == "OpConstant":
             t = types[args[0]][0]
             if t == "Float":
-                consts[res] = float(args[1]) if types[args[0]][1] == "64" else f32(float(args[1]))
+                consts[res] = float(args[1]) if types[args[0]][1] == "64" else (
+                    u2f(float_literal_bits(args[1])) if "x" in args[1].lower() else f32(float(args[1])))
             else:
                 consts[res] = int(args[1]) & M32
         elif op == "OpConstantTrue":
@@ -197,6 +215,7 @@ def run(spvasm):
         "OpFOrdEqual": lambda a, b: a == b,
         "OpFOrdLessThanEqual": lambda a, b: a <= b, "OpFOrdGreaterThanEqual": lambda a, b: a >= b,   # False on a NaN
         "OpLogicalOr": lambda a, b: a or b, "OpLogicalAnd": lambda a, b: a and b,
+        "OpSLessThan": lambda a, b: s32(a) < s32(b), "OpSGreaterThan": lambda a, b: s32(a) > s32(b),
         "OpSLessThanEqual": lambda a, b: s32(a) <= s32(b), "OpSGreaterThanEqual": lambda a, b: s32(a) >= s32(b),
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
         "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
@@ -204,7 +223,11 @@ def run(spvasm):
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
-    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
+    # Without an entry here a binary64 op falls through to ARITH and is rounded to binary32: until OpFDiv was added,
+    # the translated v_rcp_f64 of 3.0 gave 0x3fd5555560000000 (1/3 as a binary32) and of 1e300 gave 0.
+    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b,
+           "OpFDiv": lambda a, b: a / b if b else
+           math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b)) if a and not math.isnan(a) else math.nan}
 
     def float_bits(rt):
         t = types.get(rt)
@@ -253,6 +276,12 @@ def run(spvasm):
             return (max if fn == "SMax" else min)(*a, key=s32)
         if fn in ("UMax", "UMin"):
             return (max if fn == "UMax" else min)(*a)
+        if fn == "SClamp":
+            return min(max(a[0], a[1], key=s32), a[2], key=s32)
+        if fn == "UClamp":
+            return min(max(a[0], a[1]), a[2])
+        if fn == "FindUMsb":            # the highest set bit, -1 (all ones) for 0
+            return ((a[0] & M32).bit_length() - 1) & M32
         raise NotImplementedError("GLSL." + fn)
 
     for res, op, args in body:
@@ -319,9 +348,16 @@ def run(spvasm):
         elif op == "OpBitCount":
             val[res] = bin(get(args[1]) & M32).count("1")
         elif op == "OpConvertUToF":
-            val[res] = f32(float(get(args[1])))
+            x = float(get(args[1]))     # every 32-bit integer is a binary64: only a binary32 result rounds
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertSToF":
-            val[res] = f32(float(s32(get(args[1]))))
+            x = float(s32(get(args[1])))
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
+        elif op == "OpFConvert":
+            # binary64 -> binary32 rounds to nearest even (past the binary32 range: infinity); binary32 -> binary64 is
+            # exact. v_cvt_f32_f64 and v_cvt_f64_f32 are this.
+            x = float(get(args[1]))
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)
         elif op == "OpConvertFToS":

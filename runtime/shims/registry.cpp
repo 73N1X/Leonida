@@ -80,7 +80,10 @@ std::vector<Lookup> g_lookups;
 //  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
 //  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
 //  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
-//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory, and the GDK's gaming/gdk/docs/reference/system/dstorage/
+//  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll is the console name; xcrdapi.dll is a
+//                            console module the title may import it from (docs/directstorage.md). dstorage.cpp serves
+//                            it; the class is kept for a build without that shim.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -97,6 +100,25 @@ const char* const kNotHResult[] = {
 };
 const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi"};
 
+static bool is_audio_hal_hresult(const std::string& dll, const std::string& name) {
+    if (dll == "chad.dll") {
+        // All five XDsp* functions return HRESULT (GDK XDspAudio reference).
+        if (starts_with(name, "XDsp")) return true;
+    } else if (dll == "xapu.dll") {
+        // XApuConnect/DequeueResult/Disconnect/EnqueueCommand return HRESULT;
+        // XApuGetResultCount returns uint32_t.
+        if (name != "XApuGetResultCount" && starts_with(name, "XApu")) return true;
+    } else if (dll == "acphal.dll") {
+        // AcpHalAllocateShapeContexts, AcpHalCreate, AcpHalReleaseShapeContexts,
+        // ApuAlloc, ApuCreateHeap return HRESULT.  ApuFree, ApuIsVirtualAddressValid,
+        // ApuMapApuAddress and ApuMapVirtualAddress return other types.
+        if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
+            name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
+            name == "ApuCreateHeap") return true;
+    }
+    return false;
+}
+
 ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
         if (starts_with(name, "D3D12Create") || starts_with(name, "D3D12Serialize") ||
@@ -111,13 +133,10 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "XAudio2Create") return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
         if (name == "GameInputCreate") return ReturnClass::HResult;
-    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
+    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
-    } else if (dll == "acphal.dll") {
-        if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
-            name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
-            name == "ApuCreateHeap")
-            return ReturnClass::HResult;
+    } else if (is_audio_hal_hresult(dll, name)) {
+        return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)
@@ -387,6 +406,11 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
+
 // Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
 std::mutex& bundled_loader_mutex() {
     static auto* m = new std::mutex;
@@ -395,6 +419,16 @@ std::mutex& bundled_loader_mutex() {
 
 std::vector<BundledLoaderEntry>& bundled_loaders() {
     static auto* v = new std::vector<BundledLoaderEntry>;
+    return *v;
+}
+
+std::mutex& xmem_hooks_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<XMemHooksEntry>& xmem_hooks_entries() {
+    static auto* v = new std::vector<XMemHooksEntry>;
     return *v;
 }
 
@@ -480,18 +514,29 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
-bool bundled_module_path(void* module, std::wstring& path) {
-    if (!module) return false;
-    for (const auto& entry : snapshot_bundled_loaders())
-        if (entry.ops->module_path && entry.ops->module_path(entry.ctx, module, path)) return true;
-    return false;
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    std::lock_guard lock(xmem_hooks_mutex());
+    xmem_hooks_entries().push_back({owner, hooks});
 }
 
-namespace {
-std::atomic<void*> g_main_image{nullptr};
+void remove_xmem_allocation_hooks(const void* owner) {
+    std::lock_guard lock(xmem_hooks_mutex());
+    auto& list = xmem_hooks_entries();
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
-void set_main_image(void* base) { g_main_image.store(base); }
-void* main_image() { return g_main_image.load(); }
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    std::lock_guard lock(xmem_hooks_mutex());
+    const auto& list = xmem_hooks_entries();
+    return list.empty() ? nullptr : list.back().hooks;
+}
 
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
@@ -503,12 +548,9 @@ void* find(const std::string& dll_lower, const std::string& name) {
 }
 
 bool owns_dll(const std::string& dll_lower) {
-    // advapi32.dll: registry_oem.cpp answers four of its imports; LoadLibrary still gets the host module.
-    // mfplat.dll: media_foundation.cpp answers MFCreateSourceResolver; the rest of Media Foundation is the host's.
-    // ws2_32.dll: winsock_offline.cpp vets the ways out of it and the rest is the host's.
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
-                                       "vulkan-1.dll", "ntdll.dll", "user32.dll", "advapi32.dll", "mfplat.dll",
-                                       "ws2_32.dll"};
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll",
+                                       "wsock32.dll", "advapi32.dll"};
     if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
     for (const char* h : host)
         if (dll_lower == h) return false;

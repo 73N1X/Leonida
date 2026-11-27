@@ -126,6 +126,42 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 err = self.assert_preflight_fails(["runtime", "pipelines"], "VULKAN_SDK")
                 self.assertIn("vk_pipeline_check", err)
 
+    def run_runtime_preflight(self, system, vulkan_sdk, runtime_build=None):
+        with mock.patch("os.name", system), \
+                mock.patch.dict(os.environ), \
+                mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                mock.patch.object(make_game, "log") as log:
+            if vulkan_sdk is None:
+                os.environ.pop("VULKAN_SDK", None)
+            else:
+                os.environ["VULKAN_SDK"] = vulkan_sdk
+            make_game.preflight(["runtime"], self.work, runtime_build=runtime_build)
+        return [call.args[0] for call in log.call_args_list]
+
+    def test_runtime_without_vulkan_sdk_warns_that_the_vulkan_device_may_be_missing(self):
+        for sdk in (None, ""):
+            with self.subTest(sdk=sdk):
+                lines = self.run_runtime_preflight("nt", sdk)
+                self.assertEqual(len([line for line in lines if "VULKAN_SDK is not set" in line]), 1)
+                self.assertIn("LEONIDA_D3D12=vulkan", "".join(lines))
+
+    def test_runtime_with_vulkan_sdk_does_not_warn(self):
+        lines = self.run_runtime_preflight("nt", r"C:\Vulkan")
+        self.assertFalse([line for line in lines if "VULKAN_SDK" in line])
+
+    def test_runtime_warning_is_skipped_for_a_prebuilt_runtime_and_other_systems(self):
+        build = os.path.join(self.root, "build")
+        os.makedirs(build)
+        for name in make_game.RUNTIME_FILES:
+            with open(os.path.join(build, name), "wb"):
+                pass
+        self.assertFalse([line for line in self.run_runtime_preflight("nt", None, runtime_build=build)
+                          if "VULKAN_SDK" in line])
+        with mock.patch.object(make_game, "cross_build_missing", return_value=[]), \
+                mock.patch.object(make_game, "cross_configure"):
+            self.assertFalse([line for line in self.run_runtime_preflight("posix", None)
+                              if "VULKAN_SDK" in line])
+
     def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
         with mock.patch("os.name", "nt"), \
                 mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
@@ -191,6 +227,65 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             make_game.preflight(["pipelines"], self.work)
         build.assert_not_called()
+
+    def put_checker_older_than_its_source(self):
+        """runtime/build/linux/vk_pipeline_check built before its source last changed (a pull since the build)."""
+        build = os.path.join(self.root, "runtime", "build", "linux")
+        test = os.path.join(self.root, "runtime", "test")
+        os.makedirs(build)
+        os.makedirs(test)
+        checker = os.path.join(build, "vk_pipeline_check")
+        for path, text in ((checker, ""), (os.path.join(test, "vk_pipeline_check.cpp"), '#include "gate.h"\n'),
+                           (os.path.join(test, "gate.h"), "")):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        os.utime(checker, (1_000_000, 1_000_000))
+        os.utime(os.path.join(test, "vk_pipeline_check.cpp"), (500_000, 500_000))
+        return checker
+
+    def test_a_checker_older_than_its_sources_is_rebuilt(self):
+        # Old #7148: a checker from before a pull was taken as it was, and the stage checked with the old program.
+        self.write_shader_index()
+        checker = self.put_checker_older_than_its_source()
+        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assertEqual(make_game.stale_checker(checker), ["runtime/test/gate.h"])
+            make_game.preflight(["pipelines"], self.work, jobs=4)
+        build.assert_called_once_with(4)
+
+    def test_a_current_checker_in_the_build_folder_is_not_rebuilt(self):
+        self.write_shader_index()
+        checker = self.put_checker_older_than_its_source()
+        future = os.path.getmtime(os.path.join(self.root, "runtime", "test", "gate.h")) + 60
+        os.utime(checker, (future, future))
+        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assertEqual(make_game.stale_checker(checker), [])
+            make_game.preflight(["pipelines"], self.work)
+        build.assert_not_called()
+
+    def test_a_stale_checker_without_cmake_is_used_with_a_warning(self):
+        self.write_shader_index()
+        checker = self.put_checker_older_than_its_source()
+        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
+            make_game.preflight(["pipelines"], self.work)
+            build.assert_not_called()
+            with mock.patch.object(make_game, "log") as log,                     mock.patch.object(make_game, "checker_supports", side_effect=SystemExit(0)):
+                with self.assertRaises(SystemExit):
+                    make_game.pipelines(self.work, os.path.join(self.root, "out"))
+        warning = log.call_args_list[0].args[0]
+        self.assertIn("WARNING", warning)
+        self.assertIn("runtime/test/gate.h", warning)
+        self.assertIn("cmake --build runtime/build/linux --target vk_pipeline_check", warning)
+
+    def test_a_checker_outside_the_build_folder_is_not_compared(self):
+        # --runtime-build and the like: their time stamps say nothing about this checkout's sources.
+        self.put_checker_older_than_its_source()
+        elsewhere = os.path.join(self.root, "elsewhere", "vk_pipeline_check")
+        os.makedirs(os.path.dirname(elsewhere))
+        with open(elsewhere, "w", encoding="utf-8"):
+            pass
+        os.utime(elsewhere, (1_000_000, 1_000_000))
+        with mock.patch.object(make_game, "ROOT", self.root):
+            self.assertEqual(make_game.stale_checker(elsewhere), [])
 
     def test_the_build_uses_the_readme_folder(self):
         with mock.patch.object(make_game, "ROOT", self.root), \

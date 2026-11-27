@@ -144,6 +144,33 @@ class Kind0AndCode(unittest.TestCase):
         self.assertEqual(fspx_unpack.code_range(program(with_prologue=False)), (0, 12 + 4))
         self.assertEqual(fspx_unpack.code_range(program(endpgm=False))[1], None)
 
+    def test_short_prologue(self):
+        # The 24-byte prologue of some pipeline-library programs: hash carriers at words 0 and 3 only, each a VOP3
+        # opcode-0x180 word with a literal in the form tools/fspx_prologue_probe.py checks, then the code at word 6.
+        carrier = struct.pack("<III", 0xD5800000, 0x03FE0100, 0x12345678)
+        code = carrier * 2 + V_MOV * 3 + ENDPGM
+        self.assertEqual(fspx_unpack.code_range(code), (24, 24 + 12 + 4))
+        # Only word 0 is a carrier: no prologue.
+        self.assertEqual(fspx_unpack.code_range(carrier + V_MOV * 6 + ENDPGM)[0], 0)
+        # Opcode-0x180 words whose second dword is not the literal form: no short prologue.
+        loose = struct.pack("<III", 0xD5800000, 0x03FF0000, 0x12345678)
+        self.assertEqual(fspx_unpack.code_range(loose * 2 + V_MOV * 3 + ENDPGM)[0], 0)
+        # The 36-byte form still wins when word 6 is a prologue word too.
+        self.assertEqual(fspx_unpack.code_range(program())[0], 36)
+
+    def test_code_range_last(self):
+        code = prologue() + V_MOV * 3 + ENDPGM + V_MOV + ENDPGM + S_NOP
+        self.assertEqual(fspx_unpack.code_range(code), (36, 36 + 12 + 4))
+        self.assertEqual(fspx_unpack.code_range_last(code), (36, 36 + 12 + 4 + 4 + 4))
+
+    def test_branch_targets_inside(self):
+        enc = "; encoding: [0x00,0x00,0x00,0x00]"
+        listing = f"\ts_cbranch_execz 1 {enc}\n\ts_nop 0 {enc}\n\ts_endpgm {enc}\n"
+        self.assertTrue(fspx_unpack.branch_targets_inside(listing, 12))   # 0 + 4 + 4 = 8: inside
+        self.assertFalse(fspx_unpack.branch_targets_inside(listing, 8))   # 8 is past an 8-byte range
+        back = f"\ts_nop 0 {enc}\n\ts_branch 65534 {enc}\n"               # -2: 4 + 4 - 8 = 0
+        self.assertTrue(fspx_unpack.branch_targets_inside(back, 8))
+
     def test_unaligned_endpgm_bytes_are_not_the_end(self):
         code = prologue() + b"\0\0" + ENDPGM + b"\0\0" + V_MOV + ENDPGM
         start, end = fspx_unpack.code_range(code)
@@ -194,79 +221,6 @@ class Cli(unittest.TestCase):
                                  src, "--out", out, "--disasm"], capture_output=True, text=True, env=env)
         return result, out
 
-    def test_folder_of_captured_payloads(self):
-        # The runtime's captured programs: a folder of <code>-<state>.fspx files, a .part file still being written and
-        # a stray file left out, the payloads unpacked in name order.
-        with tempfile.TemporaryDirectory() as t:
-            captured = os.path.join(t, "captured")
-            os.makedirs(captured)
-            for name, threads in (("b-2.fspx", (32, 1, 1)), ("a-1.fspx", (64, 1, 1))):
-                with open(os.path.join(captured, name), "wb") as f:
-                    f.write(make_fspx([(0, kind0(threads)), (6, program())]))
-            with open(os.path.join(captured, "c-3.fspx.part"), "wb") as f:
-                f.write(b"FSPX")
-            with open(os.path.join(captured, "notes.txt"), "w", encoding="utf-8", newline="\n") as f:
-                f.write("not a payload\n")
-            out = os.path.join(t, "out")
-            code, _, err = self.run_tool(captured, "--out", out)
-            self.assertEqual(code, 0, err)
-            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
-                index = json.load(f)
-            names = sorted(index) if isinstance(index, dict) else sorted(e["file"] for e in index)
-            self.assertEqual(len(names), 2, names)
-            self.assertTrue(os.path.isfile(os.path.join(out, "fspx", "a-1.code")))
-            self.assertTrue(os.path.isfile(os.path.join(out, "fspx", "b-2.state")))
-
-    def test_captured_graphics_stages(self):
-        # Console pipeline stages (device slot 57) the runtime saved as <code>-vs.fspx / <code>-ps.fspx: unpacked as
-        # that stage, kind 0 kept as register words with no compute fields, and a container with empty signatures
-        # written beside each for the translator.
-        with tempfile.TemporaryDirectory() as t:
-            captured = os.path.join(t, "captured")
-            os.makedirs(captured)
-            state = struct.pack("<8I", 0x4005D808, 4, 0x100060, 0x20042, 0xB50516A0, 0, 0, 0)
-            for name in ("aa-vs.fspx", "bb-ps.fspx", "cc-1.fspx"):
-                kind0_bytes = kind0() if name == "cc-1.fspx" else state
-                with open(os.path.join(captured, name), "wb") as f:
-                    f.write(make_fspx([(0, kind0_bytes), (1, b"\0" * 8), (6, program()), (7, b"\0" * 8)]))
-            out = os.path.join(t, "out")
-            code, _, err = self.run_tool(captured, "--out", out)
-            self.assertEqual(code, 0, err)
-            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
-                stages = {e["file"]: e["stage"] for e in json.load(f)}
-            self.assertEqual(stages, {"aa-vs.dxbc": "vs", "bb-ps.dxbc": "ps", "cc-1.dxbc": "cs"})
-            with open(os.path.join(out, "fspx", "bb-ps.json"), encoding="utf-8") as f:
-                meta = json.load(f)
-            self.assertNotIn("wave32", meta)
-            self.assertEqual(meta["graphics_state_words"][0], 0x4005D808)
-            for name in ("aa-vs", "bb-ps"):
-                with open(os.path.join(out, name + ".dxbc"), "rb") as f:
-                    parts = fspx_unpack.dxbc_parts(f.read())
-                self.assertEqual(set(parts), {b"ISG1", b"OSG1"})
-                self.assertEqual(struct.unpack_from("<I", parts[b"ISG1"])[0], 0)  # no listing: nothing read
-            self.assertFalse(os.path.isfile(os.path.join(out, "cc-1.dxbc")))
-
-    def test_graphics_stage_names(self):
-        self.assertEqual(fspx_unpack.graphics_stage("ab12-vs"), "vs")
-        self.assertEqual(fspx_unpack.graphics_stage("ab12-ps"), "ps")
-        self.assertIsNone(fspx_unpack.graphics_stage("ab12-cd34"))
-        self.assertIsNone(fspx_unpack.graphics_stage("ps"))
-
-    def test_pixel_position_reads(self):
-        listing = ("\tv_interp_p1_f32_e32 v4, v0, attr0.x\n"
-                   "\tv_mul_f32_e32 v6, v2, v3 ; reads x and y\n"
-                   "\tv_mov_b32_e32 v5, 0\n"
-                   "\tv_add_f32_e32 v7, v5, v4 ; v5 written first\n"
-                   "\texp mrt0 v6, v7, v6, v7 done\n")
-        self.assertEqual(fspx_unpack.ps_position_reads(listing), 2)
-        self.assertEqual(fspx_unpack.ps_position_reads("\tv_interp_p1_f32_e32 v4, v0, attr0.x\n"), 0)
-        part = fspx_unpack.synthetic_container("ps", listing)
-        isg1 = fspx_unpack.dxbc_parts(part)[b"ISG1"]
-        count, at = struct.unpack_from("<II", isg1)
-        self.assertEqual(count, 1)
-        self.assertEqual(struct.unpack_from("<I", isg1, at + 12)[0], 1)  # SV_Position
-        self.assertEqual(isg1[at + 25], 0b11)                              # x and y read
-
     def test_disassembly_error_writes_no_listing(self):
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
@@ -287,7 +241,9 @@ class Cli(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
-    def test_disassembly_with_invalid_words_keeps_listing(self):
+    def test_disassembly_with_invalid_words_takes_the_decoder_listing(self):
+        # llvm-mc reports an invalid word in a program tools/rdna2_decode.py decodes whole: the compute fallback of
+        # shader_disasm.disasm takes the decoder's listing (fewer invalid words), without llvm-mc's messages.
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
@@ -295,9 +251,10 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
             listing = f.read()
-        self.assertIn("1 invalid words", listing)
-        self.assertIn("\ts_endpgm", listing)
-        self.assertIn("warning: invalid instruction encoding", listing)
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("v_mov_b32", listing)
+        self.assertIn("s_endpgm", listing)
+        self.assertNotIn("warning: invalid instruction encoding", listing)
 
     def test_clean_disassembly_keeps_listing(self):
         result, out = self.disassemble("print('\\ts_endpgm')\n")

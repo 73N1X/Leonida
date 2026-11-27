@@ -30,11 +30,11 @@ class MeshBarrierFence(unittest.TestCase):
     def test_guarded_barrier_is_a_fence(self):
         spv, g = tiers.translate("ms_barrier_fence", PROGRAM, threads=32, emulate=False)
         self.assertEqual(g.stage, "ms")
-        # The structured tree guards every block after a branch, the join too, so both are fences: conservative (a
-        # mesh shader that exchanges LDS across a join barrier may read early) but never a hang.
-        self.assertEqual(len(g.fence_only_barriers), 2)
-        self.assertEqual(spv.count("OpMemoryBarrier"), 2)
-        self.assertEqual(spv.count("OpControlBarrier"), 1)   # the output epilogue's, which every invocation reaches
+        # The guarded block's barrier is a fence. The join is at the top level of the structured tree (its %pc guard
+        # is tautological and cfg_structure unwraps it), so every invocation reaches its barrier and it stays one.
+        self.assertEqual(g.fence_only_barriers, {1})
+        self.assertEqual(spv.count("OpMemoryBarrier"), 1)
+        self.assertEqual(spv.count("OpControlBarrier"), 2)   # the join's and the output epilogue's
 
     def test_top_level_barrier_only_stays_a_barrier(self):
         spv, g = tiers.translate("ms_barrier_top", ["s_barrier", "s_endpgm"], threads=32, emulate=False)

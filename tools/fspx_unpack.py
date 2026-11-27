@@ -24,7 +24,7 @@ corpus uses, so tools/rdna2spirv.py can read it:
     DIR/fspx/<name>.json     the decoded kind-0 entry, the directory and the code range
     DIR/fspx/<name>.code     the kind-6 program
     DIR/fspx/<name>.state    the kind-0 entry as it is (its SHA-256 is the index's fspx_state_sha256)
-    DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue
+    DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue (36 or 24 bytes)
 """
 import argparse
 import json
@@ -46,6 +46,11 @@ KINDS = (0, 1, 6, 7)
 # kind-7 hash; llvm-mc rejects them. Measured on all 29 shaders of the 1.0.2.1 DLL (docs/fspx.md).
 PROLOGUE_WORDS = (0, 3, 6)
 PROLOGUE_SIZE = 36
+# Some programs of the pipeline library in shaders.rpf carry only two of those words (0 and 3): a 24-byte prologue, with
+# the code starting at word 6 (50 of the 2,684 library programs of 1.0.2.1, docs/fspx.md). Read from word 0 they never
+# decode.
+SHORT_PROLOGUE_WORDS = (0, 3)
+SHORT_PROLOGUE_SIZE = 24
 STAGE_COMPUTE = 5  # PSVRuntimeInfo1 ShaderStage (DirectX): 5 = compute
 
 
@@ -140,41 +145,33 @@ def decode_kind0(b: bytes) -> dict:
     }
 
 
-def code_range(code: bytes, last: bool = False):
-    """(start, end) of the instructions in a kind-6 program: after the 36-byte prologue when it is there, through
-    the first s_endpgm, or with `last` the last one. end is None when the program has no s_endpgm. The compute
-    programs hold one; a console graphics or mesh program can end early on some paths (an s_endpgm in the middle,
-    the rest of the code after it), so its listing runs to the last."""
+def code_range(code: bytes):
+    """(start, end) of the instructions in a kind-6 program: after the 36- or 24-byte prologue when it is there, through
+    the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
     start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
-    found = None
+    # Some pipeline programs have only the two hash carriers. Both must be literal-bearing
+    # VOP3 NOPs of the form in fspx_prologue_probe; the first body instruction starts at byte 24.
+    if not start and len(words) >= 6 and all(
+            words[k] >> 16 == 0xD580 and words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in SHORT_PROLOGUE_WORDS):
+        start = SHORT_PROLOGUE_SIZE
     pos = code.find(ENDPGM, start)
-    while pos >= 0:
-        if pos % 4 == 0:
-            found = pos
-            if not last:
-                break
+    while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)
-    return start, (found + 4 if found is not None else None)
+    return start, (pos + 4 if pos >= 0 else None)
 
 
-def disasm_with_fallback(disasm, code: bytes, mcpu: str):
-    """llvm-mc's listing, or tools/rdna2_decode.py's (shader_disasm's "python" backend) when llvm-mc reports
-    undecodable words and ours reports fewer. The title's captured programs load SGPR tuples that run past s105
-    into VCC (`s_load_dwordx8 s[100:107]`, encoding 0xf40c190f), which the hardware does and llvm-mc refuses as an
-    invalid register tuple; from there llvm-mc resynchronises off the instruction boundaries and prints garbage
-    (`exp invalid_target_22` in compute code), so the translator stopped at "fall-through into undecodable words"
-    (16 of the first 20 failed captured compute programs; our decoder reads all 20 with none). Returns
-    (asm, invalid, err, decoder)."""
-    asm, invalid, err = disasm.disasm(code, mcpu)
-    if invalid and asm.strip():
-        try:
-            py_asm, py_invalid, py_err = disasm.disasm(code, mcpu, backend="python")
-        except Exception as error:  # the fallback must not cost the llvm-mc listing
-            return asm, invalid, err + f"\npython decoder: {error}", "llvm-mc"
-        if py_asm.strip() and py_invalid < invalid:
-            return py_asm, py_invalid, py_err, "python"
-    return asm, invalid, err, "llvm-mc"
+def code_range_last(code: bytes):
+    """code_range through the last 4-byte-aligned s_endpgm instead of the first, as shader_library.code_range: a
+    program with an early exit branches to code after its first s_endpgm (28 of the 50 pipeline-library programs the
+    runtime dumped as untranslated: "branch target outside code")."""
+    start, first = code_range(code)
+    if first is None:
+        return start, None
+    last = code.rfind(ENDPGM)
+    while last >= first and (last - start) % 4:
+        last = code.rfind(ENDPGM, 0, last)
+    return start, max(first, last + 4)
 
 
 def psv_stage(container_parts: dict):
@@ -186,143 +183,69 @@ def psv_stage(container_parts: dict):
     return psv[4 + 24] if size > 24 and len(psv) > 4 + 24 else None
 
 
-def unpack_payload(payload: bytes, graphics: bool = False):
+def branch_targets_inside(asm: str, size: int) -> bool:
+    """Whether every s_branch / s_cbranch_* of a shader_disasm.py listing lands inside [0, size)."""
+    pc = 0
+    for line in asm.splitlines():
+        if "; encoding: [" not in line:
+            continue
+        text, enc = line.split("; encoding: [", 1)
+        length = enc.count(",") + 1
+        parts = text.split()
+        if parts and (parts[0] == "s_branch" or parts[0].startswith("s_cbranch_")) and len(parts) > 1:
+            try:
+                k = int(parts[1].rstrip(","), 0)
+            except ValueError:
+                k = None
+            if k is not None:
+                if k > 0x7FFF:
+                    k -= 0x10000
+                target = pc + 4 + 4 * k
+                if not 0 <= target < size:
+                    return False
+        pc += length
+    return True
+
+
+def branch_closed_end(code: bytes, start: int, mcpu: str, disasm) -> int | None:
+    """The end (after its s_endpgm) of the shortest range from `start` through an aligned s_endpgm whose branches all
+    stay inside it, or None. Tried from the first s_endpgm on."""
+    pos = code.find(ENDPGM, start)
+    while pos >= 0:
+        if (pos - start) % 4 == 0:
+            asm, invalid, _ = disasm.disasm(code[start:pos + 4], mcpu, compute=True)
+            if asm.strip() and branch_targets_inside(asm, pos + 4 - start):
+                return pos + 4
+        pos = code.find(ENDPGM, pos + 1)
+    return None
+
+
+def unpack_payload(payload: bytes, last_endpgm: bool = False):
     status, entries = parse_fspx(payload)
     if status:
         return None, status
     blob = {k: payload[o:o + s] for k, (o, s) in entries.items()}
-    # To the last s_endpgm for every program: the title's own compute programs end early on some paths too (13 of
-    # them branched past the first, "branch target outside code"); the DLL's 29 hold exactly one, so theirs is unchanged.
-    start, end = code_range(blob[6], last=True)
+    start, end = (code_range_last if last_endpgm else code_range)(blob[6])
     meta = {
         "version": struct.unpack_from("<I", payload, 4)[0],
         "directory": {str(k): [o, s] for k, (o, s) in sorted(entries.items())},
-        "code": {"start": start, "end": end, "prologue": start == PROLOGUE_SIZE},
+        "code": {"start": start, "end": end, "prologue": start > 0},
+        **decode_kind0(blob[0]),
     }
-    if graphics:
-        # A console pipeline's kind 0 is its register state, not a dispatch state: kept as words, and no wave32
-        # field, so the translator takes the wave size from the code (docs/fspx.md, "Graphics pipelines").
-        meta["graphics_state_words"] = list(struct.unpack_from(f"<{len(blob[0]) // 4}I", blob[0]))
-    else:
-        meta.update(decode_kind0(blob[0]))
     return (meta, blob), 0
-
-
-# A payload the runtime saved from a console graphics pipeline (device slot 57) is named <kind-6 sha256>-<stage>.fspx.
-GRAPHICS_STAGES = ("vs", "ps", "ms")
-
-
-def graphics_stage(stem: str):
-    """'vs', 'ps' or 'ms' for a captured console pipeline stage's file stem, else None."""
-    head, _, tail = stem.rpartition("-")
-    return tail if head and tail in GRAPHICS_STAGES else None
-
-
-VGPR_RE = None
-
-
-def ps_position_reads(listing: str) -> int:
-    """How many SV_Position components a console pixel program reads: the highest of v2..v5 it reads before writing
-    them, walking the listing in order (a straight-line approximation of the translator's own check). The hardware
-    puts the enabled components there in order after the v0/v1 barycentrics (docs/design.md, pixel-shader system
-    VGPRs), so reading v3 means x and y are there."""
-    import re
-    global VGPR_RE
-    if VGPR_RE is None:
-        VGPR_RE = re.compile(r"\bv(\d+)\b|\bv\[(\d+):(\d+)\]")
-    written, highest = set(), 1
-    read_only = ("exp", "buffer_store", "global_store", "ds_write", "image_store", "tbuffer_store", "scratch_store",
-                 "flat_store", "s_", "v_cmp", "v_readlane", "v_readfirstlane")
-    for line in listing.splitlines():
-        text = line.split(";", 1)[0].strip()
-        if not text or text.endswith(":"):
-            continue
-        op, _, rest = text.partition(" ")
-        regs = []
-        for m in VGPR_RE.finditer(rest):
-            if m.group(1) is not None:
-                regs.append([int(m.group(1))])
-            else:
-                regs.append(list(range(int(m.group(2)), int(m.group(3)) + 1)))
-        if not regs:
-            continue
-        dest = [] if op.startswith(read_only) else regs[0]
-        sources = regs if not dest else regs[1:]
-        if op.startswith("v_interp"):
-            sources = []  # the barycentric operand is v0/v1, modelled through v_interp
-        for group in sources:
-            for r in group:
-                if 2 <= r <= 5 and r not in written:
-                    highest = max(highest, r)
-        written.update(dest)
-    return highest - 1
-
-
-def signature_part(elements) -> bytes:
-    """An ISG1/OSG1 part payload: (semantic, index, system value, register, mask, rw mask) per element."""
-    head = struct.pack("<II", len(elements), 8)
-    names, table = b"", b""
-    base = 8 + 32 * len(elements)
-    for semantic, index, sysv, reg, mask, rw in elements:
-        table += struct.pack("<IIIIII", 0, base + len(names), index, sysv, 3, reg) + bytes([mask, rw, 0, 0]) + b"\0" * 4
-        names += semantic.encode() + b"\0"
-    return head + table + names
-
-
-# A console mesh program's launch shape: what all 9,282 of the game's own FSSM mesh shaders declare (128 threads,
-# 128 vertices, 128 primitives, triangles), and group-shared memory above the 5,200 bytes the largest common ones
-# use (the translator grows it to cover every constant LDS offset too).
-MESH_THREADS, MESH_MAX_VERTICES, MESH_MAX_PRIMITIVES, MESH_SHARED_BYTES = 128, 128, 128, 8192
-
-
-def mesh_psv0() -> bytes:
-    """A PSV0 part for a console mesh program, in the layout rdna2spirv.mesh_psv reads: MSInfo (GroupSharedBytesUsed,
-    two words, u16 MaxOutputVertices, u16 MaxOutputPrimitives), the wave lane counts, then PSVRuntimeInfo1 (stage 13 =
-    mesh, UsesViewID, SigPrimVectors, MeshOutputTopology 2 = triangles) and NumThreads at 36."""
-    info = bytearray(52)
-    struct.pack_into("<I", info, 0, MESH_SHARED_BYTES)
-    struct.pack_into("<HH", info, 12, MESH_MAX_VERTICES, MESH_MAX_PRIMITIVES)
-    info[24], info[27] = 13, 2
-    struct.pack_into("<III", info, 36, MESH_THREADS, 1, 1)
-    return struct.pack("<I", len(info)) + bytes(info)
-
-
-def synthetic_container(stage: str, listing: str) -> bytes:
-    """A DXBC container holding only the signatures the translator reads for a console program, which comes without
-    one: a vertex program's are empty (it fetches its own vertices, and pos0 is SV_Position), a pixel program's input
-    declares the SV_Position components it reads (ps_position_reads); without an OSG1, export mrtN is render target
-    N (rdna2spirv)."""
-    inputs = []
-    if stage == "ps":
-        n = ps_position_reads(listing)
-        if n > 0:
-            inputs.append(("SV_Position", 0, 1, 0, 0xF, (1 << n) - 1))
-    parts = [(b"ISG1", signature_part(inputs)), (b"OSG1", signature_part([]))]
-    if stage == "ms":
-        parts.append((b"PSV0", mesh_psv0()))
-    offset = 32 + 4 * len(parts)
-    offsets, body = [], b""
-    for tag, payload in parts:
-        offsets.append(offset + len(body))
-        body += tag + struct.pack("<I", len(payload)) + payload
-    total = offset + len(body)
-    return DXBC + b"\0" * 16 + struct.pack("<III", 1, total, len(parts)) + struct.pack(f"<{len(parts)}I", *offsets) + body
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
-    ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads, or a folder of .fspx payloads (the runtime's captured programs, docs/fspx.md)")
+    ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
     ap.add_argument("--out", required=True)
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
-    ap.add_argument("--python-fallback", action="store_true",
-                    help="with --disasm: a listing llvm-mc decodes with invalid words is taken from tools/rdna2_decode.py "
-                         "when that decodes fewer (the title's captured programs, docs/fspx.md)")
-    ap.add_argument("--only", choices=("all", "compute", "graphics"), default="all",
-                    help="for a folder: only its compute payloads, or only its console graphics stages "
-                         "(<code>-vs.fspx / <code>-ps.fspx)")
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
+    ap.add_argument("--last-endpgm", action="store_true",
+                    help="end each program at its last s_endpgm, not its first (pipeline-library programs the "
+                         "runtime dumped with LEONIDA_DUMP_MISSING: early exits branch past the first)")
     a = ap.parse_args(argv)
     # An output in the input folder can replace a .dxbc input and, when the input is the folder itself,
     # os.makedirs writes there before open() tries to read the folder as a file. Refuse before either.
@@ -352,21 +275,7 @@ def main(argv=None) -> int:
             return 2
     index, bad = [], 0
     used_names = set()
-    inputs = []
     for path in a.files:
-        if os.path.isdir(path):
-            # A folder holds payloads the runtime saved (<code sha256>-<state sha256>.fspx); unfinished .part files
-            # are left out. Sorted, so the same folder gives the same names on every platform.
-            with os.scandir(path) as entries:
-                found = sorted(e.path for e in entries if e.name.endswith(".fspx") and e.is_file(follow_symlinks=False))
-            if a.only != "all":
-                want = a.only == "graphics"
-                found = [p for p in found
-                         if (graphics_stage(os.path.splitext(os.path.basename(p))[0]) is not None) == want]
-            inputs.extend(found)
-        else:
-            inputs.append(path)
-    for path in inputs:
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -383,10 +292,9 @@ def main(argv=None) -> int:
             print(f"{path}: no FSPX payload found", file=sys.stderr)
             bad += 1
             continue
-        gstage = graphics_stage(stem) if data[:4] == MAGIC else None
         for n, (off, container, payload) in enumerate(items):
             name = f"{stem}_{n:02d}" if len(items) > 1 else stem
-            got, status = unpack_payload(payload, graphics=gstage is not None)
+            got, status = unpack_payload(payload, a.last_endpgm)
             if not got:
                 print(f"{name}: FSPX status {status}", file=sys.stderr)
                 bad += 1
@@ -402,8 +310,6 @@ def main(argv=None) -> int:
             meta["source"] = {"file": os.path.basename(path), "offset": off}
             entry = {"file": name + ".dxbc", "stage": "cs" if stage in (None, STAGE_COMPUTE) else f"psv{stage}",
                      "source_offset": off}
-            if gstage:
-                entry["stage"] = gstage
             if "threads" in meta:
                 entry["threads"] = meta["threads"]
             if "wave32" in meta:
@@ -411,13 +317,13 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                if a.python_fallback:
-                    asm, invalid, err, decoder = disasm_with_fallback(disasm, blob[6][start:end], a.mcpu)
-                else:
-                    asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
-                    decoder = "llvm-mc"
-                if decoder != "llvm-mc":
-                    entry["decoder"] = decoder
+                if a.last_endpgm:
+                    # The last s_endpgm can lie in data after the code; the first s_endpgm whose listing keeps
+                    # every branch inside the code is the program's end.
+                    end = branch_closed_end(blob[6], start, a.mcpu, disasm) or end
+                    meta["code"]["end"] = end
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, wave32=meta.get("wave32", True),
+                                                  compute=True)
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)
@@ -427,9 +333,6 @@ def main(argv=None) -> int:
                 listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
                 if err.strip():
                     listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
-            if gstage and container is None:
-                # The translator reads a graphics program's signatures from a container beside it.
-                container = synthetic_container(gstage, listing or "")
             if container:
                 with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
                     f.write(container)

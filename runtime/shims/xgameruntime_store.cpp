@@ -92,9 +92,6 @@ static_assert(sizeof(kOfflineSku) <= SKU_ID_SIZE, "fits licensableSku");
 
 std::mutex g_mutex;
 std::unordered_set<const void*> g_contexts, g_licenses, g_queries;
-// Licenses the user does not hold (durables, VIctory xstore.rs license_for_durables_async): real handles the title
-// may close, which XStoreIsLicenseValid answers false for.
-std::unordered_set<const void*> g_unowned_licenses;
 uint64_t g_next_token = 1;
 
 template <class T> T* new_handle(std::unordered_set<const void*>& set) {
@@ -128,6 +125,27 @@ template <int Slot> HRESULT STDMETHODCALLTYPE offline_failure(void*) {
     return E_FAIL;
 }
 
+// The *Async half of such an operation (review M11). Failing it synchronously left the XAsyncBlock unstarted, so a
+// caller that does not branch on the HRESULT and waits on the block (XAsyncGetStatus(async, true), or its callback)
+// never got an answer and hung. The block is now started and completed with E_FAIL on its queue, as the GDK reports
+// an operation that fails after it starts; the Result partner keeps returning E_FAIL. `AsyncArg` is the 1-based
+// position of the XAsyncBlock* among the arguments after `this`, from the GDK signature (the slot table names each).
+// Arguments past the fourth are on the caller's stack; reading a declared one the caller did not pass reads its
+// argument area, which x64 callers always reserve (32 bytes) and is never written.
+template <int Slot, int AsyncArg>
+HRESULT STDMETHODCALLTYPE offline_failure_async(void*, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
+    static_assert(AsyncArg >= 1 && AsyncArg <= 6, "the XAsyncBlock* is one of the first six arguments");
+    const std::uint64_t words[] = {a1, a2, a3, a4, a5, a6};
+    auto* const async = reinterpret_cast<XAsyncBlock*>(words[AsyncArg - 1]);
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XStoreImpl slot %d is not available offline: started and completed "
+                             "with E_FAIL\n", Slot);
+    if (!async) return E_POINTER;
+    return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return E_FAIL; });
+}
+
 // A slot the docs don't name, or name without a signature: E_NOTIMPL, so nothing reads outputs it didn't write.
 template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
     static std::atomic<bool> s_logged{false};
@@ -139,11 +157,11 @@ template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
 // ---- Async: every served *Async completes at once on the title's queue ----
 
 const char kProductsIdentity = 0, kLicenseIdentity = 0, kCanAcquireIdentity = 0, kGameLicenseIdentity = 0,
-           kAddOnsIdentity = 0, kUpdatesIdentity = 0, kUnownedLicenseIdentity = 0;
+           kAddOnsIdentity = 0, kUpdatesIdentity = 0;
 
 size_t result_size(const void* identity) {
     if (identity == &kProductsIdentity) return sizeof(XStoreProductQueryHandle);
-    if (identity == &kLicenseIdentity || identity == &kUnownedLicenseIdentity) return sizeof(XStoreLicenseHandle);
+    if (identity == &kLicenseIdentity) return sizeof(XStoreLicenseHandle);
     if (identity == &kCanAcquireIdentity) return sizeof(XStoreCanAcquireLicenseResult);
     if (identity == &kGameLicenseIdentity) return sizeof(XStoreGameLicense);
     return 0;   // add-ons, updates: a count of 0, no buffer
@@ -165,8 +183,6 @@ HRESULT CALLBACK store_provider(XAsyncOp op, const XAsyncProviderData* data) {
             *static_cast<XStoreProductQueryHandle*>(data->buffer) = new_handle<XStoreProductQuery>(g_queries);
         } else if (identity == &kLicenseIdentity) {
             *static_cast<XStoreLicenseHandle*>(data->buffer) = new_handle<XStoreLicense>(g_licenses);
-        } else if (identity == &kUnownedLicenseIdentity) {
-            *static_cast<XStoreLicenseHandle*>(data->buffer) = new_handle<XStoreLicense>(g_unowned_licenses);
         } else if (identity == &kCanAcquireIdentity) {
             auto* r = static_cast<XStoreCanAcquireLicenseResult*>(data->buffer);
             *r = XStoreCanAcquireLicenseResult{};
@@ -274,10 +290,7 @@ HRESULT STDMETHODCALLTYPE store_acquire_package_result(void*, XAsyncBlock* async
 bool STDMETHODCALLTYPE store_is_license_valid(void*, XStoreLicenseHandle h) { return live(g_licenses, h); }
 
 // 23: void XStoreCloseLicenseHandle(XStoreLicenseHandle storeLicenseHandle)
-void STDMETHODCALLTYPE store_close_license(void*, XStoreLicenseHandle h) {
-    if (live(g_unowned_licenses, h)) close_handle(g_unowned_licenses, h);
-    else close_handle(g_licenses, h);
-}
+void STDMETHODCALLTYPE store_close_license(void*, XStoreLicenseHandle h) { close_handle(g_licenses, h); }
 
 // 24: HRESULT XStoreCanAcquireLicenseForStoreIdAsync(context, const char* storeProductId, XAsyncBlock*)
 // 26: HRESULT XStoreCanAcquireLicenseForPackageAsync(context, const char* packageIdentifier, XAsyncBlock*)
@@ -343,21 +356,6 @@ HRESULT STDMETHODCALLTYPE store_query_package_identifier(void*, const char* stor
     if (!store_id || !out) return E_INVALIDARG;
     if (size) out[0] = '\0';
     return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-}
-
-// 71: HRESULT XStoreAcquireLicenseForDurablesAsync(context, const char* storeId, XAsyncBlock*) (IXStoreImpl3).
-// Ported from VIctory victory-hle src/modules/xstore.rs (GPL-3.0-or-later): the user owns no durables, so the call
-// succeeds with a license XStoreIsLicenseValid answers false for, rather than failing as a store-service call.
-HRESULT STDMETHODCALLTYPE store_acquire_durables_async(void*, XStoreContextHandle c, const char* store_id,
-                                                       XAsyncBlock* a) {
-    if (!store_id) return E_INVALIDARG;
-    return begin(c, a, &kUnownedLicenseIdentity, "XStoreAcquireLicenseForDurablesAsync");
-}
-// 72: HRESULT XStoreAcquireLicenseForDurablesResult(XAsyncBlock* async, XStoreLicenseHandle* storeLicenseHandle)
-HRESULT STDMETHODCALLTYPE store_acquire_durables_result(void*, XAsyncBlock* async, XStoreLicenseHandle* out) {
-    if (!out) return E_POINTER;
-    *out = nullptr;
-    return XAsyncGetResult(async, &kUnownedLicenseIdentity, sizeof(*out), out, nullptr);
 }
 
 // 66: HRESULT XStoreRegisterGameLicenseChanged(context, XTaskQueueHandle, void* context, callback, token*)
@@ -445,36 +443,36 @@ const void* const kStoreVtable[] = {
     FN(store_addons_async),                  // 30 XStoreQueryAddOnLicensesAsync
     FN(store_addons_count),                  // 31 XStoreQueryAddOnLicensesResultCount
     FN(store_addons_result),                 // 32 XStoreQueryAddOnLicensesResult
-    FN(offline_failure<33>),                 // 33 XStoreQueryConsumableBalanceRemainingAsync
+    FN((offline_failure_async<33, 3>)),      // 33 XStoreQueryConsumableBalanceRemainingAsync
     FN(offline_failure<34>),                 // 34 XStoreQueryConsumableBalanceRemainingResult
-    FN(offline_failure<35>),                 // 35 XStoreReportConsumableFulfillmentAsync
+    FN((offline_failure_async<35, 5>)),      // 35 XStoreReportConsumableFulfillmentAsync
     FN(offline_failure<36>),                 // 36 XStoreReportConsumableFulfillmentResult
-    FN(offline_failure<37>),                 // 37 XStoreGetUserCollectionsIdAsync
+    FN((offline_failure_async<37, 4>)),      // 37 XStoreGetUserCollectionsIdAsync
     FN(offline_failure<38>),                 // 38 XStoreGetUserCollectionsIdResultSize
     FN(offline_failure<39>),                 // 39 XStoreGetUserCollectionsIdResult
-    FN(offline_failure<40>),                 // 40 XStoreGetUserPurchaseIdAsync
+    FN((offline_failure_async<40, 4>)),      // 40 XStoreGetUserPurchaseIdAsync
     FN(offline_failure<41>),                 // 41 XStoreGetUserPurchaseIdResultSize
     FN(offline_failure<42>),                 // 42 XStoreGetUserPurchaseIdResult
-    FN(offline_failure<43>),                 // 43 XStoreQueryLicenseTokenAsync
+    FN((offline_failure_async<43, 5>)),      // 43 XStoreQueryLicenseTokenAsync
     FN(offline_failure<44>),                 // 44 XStoreQueryLicenseTokenResultSize
     FN(offline_failure<45>),                 // 45 XStoreQueryLicenseTokenResult
     FN(unknown_slot<46>),                    // 46 (unknown in the docs)
     FN(unknown_slot<47>),                    // 47 (unknown in the docs)
     FN(unknown_slot<48>),                    // 48 (unknown in the docs)
-    FN(offline_failure<49>),                 // 49 XStoreShowPurchaseUIAsync
+    FN((offline_failure_async<49, 5>)),      // 49 XStoreShowPurchaseUIAsync
     FN(offline_failure<50>),                 // 50 XStoreShowPurchaseUIResult
-    FN(offline_failure<51>),                 // 51 XStoreShowRateAndReviewUIAsync
+    FN((offline_failure_async<51, 2>)),      // 51 XStoreShowRateAndReviewUIAsync
     FN(offline_failure<52>),                 // 52 XStoreShowRateAndReviewUIResult
-    FN(offline_failure<53>),                 // 53 XStoreShowRedeemTokenUIAsync
+    FN((offline_failure_async<53, 6>)),      // 53 XStoreShowRedeemTokenUIAsync
     FN(offline_failure<54>),                 // 54 XStoreShowRedeemTokenUIResult
     FN(store_updates_async),                 // 55 XStoreQueryGameAndDlcPackageUpdatesAsync
     FN(store_updates_count),                 // 56 XStoreQueryGameAndDlcPackageUpdatesResultCount
     FN(store_updates_result),                // 57 XStoreQueryGameAndDlcPackageUpdatesResult
-    FN(offline_failure<58>),                 // 58 XStoreDownloadPackageUpdatesAsync
+    FN((offline_failure_async<58, 4>)),      // 58 XStoreDownloadPackageUpdatesAsync
     FN(offline_failure<59>),                 // 59 XStoreDownloadPackageUpdatesResult
-    FN(offline_failure<60>),                 // 60 XStoreDownloadAndInstallPackageUpdatesAsync
+    FN((offline_failure_async<60, 4>)),      // 60 XStoreDownloadAndInstallPackageUpdatesAsync
     FN(offline_failure<61>),                 // 61 XStoreDownloadAndInstallPackageUpdatesResult
-    FN(offline_failure<62>),                 // 62 XStoreDownloadAndInstallPackagesAsync
+    FN((offline_failure_async<62, 4>)),      // 62 XStoreDownloadAndInstallPackagesAsync
     FN(offline_failure<63>),                 // 63 XStoreDownloadAndInstallPackagesResultCount
     FN(offline_failure<64>),                 // 64 XStoreDownloadAndInstallPackagesResult
     FN(store_query_package_identifier),      // 65 XStoreQueryPackageIdentifier
@@ -483,11 +481,11 @@ const void* const kStoreVtable[] = {
     FN(store_register),                      // 68 XStoreRegisterPackageLicenseLost
     FN(store_unregister),                    // 69 XStoreUnregisterPackageLicenseLost
     FN(unknown_slot<70>),                    // 70 XStoreIsAvailabilityPurchasable (2; no documented signature)
-    FN(store_acquire_durables_async),        // 71 XStoreAcquireLicenseForDurablesAsync (3)
-    FN(store_acquire_durables_result),       // 72 XStoreAcquireLicenseForDurablesResult (3)
-    FN(offline_failure<73>),                 // 73 XStoreShowAssociatedProductsUIAsync (4)
+    FN((offline_failure_async<71, 3>)),      // 71 XStoreAcquireLicenseForDurablesAsync (3)
+    FN(offline_failure<72>),                 // 72 XStoreAcquireLicenseForDurablesResult (3)
+    FN((offline_failure_async<73, 4>)),      // 73 XStoreShowAssociatedProductsUIAsync (4)
     FN(offline_failure<74>),                 // 74 XStoreShowAssociatedProductsUIResult (4)
-    FN(offline_failure<75>),                 // 75 XStoreShowProductPageUIAsync (4)
+    FN((offline_failure_async<75, 3>)),      // 75 XStoreShowProductPageUIAsync (4)
     FN(offline_failure<76>),                 // 76 XStoreShowProductPageUIResult (4)
     FN(store_query_associated_for_id_async), // 77 XStoreQueryAssociatedProductsForStoreIdAsync (5)
     FN(store_products_result),               // 78 XStoreQueryAssociatedProductsForStoreIdResult (5)

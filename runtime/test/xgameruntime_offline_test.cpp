@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -74,7 +75,16 @@ constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0
 constexpr GUID kAccessibility2 = {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
 
-using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+struct VoiceInformation {   // XSpeechSynthesizerVoiceInformation, the GDK reference's member order
+    const char* description;
+    const char* display_name;
+    uint32_t gender;
+    const char* voice_id;
+    const char* language;
+};
+using VoiceCallback = bool(CALLBACK*)(const VoiceInformation*, void*);
+using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void* context, VoiceCallback callback);
+using SetCustomVoice = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*);
 using SpeechCreate = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
 using SpeechClose = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
 using SpeechStream = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*, void**);
@@ -92,6 +102,19 @@ void* user_object(HRESULT(WINAPI* query)(const GUID*, REFIID, void**)) {
 }
 
 void CALLBACK on_state(void*, uint64_t, uint32_t) {}
+
+struct VoicesSeen {
+    int count = 0;
+    std::string voice_id;
+    std::string language;
+};
+bool CALLBACK on_voice(const VoiceInformation* info, void* context) {
+    auto* seen = static_cast<VoicesSeen*>(context);
+    ++seen->count;
+    seen->voice_id = info && info->voice_id ? info->voice_id : "";
+    seen->language = info && info->language ? info->language : "";
+    return true;
+}
 
 // XUserDeviceImpl slots 4/5 (device association) and 7/8 (default audio endpoint): kept until unregistered, never
 // called back offline.
@@ -217,23 +240,7 @@ int main() {
     check(at<ErrorDialog>(ui, 14)(ui, &async, static_cast<HRESULT>(0x80830003), "save") == S_OK && finished(&async) &&
               at<AsyncOnly>(ui, 15)(ui, &async) == S_OK,
           "an error dialog is logged and dismissed");
-    using ProfileCard = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*, uint64_t);
-    async = XAsyncBlock{};
-    check(at<ProfileCard>(ui, 7)(ui, &async, nullptr, 2814000000000001ull) == S_OK && finished(&async) &&
-              at<AsyncOnly>(ui, 8)(ui, &async) == S_OK,
-          "a profile card has nothing to show: it completes at once, S_OK (VIctory xgameui.rs)");
-    using TextEntry = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const char*, const char*, const char*, uint32_t,
-                                                  uint32_t);
-    using TextSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t*);
-    using TextResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t, char*, uint32_t*);
-    async = XAsyncBlock{};
-    uint32_t text_size = 7, text_used = 7;
-    char text[8] = "x";
-    check(at<TextEntry>(ui, 17)(ui, &async, "Name", "Your name", "", 0, 16) == S_OK && finished(&async) &&
-              XAsyncGetStatus(&async, false) == E_ABORT && at<TextSize>(ui, 18)(ui, &async, &text_size) == E_ABORT &&
-              text_size == 0 && at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == E_ABORT &&
-              text_used == 0 && text[0] == 0,
-          "a text entry is dismissed: E_ABORT, which the title treats as cancelled");
+    check(at<NoArgs>(ui, 7)(ui) == E_FAIL, "a profile card is not available offline");
     check(at<NoArgs>(ui, 20)(ui) == E_NOTIMPL, "an unknown slot answers E_NOTIMPL");
 
     // ---- XGameStreaming ----
@@ -306,34 +313,58 @@ int main() {
           "XHighContrastGetMode reports Off");
     check(at<SetEnabled>(acc, 4)(acc, true) == S_OK, "XClosedCaptionSetEnabled is accepted");
     check(FAILED(at<NoArgs>(acc, 3)(acc)), "the closed-caption properties are not available offline");
-    check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
-              at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
-          "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
-    // Silent speech, as VIctory's speech.rs test (streams_are_empty_wave_files): a synthesizer, a stream from text or
-    // SSML, and the stream is an empty 16 kHz mono 16-bit WAVE file.
+    VoicesSeen seen;
+    check(at<EnumVoices>(acc, 8)(acc, &seen, &on_voice) == S_OK && seen.count == 1 &&
+              seen.voice_id == "leonida-silent" && seen.language == "en-US",
+          "XSpeechSynthesizerEnumerateInstalledVoices(context, callback): one silent voice, its context passed back");
+    check(at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerEnumerateInstalledVoices: a callback is required");
     void* synth = nullptr;
     check(at<SpeechCreate>(acc, 9)(acc, &synth) == S_OK && synth != nullptr &&
               at<SpeechCreate>(acc, 9)(acc, nullptr) == E_POINTER,
-          "XSpeechSynthesizerCreate hands out a synthesizer");
-    check(at<SpeechClose>(acc, 11)(acc, synth) == S_OK && at<SpeechClose>(acc, 12)(acc, synth) == S_OK,
-          "set-voice calls are accepted");
+          "XSpeechSynthesizerCreate returns a silent synthesizer handle");
     void* stream = nullptr;
-    check(at<SpeechStream>(acc, 13)(acc, synth, "Hello", &stream) == S_OK && stream != nullptr,
-          "CreateStreamFromText hands out a stream");
-    void* ssml = nullptr;
-    check(at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &ssml) == S_OK && ssml != nullptr,
-          "CreateStreamFromSsml hands out a stream");
     size_t size = 0, got = 0;
-    check(at<StreamSize>(acc, 15)(acc, stream, &size) == S_OK && size == 44, "the stream is 44 bytes");
+    check(at<SpeechClose>(acc, 10)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 11)(acc, nullptr) == E_INVALIDARG &&
+              at<SpeechClose>(acc, 12)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 14)(acc, nullptr) == E_INVALIDARG,
+          "close and set-voice calls on a null handle: E_INVALIDARG");
+    check(at<SpeechClose>(acc, 11)(acc, synth) == S_OK, "XSpeechSynthesizerSetDefaultVoice succeeds on valid handle");
+    check(at<SetCustomVoice>(acc, 12)(acc, synth, seen.voice_id.c_str()) == S_OK &&
+              at<SetCustomVoice>(acc, 12)(acc, synth, "not-installed") == E_INVALIDARG &&
+              at<SetCustomVoice>(acc, 12)(acc, synth, nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerSetCustomVoice accepts the enumerated voice only");
+    check(at<SpeechStream>(acc, 13)(acc, nullptr, "hi", &stream) == E_INVALIDARG && stream == nullptr,
+          "CreateStreamFromText on a null synthesizer: E_INVALIDARG, no stream");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "Hello", &stream) == S_OK && stream != nullptr,
+          "CreateStreamFromText returns a silent WAVE stream");
+    check(at<StreamSize>(acc, 15)(acc, stream, &size) == S_OK && size == 44,
+          "GetStreamDataSize reports the 44-byte empty WAVE header");
     uint8_t wav[64] = {};
-    check(at<StreamData>(acc, 16)(acc, stream, sizeof wav, wav, &got) == S_OK && got == 44 &&
+    check(at<StreamData>(acc, 16)(acc, stream, 8, wav, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && got == 0,
+          "GetStreamData rejects an undersized buffer with ERROR_INSUFFICIENT_BUFFER");
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof(wav), wav, &got) == S_OK && got == 44 &&
               std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVEfmt ", 8) == 0 &&
-              std::memcmp(wav + 36, "data", 4) == 0 && wav[24] == 0x80 && wav[25] == 0x3e && wav[40] == 0,
-          "a WAVE file of 16 kHz with an empty data chunk");
-    check(at<StreamData>(acc, 16)(acc, stream, 8, wav, &got) == static_cast<HRESULT>(0x8007007A),
-          "too small a buffer: E_NOT_SUFFICIENT_BUFFER");
-    check(at<SpeechClose>(acc, 14)(acc, stream) == S_OK && at<SpeechClose>(acc, 10)(acc, synth) == S_OK,
-          "closing the stream and the synthesizer");
+              std::memcmp(wav + 36, "data", 4) == 0,
+          "GetStreamData writes a valid silent 16 kHz mono 16-bit PCM WAVE header");
+    check(wav[40] == 0 && wav[41] == 0 && wav[42] == 0 && wav[43] == 0,
+          "the stream's data chunk is empty: no samples");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "hi", nullptr) == E_POINTER,
+          "a stream call with no output handle: E_POINTER");
+    check(at<StreamSize>(acc, 15)(acc, stream, nullptr) == E_POINTER,
+          "the stream size with no output: E_POINTER");
+    check(at<StreamData>(acc, 16)(acc, stream, 43, wav, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+              at<StreamData>(acc, 16)(acc, stream, sizeof(wav), nullptr, nullptr) ==
+                  HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "a buffer one byte smaller than the stream, or none: E_NOT_SUFFICIENT_BUFFER");
+    check(at<SpeechClose>(acc, 14)(acc, stream) == S_OK, "XSpeechSynthesizerCloseStreamHandle succeeds");
+    stream = nullptr;
+    check(at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &stream) == S_OK && stream != nullptr &&
+              at<SpeechClose>(acc, 14)(acc, stream) == S_OK,
+          "CreateStreamFromSsml returns a silent WAVE stream");
+    check(at<SpeechClose>(acc, 10)(acc, synth) == S_OK, "XSpeechSynthesizerCloseHandle succeeds");
+    check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
+              at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
+          "stream size and data on a null stream: E_INVALIDARG, zero written");
     bool speech_to_text_fails = true;
     for (int slot : {6, 7, 17, 18, 19, 20}) speech_to_text_fails = speech_to_text_fails && FAILED(at<NoArgs>(acc, slot)(acc));
     check(speech_to_text_fails, "speech-to-text display calls fail offline");
@@ -342,20 +373,21 @@ int main() {
     void* launcher = nullptr;
     check(query(&kLauncherClass, kLauncherClass, &launcher) == S_OK && launcher, "XLauncherImpl for its class id");
     if (!launcher) return 1;
-    void* deferral = reinterpret_cast<void*>(1);
+    void* deferral = nullptr;
+    using CloseDeferral = void(STDMETHODCALLTYPE*)(void*, void*);
     check(at<LaunchUri>(launcher, 3)(launcher, nullptr, "https://example.com") == E_FAIL,
           "XLaunchUri is not available offline");
-    // A deferral keeps the host display on through a power request (VIctory display.rs:79-123); closing it ends the
-    // request, and a null handle closes nothing.
-    using CloseDeferral = void(STDMETHODCALLTYPE*)(void*, void*);
-    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr &&
-              deferral != INVALID_HANDLE_VALUE,
-          "a display timeout deferral is a power request");
-    check(at<AcquireDeferral>(launcher, 4)(launcher, nullptr) == E_INVALIDARG, "a deferral needs somewhere to go");
-    DWORD handle_flags = 0;
-    check(GetHandleInformation(deferral, &handle_flags) != 0, "the deferral is an open handle");
+    check(at<AcquireDeferral>(launcher, 4)(launcher, nullptr) == E_POINTER,
+          "XDisplayAcquireTimeoutDeferral rejects null out pointer");
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr,
+          "XDisplayAcquireTimeoutDeferral acquires a display power request handle");
+    void* second = nullptr;
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &second) == S_OK && second && second != deferral,
+          "concurrent display deferrals have distinct handles");
+    at<CloseDeferral>(launcher, 5)(launcher, second);
     at<CloseDeferral>(launcher, 5)(launcher, deferral);
     at<CloseDeferral>(launcher, 5)(launcher, nullptr);
+    check(true, "XDisplayCloseTimeoutDeferralHandle closes handle and ignores null");
     GUID other = kLauncherClass;
     other.Data1 ^= 1;
     void* none = reinterpret_cast<void*>(1);

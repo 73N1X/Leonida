@@ -1,4 +1,6 @@
 #pragma once
+#include "command_list_epochs.h"
+#include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
@@ -414,6 +416,26 @@ struct DrawViews {
     std::uint32_t render_target_count = 8;
 };
 
+// Shared across draws that keep the same multi-viewport / multi-scissor state (null for the common 1-viewport case).
+struct DrawViewports {
+    static constexpr std::uint32_t max_count = 16;
+    std::array<Viewport, max_count> viewports{};
+    std::uint32_t viewport_count = 0;
+    std::array<Rect, max_count> scissors{};
+    std::uint32_t scissor_count = 0;
+};
+
+// Simple DRAW or DRAW_INDEXED records. The GPU consumes the action's arguments;
+// the IR retains an ordinary record-time graphics-state snapshot alongside them.
+struct IndirectDrawArgs {
+    ResourceId argument_buffer = 0;
+    std::uint64_t argument_offset = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t max_count = 1;
+    ResourceId count_buffer = 0;  // zero: fixed draw count; otherwise, a GPU-written uint32
+    std::uint64_t count_offset = 0;
+};
+
 // DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
 // D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
 // list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
@@ -440,20 +462,17 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
-    // OMSetDepthBounds, for pipelines with the depth-bounds test. Last, as the draws are aggregate-initialised in order.
-    float depth_bounds_min = 0.0f;
-    float depth_bounds_max = 1.0f;
-    // A mesh draw from ExecuteIndirect (a command signature ending in DISPATCH_MESH): its group counts are read from
-    // indirect_buffer (D3D12_DISPATCH_MESH_ARGUMENTS, the layout of VkDrawMeshTasksIndirectCommandEXT), up to
-    // indirect_max records indirect_stride apart, and with an indirect_count_buffer at most the count it holds. The
-    // rest of the draw's state is what DispatchMesh would record. 0: a direct draw.
-    ResourceId indirect_buffer = 0;
-    std::uint64_t indirect_offset = 0;
-    ResourceId indirect_count_buffer = 0;
-    std::uint64_t indirect_count_offset = 0;
-    std::uint32_t indirect_stride = 0;
-    std::uint32_t indirect_max = 0;
+    std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
+    std::array<float, 2> depth_bounds{0, 1};  // OMSetDepthBounds (min, max); used by depth-bounds pipelines only
 };
+
+// Only indirect draws allocate this extra payload. Copies of the IR share both its
+// immutable state and the usual cached DrawViews; direct draws and barriers stay compact.
+struct IndirectRasterPayload {
+    Draw state;
+    IndirectDrawArgs arguments;
+};
+using IndirectRasterDraw = std::shared_ptr<const IndirectRasterPayload>;
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
@@ -528,8 +547,9 @@ struct UavView {
     std::uint64_t size;          // buffer: bytes in the view
     std::uint32_t element_size;  // buffer: bytes an element (rects count elements), 4 for a raw view
     std::uint32_t mip;           // texture
-    std::uint32_t first_layer;
-    std::uint32_t layer_count;
+    std::uint32_t first_layer;   // 1D/2D array: first slice; 3D volume: FirstWSlice
+    std::uint32_t layer_count;   // 1D/2D array: slice count; 3D volume: WSize
+    bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
 // ClearUnorderedAccessViewUint / ...Float; the resource must be in unordered_access state at execution. values are
@@ -600,7 +620,21 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
+    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
+    dispatch_mesh = 3,
 };
+
+// For a creation-validated signature, commands are stride bytes apart, but no padding follows the
+// last packed payload. A zero maximum reads no records (offset alignment is checked separately).
+constexpr bool indirect_records_fit(std::uint64_t buffer_size, std::uint64_t offset, std::uint32_t max_count,
+                                    std::uint32_t stride, std::uint32_t packed_size) {
+    if (!packed_size || packed_size > stride || stride % 4) return false;
+    if (!max_count) return true;
+    // All factors are UINT32 and packed_size <= stride: required <= UINT32_MAX squared.
+    const auto required = std::uint64_t(max_count - 1) * stride + packed_size;
+    return offset <= buffer_size && required <= buffer_size - offset;
+}
 
 struct ExecuteIndirect {
     IndirectKind kind = IndirectKind::draw;
@@ -653,6 +687,11 @@ struct CopyAccelerationStructure {
     std::uint64_t dst_va = 0;
     std::uint64_t src_va = 0;
     std::uint32_t mode = 0;
+    // Set where the layer resolved a VA in the title's memory to the copy shaders reach it by (an XDXR build, at
+    // record time): the bytes that copy has from the VA on. 0: the VA names one of the layer's buffers, sized at
+    // replay by its binding.
+    std::uint64_t dst_room = 0;
+    std::uint64_t src_room = 0;
 };
 
 // EmitRaytracingAccelerationStructurePostbuildInfo, and each postbuild desc of BuildRaytracingAccelerationStructure:
@@ -662,45 +701,28 @@ struct AccelerationStructurePostbuild {
     std::uint64_t dest_va = 0;
     std::uint32_t type = 0;
     std::vector<std::uint64_t> sources;
-};
-
-// A wait for a value in memory (the Xbox list's WaitValue32/64, console list slots 73/74): the commands from `at` on
-// run once the 32 or 64 bits at `address` compare with `reference` as `comparison` says. The codes are D3D12's
-// comparison functions, the value against the reference (1 never, 2 less, 3 equal, 4 less-equal, 5 greater,
-// 6 not-equal, 7 greater-equal, 8 always); any other code is met. A 32-bit wait compares the low halves. Ported from
-// VIctory (GPL-3.0-or-later, Marvisak and contributors, DexNom fork), victory-gpu list.rs:1800-1845 (ValueWait) and
-// 1891-1928: the console's queue runs the list up to the wait and stands there until the value is in memory, so the
-// queue that executes the list cuts it at its waits (vulkan_backend.h, VulkanQueue::execute_parts). Not a Command:
-// it is where the list is cut, kept beside its commands.
-struct MemoryWait {
-    std::uint64_t address = 0;
-    std::uint32_t comparison = 0;
-    std::uint64_t reference = 0;
-    bool wide = false;
-    std::size_t at = 0;  // the first command after the wait
-
-    bool met_by(std::uint64_t value) const {
-        const std::uint64_t mask = wide ? ~std::uint64_t(0) : 0xffffffffu;
-        const std::uint64_t v = value & mask, r = reference & mask;
-        switch (comparison) {
-        case 1: return false;
-        case 2: return v < r;
-        case 3: return v == r;
-        case 4: return v <= r;
-        case 5: return v > r;
-        case 6: return v != r;
-        case 7: return v >= r;
-        default: return true;
-        }
-    }
+    std::uint64_t dest_room = 0;  // as CopyAccelerationStructure::dst_room
 };
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             WriteImmediate, label::Write, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
-                             AccelerationStructurePostbuild>;
+                             AccelerationStructurePostbuild, IndirectRasterDraw>;
+
+struct DrawCommandView {
+    const Draw* state = nullptr;
+    const IndirectDrawArgs* arguments = nullptr;
+};
+
+// Queries, shader-work detection and replay all see the same captured graphics state.
+inline DrawCommandView draw_command(const Command& command) noexcept {
+    if (const auto* draw = std::get_if<Draw>(&command)) return {draw, nullptr};
+    if (const auto* indirect = std::get_if<IndirectRasterDraw>(&command); indirect && *indirect)
+        return {&(*indirect)->state, &(*indirect)->arguments};
+    return {};
+}
 
 class CommandList {
 public:
@@ -732,10 +754,11 @@ public:
         return append(barrier);
     }
 
+    // LayoutAfter UNDEFINED is legal: the subresources' contents are no longer needed, as before their memory is
+    // aliased (the retail title ends a depth buffer's use this way, #984; WARP closes such a list,
+    // d3d12_close_parity_test). Replay keeps the image's Vulkan layout and orders the accesses only.
     bool barrier(const TextureBarrier& barrier) {
         if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
-        if (barrier.layout_after == d3d12_layout::undefined && barrier.layout_before != d3d12_layout::undefined)
-            return false;
         if (barrier.flags & ~texture_barrier_discard) return false;
         if (barrier.range.mip_count && (!barrier.range.layer_count || !barrier.range.plane_count)) return false;
         if (barrier.sync_after == d3d12_sync::split) return !closed_;
@@ -799,6 +822,12 @@ public:
         return append(std::move(draw));
     }
 
+    bool draw_indirect(Draw&& state, const IndirectDrawArgs& arguments) {
+        if (closed_ || !state.pipeline) return false;
+        if (!arguments.max_count) return true;
+        return append(std::make_shared<const IndirectRasterPayload>(std::move(state), arguments));
+    }
+
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
     bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
@@ -827,6 +856,11 @@ public:
     }
 
     // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.
+    bool write_gpu_label(const label::Write& write) {
+        if(write.target.owner.expired() || write.clock>2) return false;
+        return append(write);
+    }
+
     bool write_immediate(const WriteImmediate& write) {
         if (!write.address || write.address % 4 || write.mode > write_immediate_mode::marker_out) return false;
         return append(write);
@@ -949,23 +983,13 @@ public:
         if (!closed_) return false;
         commands_.clear();
         active_.clear();
-        memory_waits_.clear();
         closed_ = false;
-        return true;
-    }
-
-    // A wait for a memory value before the next command recorded (MemoryWait).
-    bool wait_memory(MemoryWait wait) {
-        if (closed_ || !wait.address) return false;
-        wait.at = commands_.size();
-        memory_waits_.push_back(wait);
+        stamp_.restamp();
         return true;
     }
 
     bool closed() const { return closed_; }
     std::span<const Command> commands() const { return commands_; }
-    // In the order they were recorded, so their `at` never goes down.
-    std::span<const MemoryWait> memory_waits() const { return memory_waits_; }
 
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
@@ -1003,8 +1027,8 @@ private:
 
     std::vector<Command> commands_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
-    std::vector<MemoryWait> memory_waits_;
     bool closed_ = false;
+    command_list_epochs::Stamp stamp_;  // when this recording began: a copy the layer retires waits for it
 };
 
 } // namespace leonida

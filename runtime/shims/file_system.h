@@ -28,6 +28,19 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
+// The folder "T:\" names in this process: <overlay dir>\.gta6rt-temp\<stem>, or <stem>-2, -3, ... when that name was
+// taken (scratch_stem(), reserve_unique_dir). Reserved on the first T: call or the first call of this function for the
+// overlay and kept for the rest of the process; empty while no overlay is configured or when no folder could be made.
+std::filesystem::path scratch_dir();
+// The first name tried for that folder: the process's start time (UTC) and id, "YYYYMMDD-HHMMSS-mmm-pid<id>".
+std::wstring scratch_stem();
+
+// Makes a new folder base\stem, or base\stem-2 ... base\stem-<max_tries> when the names before it exist, each with a
+// create-only CreateDirectoryW, so the folder returned did not exist before and no other process got it. Makes `base`
+// first. Returns an empty path, with the Win32 error in `error`, when every name was taken (ERROR_ALREADY_EXISTS) or
+// a create failed for another reason.
+std::filesystem::path reserve_unique_dir(const std::filesystem::path& base, const std::wstring& stem,
+                                         unsigned long& error, unsigned max_tries = 1000);
 
 // The host file a read of `path` opens, by the rules above: a GAME:/G:/T: path becomes its overlay or package file,
 // anything else is returned unchanged. False for a refused console path or a package file the title deleted.

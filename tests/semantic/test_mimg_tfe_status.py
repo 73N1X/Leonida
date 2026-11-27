@@ -30,7 +30,7 @@ def run_ps(lines):
     tsharp = [0 if w == 1 else 0x11110000 + w for w in range(8)]      # word 1 = 0: a float format
     base = 0x1000
     memory = {base + 4 * w: word for w, word in enumerate(tsharp)}
-    desc_map = [0, *tsharp, 1]                                          # one slot, bindless index 1
+    desc_map = [0, *tsharp, 1, 1]                                       # one slot: bindless index 1, kind 1
     images = [None, lambda coord, lod: TEXEL]
     _, outs = si.run_workgroup(spv, 1, 32, inputs_for=lambda i: {"%sg_lane": i}, push_constants=[base, 0],
                                memory=memory, resources={"%desc_map": desc_map, "%images": images},

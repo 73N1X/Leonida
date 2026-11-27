@@ -74,7 +74,10 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertEqual(summary["error"], "full: exit code 7")
                     self.assertEqual(summary["runs"]["full"]["outcome"], "exited")
                     self.assertEqual(summary["runs"]["full"]["returncode"], 7)
-                    self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
+                    # The runner resolves --out before it writes (run_guest_scene.py:355), so the report path it
+                    # prints is the physical one: on Windows the 8.3 name (RUNNER~1) is expanded, and on macOS the
+                    # unresolved /var prefix only matched as a suffix of /private/var.
+                    self.assertIn(str(report.resolve()).encode(encoding, "backslashreplace"), result.stdout)
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
@@ -109,7 +112,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader), "--wine-arg=-a", "--wine-arg=path with spaces/wine"]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            # The runner's "could not launch" line carries the OS error text, which Windows localizes and the child
+            # prints in the ANSI code page (cp1251 on a Russian host): a strict UTF-8 decode would leave stdout None.
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])
@@ -117,7 +122,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(record, report["runs"]["full"])
             self.assertEqual(record["outcome"], "launch_failed")
             self.assertIsNone(record["returncode"])
-            self.assertEqual(record["cmd"][0], str(bad_loader))
+            # The runner resolves --loader, --guest and --shaders before it runs (scripts/run_guest_scene.py:348),
+            # so the record holds the physical path: on macOS /var/folders is a symlink to /private/var/folders.
+            self.assertEqual(record["cmd"][0], str(bad_loader.resolve()))
             if sys.platform != "win32":
                 self.assertEqual(record["cmd"][1:3], ["-a", "path with spaces/wine"])
             self.assertTrue(record["launch_error"])

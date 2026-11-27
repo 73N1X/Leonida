@@ -2,7 +2,8 @@ r"""Measure RDNA2 (GFX10) f16/f64 results under MODE.FP_ROUND[3:2] nearest-even 
 
 Runs two native sweeps through tools/hw_oracle in wave32 and wave64:
 1. Targeted f16/f64 rounding cases (v_cvt_f16_f32, v_add_f16, v_sub_f16, v_mul_f16, v_fma_f16, v_pk_add_f16,
-   v_pk_fma_f16, v_fma_mixlo_f16, v_fma_mixhi_f16, v_add_f64 including exact-sum and finite-overflow saturation)
+   v_pk_fma_f16, v_fma_mixlo_f16, v_fma_mixhi_f16, v_ldexp_f16 overflow and denormal results, v_add_f64 including
+   exact-sum and finite-overflow saturation)
    under s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0 (RNE) vs 3 (RTZ).
 2. Exhaustive 65,536-input RNE vs RTZ comparison of all seven f16 transcendentals (v_rcp_f16, v_rsq_f16,
    v_sqrt_f16, v_sin_f16, v_cos_f16, v_exp_f16, v_log_f16), confirming that none of them depend on MODE.FP_ROUND.
@@ -59,6 +60,10 @@ CASES = (
      "v_fma_mixhi_f16 v3, v1, v2, v5", False, 0xC0001234, 0xBFFF1234),
     ("fma_mixlo_ovf", ("v_mov_b32 v1, 0x5f800000", "v_mov_b32 v2, 0x5f800000", "v_mov_b32 v5, 0"),
      "v_fma_mixlo_f16 v3, v1, v2, v5", False, 0x7C00, 0x7BFF),
+    ("ldexp_f16_ovf", ("v_mov_b32 v1, 0x7bff", "v_mov_b32 v2, 1"),
+     "v_ldexp_f16_e32 v3, v1, v2", False, 0x7C00, 0x7BFF),
+    ("ldexp_f16_sub", ("v_mov_b32 v1, 0xbc03", "v_mov_b32 v2, -15"),
+     "v_ldexp_f16_e32 v3, v1, v2", False, 0x8202, 0x8201),
     ("add_f64", ("v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3ff00000", "v_mov_b32 v6, 0", "v_mov_b32 v7, 0xbc300000"),
      "v_add_f64 v[3:4], v[0:1], v[6:7]", True, (0x00000000, 0x3FF00000), (0xFFFFFFFF, 0x3FEFFFFF)),
     ("add_f64_ovf", ("v_mov_b32 v0, -1", "v_mov_b32 v1, 0x7fefffff"),
@@ -271,30 +276,34 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    mismatches = 0
-    for wave in waves:
-        c = probe_cases(oracle, asm, wave)
-        t = probe_transcendentals(oracle, asm, wave)
-        out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
-        if c["ok"] != c["total"] or not t["all_ok"]:
-            mismatches += 1
-        t_ok = sum(info["ok"] for info in t["ops"].values())
-        print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
-              f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
-        for op, info in t["ops"].items():
-            if not info["ok"]:
-                print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
-                      f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
-    if args.json_out is not None:
-        write_err = write_json_report(args.json_out, out)
-        if write_err:
-            print(f"error: {write_err}", file=sys.stderr)
-            return 1
-    return 1 if mismatches else 0
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        mismatches = 0
+        for wave in waves:
+            c = probe_cases(oracle, asm, wave)
+            t = probe_transcendentals(oracle, asm, wave)
+            out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
+            if c["ok"] != c["total"] or not t["all_ok"]:
+                mismatches += 1
+            t_ok = sum(info["ok"] for info in t["ops"].values())
+            print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
+                  f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
+            for op, info in t["ops"].items():
+                if not info["ok"]:
+                    print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
+                          f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
+        if args.json_out is not None:
+            write_err = write_json_report(args.json_out, out)
+            if write_err:
+                print(f"error: {write_err}", file=sys.stderr)
+                return 1
+        return 1 if mismatches else 0
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
 
 
 if __name__ == "__main__":

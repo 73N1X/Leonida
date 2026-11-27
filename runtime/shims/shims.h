@@ -89,6 +89,19 @@ bool bundled_module_path(void* module, std::wstring& path);
 void set_main_image(void* base);
 void* main_image();
 
+// Title-exported __XMemAllocationHooks__ (GDK XMEM_ALLOCATION_HOOKS): the console runtime routes internal
+// allocations (including D3D12 descriptor heaps) through these callbacks when the mapped image exports the struct.
+// Registered by Loader after relocations and removed in Loader::~Loader.
+using XMemAllocHookFn = void*(__stdcall*)(size_t size, uint64_t attributes);
+using XMemFreeHookFn = void(__stdcall*)(void* ptr, uint64_t attributes);
+struct XMemAllocationHooks {
+    XMemAllocHookFn alloc;
+    XMemFreeHookFn free;
+};
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks);
+void remove_xmem_allocation_hooks(const void* owner);
+const XMemAllocationHooks* xmem_allocation_hooks();
+
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).
 using TestHook = void (*)(const void* return_address_slot);
