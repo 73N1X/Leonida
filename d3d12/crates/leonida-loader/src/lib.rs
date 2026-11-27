@@ -27,6 +27,8 @@ mod crash;
 // LOCAL (leonida-perf, via our wt5): LEONIDA_RENDER_SCALE / LEONIDA_OWN_UPSCALER / LEONIDA_NO_WATCHDOG title patches.
 #[cfg(windows)]
 mod hooks;
+// Leonida: the game patches after VI-Patch (60 fps always, the others by `LEONIDA_VIPATCH_*`); docs/vi_patch.md.
+mod vipatch;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
