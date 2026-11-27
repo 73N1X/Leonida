@@ -43,13 +43,40 @@ float3 sharpened(float2 uv) {
     float3 c = (g + (l + r + u + d) * k) / (1.0 + 4.0 * k);
     return clamp(c, lo, hi);
 }
+// A clamp to [0,1] that is safe for NaN and infinity (CLEAN, set when the pass is made from LEONIDA_COMPOSE_NAN):
+// saturate() makes a NaN 0, which showed as black specks and a black sun where the upscaler or frame generation
+// handed one over (sun glints on water). Here a NaN becomes 1, +infinity 1, a negative value and -infinity 0. The
+// test is on the bits: the compiler may fold x != x or isnan() away.
+// From aki-gta6/aki-runtime 33c21b9 (Aki-Developer), GPL-3.0.
+float clean1(float x) {
+#if CLEAN
+    return (asuint(x) & 0x7FFFFFFFu) > 0x7F800000u ? 1.0 : saturate(x);
+#else
+    return saturate(x);
+#endif
+}
+float3 clean(float3 x) {
+    return float3(clean1(x.r), clean1(x.g), clean1(x.b));
+}
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float3 s = sharpened(v.uv);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s * (1 - saturate(o.a))), 1);
+    return float4(clean(o.rgb + s * (1 - clean1(o.a))), 1);
 }
 "#;
+
+/// Whether the composer's clamp keeps a NaN from coming out black (`clean1` in [`SOURCE`]). On by default;
+/// `LEONIDA_COMPOSE_NAN=0`: plain `saturate`, as before.
+fn clean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_COMPOSE_NAN").is_none_or(|v| v != "0"))
+}
+
+/// [`SOURCE`] with its two settings in front.
+fn source(sharpen: f32, clean: bool) -> String {
+    format!("#define SHARPEN {sharpen:.3}\n#define CLEAN {}\n{SOURCE}", u8::from(clean))
+}
 
 /// Leonida: how much the scene is sharpened before the interface goes over it (`LEONIDA_SHARPEN`, 0 to 1;
 /// default 0.6; 0: off). The title renders 1280x720 on Series S and DLSS takes it to 1920x1080; the DLSS
@@ -77,8 +104,10 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
-    let source = format!("#define SHARPEN {:.3}
-{SOURCE}", sharpen());
+    compile_source(&source(sharpen(), clean()), entry, target)
+}
+
+fn compile_source(source: &str, entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
@@ -248,6 +277,30 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
         90 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
         10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(d.Format),
         _ => None,
+    }
+}
+
+/// No card needed: the compiler alone.
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    /// The pixel program compiles with the NaN-safe clamp and without it, sharpened or not, and the two clamps
+    /// are different code (the bit test is not folded away).
+    #[test]
+    fn the_composer_compiles_with_and_without_the_nan_clamp() {
+        let bytes = |source: &str| {
+            let blob = compile_source(source, s!("ps"), s!("ps_5_1")).expect("the composer's pixel program compiles");
+            // SAFETY: the blob's own bytes, copied while it lives.
+            unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()).to_vec() }
+        };
+        for sharpen in [0.0, 0.6] {
+            let (with, without) = (bytes(&source(sharpen, true)), bytes(&source(sharpen, false)));
+            assert_ne!(with, without, "the clamp changed nothing at sharpen {sharpen}");
+        }
+        compile_source(&source(0.6, true), s!("vs"), s!("vs_5_1")).expect("the vertex program compiles");
+        assert!(source(0.25, true).starts_with("#define SHARPEN 0.250\n#define CLEAN 1\n"));
+        assert!(source(0.0, false).contains("#define CLEAN 0\n"));
     }
 }
 

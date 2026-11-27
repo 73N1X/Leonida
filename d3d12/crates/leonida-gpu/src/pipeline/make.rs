@@ -149,11 +149,38 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
+        });
+    }
+
+    /// [`Pending::make`] by `build`. A build that panics (a shader the
+    /// translator trips over) is a pipeline refused: the entry is complete,
+    /// its waiters are woken and the worker goes on to the next one. Before,
+    /// the panic ended the worker's thread with the entry never made: every
+    /// draw with it waited out its budget, and with each such pipeline one
+    /// worker fewer made the others. `LEONIDA_PIPELINE_PANIC_CATCH=0`: the
+    /// panic goes on, as before.
+    ///
+    /// From aki-gta6/aki-runtime d9d1341 (Aki-Developer; their port of
+    /// fxceless/victory-fork 46da5ee, pull request 1353), GPL-3.0.
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        static CATCH: OnceLock<bool> = OnceLock::new();
+        let catch = *CATCH.get_or_init(|| std::env::var_os("LEONIDA_PIPELINE_PANIC_CATCH").is_none_or(|v| v != "0"));
+        self.made.get_or_init(|| {
+            if !catch {
+                return build();
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "a host pipeline's build panicked: it counts as refused");
+                    None
+                }
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,6 +208,30 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 failed.join(" + ")
             })
         }
+    }
+}
+
+/// Why a pipeline has no host pipeline, for the drop counters
+/// (`crate::drops`). From aki-gta6/aki-runtime d9d1341 (Aki-Developer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Gone {
+    /// Left out on purpose (`left_out`).
+    LeftOut,
+    /// Not made yet (queued or compiling), or, for a draw into formats other
+    /// than the title's, the pipeline made again for them is not.
+    Making,
+    /// Made, and there is none: a shader does not translate or the host
+    /// refused it.
+    Refused,
+}
+
+pub(crate) fn gone(p: &Pending) -> Gone {
+    if p.left_out.is_some() {
+        Gone::LeftOut
+    } else if matches!(p.made.get(), Some(None)) {
+        Gone::Refused
+    } else {
+        Gone::Making
     }
 }
 
@@ -676,6 +727,25 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A build that panics leaves a refused pipeline, and the thread that
+    /// made it goes on (aki-runtime d9d1341, after fxceless 46da5ee).
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let (failed, next) = (bad.clone(), good.clone());
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+        assert_eq!(gone(&bad), Gone::Refused);
+        // (Complete: it is not built a second time.)
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
     }
 
     #[test]

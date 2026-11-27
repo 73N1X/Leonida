@@ -423,6 +423,16 @@ pub fn translation_fingerprint() -> Vec<u8> {
 ///   (every other form refused them; the 2-D tile groups of one console wave unless
 ///   `LEONIDA_WAVE_WIDE_LAST` says otherwise, and with `LEONIDA_WAVE_WIDE=1`). No program another
 ///   form takes changes.
+/// - `exact`: also before anything approximate. Once the forms that are exact without a group
+///   barrier have refused a program (as it is, without its early-outs or skips, each host wave
+///   on its own where that is the allocation idiom), the paired form is tried, before the exact
+///   forms that cost group barriers and before each half-wave is given results of its own
+///   (`local waves (APPROXIMATE)`: a tile-wide result becomes two half-tile ones). An exact form
+///   then stands where an approximate one did: aki-gta6/aki-runtime fe9c736 (Aki-Developer,
+///   GPL-3.0) tries the paired form there by default, and about 30 of the title's programs take
+///   it on a 32-lane card. Not the default here until it has run in the game: this tree's paired
+///   form of the water's programs still draws blocks, and unlike theirs it takes 32-bit float
+///   sums in the host's order (`paired.rs`, `paired_shape`).
 /// - `first`: first of all the forms for every console wave64 compute program that does not
 ///   translate as it is (for trying it on programs another form takes).
 /// - `0`: never.
@@ -435,6 +445,7 @@ pub enum PairedLanes {
     Off = 0,
     BeforeWide = 1,
     First = 2,
+    Exact = 3,
 }
 
 /// `LEONIDA_PAIRED_LANES` ([`PairedLanes`]), read once.
@@ -452,6 +463,7 @@ fn parse_paired_lanes(value: Option<&str>) -> PairedLanes {
     match value.map(str::trim) {
         Some("0") => PairedLanes::Off,
         Some("first") => PairedLanes::First,
+        Some("exact") => PairedLanes::Exact,
         _ => PairedLanes::BeforeWide,
     }
 }
@@ -748,6 +760,16 @@ pub fn emit(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
+                // `LEONIDA_PAIRED_LANES=exact`: the paired form before anything approximate, and
+                // before the exact forms that cost group barriers. Where it refuses, what
+                // follows is unchanged.
+                if pairs == PairedLanes::Exact {
+                    let again = paired(c, native, p, why);
+                    report("paired lanes (before the approximate forms)", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
@@ -3380,6 +3402,27 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// The colour a pixel program writes is held to the console's HDR range unless
+    /// `LEONIDA_HDR_CLAMP=0` (`Lower::clamp_hdr`, after aki-runtime 01f6f31): the program with
+    /// the bounds is another, longer one, and both are valid.
+    #[test]
+    fn a_pixel_colour_output_is_held_to_the_consoles_hdr_range() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let translated = |on: bool| {
+            let was = lower::TEST_HDR_CLAMP.replace(Some(on));
+            let shader = pixel(&words, PERSP_CENTER);
+            lower::TEST_HDR_CLAMP.set(was);
+            shader.expect("the pixel program translates")
+        };
+        let (held, plain) = (translated(true), translated(false));
+        assert!(held.dxil.len() > plain.dxil.len(), "the clamp added nothing");
+        assert_eq!(translated(true).dxil, held.dxil);
+        validate(&held);
+        validate(&plain);
+        assert_eq!(lower::HDR_MAX, 65024.0);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

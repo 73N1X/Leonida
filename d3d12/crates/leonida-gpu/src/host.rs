@@ -2981,6 +2981,26 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
+    /// Two planes are composed into 10 bits only while Streamline presents,
+    /// the switch is on and the swap chain took the format.
+    #[test]
+    fn two_planes_are_composed_into_10_bits_under_streamline_only() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM};
+        assert_eq!(super::planes_format(true, true, false), DXGI_FORMAT_R10G10B10A2_UNORM);
+        assert_eq!(super::planes_format(false, true, false), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(super::planes_format(true, false, false), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(super::planes_format(true, true, true), DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+
+    /// A removed device's fence value is not a value reached.
+    #[test]
+    fn a_removed_devices_fence_value_is_not_reached() {
+        assert!(!super::fence_reached(u64::MAX, 1));
+        assert!(!super::fence_reached(6, 7));
+        assert!(super::fence_reached(7, 7));
+        assert!(super::fence_reached(8, 7));
+    }
+
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
     /// before the flight.
@@ -3733,6 +3753,104 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// Whether the dynamic slots of a flight's descriptor tables are given back
+/// as soon as the card has run the flight: at the start of its landing, and
+/// by a recording thread that finds the ring without room
+/// ([`release_finished_tables`]). Only the card reads the slots, and what
+/// follows a flight (copies back, read-backs, telling the title) took
+/// milliseconds a flight during which a heavy frame's recording found the
+/// ring full. On by default; `LEONIDA_TABLES_EARLY=0`: at the end of the
+/// landing, as before.
+///
+/// From aki-gta6/aki-runtime d9d1341 (Aki-Developer), GPL-3.0.
+fn tables_early() -> bool {
+    crate::toggled!("LEONIDA_TABLES_EARLY")
+}
+
+/// Whether a table that still finds no dynamic slots waits for the flights
+/// in the air ([`settle_for_fence`]) before it is refused and its draw
+/// dropped. The wait holds up the thread that records the list, and under
+/// the relay every flight must have landed: aki-runtime measured frames of
+/// 90-120 ms against 55 with this and two other waits on, and runs with it
+/// off. On by default here, as before (a refused table is a dropped draw);
+/// `LEONIDA_SLOT_SETTLE=0`: refused without the wait. The frame line counts
+/// the waits (`crate::drops::tables_text`).
+fn slot_settle() -> bool {
+    crate::toggled!("LEONIDA_SLOT_SETTLE")
+}
+
+/// [`tables_early`], at a landing: gives the tables' slots of flights the
+/// card has run back before anything else is done for them. (Done again at
+/// the landing's end, where it finds nothing left.)
+fn release_flown_tables(items: &mut [Late]) {
+    if !tables_early() {
+        return;
+    }
+    for item in items {
+        if let Late::Run(flight) = item {
+            for detached in &mut flight.lists {
+                detached.release_tables();
+            }
+        }
+    }
+}
+
+/// [`tables_early`], for a recording thread that found no dynamic slots:
+/// gives back the tables' slots of the flights in the line the card has run
+/// already and the thread that lands them has not taken yet, without
+/// waiting for anything. Whether any were given back.
+pub(crate) fn release_finished_tables() -> bool {
+    if !tables_early() || !late() {
+        return false;
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: a plain query.
+    let done = unsafe { host.fence.GetCompletedValue() };
+    // (A removed device says `u64::MAX`: nothing has run.)
+    if done == u64::MAX {
+        return false;
+    }
+    // Taken under the line's lock, let go of after it: giving slots back
+    // takes the heaps' locks and may drop host copies.
+    let held: Vec<crate::draw::TablesHeld> = {
+        let mut line = line();
+        line.line
+            .iter_mut()
+            .filter_map(|item| match item {
+                Late::Run(flight) if flight.fence <= done => Some(flight),
+                _ => None,
+            })
+            .flat_map(|flight| flight.lists.iter_mut().filter_map(|detached| detached.take_tables()))
+            .collect()
+    };
+    !held.is_empty()
+}
+
+/// Dynamic slots for a table a draw cannot run without: when the ring has
+/// no room, first the slots of flights the card has run are given back
+/// ([`release_finished_tables`]), and only then the flights in the air are
+/// waited for ([`slot_settle`]). Before, the wait came at once.
+pub(crate) fn table_slots(heap: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+    if let Some(first) = heap.dynamic(n) {
+        return Some(first);
+    }
+    if release_finished_tables()
+        && let Some(first) = heap.dynamic(n)
+    {
+        crate::drops::table_helped(false);
+        return Some(first);
+    }
+    if !slot_settle() {
+        return None;
+    }
+    crate::drops::table_helped(true);
+    // (Counts the wait, and with `LEONIDA_DYNAMIC_WAIT=1` waits for the next
+    // landing without the submission lock before it settles everything.)
+    wait_for_slots(|| heap.dynamic(n))
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
@@ -3853,6 +3971,55 @@ fn dynamic_wait_line(frames: f64) {
     );
 }
 
+/// Whether the fence's completed value says the card ran up to `target`:
+/// `u64::MAX` is what a removed device reports, not a value reached.
+///
+/// From aki-gta6/aki-runtime d9d1341 (Aki-Developer; their port of
+/// fxceless/victory-fork d036cea, pull request 1366), GPL-3.0.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Whether a background thread that waits on the host's fence stops the run
+/// with a report when the wait fails or the fence did not reach its value
+/// (a removed device): one that went on landed flights the card never ran,
+/// and what their shaders "wrote" went into title memory before the run
+/// ended elsewhere. On by default; `LEONIDA_FENCE_CHECK=0`: goes on, as
+/// before.
+fn fence_checked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_FENCE_CHECK").is_none_or(|v| v != "0"))
+}
+
+/// Waits on the fence for a background thread ([`fence_checked`]). Whether
+/// the wait was made (without the check a failed one is not).
+///
+/// # Safety
+/// The event is private to the waiting thread and the fence remains alive.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) -> bool {
+    // SAFETY: the caller owns the event and fence for the whole wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        if fence_checked() {
+            fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
+        }
+        return false;
+    }
+    // SAFETY: as above.
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if !fence_checked() {
+        return true;
+    }
+    if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    // SAFETY: a plain query.
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
+    }
+    true
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3920,11 +4087,9 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -4056,6 +4221,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX && fence_checked() {
+                    drop(line);
+                    fail(format_args!("relay: the fence reports the device removed"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -4083,12 +4252,8 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
+                let waited = unsafe { wait_host_fence(&host.fence, target, event, "relay") };
+                if !waited {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5555,8 +5720,10 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run them: the slots of their tables are free at once.
+        release_flown_tables(&mut items);
         // Leonida, an experiment (`tell_early`): the title is told first.
         let early = tell_early();
         if early {
@@ -6034,7 +6201,7 @@ impl Host {
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
         loop {
-            let items = {
+            let mut items = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -6066,6 +6233,7 @@ impl Host {
                             WaitForSingleObject(self.event, INFINITE);
                             stood(waiting);
                             working(true);
+                            release_flown_tables(&mut items);
                         }
                         Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
                     }
@@ -7449,10 +7617,16 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        let existing = deferred.back_wanted.iter_mut().find(|target| target.owner() == resource as usize);
+        let renew = crate::toggled!("LEONIDA_BACK_RENEW");
+        match crate::texback::again(existing.as_ref().map(|target| target.fresh()), renew) {
+            crate::texback::Again::Keep => {}
+            crate::texback::Again::Renew => {
+                if let (Some(entry), Some(target)) = (existing, crate::texback::Target::new(resource)) {
+                    *entry = target;
+                }
+            }
+            crate::texback::Again::Add => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
         }
     }
 
@@ -10359,6 +10533,31 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// The format two presented planes are composed into: 8 bits a channel, or
+/// 10 while Streamline presents (`streamline`) unless `ten` is off. DLSS
+/// frame generation makes its frames from the swap chain's picture, and
+/// from an 8-bit one they came out in bands (sky, skin: aki-runtime's runs
+/// of 2026-11-27, gone with 10 bits). `refused`: the swap chain did not take
+/// the 10-bit format, and 8 bits are composed as before.
+///
+/// From aki-gta6/aki-runtime 2f43f8b and bdcb503 (Aki-Developer), GPL-3.0.
+/// A single plane is not converted as there: it is copied in the title's
+/// own format, 10 bits or more where the title has them.
+fn planes_format(streamline: bool, ten: bool, refused: bool) -> DXGI_FORMAT {
+    if streamline && ten && !refused { DXGI_FORMAT_R10G10B10A2_UNORM } else { DXGI_FORMAT_R8G8B8A8_UNORM }
+}
+
+/// Whether two planes are composed into 10 bits under Streamline
+/// ([`planes_format`]). On by default; `LEONIDA_PRESENT_10BIT=0`: 8 bits, as
+/// before.
+fn present_tenbit() -> bool {
+    static TEN: OnceLock<bool> = OnceLock::new();
+    *TEN.get_or_init(|| std::env::var_os("LEONIDA_PRESENT_10BIT").is_none_or(|v| v != "0"))
+}
+
+/// The swap chain refused the 10-bit format once ([`planes_format`]).
+static TEN_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -10453,6 +10652,9 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // Of those two together, by reason (`crate::drops`): what is left
+        // out on purpose apart from what was not meant to be.
+        let (drop_reasons, _, _) = crate::drops::line(frames);
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -10642,7 +10844,7 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect, of both per frame: {drop_reasons}; heap buffers {picked:.1} passes {picked_ms:.1} ms;                 texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
@@ -10761,7 +10963,7 @@ impl Host {
             ))
         });
         let format = if planes.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
+            planes_format(crate::fg::active(), present_tenbit(), TEN_REFUSED.load(Ordering::Relaxed))
         } else {
             let Some(format) = swap_format(desc.Format) else {
                 tracing::warn!(format = desc.Format.0, "cannot present this format");
@@ -10827,6 +11029,15 @@ impl Host {
                         "the swap chain's buffers were made again for another size or format"
                     );
                     self.log_video_memory("right after the swap chain's buffers were made again");
+                }
+                Err(e) if planes.is_some()
+                    && format == DXGI_FORMAT_R10G10B10A2_UNORM
+                    && !TEN_REFUSED.swap(true, Ordering::Relaxed) =>
+                {
+                    // Once: the planes are composed into 8 bits from now on.
+                    tracing::warn!(error = %e, "the swap chain does not take 10 bits a channel: the two planes are composed into 8, as before");
+                    drop(presenter);
+                    return self.present_planes(texture, state_u32, overlay, frame);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");

@@ -244,6 +244,12 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // They have run and are not detached on this path: their tables'
+        // slots are given back now, as in `submit_cut`, not at the title's
+        // reset. (This path is taken only with `LEONIDA_CUT_WAITS=0`.)
+        // From aki-gta6/aki-runtime d9d1341 (their port of fxceless
+        // af23c65, pull request 1320).
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);

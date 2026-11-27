@@ -209,6 +209,13 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
+
+    /// As [`Detached::release_tables`], for a caller that holds a lock: what
+    /// the list held, to be dropped once the lock is let go
+    /// ([`crate::draw::State::tables_taken`]).
+    pub(crate) fn take_tables(&mut self) -> Option<crate::draw::TablesHeld> {
+        self._state.tables_taken()
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -2138,6 +2145,9 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // By the reason `State::execute_indirect` noted, if it did.
+    #[cfg(windows)]
+    crate::drops::count_noted(crate::drops::Kind::Indirect, crate::drops::Why::Other);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {

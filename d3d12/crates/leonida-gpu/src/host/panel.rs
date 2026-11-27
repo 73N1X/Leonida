@@ -134,7 +134,8 @@ impl Counters {
             get(&COPY_BACK[0]),
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
-            crate::draw::dropped_now(),
+            // (Those not meant: what is left out on purpose is no fault.)
+            crate::drops::totals().1,
             peek(C::RecordNs),
             crate::draw::drawn(),
         ])
