@@ -1706,3 +1706,80 @@ fn the_console_threads_of_groups_of_other_shapes_are_each_given_once() {
         eprintln!("{w} x {h} on the hardware device: all {threads} console threads once; the old rounding: {before:?}");
     }
 }
+
+/// Two wave ORs one after the other in a console wave of two host waves: each is an exchange of
+/// the halves that no thread runs twice, so each has LDS dwords of its own and one group
+/// barrier (after the stores); with the shared pair the second would also need one after the
+/// loads, so that the next store does not overtake a slow reader. Same values both ways.
+#[test]
+fn exchanges_that_run_once_meet_once() {
+    let mut words = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0xBE94_0307, // s_mov_b32 s20, s7
+        0x7E0E_0300, // v_mov_b32 v7, v0
+    ]);
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0x38 << 26 | 0x1C << 18 | 4,
+        0x80 << 24 | 2 << 16 | 1 << 8, // buffer_store_dword v1, off, s[8:11], 0 offset:4
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let lower_with = |sites: u32| {
+        let was = lower::TEST_EXCHANGE_SITES.replace(Some(sites));
+        lower::TEST_GROUP_SYNCS.set(0);
+        let shader = lowered(&native, &p, &HashSet::new());
+        let syncs = lower::TEST_GROUP_SYNCS.get();
+        lower::TEST_EXCHANGE_SITES.set(was);
+        (syncs, shader.expect("lower"))
+    };
+    let (shared_syncs, shared) = lower_with(0);
+    let (own_syncs, own) = lower_with(24);
+    assert!(
+        own_syncs + 2 <= shared_syncs,
+        "group barriers: {own_syncs} with dwords of their own, {shared_syncs} with the shared pair"
+    );
+    eprintln!("group barriers: {own_syncs} with dwords of their own, {shared_syncs} with the shared pair");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = own.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    for (name, shader) in [("shared pair", &shared), ("own dwords", &own)] {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return;
+            }
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        // the second OR is over the thread numbers 0..63, the first over the bits 1 << (t >> 1)
+        assert_eq!(out[0][..2], [63, u32::MAX], "{name}");
+    }
+}
