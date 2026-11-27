@@ -11,7 +11,18 @@ console maker's artwork. It needs no game file and writes only the files you nam
     python -I tools/ps_prompt_glyphs.py --zlib glyphs.zlib --pad-to 9644   # zero-padded to a stored size
     python -I tools/ps_prompt_glyphs.py --selftest
 
-The movie holds, besides the sprites and their export names (tag 56), a small ActionScript 3 block (DoABC) that
+The runtime (leonida-hle, `glyphs`) serves a movie of exactly the title's size (28,148 bytes) from
+`ps_prompt_glyphs.gfx` beside leonida.exe (or `LEONIDA_PS_GLYPHS`). Two ways to build it:
+
+    # over the title's own movie: keeps its ActionScript, export and class tables as they are and swaps only the
+    # sprites' drawings. Reads the stream from your own data.rpf (read-only); the output holds those non-drawing
+    # tags of the game's movie, so keep it on your PC and never commit it.
+    python -I tools/ps_prompt_glyphs.py --from-archive "<package>/data.rpf" --out ps_prompt_glyphs.gfx
+
+    # standalone: our own ActionScript block too (never run in the title), padded to the title's size
+    python -I tools/ps_prompt_glyphs.py --pad-inflated 28148 --out ps_prompt_glyphs.gfx
+
+The standalone movie holds, besides the sprites and their export names (tag 56), a small ActionScript 3 block (DoABC) that
 declares one empty ``MovieClip`` subclass per export, and a SymbolClass tag binding each sprite to its class, so a
 loader that looks symbols up by class name or by export name finds them either way.
 
@@ -589,6 +600,120 @@ def build_abc(names):
 HEADER_FRAME = rect_bytes(0, 150 * TWIP, 0, 150 * TWIP) + struct.pack("<HH", 30 << 8, 1)
 
 
+def sprite_tag(sid, g):
+    """DefineSprite `sid` of one frame placing the glyph's shapes."""
+    body = struct.pack("<HH", sid, 1)
+    for depth, (cid, tx, ty) in enumerate(g.items, 1):
+        b = Bits()
+        b.ub(0, 2)  # no scale, no rotate
+        nb = sbits(tx, ty)
+        b.ub(nb, 5)
+        b.sb(tx, nb)
+        b.sb(ty, nb)
+        body += tag(26, bytes([0x06]) + struct.pack("<HH", depth, cid) + b.bytes())
+    body += tag(1, b"") + tag(0, b"")
+    return tag(39, body)
+
+
+def padding_tag(size):
+    """A Metadata tag (77, empty text) of exactly `size` bytes, which every player skips."""
+    if size < 2:
+        raise ValueError("cannot pad by %d byte(s)" % size)
+    if size <= 64:
+        return struct.pack("<H", 77 << 6 | (size - 2)) + bytes(size - 2)
+    return struct.pack("<HI", 77 << 6 | 63, size - 6) + bytes(size - 6)
+
+
+def pad_movie(data, size):
+    """`data` (a whole movie ending with the End tag) grown to `size` bytes by a padding tag before its End tag,
+    and its length field set."""
+    if len(data) > size:
+        raise ValueError("the movie is %d bytes, over %d" % (len(data), size))
+    if len(data) < size:
+        data = data[:-2] + padding_tag(size - len(data)) + data[-2:]
+    return data[:4] + struct.pack("<I", len(data)) + data[8:]
+
+
+def read_tags(data):
+    """The top-level tags of a movie, End included: [(code, body)], and the offset the first one starts at."""
+    n = data[8] >> 3
+    o = 8 + (5 + 4 * n + 7) // 8 + 4  # frame rectangle, rate and frame count
+    start, out = o, []
+    while o < len(data):
+        head = struct.unpack_from("<H", data, o)[0]
+        code, length = head >> 6, head & 63
+        o += 2
+        if length == 63:
+            length = struct.unpack_from("<I", data, o)[0]
+            o += 4
+        out.append((code, data[o:o + length]))
+        o += length
+        if code == 0:
+            break
+    return out, start
+
+
+def exports_of(tags):
+    """{character id: N} of the `Main_Button_<N>` exports in a movie's ExportAssets tags."""
+    prefix = EXPORT_PREFIX + "Main_Button_"
+    found = {}
+    for code, body in tags:
+        if code != 56:
+            continue
+        o = 2
+        for _ in range(struct.unpack_from("<H", body, 0)[0]):
+            cid = struct.unpack_from("<H", body, o)[0]
+            end = body.index(b"\0", o + 2)
+            name = body[o + 2:end].decode("ascii", "replace")
+            o = end + 1
+            if name.startswith(prefix):
+                found[cid] = int(name[len(prefix):])
+    return found
+
+
+def build_over(base):
+    """The title's own movie `base` with each exported sprite's drawing swapped for ours: same character ids, so its
+    ExportAssets, SymbolClass and DoABC tags (the ActionScript) stay exactly as they are; its shapes are dropped and
+    ours take their place before the first sprite. Padded to the length of `base`."""
+    if base[:3] not in (b"GFX", b"FWS"):
+        raise ValueError("not an uncompressed movie")
+    tags, start = read_tags(base)
+    ids = exports_of(tags)
+    unknown = sorted(n for n in ids.values() if n not in GLYPHS)
+    if unknown or not ids:
+        raise ValueError("the movie's exports are not the ones this tool draws: %s" % (unknown or "none found"))
+    movie = Movie()
+    movie.next_id = 1 + max(struct.unpack_from("<H", body, 0)[0] for code, body in tags if code in (2, 22, 32, 39, 83))
+    sprites = {cid: sprite_tag(cid, build_sprite(movie, n)) for cid, n in ids.items()}
+    out, placed = [], False
+    for code, body in tags:
+        if code in (32, 39) and not placed:
+            out.extend(tag(32, movie.shapes[key][1]) for key in movie.order)
+            placed = True
+        if code == 32:
+            continue
+        if code == 39:
+            cid = struct.unpack_from("<H", body, 0)[0]
+            if cid not in sprites:
+                raise ValueError("a sprite (%d) that is not one of the exports" % cid)
+            out.append(sprites[cid])
+            continue
+        out.append(tag(code, body))
+    data = base[:4] + struct.pack("<I", 0) + base[8:start] + b"".join(out)
+    return pad_movie(data, len(base))
+
+
+def read_archive_movie(path, offset=0x117D7000, size=28148):
+    """The inflated movie in the title's archive (a zlib stream at `offset`), read-only."""
+    with open(path, "rb") as f:
+        f.seek(offset)
+        raw = f.read(1 << 20)
+    data = zlib.decompressobj().decompress(raw, size + 1)
+    if len(data) != size or data[:3] != b"GFX":
+        raise ValueError("%s has no %d byte GFX movie at %#x" % (path, size, offset))
+    return data
+
+
 def build():
     movie = Movie()
     sprites = []  # (n, character id placeholder, glyph)
@@ -607,17 +732,7 @@ def build():
     classes = []
     for i, (n, g) in enumerate(sprites):
         sid = next_id + i
-        body = struct.pack("<HH", sid, 1)
-        for depth, (cid, tx, ty) in enumerate(g.items, 1):
-            b = Bits()
-            b.ub(0, 2)  # no scale, no rotate
-            nb = sbits(tx, ty)
-            b.ub(nb, 5)
-            b.sb(tx, nb)
-            b.sb(ty, nb)
-            body += tag(26, bytes([0x06]) + struct.pack("<HH", depth, cid) + b.bytes())
-        body += tag(1, b"") + tag(0, b"")
-        tags.append(tag(39, body))
+        tags.append(sprite_tag(sid, g))
         exports.append((sid, EXPORT_PREFIX + "Main_Button_%d" % n))
         classes.append(PACKAGE + ".Main_Button_%d" % n)
     tags.append(tag(56, struct.pack("<H", len(exports)) + b"".join(struct.pack("<H", s) + cstr(nm) for s, nm in exports)))
@@ -644,11 +759,24 @@ def main(argv):
     ap.add_argument("--out", help="write the uncompressed movie (GFX header + tags) here")
     ap.add_argument("--zlib", help="write the movie as one zlib stream here")
     ap.add_argument("--pad-to", type=int, help="with --zlib: zero-pad the stream to this many bytes")
+    ap.add_argument("--pad-inflated", type=int, help="pad the movie to this many bytes (28148: the title's)")
+    ap.add_argument("--from-archive", help="build over the title's own movie in this data.rpf (see above)")
+    ap.add_argument("--base", help="build over this inflated movie file instead of the archive")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
-    data = build()
+    if args.from_archive or args.base:
+        if args.base:
+            with open(args.base, "rb") as f:
+                base = f.read()
+        else:
+            base = read_archive_movie(args.from_archive)
+        data = build_over(base)
+    else:
+        data = build()
+        if args.pad_inflated:
+            data = pad_movie(data, args.pad_inflated)
     if args.out:
         with open(args.out, "wb") as f:
             f.write(data)
