@@ -150,6 +150,25 @@ fn nan_scrub_holds_infinity() -> bool {
 /// The bits of 65504.0, the largest finite 16-bit float.
 const HALF_MAX: u32 = 0x477F_E000;
 
+/// Whether the size fields a program reads from a descriptor count a view that shows nothing
+/// as one texel and one level, as the console's empty descriptor reads (on;
+/// `LEONIDA_NULL_VIEW_SIZE=0`: the host's zeros less one, as before). See
+/// `Lower::descriptor_data`.
+fn null_view_size() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NULL_VIEW_SIZE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_NULL_VIEW_SIZE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`null_view_size`], for its thread only.
+    pub(super) static TEST_NULL_VIEW_SIZE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether the title dispatches the program by a count of threads whose last
 /// group may be partial: the structure builder's programs of one dimension.
 /// Their lanes past the count must not run (they count the lanes of a wave
@@ -7775,7 +7794,22 @@ impl<'a> Lower<'a> {
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+                // A slot that shows nothing (a null view: a texture not there yet, a view the
+                // host refused) reports no texels and no levels, and 0 - 1 filled every bit of
+                // these fields: 65,536 texels each way, sixteen levels and a type of all ones.
+                // The console's empty descriptor holds 0 in them, which reads as one texel and
+                // one level, so each count is taken as at least 1
+                // (`LEONIDA_NULL_VIEW_SIZE=0`: as it comes, as before). After brcly/TuxBox
+                // 0a5ebfa (Apache-2.0), which found the same in its own translator.
+                let floor = null_view_size();
+                let less = |l: &mut Self, x: V| {
+                    let x = if floor && x != one {
+                        l.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[x, one])
+                    } else {
+                        x
+                    };
+                    l.s.m.bin(c, Bin::Sub, x, one)
+                };
                 let (w, height, depth, levels) = (
                     less(self, w),
                     less(self, height),

@@ -156,6 +156,32 @@ fn the_size_of_a_heap_texture_nothing_reads() {
     }
 }
 
+/// A slot that shows no texture (a null view) is one texel each way to the program, as the
+/// console's empty descriptor reads: the host's count of none, less one, filled the fields
+/// (65,536 each way). `LEONIDA_NULL_VIEW_SIZE=0`: as before.
+#[test]
+fn the_size_of_a_null_texture_is_one_texel() {
+    let words = [TABLE, FROM_HEAP, SIZES, STORE].concat();
+    let one = [[0.0; 4]; 1];
+    let views = [View::Texture(1, 1, &one), View::NullTexture, View::RawUav(2)];
+    let shader = build(&words, (8, 0)).expect("translates");
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [1, 1], "{label}");
+    }
+    let was = lower::TEST_NULL_VIEW_SIZE.replace(Some(false));
+    let before = build(&words, (8, 0)).expect("translates");
+    lower::TEST_NULL_VIEW_SIZE.set(was);
+    for (label, got) in run(&before, &views) {
+        assert_eq!(got[..2], [65536, 65536], "{label}: without the floor");
+    }
+    // (a texture that is there keeps its size either way)
+    let texels = [[0.0; 4]; 15];
+    let views = [View::Texture(1, 1, &one), View::Texture(5, 3, &texels), View::RawUav(2)];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [5, 3], "{label}");
+    }
+}
+
 /// Without the height nothing tells a 2D texture from the others: taken for
 /// one, as most are. A volume's depth or an array's layers are no 2D
 /// texture's.
