@@ -71,6 +71,20 @@ pub(crate) const RENDER_SCALE_ENV: &str = "LEONIDA_RENDER_SCALE";
 /// on every console profile (Series S otherwise picks FSR).
 pub(crate) const OWN_UPSCALER_ENV: &str = "LEONIDA_OWN_UPSCALER";
 
+/// Leonida: environment variable that tops the title's output modes at 2560x1440 (Series X: the 3840x2160 row
+/// of its mode table becomes 2560x1440, so it never finds a 4K mode and presents 1440p).
+pub(crate) const OUTPUT_1440_ENV: &str = "LEONIDA_OUTPUT_1440";
+
+/// The title's table of output modes in `.rdata` (width, height, refresh, 1 per row: 720p, 936p, 1080p, 1440p,
+/// 2160p, all 60 Hz); its last row, 3840x2160, made 2560x1440. The code that builds the mode list copies the rows,
+/// and the two checks for a 4K output look 3840x2160 up in that list.
+const OUTPUT_1440: Patch<'static> = Patch {
+    what: "output modes: 2560x1440 at most",
+    rva: 0x615c100,
+    expect: &[0x00, 0x0F, 0, 0, 0x70, 0x08, 0, 0],
+    new: &[0x00, 0x0A, 0, 0, 0xA0, 0x05, 0, 0],
+};
+
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
     what: &'static str,
@@ -164,7 +178,8 @@ fn parse_scale(text: &str) -> Option<f32> {
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
-    if scale.is_none() && !own {
+    let output_1440 = std::env::var_os(OUTPUT_1440_ENV).is_some_and(|v| v == "1");
+    if scale.is_none() && !own && !output_1440 {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -174,6 +189,10 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         return 0;
     }
     let mut applied = 0;
+    if output_1440 {
+        // SAFETY: forwarded from this function's contract.
+        applied += usize::from(unsafe { apply(base, &OUTPUT_1440) });
+    }
     if own {
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
@@ -203,7 +222,7 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
 /// See `disarm_watchdog`.
 unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
     let at = (base + p.rva) as *mut u8;
-    // SAFETY: the offset is inside the mapped .text of this exact build.
+    // SAFETY: the offset is inside the mapped image of this exact build (.text, or .rdata for the mode table).
     let now = unsafe { std::slice::from_raw_parts(at, p.expect.len()) };
     if now != p.expect || p.new.len() != p.expect.len() {
         tracing::warn!(what = p.what, "hook skipped: the bytes are not the expected ones");
@@ -227,6 +246,15 @@ unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_output_patch_turns_4k_into_1440p() {
+        let pair = |b: &[u8]| {
+            (u32::from_le_bytes(b[0..4].try_into().unwrap()), u32::from_le_bytes(b[4..8].try_into().unwrap()))
+        };
+        assert_eq!(pair(OUTPUT_1440.expect), (3840, 2160));
+        assert_eq!(pair(OUTPUT_1440.new), (2560, 1440));
+    }
 
     #[test]
     fn scales_outside_the_floor_are_refused() {
