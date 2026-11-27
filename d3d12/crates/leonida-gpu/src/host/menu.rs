@@ -318,6 +318,22 @@ impl Menu {
         }
     }
 
+    /// Leonida: the settings that change while running are shown as they are
+    /// now when the menu opens: F3 and the trainer menu (`super::trainer`)
+    /// change the panel, the frame-rate cap and DLSS's sharpness too.
+    fn refresh_live(&mut self) {
+        for (i, item) in ITEMS.iter().enumerate() {
+            if !item.live {
+                continue;
+            }
+            self.values[i] = match item.var {
+                "LEONIDA_PANEL" if super::panel::shown().load(Ordering::Relaxed) => "1".to_owned(),
+                "LEONIDA_PANEL" => String::new(),
+                var => get(var),
+            };
+        }
+    }
+
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = std::env::var_os("LEONIDA_MENU_FILE") else {
@@ -410,6 +426,9 @@ impl Menu {
             let open = Self::open();
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
+                if !open && vk == VK_F1 {
+                    self.refresh_live();
+                }
                 self.note.clear();
                 self.changed = true;
                 continue;

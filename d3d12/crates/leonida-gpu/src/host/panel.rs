@@ -131,6 +131,13 @@ fn scale(height: u32) -> u32 {
     (height / 540).max(1)
 }
 
+/// Leonida: how many lines of a picture `height` lines high the box takes
+/// while it is shown (0 while hidden), for what stands below it (the
+/// trainer menu, `super::trainer`).
+pub(super) fn lines_taken(height: u32) -> u32 {
+    if shown().load(Ordering::Relaxed) { size(scale(height)).1 } else { 0 }
+}
+
 /// Whether a dot of the picture of `lines` is white.
 fn lit(lines: &[String], x: u32, y: u32) -> bool {
     let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {

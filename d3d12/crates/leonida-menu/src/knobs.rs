@@ -35,6 +35,7 @@ pub const SHOT: u32 = 2;
 
 /// What a present has to do for the menu: 0 while it is closed and no
 /// screenshot is asked for, so that such a present pays this one load.
+#[inline]
 pub fn work() -> u32 {
     WORK.load(Ordering::Relaxed)
 }

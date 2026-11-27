@@ -3755,6 +3755,8 @@ pub(crate) mod indirects;
 mod panel;
 #[cfg(feature = "diagnostics")]
 mod menu;
+// Leonida: the trainer menu laid over the picture (`leonida-menu`, F4).
+mod trainer;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -8920,6 +8922,8 @@ struct Presenter {
     panel: panel::Panel,
     #[cfg(feature = "diagnostics")]
     menu: menu::Menu,
+    /// Leonida: the trainer menu (`trainer`).
+    trainer: trainer::Overlay,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9325,6 +9329,8 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    // Leonida: the trainer menu is painted for the picture's height.
+                    leonida_menu::set_height(height);
                     tracing::info!(
                         width,
                         height,
@@ -9357,11 +9363,18 @@ impl Host {
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
+            // Leonida: what this present has to do for the trainer menu
+            // (`trainer`): one atomic load, and nothing more while the menu
+            // is closed and no screenshot is asked for.
+            let trainer_work = leonida_menu::work();
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = crate::capture::wanted(frame)
+                || crate::capture::listed(frame)
+                // Leonida: a screenshot asked for in the trainer menu is read back at once too.
+                || trainer_work & leonida_menu::SHOT != 0;
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -9453,8 +9466,13 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
+            // Leonida: the trainer menu's screenshot is this present's
+            // read-back too: the title's picture, before the panel and the
+            // menus are laid over it.
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let shot = trainer::shot(trainer_work);
+            #[cfg(feature = "diagnostics")]
+            let capture = (crate::capture::wanted(frame) || shot.is_some())
                 .then(|| {
                     if composed {
                         list.ResourceBarrier(&[transition(
@@ -9490,6 +9508,11 @@ impl Host {
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(feature = "diagnostics")]
             p.menu.draw(self, copy, &back, (width, height), format);
+            // Leonida: the trainer menu, where the panel and the F1 menu
+            // are put (so frame generation sees all three alike).
+            if trainer_work & leonida_menu::DRAW != 0 {
+                p.trainer.draw(self, copy, &back, (width, height), format);
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -9530,7 +9553,13 @@ impl Host {
             let _ = flown;
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                if crate::capture::wanted(frame) {
+                    crate::capture::save_read_back(frame, &buffer, &footprint);
+                }
+                // Leonida: the same read-back as the trainer menu's screenshot.
+                if let Some(path) = shot {
+                    trainer::save_shot(path, &buffer, &footprint);
+                }
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
@@ -9602,6 +9631,7 @@ impl Host {
                 panel: panel::Panel::new(),
                 #[cfg(feature = "diagnostics")]
                 menu: menu::Menu::new(),
+                trainer: trainer::Overlay::new(height),
             })
         }
     }

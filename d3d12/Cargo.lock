@@ -291,6 +291,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "leonida-formats",
+ "leonida-menu",
  "leonida-pipeline",
  "leonida-shader",
  "tempfile",
