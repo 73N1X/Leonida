@@ -1868,6 +1868,14 @@ fn timing() -> bool {
     *ON.get_or_init(|| crate::switch::on("LEONIDA_GPU_TIMING"))
 }
 
+/// From how many milliseconds a list of the timing run is logged as slow, with what its time is made of
+/// (`LEONIDA_GPU_TIMING_SLOW_MS`, 50).
+#[cfg(feature = "diagnostics")]
+fn timing_slow_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("LEONIDA_GPU_TIMING_SLOW_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50))
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on), or for
 /// the frame recorder (`LEONIDA_RECORD`).
@@ -2861,6 +2869,26 @@ fn late_writes() -> bool {
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
 type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
+/// Leonida, an experiment and not a setting to play with: whether the relay tells the title that
+/// flights have run (their read-backs, bottom-of-pipe writes and fence signals) before what their
+/// shaders wrote is back in title memory, not after (`LEONIDA_TELL_EARLY=1`, or by turns with
+/// `LEONIDA_AB=<s>,LEONIDA_TELL_EARLY`; off by default).
+///
+/// Why it is asked: the card's share of a frame is 0-8 ms at 720p and the frame stays 101-108 ms;
+/// the landing is 30-40 ms of it, and the title's fences are signalled behind it. This measures
+/// what the frame would be if they were not. Why it cannot stay on as it is: on the console a
+/// fence means the shaders' bytes are in memory, and the title may write a buffer again, or map
+/// other pages there, as soon as it is signalled. Here the landing would then store what the
+/// card wrote over what the title has put there since.
+fn tell_early() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_TELL_EARLY") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_TELL_EARLY").is_some_and(|v| v == "1"))
+}
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -5189,6 +5217,22 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // Leonida, an experiment (`tell_early`): the title is told first.
+        let early = tell_early();
+        if early {
+            let _first = crate::timeline::span("landing: telling the title first (LEONIDA_TELL_EARLY)");
+            for item in &items {
+                match item {
+                    Late::Run(flight) => {
+                        for &i in &flight.order {
+                            read_backs(flight.lists[i].host());
+                        }
+                    }
+                    &Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                    &Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                }
+            }
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5255,8 +5299,10 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                    if !early {
+                        for &i in &flight.order {
+                            read_backs(flight.lists[i].host());
+                        }
                     }
                     let done_from = std::time::Instant::now();
                     if let Some(card) = flight.card {
@@ -5273,11 +5319,15 @@ impl Host {
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
-                    what.write(at as *mut u8, bytes);
+                    if !early {
+                        what.write(at as *mut u8, bytes);
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value);
+                    if !early {
+                        crate::fence::set(fence as crate::object::This, value);
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -6205,7 +6255,7 @@ impl Host {
             // > 1` was the test): the two 50 ms lists of the gameplay
             // frame, each a submission of its own, printed nothing.
             #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && started.elapsed() > std::time::Duration::from_millis(timing_slow_ms()) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -6213,6 +6263,35 @@ impl Host {
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
+                // Leonida: where a slow list's time is: in a few commands, in many small ones (by kind and by
+                // pipeline), or in none of them (the wait less the commands: our own lists and the waits).
+                let all = runs[i].slowest(frequency, usize::MAX);
+                let sum: f64 = all.iter().map(|(ms, _)| ms).sum();
+                let mut kinds: std::collections::BTreeMap<String, (u64, f64)> = Default::default();
+                let mut pipelines: std::collections::HashMap<String, (u64, f64)> = Default::default();
+                for (ms, op) in &all {
+                    let head = op.split(" | ").next().unwrap_or(op);
+                    let word = head.split(' ').next().unwrap_or("").to_owned();
+                    let key = match (head.find('['), head.find(']')) {
+                        (Some(a), Some(b)) if a < b => format!("{word} {}", &head[a..=b]),
+                        _ => head.split(' ').take(2).collect::<Vec<_>>().join(" "),
+                    };
+                    let k = kinds.entry(word).or_default();
+                    (k.0, k.1) = (k.0 + 1, k.1 + ms);
+                    let p = pipelines.entry(key).or_default();
+                    (p.0, p.1) = (p.0 + 1, p.1 + ms);
+                }
+                let kinds: Vec<String> = kinds.iter().map(|(w, (n, ms))| format!("{w} {ms:.1} ms in {n}")).collect();
+                let mut pipelines: Vec<(String, (u64, f64))> = pipelines.into_iter().collect();
+                pipelines.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+                let top: Vec<String> = pipelines.iter().take(8).map(|(p, (n, ms))| format!("{ms:.2} ms in {n}: {p}")).collect();
+                tracing::warn!(
+                    "slow host list: waited {:.1} ms, its {} timed commands {sum:.1} ms; by kind: {}; heaviest: {}",
+                    started.elapsed().as_secs_f64() * 1e3,
+                    all.len(),
+                    kinds.join(", "),
+                    top.join("; ")
+                );
             }
             let _ = (i, started);
         }
