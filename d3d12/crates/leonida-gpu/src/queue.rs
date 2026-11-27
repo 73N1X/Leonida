@@ -1317,7 +1317,7 @@ const PAGE: u64 = 64 << 10;
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -1337,13 +1337,14 @@ extern "system" fn copy_page_mappings(
     });
     let mut ok = true;
     let many = crate::resource::many_page_mapper();
+    let later = crate::resource::later_page_mapper().filter(|_| alias_behind());
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
-    let mut map = |to: u64, from: u64, len: u64| match many {
-        Some(_) => {
+    let mut map = |to: u64, from: u64, len: u64| match (many, later) {
+        (Some(_), _) | (_, Some(_)) => {
             gathered.push((to, from, len));
             true
         }
-        None => map(to, from, len),
+        _ => map(to, from, len),
     };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1366,7 +1367,13 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
-    if let Some(many) = many {
+    if let Some(later) = later {
+        // What the ranges are to show is looked up here, in the title's call (it maps other
+        // pages into the pool next); the mapping itself is another thread's.
+        if ok && !gathered.is_empty() {
+            behind::alias_later(this, later(&gathered));
+        }
+    } else if let Some(many) = many {
         ok &= many(&gathered);
     }
     if !ok {
@@ -1374,6 +1381,26 @@ extern "system" fn copy_page_mappings(
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+/// Whether the title's page-mapping copies are done by a thread of ours behind its call
+/// (`LEONIDA_ALIAS_LATER=0`: in the call, as before; needs the line of submissions).
+///
+/// While the world streams in (and while the player drives) the title maps 1,000-3,000 pages of
+/// 64 KiB a second this way, each an unmapping and a mapping at 60-300 us (the unmapping flushes
+/// every processor's translations): 600-1,900 ms of its thread a second, 69 ms a frame in 2.2
+/// calls with the longest 188 ms, and in the chain a present waits for while the card stood
+/// idle 79-122 ms a frame (timelines and the streaming log of 2026-11-27, Series X profile,
+/// Ryzen 5 7600X). The title's CPU does not read the addresses mapped (the GPU's side of its
+/// tiled heap): the layer does, for the textures there. So the call only looks up which
+/// physical pages the ranges are to show and leaves; the mapping is done by a thread of its
+/// own, in the order asked, and the queue's line gets an entry that every later submission and
+/// present of the title stands behind until those mappings are done (`behind::alias_later`).
+/// Submissions already in the line run before it, as on the console's queue. Whoever reads
+/// title memory outside that order (the passes ahead of a frame) may see a page as it was for a
+/// moment longer; the mapping tells the GPU side when it is there, as every mapping does.
+pub(crate) fn alias_behind() -> bool {
+    line_on() && crate::toggled!("LEONIDA_ALIAS_LATER")
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {

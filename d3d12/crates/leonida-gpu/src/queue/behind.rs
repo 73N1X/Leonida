@@ -455,6 +455,9 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
+    /// Page mappings the title asked for before what follows ([`alias_later`]): the line stands
+    /// here until the thread that maps has done them (their number).
+    Alias(u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
     Present(
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
@@ -472,6 +475,7 @@ enum Ask {
     Wait(usize, u64),
     Value(crate::list::ValueWait),
     Lists(Recordings),
+    Alias(u64),
 }
 
 impl Work for Job {
@@ -482,6 +486,7 @@ impl Work for Job {
             &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
             Job::Value(wait) => Some(Ask::Value(*wait)),
             Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
+            &Job::Alias(number) => Some(Ask::Alias(number)),
             _ => None,
         }
     }
@@ -505,8 +510,10 @@ impl Work for Job {
     }
 
     fn settle(ask: &Ask) {
-        if let Ask::Lists(recordings) = ask {
-            recordings.iter().for_each(|r| r.wait());
+        match ask {
+            Ask::Lists(recordings) => recordings.iter().for_each(|r| r.wait()),
+            &Ask::Alias(number) => alias_wait(number),
+            _ => {}
         }
     }
 
@@ -540,6 +547,7 @@ impl Work for Job {
             &Ask::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
             Ask::Value(wait) => super::value_met(wait),
             Ask::Lists(recordings) => recordings.iter().all(|r| r.done()),
+            &Ask::Alias(number) => ALIAS_DONE.load(Relaxed) >= number,
         }
     }
 
@@ -584,7 +592,7 @@ impl Work for Job {
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) | Job::Alias(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -629,6 +637,8 @@ impl Work for Job {
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
+            // (Met, or a present went ahead of it: the mappings are waited for all the same.)
+            Job::Alias(number) => alias_wait(number),
             Job::Run(queue, lists, order) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
@@ -827,6 +837,89 @@ pub(super) fn wake() {
     LANE.wake();
 }
 
+/// Page mappings to be done: their number and the work (`leonida-hle` made it, with the pages it
+/// maps already looked up).
+type AliasWork = Box<dyn FnOnce() -> bool + Send>;
+static ALIAS: Mutex<(VecDeque<(u64, AliasWork)>, bool)> = Mutex::new((VecDeque::new(), false));
+static ALIAS_MORE: Condvar = Condvar::new();
+/// How many were asked for, and how many are done.
+static ALIAS_SENT: AtomicU64 = AtomicU64::new(0);
+static ALIAS_DONE: AtomicU64 = AtomicU64::new(0);
+static ALIAS_WAITERS: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+/// Since the last frame-rate line: batches done, and the microseconds they took the mapping thread.
+static ALIAS_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The title's page-mapping copies, done by a thread of ours behind its call
+/// ([`super::alias_behind`]): `work` goes to that thread, and the queue's line gets an entry
+/// that everything the title submits afterwards stands behind until the mappings are done.
+pub(super) fn alias_later(queue: This, work: AliasWork) {
+    let number = {
+        let mut line = ALIAS.lock().unwrap_or_else(|e| e.into_inner());
+        if !line.1 {
+            line.1 = true;
+            if std::thread::Builder::new().name("leonida-alias".into()).spawn(alias_worker).is_err() {
+                // No thread: here, as before.
+                line.1 = false;
+                drop(line);
+                work();
+                return;
+            }
+        }
+        let number = ALIAS_SENT.fetch_add(1, Relaxed) + 1;
+        line.0.push_back((number, work));
+        number
+    };
+    ALIAS_MORE.notify_one();
+    LANE.push(queue as usize, [Job::Alias(number)]);
+}
+
+fn alias_worker() {
+    no_drain_here();
+    loop {
+        let (number, work) = {
+            let mut line = ALIAS.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                match line.0.pop_front() {
+                    Some(next) => break next,
+                    None => line = ALIAS_MORE.wait(line).unwrap_or_else(|e| e.into_inner()),
+                }
+            }
+        };
+        let began = Instant::now();
+        let _mapping = crate::timeline::span("page mappings behind the title's call");
+        if !work() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a page mapping done behind the title's call failed"));
+        }
+        ALIAS_STATS[0].fetch_add(1, Relaxed);
+        ALIAS_STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        {
+            let _held = ALIAS_WAITERS.0.lock().unwrap_or_else(|e| e.into_inner());
+            ALIAS_DONE.store(number, Relaxed);
+        }
+        ALIAS_WAITERS.1.notify_all();
+        LANE.wake();
+    }
+}
+
+/// Until the mappings numbered `number` are done.
+fn alias_wait(number: u64) {
+    if ALIAS_DONE.load(Relaxed) >= number {
+        return;
+    }
+    let _waiting = crate::timeline::span("the line: waiting for page mappings");
+    let mut held = ALIAS_WAITERS.0.lock().unwrap_or_else(|e| e.into_inner());
+    while ALIAS_DONE.load(Relaxed) < number {
+        held = ALIAS_WAITERS.1.wait_timeout(held, Duration::from_millis(2)).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// For whoever must see every page mapping the title asked for so far (a read of title memory
+/// outside the line's order): until they are all done.
+pub(super) fn alias_drain() {
+    alias_wait(ALIAS_SENT.load(Relaxed));
+}
+
 /// This thread does work the line waits for.
 pub(super) fn no_drain_here() {
     OURS.set(true);
@@ -953,6 +1046,15 @@ pub(super) fn present(
 pub(super) fn line(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
+    {
+        let [batches, us] = [0, 1].map(|i| ALIAS_STATS[i].swap(0, Relaxed) as f64 / frames);
+        if batches > 0.0 {
+            tracing::info!(
+                "page mappings done behind the title's call, per frame (LEONIDA_ALIAS_LATER): {batches:.1} batches, {:.1} ms of the                  mapping thread",
+                us / 1000.0
+            );
+        }
+    }
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (LEONIDA_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \

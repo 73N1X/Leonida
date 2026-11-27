@@ -977,6 +977,22 @@ pub(crate) fn many_page_mapper() -> Option<ManyPageMapper> {
     MANY_PAGE_MAPPER.get().copied()
 }
 
+/// As a [`ManyPageMapper`], in two steps: the call looks up what the ranges are to show (the
+/// pages their sources show now) and hands back the mapping itself, to be done once, later
+/// and on another thread (`crate::queue::alias_behind`).
+pub type LaterPageMapper = fn(&[(u64, u64, u64)]) -> Box<dyn FnOnce() -> bool + Send>;
+
+static LATER_PAGE_MAPPER: std::sync::OnceLock<LaterPageMapper> = std::sync::OnceLock::new();
+
+/// Sets what maps pages behind the title's call. Called once, by `leonida-hle`.
+pub fn use_later_page_mapper(mapper: LaterPageMapper) {
+    let _ = LATER_PAGE_MAPPER.set(mapper);
+}
+
+pub(crate) fn later_page_mapper() -> Option<LaterPageMapper> {
+    LATER_PAGE_MAPPER.get().copied()
+}
+
 pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }

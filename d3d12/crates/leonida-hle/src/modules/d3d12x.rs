@@ -20,6 +20,7 @@ extern "system" fn create_device(
     leonida_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     leonida_gpu::resource::use_page_mapper(super::xmem::map_alias);
     leonida_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
+    leonida_gpu::resource::use_later_page_mapper(super::xmem::map_aliases_later);
     #[cfg(windows)]
     leonida_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

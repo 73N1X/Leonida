@@ -1311,23 +1311,91 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         // As in `XMemMapPhysicalPages`: no read in place meets the gap. Taken
         // for a chunk at a time ([`alias_chunk`]).
         let _changing = leonida_gpu::title_memory_remapping();
-        unmap(&mut physical, to + done, n);
-        for k in (done..done + n).step_by(PAGE) {
-            if from == 0 {
-                break;
+        // Pages that show what they are to show already are left mapped ([`alias_same`]); the
+        // others go run by run, each run unmapped at once as the whole chunk was.
+        let same: Vec<bool> = (done..done + n)
+            .step_by(PAGE)
+            .map(|k| from != 0 && alias_same() && physical.slice_at(from + k).is_some_and(|w| shows(&physical, to + k, &w)))
+            .collect();
+        ALIAS_PAGES[0].fetch_add(same.len() as u64, Ordering::Relaxed);
+        ALIAS_PAGES[1].fetch_add(same.iter().filter(|s| **s).count() as u64, Ordering::Relaxed);
+        let mut i = 0;
+        while i < same.len() {
+            let k = done + i * PAGE;
+            if same[i] {
+                // The same page at the same place: what it holds may be new all the same (bytes
+                // put there through another view), which is what a mapping tells the GPU side.
+                leonida_gpu::title_memory_remapped(to + k, PAGE);
+                i += 1;
+                continue;
             }
-            let at = from + k;
-            let Some(slice) = physical.slice_at(at) else {
-                return false;
-            };
-            if !map(&mut physical, to + k, PAGE, slice) {
-                return false;
+            let run = same[i..].iter().take_while(|s| !**s).count();
+            let bytes = (run * PAGE).min(done + n - k);
+            unmap(&mut physical, to + k, bytes);
+            for k in (k..k + bytes).step_by(PAGE) {
+                if from == 0 {
+                    break;
+                }
+                let Some(slice) = physical.slice_at(from + k) else {
+                    return false;
+                };
+                if !map(&mut physical, to + k, PAGE, slice) {
+                    return false;
+                }
             }
+            i += run;
         }
         done += n;
         if done >= len {
+            alias_said();
             return true;
         }
+    }
+}
+
+/// Whether the view at `at` is one page that shows `slice`.
+fn shows(physical: &Physical, at: usize, slice: &Slice) -> bool {
+    physical
+        .views
+        .get(&at)
+        .is_some_and(|(size, shown)| *size == PAGE && shown.index == slice.index && Arc::ptr_eq(&shown.section, &slice.section))
+}
+
+/// Whether [`map_alias`] leaves a page mapped that shows the page it is to show already
+/// (`LEONIDA_ALIAS_SAME=0`: unmapped and mapped again, as before).
+///
+/// Why it is asked: while the world streams in, the title's page-mapping copies were 69 ms a
+/// frame of its thread in 2.2 calls (the longest 188 ms) and were in the chain a present waits
+/// for, with the card idle 79-122 ms a frame (timelines at 200 and 240 s of a run on the Series X
+/// profile, 2026-11-27). Each page is an unmapping and a mapping, two system calls that wait for
+/// the process's address-space lock. A page that shows the same physical page afterwards needs
+/// neither: the GPU side is told as for a mapping (what the page holds may be new), nothing
+/// else changes. How many pages that is, is counted and said ([`alias_said`]): none of the first
+/// 112,452 pages of a session of driving (65,536 calls), so this saves nothing with this title;
+/// what did is the mapping done behind the call (`leonida_gpu`'s `alias_behind`).
+fn alias_same() -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = leonida_gpu::switched("LEONIDA_ALIAS_SAME") {
+        return on;
+    }
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("LEONIDA_ALIAS_SAME").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Pages [`map_alias`] was asked to map, and those of them left mapped as they showed the same.
+static ALIAS_PAGES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Says [`ALIAS_PAGES`] at the 1st, 2nd, 4th ... call that ends.
+fn alias_said() {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            calls = n,
+            pages = ALIAS_PAGES[0].load(Ordering::Relaxed),
+            same = ALIAS_PAGES[1].load(Ordering::Relaxed),
+            "page-mapping copies so far: pages asked for, and those that showed the same page already (LEONIDA_ALIAS_SAME)"
+        );
     }
 }
 
@@ -1354,6 +1422,86 @@ fn alias_chunk() -> usize {
     static ASKED: LazyLock<usize> =
         LazyLock::new(|| std::env::var("LEONIDA_ALIAS_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16));
     *ASKED
+}
+
+/// [`map_aliases`] in two steps (`leonida_gpu::resource::LaterPageMapper`): the pages the ranges
+/// are to show are looked up now, while their sources show them (the title maps other pages into
+/// its pool next); what comes back maps them, once, on whichever thread calls it.
+pub fn map_aliases_later(ranges: &[(u64, u64, u64)]) -> Box<dyn FnOnce() -> bool + Send> {
+    if ranges.iter().any(|&(to, from, _)| to as usize % PAGE != 0 || (from != 0 && from as usize % PAGE != 0)) {
+        // Not on pages: as before, in the call.
+        let done = map_aliases(ranges);
+        return Box::new(move || done);
+    }
+    let mut ok = true;
+    let mut pages: Vec<(usize, Option<Slice>)> = Vec::new();
+    {
+        let physical = physical();
+        'ranges: for &(to, from, len) in ranges {
+            let (to, from, len) = (to as usize, from as usize, len as usize);
+            for k in (0..len).step_by(PAGE) {
+                let slice = match from {
+                    0 => None,
+                    _ => match physical.slice_at(from + k) {
+                        Some(slice) => Some(slice),
+                        // As `map_alias`: what follows a source page that is not mapped is left.
+                        None => {
+                            ok = false;
+                            break 'ranges;
+                        }
+                    },
+                };
+                pages.push((to + k, slice));
+            }
+        }
+    }
+    Box::new(move || alias_pages(&pages) && ok)
+}
+
+/// Maps each address of `pages` to what stands beside it (`None`: unmaps it), in order, a chunk
+/// ([`alias_chunk`]) under one taking of the locks: the second step of [`map_aliases_later`].
+fn alias_pages(pages: &[(usize, Option<Slice>)]) -> bool {
+    let _costed = Costed::begin(None);
+    let chunk = match alias_chunk() {
+        0 => pages.len().max(1),
+        n => n,
+    };
+    for part in pages.chunks(chunk) {
+        let _busy = Busy::begin();
+        let mut physical = physical();
+        // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+        let _changing = leonida_gpu::title_memory_remapping();
+        let same = |physical: &Physical, (to, slice): &(usize, Option<Slice>)| {
+            alias_same() && slice.as_ref().is_some_and(|slice| shows(physical, *to, slice))
+        };
+        ALIAS_PAGES[0].fetch_add(part.len() as u64, Ordering::Relaxed);
+        let mut i = 0;
+        while i < part.len() {
+            let to = part[i].0;
+            if same(&physical, &part[i]) {
+                ALIAS_PAGES[1].fetch_add(1, Ordering::Relaxed);
+                leonida_gpu::title_memory_remapped(to, PAGE);
+                i += 1;
+                continue;
+            }
+            // The addresses that follow one another and are to change: unmapped at once.
+            let mut run = 1;
+            while i + run < part.len() && part[i + run].0 == to + run * PAGE && !same(&physical, &part[i + run]) {
+                run += 1;
+            }
+            unmap(&mut physical, to, run * PAGE);
+            for (to, slice) in &part[i..i + run] {
+                if let Some(slice) = slice
+                    && !map(&mut physical, *to, PAGE, slice.clone())
+                {
+                    return false;
+                }
+            }
+            i += run;
+        }
+    }
+    alias_said();
+    true
 }
 
 /// [`map_alias`] of many ranges, in order.
@@ -2206,6 +2354,59 @@ mod tests {
         unsafe { at(3).cast::<u32>().write(7) };
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// The two steps of a page-mapping copy: what the ranges are to show is looked up at the
+    /// call; the pool mapped to other pages before the mapping is done changes nothing of it. A
+    /// page that shows the same page already stays mapped, and a source of 0 unmaps.
+    #[test]
+    fn page_mappings_done_later_show_what_the_pool_showed_at_the_call() {
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = |count: usize| XMemVirtualAlloc(std::ptr::null_mut(), count * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (pool, heap) = (reserve(2), reserve(3));
+        assert!(!pool.is_null() && !heap.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        // SAFETY: mapped read-write.
+        unsafe {
+            pool.cast::<u8>().write(11);
+            at(pool, 1).cast::<u8>().write(22);
+        }
+        let later = map_aliases_later(&[(heap as u64, pool as u64, (2 * PAGE) as u64)]);
+        // The title goes on: other pages in the pool, written with other bytes.
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages[2..].as_ptr()), pool);
+        // SAFETY: mapped read-write.
+        unsafe {
+            pool.cast::<u8>().write(33);
+            at(pool, 1).cast::<u8>().write(44);
+        }
+        assert_eq!(query(heap).host.State, MEM_RESERVE);
+        assert!(later());
+        // SAFETY: mapped by the copy.
+        unsafe {
+            assert_eq!(heap.cast::<u8>().read(), 11);
+            assert_eq!(at(heap, 1).cast::<u8>().read(), 22);
+        }
+        assert_eq!(query(at(heap, 2)).host.State, MEM_RESERVE);
+        // The same again: both pages show what they are to show and stay as they are.
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        let before = ALIAS_PAGES[1].load(Ordering::Relaxed);
+        assert!(map_aliases_later(&[(heap as u64, pool as u64, (2 * PAGE) as u64)])());
+        if alias_same() {
+            assert!(ALIAS_PAGES[1].load(Ordering::Relaxed) >= before + 2);
+        }
+        // SAFETY: still mapped.
+        unsafe { assert_eq!(heap.cast::<u8>().read(), 11) };
+        // A source of 0 unmaps; a source that shows nothing fails and maps nothing after it.
+        assert!(map_aliases_later(&[(at(heap, 1) as u64, 0, PAGE as u64)])());
+        assert_eq!(query(at(heap, 1)).host.State, MEM_RESERVE);
+        // SAFETY: the first page stays.
+        unsafe { assert_eq!(heap.cast::<u8>().read(), 11) };
+        assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
+        assert!(!map_aliases_later(&[(at(heap, 2) as u64, pool as u64, PAGE as u64)])());
+        assert_eq!(query(at(heap, 2)).host.State, MEM_RESERVE);
     }
 
     #[test]
