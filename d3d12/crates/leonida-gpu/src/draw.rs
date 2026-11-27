@@ -3696,6 +3696,31 @@ impl State {
             } else {
                 host.slot_tabled(index);
             }
+        } else if u.kind == ResourceType::Sampler {
+            // Leonida (diagnostics): a shader samples through a slot whose
+            // record is no sampler of ours, so the slot holds the point
+            // stand-in (`descriptor/host.rs` `null_sampler`). The first few
+            // slots are named, with the record as the title has it: the
+            // posterized picture of some runs is a table of colours read
+            // without filtering, and this says through which slot.
+            #[cfg(feature = "diagnostics")]
+            {
+                static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 32 && !seen.contains(&index) {
+                    seen.push(index);
+                    // SAFETY: a descriptor slot in title memory (`mirror` just read it).
+                    let record = unsafe { (handle as *const [u32; 8]).read_unaligned() };
+                    tracing::warn!(
+                        slot = index,
+                        frame = crate::frame::current(),
+                        pipeline = format_args!("{:#x}", self.pipeline),
+                        compute,
+                        record = ?record.map(|w| format!("{w:#x}")),
+                        "a shader samples through a slot without a sampler of ours: it reads the point stand-in"
+                    );
+                }
+            }
         }
     }
 

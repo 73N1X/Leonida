@@ -1365,11 +1365,19 @@ fn view_bytes() -> bool {
 
 /// Whether, on a host without raw twins, a structured view that begins on
 /// one of its elements but off 16 bytes gets a copy of its own bytes as well
-/// ([`off_elements`]). On by default; `LEONIDA_STRUCTURED_BYTES=0` leaves it
-/// structured on its buffer's copy, as before.
+/// ([`off_elements`]). Off unless `LEONIDA_STRUCTURED_BYTES=1`: it leaves
+/// such a view structured on its buffer's copy, as before.
+///
+/// Off because of its cost here: in the world the title makes about 2,500
+/// such views a frame at ring places that move every frame, and with this on
+/// 270 to 475 copies of their own bytes were made a frame (each a buffer, a
+/// refresh and a view), the eight threads that translate lists stood in line
+/// for them, and the title ran at 4 fps where it ran at 12 (runs p1 and p2
+/// against n3). It needs a cheaper form (views into one ring copy per
+/// buffer) before it can be on.
 fn structured_bytes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_STRUCTURED_BYTES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_STRUCTURED_BYTES").is_some_and(|v| v == "1"))
 }
 
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one

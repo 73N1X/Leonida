@@ -5408,32 +5408,80 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
-    }
-    if map.len() >= MANY {
+    // Leonida: the map's lock is held for the look alone. Since structured
+    // views off 16 bytes come here too (hosts without raw twins,
+    // `descriptor/host.rs` `off_elements`) a frame asks 3,500 times and
+    // makes 270 copies, where it was one ask a frame; with a buffer made
+    // and the idle ones looked for and let go under the lock at every one
+    // of those, the eight threads that translate lists stood in line here
+    // for 94 % of their waiting, and the title ran at 4 fps where it had
+    // run at 14 (run p1, profile p1-prof).
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let now = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
         // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+        // slot shows it), and not asked for lately: looked for at one miss
+        // in thirty-two, not at each.
+        if map.len() >= MANY && now.is_multiple_of(32) {
+            map.retain(|_, (shadow, used)| {
+                let keep = Arc::strong_count(shadow) > 1
+                    || crate::host::references(&shadow.buffer) > 1
+                    || *used + LATELY > now;
+                if !keep {
+                    gone.push(shadow.clone());
+                }
+                keep
+            });
+        }
+        now
+    };
+    // The buffers of those let go are kept for the next copies of their
+    // width (the title's ring gives the same few sizes at new places every
+    // frame): making a buffer and letting one go are a call into the kernel
+    // each, and were most of what these threads ran.
+    let width = len.next_multiple_of(256);
+    let spare = {
+        let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for shadow in gone.drain(..) {
+            if spare.len() < SPARE_MOST && shadow.place.is_none() {
+                spare.push((shadow.width(), shadow.buffer.clone(), shadow.data as usize));
+            }
+        }
+        spare.iter().position(|(w, ..)| *w == width).map(|i| spare.swap_remove(i))
+    };
+    let (buffer, data) = match spare {
+        Some((_, buffer, data)) => (buffer, data as *mut u8),
+        None => host()?.shared_buffer(width)?,
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    // (Another thread may have made it meanwhile: its copy is the one.)
+    if let Some((there, used)) = guard.1.get_mut(&(address, len)) {
+        *used = now;
+        return Some(there.clone());
+    }
+    guard.1.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
 }
+
+/// Leonida: buffers of copies [`exact`] let go, with their widths and where
+/// they are mapped, for its next copies of the same width.
+static EXACT_SPARE: Mutex<Vec<(u64, ID3D12Resource, usize)>> = Mutex::new(Vec::new());
+/// At most so many are kept (what comes after goes, as before).
+const SPARE_MOST: usize = 1024;
 
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);

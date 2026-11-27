@@ -139,10 +139,13 @@ fn most() -> f32 {
 /// misses' sky and stale history are what made eyes and posters glow.
 ///
 /// Off unless asked for since the renderer changed (cool_fox's, with DLSS
-/// in place of the title's upscaler): on, the whole picture came out
-/// posterized and greyed, sky and skin in a few flat tones (run n2, every
-/// one of 411 frames; with `LEONIDA_REFLECT_MOST=0`, run n3, none of 431).
-/// The program it follows is not only the reflections' on this renderer.
+/// in place of the title's upscaler): it has not been shown to do what it
+/// is for there, and `CS_UpdateHistory` is not known to be only the
+/// reflections' program on that renderer. (It was first taken for the
+/// cause of the posterized picture of some runs: run n2 with it was
+/// posterized and run n3 without it was not. Runs n4 and p1, without it,
+/// were posterized too: that fault comes and goes by the run, whatever
+/// this is set to.)
 fn reflect_most() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
