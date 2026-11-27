@@ -20215,10 +20215,9 @@ def main():
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
     ap.add_argument("--mesh-serial-waves", action="store_true",
-                    default=os.environ.get("LEONIDA_MESH_SERIAL_WAVES") == "1",
-                    help="with --wave64-emulate: a mesh shader of more than 64 threads whose waves share no LDS runs "
-                         "its waves one after the other in 64 invocations (one single-wave pass per wave) instead of "
-                         "side by side; also on with LEONIDA_MESH_SERIAL_WAVES=1")
+                    help="with --wave64-emulate: a mesh shader of more than 64 threads whose waves cannot pass each "
+                         "other anything (no LDS, no store or atomic) runs its waves one after the other in 64 "
+                         "invocations, one single-wave pass per wave, instead of side by side (docs/design.md)")
     ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
                     help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
                          "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
