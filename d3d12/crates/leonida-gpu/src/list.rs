@@ -982,6 +982,13 @@ pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
         }
         if !done {
             done = crate::stretch::record_stretch(&host.device, &list.list, to, from, up.render);
+            // Frame generation's inputs from a stretched upscale as well (a DLSS one notes them itself): the
+            // title's depth, motion vectors and jitter are the same whoever makes the output.
+            if done && crate::fg::active() {
+                // SAFETY: a live resource.
+                let colour = unsafe { from.GetDesc() };
+                crate::fg::tag_plain(up, [colour.Width as u32, colour.Height]);
+            }
         }
         if done {
             crate::texture::host_written(output);
@@ -2582,6 +2589,29 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn an_upscale_keeps_its_numbers_through_its_words() {
+        let up = Upscale {
+            colour: 1,
+            depth: 2,
+            motion: 3,
+            exposure: 4,
+            output: 5,
+            render: [2560, 1440],
+            jitter: [0.25, -0.5],
+            motion_scale: [2560.0, 1440.0],
+            reset: true,
+            pre_exposure: 1.5,
+            near: 1000.0,
+            far: 0.1,
+            frame_ms: 91.0,
+            dlss: true,
+        };
+        let back = Upscale::from_words(&up.to_words()).expect("eleven words");
+        assert_eq!(format!("{back:?}"), format!("{up:?}"));
+        assert!(Upscale::from_words(&up.to_words()[..10]).is_none());
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

@@ -171,10 +171,12 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    // `LEONIDA_UPSCALE=stretch` (Series S): the upscale dispatch is ours
-    // (`leonida_hle::modules::ffx`, a plain stretch) instead of the title's
+    // `LEONIDA_UPSCALE=stretch|dlss`: the upscale dispatch is ours
+    // (`leonida_hle::modules::ffx`: DLSS, or a plain stretch) instead of the title's
     // own FidelityFX passes, which are slow translated on 32-lane hosts; the
     // rest of that DLL stays the title's. Unset: the title's own, as before.
+    // The title upscales with FidelityFX on Series S, and on the other consoles
+    // when the loader makes it (`LEONIDA_FSR_UPSCALER=1`, leonida-loader's hooks.rs).
     struct TakeDispatch<'a>(&'a dyn leonida_loader::ImportResolver, bool);
     impl leonida_loader::ImportResolver for TakeDispatch<'_> {
         fn resolve(&self, dll: &str, symbol: &leonida_pe::ImportSymbol) -> leonida_loader::Resolution {
@@ -190,7 +192,9 @@ pub fn run(
             self.0.resolve(dll, symbol)
         }
     }
-    let take = leonida_hle::console::current() == leonida_hle::console::Console::SeriesS
+    let fsr_asked = std::env::var_os("LEONIDA_FSR_UPSCALER").is_some_and(|v| v == "1")
+        && std::env::var_os("LEONIDA_OWN_UPSCALER").is_none_or(|v| v == "0");
+    let take = (leonida_hle::console::current() == leonida_hle::console::Console::SeriesS || fsr_asked)
         && std::env::var_os("LEONIDA_UPSCALE").is_some_and(|v| v == "stretch" || v == "dlss");
     if take {
         println!("upscale        the title's ffxDispatch is ours (LEONIDA_UPSCALE=stretch|dlss)");

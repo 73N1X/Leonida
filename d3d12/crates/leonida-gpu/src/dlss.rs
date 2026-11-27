@@ -1,5 +1,9 @@
-//! NVIDIA DLSS in place of the title's FidelityFX upscale (Series S,
-//! `LEONIDA_UPSCALE=dlss`, builds with the `dlss` feature).
+//! NVIDIA DLSS in place of the title's FidelityFX upscale
+//! (`LEONIDA_UPSCALE=dlss`, builds with the `dlss` feature): on Series S, where
+//! the title upscales with FidelityFX by itself, and on Series X when the loader
+//! makes it do so (`LEONIDA_FSR_UPSCALER=1`, leonida-loader's `hooks.rs`; there
+//! the title's own temporal upscaler runs otherwise, as passes of its own that
+//! hand nothing over).
 //!
 //! The title renders below its output size and asks its upscaler to make the
 //! output from the colour, depth and motion vectors it rendered, with the

@@ -98,9 +98,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if levers > 0 {
         tracing::warn!(
             applied = levers,
-            "title resolution levers ({}, {})",
+            "title resolution levers ({}, {}, {})",
             crate::hooks::RENDER_SCALE_ENV,
-            crate::hooks::OWN_UPSCALER_ENV
+            crate::hooks::OWN_UPSCALER_ENV,
+            crate::hooks::FSR_UPSCALER_ENV
         );
     }
     // Leonida: the game patches after VI-Patch (`vipatch.rs`, docs/vi_patch.md), for the title's executable

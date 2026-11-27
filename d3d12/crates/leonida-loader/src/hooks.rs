@@ -100,6 +100,12 @@ struct OwnedPatch {
     new: Vec<u8>,
 }
 
+impl OwnedPatch {
+    fn borrowed(&self) -> Patch<'_> {
+        Patch { what: self.what, rva: self.rva, expect: &self.expect, new: &self.new }
+    }
+}
+
 /// The upscaler choice: `mov eax, 6` (own upscaler) then `cmovne eax, ecx`
 /// (FSR when the profile asks for it). NOPing the cmovne keeps 6.
 const OWN_UPSCALER: Patch<'static> = Patch {
@@ -109,21 +115,50 @@ const OWN_UPSCALER: Patch<'static> = Patch {
     new: &[0x0F, 0x1F, 0x00],
 };
 
+/// Leonida: environment variable that makes the title use its FidelityFX upscaler on every console profile
+/// (Series X otherwise uses its own). Its upscale is then one `ffxDispatch` call, which DLSS or the stretch take
+/// (`LEONIDA_UPSCALE`, `leonida-hle`'s `ffx.rs`) with the depth, motion vectors and jitter that frame generation
+/// needs as well. [`OWN_UPSCALER_ENV`] wins over it.
+pub(crate) const FSR_UPSCALER_ENV: &str = "LEONIDA_FSR_UPSCALER";
+
+/// The upscaler choice again ([`OWN_UPSCALER`]), from two instructions earlier: `test al, al` asks whether the
+/// console is a Series S (the device type, 6), and only then does the `cmovne` take ecx, which is 7 (FidelityFX)
+/// when the title has that upscaler and 6 without it. `or al, 1` gives every console the Series S answer. Off
+/// Series S the FidelityFX upscaler renders at scale 1.0 (its other load, [`FSR_LOAD_OTHER`]).
+const FSR_UPSCALER: Patch<'static> = Patch {
+    what: "upscaler: FidelityFX on every console",
+    rva: 0x7e941f,
+    expect: &[0x84, 0xC0, 0xB8, 0x06, 0, 0, 0, 0x0F, 0x45, 0xC1],
+    new: &[0x0C, 0x01, 0xB8, 0x06, 0, 0, 0, 0x0F, 0x45, 0xC1],
+};
+
+/// The scale the FidelityFX upscaler loads on Series S, and where the constant is.
+const FSR_SCALE_S: (f32, usize) = (2.0 / 3.0, 0x615d95c);
+/// The scale it loads on the other consoles, and where the constant is.
+const FSR_SCALE_OTHER: (f32, usize) = (1.0, 0x5fc6ed8);
+/// The two loads, `vmovss xmm0, [rip + disp32]` (the next instruction at +8): Series S, the other consoles.
+const FSR_LOAD_S: usize = 0x28ef6b2;
+const FSR_LOAD_OTHER: usize = 0x28ef6a8;
+
 /// Read-only float constants of this build usable as the FSR scale:
-/// value, RVA.
-const FSR_SCALES: [(f32, usize); 4] = [
+/// value, RVA. The two its loads read untouched are among them.
+const FSR_SCALES: [(f32, usize); 8] = [
     (0.5, 0x5fc6edc),
     (0.4, 0x5fc6f90),
     (1.0 / 3.0, 0x615a240),
     (0.75, 0x6159b04),
+    FSR_SCALE_S,
+    FSR_SCALE_OTHER,
+    (0.6, 0x615a220),
+    (0.58, 0x61671d4),
 ];
 
 /// The render-scale patches for `scale`, with the image at `base`:
 /// - the own upscaler's minimum scale (an immediate, 2/3 by default) set to
 ///   `scale` and its maximum made equal to the minimum (`vmaxss` → `vmovss`),
 ///   so the scale is fixed;
-/// - FSR's scale (a load of 2/3 on Series S) pointed at a constant equal to
-///   `scale`, when this build has one, and its maximum size made the scaled
+/// - FSR's scale (a load of 2/3 on Series S, another of 1.0 on the other consoles) pointed at a constant
+///   equal to `scale`, when this build has one, and its maximum size made the scaled
 ///   size (vtable slot 11 → slot 10's function).
 fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
     let mut patches = vec![
@@ -145,17 +180,19 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
     }
     match FSR_SCALES.iter().find(|(v, _)| (v - scale).abs() < 1e-3) {
         Some(&(_, constant)) => {
-            // vmovss xmm0, [rip + disp32]; the next instruction is at +8.
-            const LOAD: usize = 0x28ef6b2;
-            let disp = (constant as i64 - (LOAD as i64 + 8)) as i32;
-            let mut new = vec![0xC5, 0xFA, 0x10, 0x05];
-            new.extend_from_slice(&disp.to_le_bytes());
-            patches.push(OwnedPatch {
-                what: "render scale: FSR scale",
-                rva: LOAD,
-                expect: vec![0xC5, 0xFA, 0x10, 0x05, 0xA2, 0xE2, 0x86, 0x03],
-                new,
-            });
+            let load = |at: usize, constant: usize| {
+                let disp = (constant as i64 - (at as i64 + 8)) as i32;
+                [&[0xC5, 0xFA, 0x10, 0x05][..], &disp.to_le_bytes()].concat()
+            };
+            for (what, at, stock) in [
+                ("render scale: FSR scale", FSR_LOAD_S, FSR_SCALE_S.1),
+                ("render scale: FSR scale off Series S", FSR_LOAD_OTHER, FSR_SCALE_OTHER.1),
+            ] {
+                // A load that reads this scale already stays as it is.
+                if constant != stock {
+                    patches.push(OwnedPatch { what, rva: at, expect: load(at, stock), new: load(at, constant) });
+                }
+            }
             patches.push(OwnedPatch {
                 what: "render scale: FSR maximum = scaled size",
                 rva: 0x6300ba8,
@@ -165,7 +202,7 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
         }
         None => tracing::warn!(
             scale,
-            "no FSR constant for this scale (0.5, 0.4, 1/3, 0.75); FSR keeps its own (use {OWN_UPSCALER_ENV}=1)"
+            "no FSR constant for this scale (1/3, 0.4, 0.5, 0.58, 0.6, 2/3, 0.75, 1); FSR keeps its own (use {OWN_UPSCALER_ENV}=1)"
         ),
     }
     patches
@@ -178,15 +215,16 @@ fn parse_scale(text: &str) -> Option<f32> {
 }
 
 /// Applies the resolution levers asked for in the environment
-/// ([`RENDER_SCALE_ENV`], [`OWN_UPSCALER_ENV`]). Returns how many applied.
+/// ([`RENDER_SCALE_ENV`], [`OWN_UPSCALER_ENV`], [`FSR_UPSCALER_ENV`]). Returns how many applied.
 ///
 /// # Safety
 /// As `disarm_watchdog`.
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
+    let fsr = std::env::var_os(FSR_UPSCALER_ENV).is_some_and(|v| v == "1");
     let output_1440 = std::env::var_os(OUTPUT_1440_ENV).is_some_and(|v| v == "1");
-    if scale.is_none() && !own && !output_1440 {
+    if scale.is_none() && !own && !fsr && !output_1440 {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -201,22 +239,22 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         applied += usize::from(unsafe { apply(base, &OUTPUT_1440) });
     }
     if own {
+        if fsr {
+            tracing::warn!("{OWN_UPSCALER_ENV} and {FSR_UPSCALER_ENV} are both set: the title's own upscaler it is");
+        }
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
+    } else if fsr {
+        // SAFETY: forwarded from this function's contract.
+        applied += usize::from(unsafe { apply(base, &FSR_UPSCALER) });
     }
     if let Some(text) = scale {
         match parse_scale(&text) {
             Some(scale) => {
                 // With the own upscaler forced, FSR is left as it is.
                 for p in render_scale_patches(base, scale, !own) {
-                    let p = Patch {
-                        what: p.what,
-                        rva: p.rva,
-                        expect: &p.expect,
-                        new: &p.new,
-                    };
                     // SAFETY: forwarded from this function's contract.
-                    applied += usize::from(unsafe { apply(base, &p) });
+                    applied += usize::from(unsafe { apply(base, &p.borrowed()) });
                 }
             }
             None => tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0"),
@@ -312,6 +350,72 @@ mod tests {
     }
 
     #[test]
+    fn the_fidelityfx_patch_gives_every_console_the_series_s_answer() {
+        // test al, al -> or al, 1; the mov eax, 6 and the cmovne eax, ecx after it stay.
+        assert_eq!(FSR_UPSCALER.expect[..2], [0x84, 0xC0]);
+        assert_eq!(FSR_UPSCALER.new[..2], [0x0C, 0x01]);
+        assert_eq!(FSR_UPSCALER.expect[2..], FSR_UPSCALER.new[2..]);
+        // The own-upscaler patch is the cmovne of the same choice: one or the other.
+        assert_eq!(FSR_UPSCALER.rva + 7, OWN_UPSCALER.rva);
+        assert_eq!(FSR_UPSCALER.expect[7..], *OWN_UPSCALER.expect);
+    }
+
+    #[test]
+    fn a_scale_one_of_the_fidelityfx_loads_reads_already_leaves_that_load() {
+        let base = 0x7ff0_0000_0000;
+        // 2/3 is Series S' own: only the other consoles' load changes.
+        let p = render_scale_patches(base, 0.6667, true);
+        assert_eq!(p.iter().map(|p| p.rva).collect::<Vec<_>>(), [0x28f1e7e, 0x28f1e87, FSR_LOAD_OTHER, 0x6300ba8]);
+        assert_eq!(p[2].expect, [0xC5, 0xFA, 0x10, 0x05, 0x28, 0x78, 0x6D, 0x03]);
+        assert_eq!(FSR_LOAD_OTHER + 8 + 0x36d7828, FSR_SCALE_OTHER.1);
+        let disp = i32::from_le_bytes(p[2].new[4..].try_into().unwrap());
+        assert_eq!((FSR_LOAD_OTHER + 8).wrapping_add_signed(disp as isize), FSR_SCALE_S.1);
+        // 1.0 is the other consoles' own: only Series S' load changes.
+        let p = render_scale_patches(base, 1.0, true);
+        assert_eq!(p.iter().map(|p| p.rva).collect::<Vec<_>>(), [0x28f1e7e, 0x28f1e87, FSR_LOAD_S, 0x6300ba8]);
+    }
+
+    /// With `LEONIDA_GAME_DIR` set to the folder of the Xbox package and the 1.0.2.1 executable in it: every
+    /// place of the resolution levers holds the bytes expected, and every scale constant its value.
+    #[test]
+    fn the_resolution_places_are_in_the_retail_executable() {
+        let Some(dir) = std::env::var_os("LEONIDA_GAME_DIR") else {
+            eprintln!("SKIP: LEONIDA_GAME_DIR is not set");
+            return;
+        };
+        let path = std::path::Path::new(&dir).join("game_scarlett_master.exe");
+        let Ok(data) = std::fs::read(&path) else {
+            eprintln!("SKIP: {} is not there", path.display());
+            return;
+        };
+        if !is_build_1_0_2_1(&blake3::hash(&data)) {
+            eprintln!("SKIP: not the 1.0.2.1 executable");
+            return;
+        }
+        let info = leonida_pe::ImageInfo::parse(&data).expect("a PE image");
+        let at = |rva: usize, len: usize| -> &[u8] {
+            let s = info
+                .sections
+                .iter()
+                .find(|s| (s.rva as usize..s.rva as usize + s.file_size as usize).contains(&rva))
+                .unwrap_or_else(|| panic!("{rva:#x} is in no section's file bytes"));
+            let offset = s.file_offset as usize + rva - s.rva as usize;
+            &data[offset..offset + len]
+        };
+        for p in [&FSR_UPSCALER, &OWN_UPSCALER] {
+            assert_eq!(at(p.rva, p.expect.len()), p.expect, "{}", p.what);
+        }
+        // The image's base does not matter to these: the vtable slot (a relocated pointer) is left out.
+        let scales = render_scale_patches(0, 0.5, true);
+        for p in scales.iter().filter(|p| p.rva != 0x6300ba8) {
+            assert_eq!(at(p.rva, p.expect.len()), p.expect, "{}", p.what);
+        }
+        for (value, rva) in FSR_SCALES {
+            assert_eq!(at(rva, 4), value.to_le_bytes(), "{value} at {rva:#x}");
+        }
+    }
+
+    #[test]
     fn scales_outside_the_floor_are_refused() {
         assert_eq!(parse_scale("0.5"), Some(0.5));
         assert_eq!(parse_scale(" 1 "), Some(1.0));
@@ -324,11 +428,15 @@ mod tests {
     fn half_scale_patches_both_upscalers() {
         let base = 0x7ff0_0000_0000;
         let p = render_scale_patches(base, 0.5, true);
-        assert_eq!(p.len(), 4);
+        assert_eq!(p.len(), 5);
         assert_eq!(p[0].new, 0.5f32.to_le_bytes());
-        // The FSR load now reads 0.5 at 0x5fc6edc: disp from the next instruction.
+        // The FSR loads now read 0.5 at 0x5fc6edc: disp from the next instruction. Series S' (2/3 before), then
+        // the other consoles' (1.0 before).
+        assert_eq!(p[2].expect, [0xC5, 0xFA, 0x10, 0x05, 0xA2, 0xE2, 0x86, 0x03]);
         assert_eq!(p[2].new, [0xC5, 0xFA, 0x10, 0x05, 0x22, 0x78, 0x6D, 0x03]);
-        assert_eq!(p[3].new, ((base + 0x28ef680) as u64).to_le_bytes());
+        assert_eq!(p[3].expect, [0xC5, 0xFA, 0x10, 0x05, 0x28, 0x78, 0x6D, 0x03]);
+        assert_eq!(p[3].new, [0xC5, 0xFA, 0x10, 0x05, 0x2C, 0x78, 0x6D, 0x03]);
+        assert_eq!(p[4].new, ((base + 0x28ef680) as u64).to_le_bytes());
         assert!(p.iter().all(|p| p.new.len() == p.expect.len()));
     }
 
@@ -399,7 +507,7 @@ mod tests {
 
     #[test]
     fn odd_scales_patch_only_the_own_upscaler() {
-        assert_eq!(render_scale_patches(0, 0.6, true).len(), 2);
+        assert_eq!(render_scale_patches(0, 0.55, true).len(), 2);
         assert_eq!(render_scale_patches(0, 0.5, false).len(), 2);
     }
 }
