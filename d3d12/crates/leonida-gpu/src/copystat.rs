@@ -272,12 +272,18 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// what another has not finished writing.
 pub(crate) fn barrier_test() -> u8 {
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("LEONIDA_BARRIER_TEST").as_deref() {
+    let asked = *TEST.get_or_init(|| match std::env::var("LEONIDA_BARRIER_TEST").as_deref() {
         Ok("groups") => 1,
         Ok("indirect") => 2,
         Ok("both") => 3,
         _ => 0,
-    })
+    });
+    // Leonida: the same experiment while the title runs, for one run to measure both sides in one scene:
+    // `LEONIDA_AB=<s>,LEONIDA_BARRIER_WAITS` (off: both kinds of waits left out, as `both`). Timing only.
+    if asked == 0 && !crate::toggled!("LEONIDA_BARRIER_WAITS") {
+        return 3;
+    }
+    asked
 }
 
 /// Per range compared after a submission (start, length): times, and the
