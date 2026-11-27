@@ -2097,6 +2097,20 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// The textures of one look of the idle sweep: up to `limit` from address
+/// `from` on. A cursor with nothing after it (the last batch ended at the final
+/// address, or what followed it was released) starts again at the first
+/// address when `wrap` (`LEONIDA_SWEEP_WRAP=0`: it stayed past the end, as
+/// before, and the sweep looked at nothing).
+/// After Davidjc13's ebf9299 in Spaghetih/victory-sley-fork (GPL-3.0-or-later,
+/// as this tree).
+#[cfg(any(windows, test))]
+fn sweep_batch(all: &std::collections::BTreeSet<usize>, from: usize, limit: usize, wrap: bool) -> impl Iterator<Item = usize> + '_ {
+    let tail = all.range(from..);
+    let batch = if wrap && from != 0 && tail.clone().next().is_none() { all.range(..) } else { tail };
+    batch.take(limit).copied()
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2193,7 +2207,7 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in sweep_batch(&all, from, part, crate::toggled!("LEONIDA_SWEEP_WRAP")).chain(by_age.iter().map(|&(_, at)| at)) {
         if bytes >= most {
             break;
         }
@@ -3470,6 +3484,17 @@ pub(crate) fn test_buffer(width: u64) -> This {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_sweep_restarts_past_the_last_texture() {
+        let mut all = std::collections::BTreeSet::from([1usize, 3, 5, 7]);
+        assert_eq!(super::sweep_batch(&all, 0, 2, true).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(super::sweep_batch(&all, 8, 2, true).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(super::sweep_batch(&all, 8, 2, false).count(), 0);
+        all.remove(&7);
+        all.remove(&5);
+        assert_eq!(super::sweep_batch(&all, 4, 2, true).collect::<Vec<_>>(), [1, 3]);
+    }
+
     use super::*;
     use crate::object::slot;
 

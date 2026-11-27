@@ -1303,10 +1303,23 @@ impl TextureQueue {
         }
     }
 
+    /// A new wait for memory or a recheck of slot `index` supersedes the hold
+    /// for card room of the same write: a slot left in `held` was woken by
+    /// [`TextureQueue::room`] before its own look was due (`LEONIDA_HELD_RESCHEDULE=0`:
+    /// left in, as before).
+    /// After Davidjc13's ebf9299 in Spaghetih/victory-sley-fork (GPL-3.0-or-later,
+    /// as this tree).
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if crate::toggled!("LEONIDA_HELD_RESCHEDULE") && self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
@@ -1346,7 +1359,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1357,7 +1370,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
@@ -6553,6 +6566,32 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    #[test]
+    fn room_only_wakes_slots_still_waiting_for_card_space() {
+        let mut q = TextureQueue::default();
+        for slot in 1..=3 {
+            q.written(slot, 0, 0, false);
+        }
+        let due = q.due(0, 3);
+        for &(slot, write) in &due {
+            q.hold(slot, write, 4);
+        }
+        for (slot, write) in due {
+            match slot {
+                1 => q.recheck(slot, write, 10, (16, 8), 1, 0, 4),
+                2 => q.partly(slot, write, 8, 4),
+                _ => q.hold(slot, write, 12),
+            }
+        }
+        // Only slot 3 is still waiting for space; 1 and 2 have looks of their own.
+        assert_eq!(q.room(5), 1);
+        let slots = |frame| q.due(frame, 3).into_iter().map(|(slot, _)| slot).collect::<Vec<_>>();
+        assert_eq!(slots(5), [3]);
+        let mut all = slots(10);
+        all.sort_unstable();
+        assert_eq!(all, [1, 2, 3]);
     }
 
     /// Textures of which only the smallest levels are held, packed into
