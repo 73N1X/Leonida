@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -301,6 +302,9 @@ pub(crate) struct HostHeap {
     /// lease of dynamic slots is known by ([`HostHeap::dynamic`]). An
     /// address would name the next heap made where a freed one lay.
     lease_id: u64,
+    /// Last remap the heap's texture pass took ([`RemapQueue`]); the lock
+    /// also serializes its passes. Ported from fxceless/victory-fork 42be495.
+    remap_cursor: Mutex<u64>,
     /// The shortest table that found no run of free slots since slots were
     /// last given back (changed under `next`'s lock; `u32::MAX`: none).
     /// Until something is given back the free runs only shrink, so a table
@@ -986,9 +990,70 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
-/// Title memory the runtime mapped, unmapped or is about to write since a
-/// texture pass last took the ranges ([`remapped`]).
-static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// Title memory the runtime mapped, unmapped or is about to write, kept for
+/// every view heap's texture pass ([`remapped`], [`RemapQueue`]).
+static REMAPPED: Mutex<RemapQueue> = Mutex::new(RemapQueue::new());
+
+/// Ranges [`REMAPPED`] keeps (a world's first minutes note tens of thousands
+/// between two passes); the oldest are evicted, and a heap behind them
+/// rescans its placed slots once.
+const REMAP_LIMIT: usize = 1 << 18;
+
+/// Ported from fxceless/victory-fork 42be495 (cwWwWwW, after
+/// Kamiloj9/victory-dlss 2023d5c8b and PastiiJay/klbf-lab 74315e7), GPL-3.0:
+/// the ranges were one list the first texture pass took whole, so a second
+/// view heap (the title binds more than one) never saw them and its placed
+/// textures kept the old bytes until their slots were written again.
+/// Sequenced ranges with a cursor per heap instead.
+struct RemapQueue {
+    ranges: VecDeque<(u64, (u64, u64))>,
+    latest: u64,
+    evicted: u64,
+    /// `latest` when a heap last took a snapshot: ranges recorded since may
+    /// be extended by the next page; older ones were seen and stay put.
+    published: u64,
+}
+
+impl RemapQueue {
+    const fn new() -> Self {
+        Self { ranges: VecDeque::new(), latest: 0, evicted: 0, published: 0 }
+    }
+
+    /// Notes `[start, end)`; pages mapped one after the other are joined
+    /// until a heap takes a snapshot. True if the oldest range was evicted.
+    fn record(&mut self, start: u64, end: u64, limit: usize) -> bool {
+        self.latest += 1;
+        if let Some((sequence, (_, last_end))) = self.ranges.back_mut()
+            && *sequence > self.published
+            && *last_end == start
+        {
+            *sequence = self.latest;
+            *last_end = end;
+            return false;
+        }
+        let overflow = self.ranges.len() >= limit;
+        if overflow && let Some((sequence, _)) = self.ranges.pop_front() {
+            self.evicted = sequence;
+        }
+        self.ranges.push_back((self.latest, (start, end)));
+        overflow
+    }
+
+    /// The ranges recorded after `cursor`; `None`: the heap missed an
+    /// evicted one and must rescan.
+    fn snapshot(&mut self, cursor: u64) -> Option<Vec<(u64, u64)>> {
+        self.published = self.latest;
+        if cursor < self.evicted {
+            return None;
+        }
+        let first = self.ranges.partition_point(|(sequence, _)| *sequence <= cursor);
+        Some(self.ranges.iter().skip(first).map(|&(_, range)| range).collect())
+    }
+}
+
+/// The cursor of the single shared pass with `LEONIDA_REMAP_HISTORY=0`
+/// (as before: the heap whose pass runs first takes the ranges).
+static REMAP_SHARED_CURSOR: Mutex<u64> = Mutex::new(0);
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -1028,31 +1093,18 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    /// (A world's first minutes note tens of thousands between two passes:
-    /// at 32,768 the list filled up.)
-    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
-    }
-    if ranges.len() >= MOST {
+    if ranges.record(start, end, REMAP_LIMIT) {
         // No pass has taken them (no shader that picks textures by index is
-        // bound, or a burst of streaming between two passes): room is made,
-        // and every change is kept for the pass that comes.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        compact(&mut ranges, MOST);
+        // bound, or a burst of streaming between two passes): the oldest is
+        // evicted, and a heap behind it rescans its placed slots.
+        STALE[2].fetch_add(1, Relaxed);
     }
-    ranges.push((start, end));
 }
 
 /// A full list of changed ranges made room in, keeping every change: those
@@ -1901,6 +1953,7 @@ impl HostHeap {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
+            remap_cursor: Mutex::new(REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).latest),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count as usize),
@@ -2153,7 +2206,13 @@ impl HostHeap {
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
+        let cursor = if crate::toggled!("LEONIDA_REMAP_HISTORY") {
+            *self.remap_cursor.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            *REMAP_SHARED_CURSOR.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        let remapped = REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).latest != cursor;
+        (writes, remapped || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2235,19 +2294,41 @@ impl HostHeap {
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
     /// left to their draws. Returns how many slots it made due.
-    /// shortcut: the ranges are kept in one place for all heaps; the heap
-    /// whose pass runs first takes them (a title has one view heap).
+    /// Each view heap has its own cursor into the ranges (fxceless/victory-fork
+    /// 42be495); a heap that fell behind the retained ones rescans its slots.
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
-            return 0;
-        }
-        join(&mut ranges);
+        self.refresh_remapped(&REMAPPED, frame)
+    }
+
+    /// [`HostHeap::texture_slots_remapped`] on `history`: what was recorded
+    /// after this heap's cursor (after the one all heaps share with
+    /// `LEONIDA_REMAP_HISTORY=0`), or every placed slot if that was evicted.
+    fn refresh_remapped(&self, history: &Mutex<RemapQueue>, frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let shared = !crate::toggled!("LEONIDA_REMAP_HISTORY");
+        let mut own = self.remap_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let mut common = shared.then(|| REMAP_SHARED_CURSOR.lock().unwrap_or_else(|e| e.into_inner()));
+        let cursor: &mut u64 = match common.as_deref_mut() {
+            Some(c) => c,
+            None => &mut own,
+        };
+        let (latest, ranges) = {
+            let mut remapped = history.lock().unwrap_or_else(|e| e.into_inner());
+            if remapped.latest == *cursor {
+                return 0;
+            }
+            (remapped.latest, remapped.snapshot(*cursor))
+        };
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            match ranges {
+                Some(mut ranges) => {
+                    join(&mut ranges);
+                    ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+                }
+                None => placed.by_slot.keys().copied().collect(),
+            }
         };
         slots.sort_unstable();
         slots.dedup();
@@ -2256,6 +2337,7 @@ impl HostHeap {
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
+        *cursor = latest;
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
     }
@@ -6669,6 +6751,24 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    /// Ported from fxceless/victory-fork 42be495: each heap's cursor sees
+    /// every range, pages joined until a snapshot, the oldest evicted.
+    #[test]
+    fn remap_history_delivers_extended_ranges_and_detects_eviction() {
+        let mut history = RemapQueue::new();
+        assert!(!history.record(10, 20, 2));
+        assert!(!history.record(20, 30, 2));
+        let captured = history.latest;
+        assert_eq!(history.snapshot(0), Some(vec![(10, 30)]));
+        assert!(!history.record(30, 40, 2));
+        assert_eq!(history.snapshot(captured), Some(vec![(30, 40)]));
+        assert!(history.record(60, 70, 2));
+        assert_eq!(history.snapshot(0), None);
+        assert_eq!(history.snapshot(captured), Some(vec![(30, 40), (60, 70)]));
+        assert_eq!(history.snapshot(history.latest), Some(Vec::new()));
+        assert_eq!(history.ranges.len(), 2);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
