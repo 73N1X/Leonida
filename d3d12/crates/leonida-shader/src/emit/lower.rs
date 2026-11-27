@@ -1924,6 +1924,16 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Leonida: `s_min_*` / `s_max_*` set SCC when the first source is the
+/// result (the comparison's outcome), as RDNA 2 does; before this the flag
+/// was left as the last instruction set it. Source: TaynanGT/Vice-Tay commit
+/// 3c83a33 (reported in Belobug/VIctory-Belobug-AMD#634), GPL-3.0.
+/// `LEONIDA_SCALAR_MINMAX_SCC=0` restores the old lowering.
+fn scalar_minmax_scc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_SCALAR_MINMAX_SCC").is_none_or(|v| v != "0"))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, counted: bool) -> Self {
         let p = x.p;
@@ -7077,8 +7087,9 @@ impl<'a> Lower<'a> {
                     "s_min_i32" => pred::SLT,
                     _ => pred::SGT,
                 };
-                let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                let first_wins = self.s.m.cmp(c, p, a, b);
+                let scc = if scalar_minmax_scc() { Some(first_wins) } else { None };
+                (self.s.m.select(c, first_wins, a, b), scc)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
