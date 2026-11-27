@@ -554,7 +554,7 @@ fn card_limits() -> (u64, u64) {
         let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("LEONIDA_CARD_BUFFERS_MIN_MB"),
-            env_mb("LEONIDA_CARD_BUFFERS_MB"),
+            explicit_card_buffers_mb(),
         );
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
@@ -577,6 +577,14 @@ fn card_limits() -> (u64, u64) {
         );
         (min_bytes, max_bytes)
     })
+}
+
+/// `LEONIDA_CARD_BUFFERS_MB` as [`card_limits`] reads it, if it is set to a
+/// number: the same reading for what copies may take and for what the
+/// texture queue keeps for them ([`card_room_kept`]).
+fn explicit_card_buffers_mb() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("LEONIDA_CARD_BUFFERS_MB").ok().and_then(|v| v.trim().parse().ok()))
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -634,8 +642,132 @@ pub(crate) fn card_room_kept() -> u64 {
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
+    // (`reservation_limits`: that cap, unless the budgets are kept in full.)
+    let (buffers, windows) =
+        reservation_limits(card_limits().1, explicit_card_buffers_mb().is_some(), window_card_most(), reserve_card_budgets());
+    remaining_card_room(
+        buffers,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+        windows,
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether the texture queue keeps the card room of the budgets as they are
+/// set, and windows go to the card up to the line title buffers do
+/// (`LEONIDA_CARD_RESERVE_BUDGETS=1`; off by default: unset or anything else
+/// is as before).
+///
+/// Without it the queue keeps at most 1 GiB for the copies of title buffers
+/// ([`card_room_kept`]), whatever `LEONIDA_CARD_BUFFERS_MB` says (the NVIDIA
+/// launcher says 1,536), and nothing for the windows outside buffers
+/// (`LEONIDA_CARD_WINDOWS_MB`, [`window_card_most`]), which are turned down
+/// from eight tenths of the card's budget on ([`window_room_for`]). The
+/// queue fills the card to its own line above that, so only the windows of
+/// the first minute in the world got a side on the card and every later one
+/// stayed in the PC's memory, where each draw that takes its vertices,
+/// indices or constants from it has the card fetch them over the bus.
+///
+/// With it the queue counts as used: the whole of a buffer budget that is
+/// set (the default one still at most 1 GiB), and what the windows' budget
+/// has left; and a window is made up to 97 hundredths of the card's budget,
+/// as a title buffer's copy is (its room was kept). What it costs is the
+/// textures' share of the card, by the budgets at most.
+///
+/// Ported from TaynanGT/Vice-Tay f3dfb5b (GPL-3.0-or-later), whose NVIDIA
+/// presets for cards of 10 to 19 GB set it together with 1,024 MB of
+/// windows (`docs/rtx4070-performance.md` there). That later windows stay
+/// in the PC's memory was also measured in fxceless/victory-fork f299fba
+/// (`VICTORY_WINDOWS_LATE`), from which the count of windows by where they
+/// were made is ([`window_line`]).
+fn reserve_card_budgets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_CARD_RESERVE_BUDGETS").is_some_and(|v| v == "1"))
+}
+
+/// The bytes the texture queue keeps room for: of title buffers' copies
+/// (`buffers`: [`card_limits`]' second number, `explicit_buffers`: set by
+/// `LEONIDA_CARD_BUFFERS_MB`) and of windows' card sides (`windows`:
+/// [`window_card_most`]). With `reserve` ([`reserve_card_budgets`]) a
+/// buffer budget that is set is kept in full and the windows' too; without,
+/// at most 1 GiB for the buffers and nothing for the windows, as before.
+fn reservation_limits(buffers: u64, explicit_buffers: bool, windows: u64, reserve: bool) -> (u64, u64) {
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    if reserve {
+        (if explicit_buffers { buffers } else { buffers.min(SEEN) }, windows)
+    } else {
+        (buffers.min(SEEN), 0)
+    }
+}
+
+/// What is left to keep of [`reservation_limits`]: the buffers' part less
+/// the copies made and those turned down, the windows' less the card sides
+/// alive.
+fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, window_used: u64) -> u64 {
+    buffers.saturating_sub(used.saturating_add(refused)).saturating_add(windows.saturating_sub(window_used))
+}
+
+/// The bytes of the card's budget in use up to which a window outside
+/// buffers gets a side on the card: eight tenths, or 97 hundredths when its
+/// room was kept (`reserved`: [`reserve_card_budgets`] with
+/// [`card_room_kept_on`]).
+fn window_usage_limit(budget: u64, reserved: bool) -> u64 {
+    if reserved { budget / 100 * 97 } else { budget / 10 * 8 }
+}
+
+/// Since the start, how many and their bytes: windows outside buffers made
+/// with a side in the card's memory, in card memory the CPU maps, and in the
+/// PC's memory alone; then the asks for a card side turned down because the
+/// card was filled to the windows' line ([`window_usage_limit`]), and for
+/// want of room under [`window_card_most`].
+static WINDOWS_MADE: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+fn window_made(which: usize, size: u64) {
+    WINDOWS_MADE[2 * which].fetch_add(1, Ordering::Relaxed);
+    WINDOWS_MADE[2 * which + 1].fetch_add(size, Ordering::Relaxed);
+}
+
+/// Title buffers turned down for a card copy because the copies made had
+/// taken `LEONIDA_CARD_BUFFERS_MB`, since the start, and their bytes: no
+/// line said so (the one of [`CARD_REFUSED`] is for a full card), and a
+/// buffer turned down is read over the bus for as long as the title keeps
+/// it. In DoubleGhosty/cool_fox 42ac562 (`docs/buffer-admission-performance.md`
+/// there, an RTX 4060 with 8 GB) one such buffer of 20 MiB cost a dispatch
+/// 63 ms where it took 0.3 ms from the card's memory: with a least size of
+/// 64 KiB every title buffer has a copy of 64 KiB or more ([`lookup`] rounds
+/// up), and thousands of small ones had filled the budget before it came.
+static CARD_FULL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The frame line of [`WINDOWS_MADE`] and [`CARD_FULL`]: where what shaders
+/// read of title memory lies. Nothing is said while there is nothing to say.
+pub(crate) fn window_line() {
+    let n = |i: usize| WINDOWS_MADE[i].load(Ordering::Relaxed);
+    let full = [0, 1].map(|i| CARD_FULL[i].load(Ordering::Relaxed));
+    if n(0) + n(2) + n(4) + full[0] == 0 {
+        return;
+    }
+    tracing::info!(
+        "windows of title memory outside buffers made since the start: {} with a side in the card's memory ({} MB), {} in card \
+         memory the CPU maps ({} MB), {} in the PC's memory alone ({} MB: the card reads those over the bus); a card side was \
+         not given {} times ({} MB) because the card was filled to the windows' line ({} hundredths of its budget; \
+         LEONIDA_CARD_RESERVE_BUDGETS=1: 97, with room kept) and {} times ({} MB) for want of room under {} MB \
+         (LEONIDA_CARD_WINDOWS_MB); title buffers turned down for a card copy with LEONIDA_CARD_BUFFERS_MB used up: {} ({} MB)",
+        n(0),
+        n(1) >> 20,
+        n(2),
+        n(3) >> 20,
+        n(4),
+        n(5) >> 20,
+        n(6),
+        n(7) >> 20,
+        window_usage_limit(100, reserve_card_budgets() && card_room_kept_on()),
+        n(8),
+        n(9) >> 20,
+        window_card_most() >> 20,
+        full[0],
+        full[1] >> 20
+    );
 }
 
 /// The copies in the card's memory, by the copy's address (no other copy has
@@ -793,6 +925,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Counted for the frame line ([`window_line`]).
+        CARD_FULL[0].fetch_add(1, Ordering::Relaxed);
+        CARD_FULL[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -817,7 +952,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// A window goes to the card while there is room under this number and
 /// while a fifth of the card's budget is free, as title buffers do
 /// (`card_for`): textures keep their room, and once they have filled the
-/// card later windows stay where they are. The CPU's side stays in the PC's
+/// card later windows stay where they are (`LEONIDA_CARD_RESERVE_BUDGETS=1`,
+/// [`reserve_card_budgets`]: the texture queue keeps this number's room and
+/// windows go up to 97 hundredths). The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
@@ -834,6 +971,9 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     let there = window_room_for(size);
+    if there.is_some() {
+        window_made(0, size);
+    }
     if there.is_some() || !windows_own() || !cards() {
         return there;
     }
@@ -844,6 +984,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
+    window_made(2, size);
     Some(buffer)
 }
 
@@ -913,12 +1054,14 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used.saturating_add(size) > window_usage_limit(budget, reserve_card_budgets() && card_room_kept_on())
     {
+        window_made(3, size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        window_made(4, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -6272,6 +6415,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
+        window_made(1, len);
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -6296,9 +6440,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 has_sent: Default::default(),
                 size: len,
             };
+            // (Counted where it was made: `window_card_for`.)
             (on_card, Some(card))
         }
-        None => (buffer, None),
+        None => {
+            window_made(2, len);
+            (buffer, None)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6459,6 +6607,29 @@ mod window_tests {
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
         tail_of, window_of,
     };
+
+    /// `LEONIDA_CARD_RESERVE_BUDGETS` (after TaynanGT/Vice-Tay f3dfb5b): off, the texture queue
+    /// keeps at most 1 GiB for buffers and nothing for windows, which stop at eight tenths of
+    /// the card's budget; on, a buffer budget that is set and the windows' are kept in full
+    /// and windows go to 97 hundredths.
+    #[test]
+    fn card_budgets_are_kept_in_full_only_when_asked() {
+        use super::{remaining_card_room, reservation_limits, window_usage_limit};
+        const MIB: u64 = 1 << 20;
+        assert_eq!(reservation_limits(1536 * MIB, true, 1024 * MIB, false), (1024 * MIB, 0));
+        assert_eq!(reservation_limits(1536 * MIB, true, 1024 * MIB, true), (1536 * MIB, 1024 * MIB));
+        // (a default buffer budget keeps its cap; no windows asked for, none kept)
+        assert_eq!(reservation_limits(2048 * MIB, false, 1024 * MIB, true), (1024 * MIB, 1024 * MIB));
+        assert_eq!(reservation_limits(512 * MIB, false, 0, false), (512 * MIB, 0));
+        assert_eq!(reservation_limits(512 * MIB, true, 0, true), (512 * MIB, 0));
+        assert_eq!(window_usage_limit(1_099, false), 872);
+        assert_eq!(window_usage_limit(1_099, true), 970);
+        // what is left to keep: each part less what it has given out, never below nothing
+        assert_eq!(remaining_card_room(1536 * MIB, 512 * MIB, 0, 1024 * MIB, 256 * MIB), 1792 * MIB);
+        assert_eq!(remaining_card_room(512 * MIB, 256 * MIB, 1024 * MIB, 1024 * MIB, 256 * MIB), 768 * MIB);
+        assert_eq!(remaining_card_room(1024 * MIB, 100 * MIB, 24 * MIB, 0, 4096 * MIB), 900 * MIB);
+        assert_eq!(remaining_card_room(0, u64::MAX, 1, 0, 0), 0);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
