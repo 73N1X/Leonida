@@ -3750,7 +3750,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        self.buffers_written();
+        self.dispatched(p);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
@@ -4830,6 +4830,23 @@ impl State {
         }
     }
 
+    /// Leonida: a dispatch with the pipeline `p` was recorded: as
+    /// [`State::buffers_written`] when its shader can store to buffers, the only
+    /// memory indirect arguments are read from. A dispatch that writes textures
+    /// alone (most of a frame's: lighting tiles, post passes) leaves every
+    /// argument as it was, so the open batch of clamped records stays open past
+    /// it, as it does past a draw that stores to no buffer ([`State::drew`]):
+    /// fewer clamp passes, each a dispatch of ours between two full waits.
+    /// `LEONIDA_BATCH_TEXTURE_DISPATCHES=0`: every dispatch ends the batch, as
+    /// before (an A/B switch, `LEONIDA_AB`).
+    fn dispatched(&mut self, p: &HostPipeline) {
+        if !crate::toggled!("LEONIDA_BATCH_TEXTURE_DISPATCHES")
+            || p.stages.iter().any(|stage| stage.translated().stores)
+        {
+            self.buffers_written();
+        }
+    }
+
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
@@ -5103,7 +5120,7 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
-            self.buffers_written();
+            self.dispatched(p);
         } else {
             self.drew(Some(p));
         }
