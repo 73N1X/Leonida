@@ -211,7 +211,7 @@ below.
 | Rainbow, pixelated skin | A texture refresh that does not wait for the runtime's remapping fills its upload from pages not there yet | `-Quality`: `LEONIDA_TEXTURE_NO_WAIT=0` |
 | Some views far too bright | Without rays the light probes keep the sky's light indoors, and the fog takes it too | Always: `LEONIDA_AMBIENT_AIR=1.5` (fog at most 1.5 times the light around), `LEONIDA_AMBIENT_MOST=2` (new, `ambient.rs`; was a fixed 4) |
 | The picture stops until you look away | A pipeline that takes longer than the wait was waited for again in every frame it was in view | Always: each pipeline is waited for once at most (`VICTORY_PIPELINE_WAIT_ONCE`, on; `pipeline/make.rs`; the problem of fxceless issue 1181) |
-| Black blobs on faces and in the air | A NaN that a shader writes is spread by blur and the temporal upscaler | Always: `LEONIDA_NAN_SCRUB=1` (new, `emit/lower.rs`): colours and image stores with NaN become 0; NaN in the fog volume is cleared too |
+| Black blobs on faces and in the air | A NaN that a shader writes is spread by blur and the temporal upscaler | Always: `LEONIDA_NAN_SCRUB=1` (new, `emit/lower.rs`): colours and image stores with NaN become 0 (an image store of 32 bits no float instruction made, which may be an integer's, loses only the NaN and infinity bit patterns a card's arithmetic gives); NaN in the fog volume is cleared too |
 
 Known faults left: the common room by its sunlit windows still goes beige and
 hazy (sky light in the fog); smearing when the camera moves fast at half scale
