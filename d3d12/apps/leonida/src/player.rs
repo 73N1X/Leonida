@@ -471,8 +471,17 @@ pub fn teleport(to: [f32; 3], hold_ms: u32) -> Result<String, String> {
     let shift = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let mut targets: Vec<(usize, Layout, [f32; 3])> = Vec::new();
     let mut line = format!("from ({:.1}, {:.1}, {:.1}) to ({:.1}, {:.1}, {:.1})", from[0], from[1], from[2], to[0], to[1], to[2]);
+    if from == [0.0; 3] {
+        return Err("The primary position reads all zeros: not a player position.".into());
+    }
     for &(address, layout, _) in &all {
         let Some(m) = read_mat(address, layout) else { continue };
+        // Never a member that is all zeros or more than 5 m from the primary.
+        let far = (0..3).map(|i| (m.pos[i] - from[i]).powi(2)).sum::<f32>().sqrt() > 5.0;
+        if m.pos == [0.0; 3] || far {
+            eprintln!("Leonida: teleport: {address:#x} {} skipped: it reads ({:.2}, {:.2}, {:.2}), not near the primary", layout.name(), m.pos[0], m.pos[1], m.pos[2]);
+            continue;
+        }
         let p = [m.pos[0] + shift[0], m.pos[1] + shift[1], m.pos[2] + shift[2]];
         let ok = write_pos(address, layout, p);
         eprintln!(

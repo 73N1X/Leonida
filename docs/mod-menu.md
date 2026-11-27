@@ -155,6 +155,13 @@ fall through ground that is not loaded yet. The menu items work only when a posi
    within 0.5 m, or off by a multiple of a 512 to 4096 m sector; z from 0.5 m below to 2.5 m above, f64 1 m below to
    3 m above), 32 at a time (+3 m for 300 ms, halving a batch that has an effect). The one that moves the copy,
    or that moves other copies, is what the teleport writes. A `LEONIDA_TELEPORT` waits for the probe.
+
+   **Status (honest): not working yet.** The finder and probe located a derived copy of the player's position and a
+   triple that drives it, but that driver sat about 3.3 m above the feet and is most likely the camera's focus, not
+   the player's authoritative position. A teleport through it moved only the camera view, the player stayed put, and
+   one write was followed by a 16.8 s title frame stall and a watchdog fault. The writer therefore skips any member
+   that is all zeros or more than 5 m from the primary, and the finder leaves bare vectors more than 1.5 m above the
+   derived position (camera focus) out of the group. Both the menu items and `LEONIDA_TELEPORT` stay opt-in.
    Then it searches for pointers to the best ones from the title's image (up to `LEONIDA_PLAYER_LEVELS` = 3 levels).
    Everything is written under `%TEMP%\leonida-player\`: `summary.txt`, `candidates.txt`, `tracks.csv`,
    `comovers.txt`, `best.txt`, `pointers.txt` and `paths.txt`. The run that found them can teleport at once.

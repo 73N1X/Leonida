@@ -1727,7 +1727,18 @@ fn probe(
     write(dir, "probe.txt", &cx.log)?;
 
     // Turns a triple into what the teleport should write: the transform whose position row it is, if any.
+    // Not a camera focus (a bare vector more than 1.5 m above the derived position; a full
+    // transform is kept) and not all zeros.
+    let dpos = pos_of(derived.0, derived.1);
     let add = |a: usize, l: Layout, group: &mut Vec<(usize, Layout)>| {
+        if !l.has_axes() {
+            match (pos_of(a, l), dpos) {
+                (Some(p), _) if p == [0.0; 3] => return,
+                (Some(p), Some(d)) if p[2] > d[2] + 1.5 => return,
+                (None, _) => return,
+                _ => {}
+            }
+        }
         if group.iter().all(|&(g, _)| g.abs_diff(a) >= 0x10) {
             group.push((a, l));
         }
