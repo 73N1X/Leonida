@@ -370,3 +370,71 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// LOCAL: with `LEONIDA_NAN_SCRUB=1` an image store keeps 32 bits that no float instruction
+/// of the program made: they may be an integer's (the view's format is not known to the
+/// translation, and the store passes the bits as they are). All-ones, which is "no number"
+/// read as a float, was made 0: a mask with every bit set came out empty. What a float
+/// instruction made is still scrubbed, and so are the bits a GPU's arithmetic gives for "no
+/// number" and the infinities, wherever they come from.
+#[test]
+fn the_nan_scrub_keeps_the_integer_bits_an_image_store_writes() {
+    // v2 = `value` (two words), stored to texel (0, 0) of the image in the table's first entry
+    let program = |value: &[u32]| {
+        let mut words = vec![
+            0xF40C_0201u32, // s_load_dwordx8 s[8:15], s[2:3], 0
+            0xFA00_0000,
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+        ];
+        words.extend_from_slice(value);
+        words.extend_from_slice(&[
+            0xF020_1F08, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf 2D
+            0x0002_0200,
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE85_0380, // s_mov_b32 s5, 0
+        ]);
+        build(&[TABLE, &words, STORE].concat(), (8, 0)).expect("translates")
+    };
+    let moved = |bits: u32| [0x7E04_02FF, bits]; // v_mov_b32 v2, bits
+    let texel = [[0.0; 4]; 1];
+    let was = lower::TEST_NAN_SCRUB.replace(Some(true));
+    // an R32_UINT image: (the bits moved in, what the texel holds)
+    let integers = [
+        (0xFFFF_FFFFu32, 0xFFFF_FFFFu32),
+        (0xFF80_0001, 0xFF80_0001),
+        (0x7F80_0001, 0x7F80_0001),
+        (0x1234_5678, 0x1234_5678),
+        // the patterns arithmetic makes, taken for what a float computation left
+        (0x7FFF_FFFF, 0),
+        (0xFFC0_0000, 0),
+        (0x7F80_0000, 0),
+    ];
+    let shaders: Vec<_> = integers.iter().map(|&(bits, _)| program(&moved(bits))).collect();
+    // a float image: 0 x infinity, made by a float instruction, is no number on any card
+    let product = program(&[
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7E0E_02FF, // v_mov_b32 v7, infinity
+        0x7F80_0000,
+        0x1004_0F06, // v_mul_f32 v2, v6, v7
+    ]);
+    lower::TEST_NAN_SCRUB.set(was);
+    let unscrubbed = program(&moved(0x7F80_0000));
+    for (shader, (bits, want)) in shaders.iter().zip(integers) {
+        let views = [View::UintTextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
+        for (label, got) in run(shader, &views) {
+            assert_eq!(got[0], want, "{label}: {bits:#010x} stored to an R32_UINT image");
+        }
+    }
+    let views = [View::TextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
+    for (label, got) in run(&product, &views) {
+        assert_eq!(got[0], 0, "{label}: 0 x infinity stored to a float image");
+    }
+    // (without the switch the store writes what it is given)
+    for (label, got) in run(&unscrubbed, &views) {
+        assert_eq!(got[0], 0x7F80_0000, "{label}: an infinity, the scrub off");
+    }
+}

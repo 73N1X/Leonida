@@ -99,8 +99,18 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 
 /// LOCAL: `LEONIDA_NAN_SCRUB=1` (off by default): see `Lower::scrub_nan`.
 pub(crate) fn nan_scrub() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_SCRUB.get() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEONIDA_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_scrub`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the title dispatches the program by a count of threads whose last
@@ -11386,15 +11396,18 @@ impl<'a> Lower<'a> {
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
                     let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    let f = self
+                        .s
+                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    // LOCAL: `LEONIDA_NAN_SCRUB=1` (see `scrub_nan`): a 16-bit float.
+                    self.scrub_nan(f)
                 } else {
-                    self.float_of(v)?
+                    // LOCAL: `LEONIDA_NAN_SCRUB=1`: a float the program computed, or 32 bits
+                    // that may be an integer's (`scrub_nan_bits`).
+                    let known = self.floats.contains_key(&v);
+                    let f = self.float_of(v)?;
+                    if known { self.scrub_nan(f) } else { self.scrub_nan_bits(f) }
                 });
-            }
-            // LOCAL: `LEONIDA_NAN_SCRUB=1` (see `scrub_nan`).
-            for v in &mut vals {
-                *v = self.scrub_nan(*v);
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
@@ -12587,8 +12600,10 @@ impl<'a> Lower<'a> {
     }
 
     /// LOCAL: with `LEONIDA_NAN_SCRUB=1` (off by default), `f` or 0 where it
-    /// is NaN. Used on the colours pixel shaders write and on float image
-    /// stores: a NaN that reaches the title's bloom, blur or temporal
+    /// is NaN. Used on the colours pixel shaders write and on image stores
+    /// of floats (16-bit ones, and 32-bit ones a float instruction of the
+    /// program made; other 32-bit data: `scrub_nan_bits`): a NaN that
+    /// reaches the title's bloom, blur or temporal
     /// upscaler spreads into black patches that stay in its history (seen on
     /// NVIDIA as black blobs on faces and in the air). Not what the console
     /// does, so it is a switch; part of the shader cache key.
@@ -12603,6 +12618,37 @@ impl<'a> Lower<'a> {
         let a = self.unary(6, f);
         let inf = self.s.m.f32(0x7f80_0000);
         let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+
+    /// [`Self::scrub_nan`] of the 32 bits an image store writes where no float instruction
+    /// made them here (a copy, a join, a select, a load, integer code): they may be an
+    /// integer's, as the console converts by the view's format, which is not known here, and
+    /// the store passes the bits as they are. All-ones and the other patterns with the
+    /// exponent bits set are common integers (a mask with every bit set, small negative
+    /// numbers): made 0 they left a tile's mask empty. So only the bits a GPU's arithmetic
+    /// gives for "no number" and for an infinity are taken: 0x7FFFFFFF (NVIDIA, measured on
+    /// this tree's test host: every NaN its float operations make or pass on), 0x7FC00000 of
+    /// either sign (AMD, x86), and the two infinities.
+    // shortcut: an integer that is one of those five patterns is still made 0, and a NaN
+    // with other bits (negated last, or loaded and stored without arithmetic) is stored.
+    // Exact needs the view's format: the host could mark texture views of integer formats
+    // in the stride table as it does buffer views (`integer_view`).
+    fn scrub_nan_bits(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let (inf, quiet, ones) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0x7FC0_0000), self.s.m.i32(0x7FFF_FFFF));
+        let is_inf = self.s.m.cmp(c, pred::EQ, abs, inf);
+        let is_quiet = self.s.m.cmp(c, pred::EQ, abs, quiet);
+        let is_ones = self.s.m.cmp(c, pred::EQ, bits, ones);
+        let bad = self.s.m.bin(c, Bin::Or, is_inf, is_quiet);
+        let bad = self.s.m.bin(c, Bin::Or, bad, is_ones);
         let zero = self.s.m.f32(0);
         self.s.m.select(c, bad, zero, f)
     }
