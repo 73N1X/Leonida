@@ -77,20 +77,72 @@ pub(crate) const RENDER_SCALE_ENV: &str = "LEONIDA_RENDER_SCALE";
 pub(crate) const OWN_UPSCALER_ENV: &str = "LEONIDA_OWN_UPSCALER";
 
 /// Leonida: environment variable that tops the title's output modes at 2560x1440 (Series X: the 3840x2160 row
-/// of its mode table becomes 2560x1440, so it never finds a 4K mode and presents 1440p).
-/// NOT USABLE YET: with it the title makes a 2560x1440 window, then stops at its own check at rva 0x247af2d (a
-/// size against 0x1fffff, `int3` when over) a second later, at render scale 0.75 and 1.0 alike (2026-11-27 runs).
+/// of its mode table becomes 2560x1440, so it never finds a 4K mode and presents 1440p): [`OUTPUT_ENV`] with
+/// `2560x1440`.
 pub(crate) const OUTPUT_1440_ENV: &str = "LEONIDA_OUTPUT_1440";
 
+/// Leonida: environment variable that sets the size of the title's largest output mode, `WIDTHxHEIGHT` (Series X:
+/// `2560x1440`, or a wide one such as `5040x2160` or `3440x1440`). EXPERIMENTAL, not run yet: three places change
+/// together ([`output_patches`], after VIctory's native 1440p profile as `runtime/src/display_profile.h` records
+/// it). Alone, the mode row made the title stop at its own check at rva 0x247af2d a second after its window came
+/// up (2026-11-27 runs, render scale 0.75 and 1.0 alike): what is left of the memory reserved for its scanout
+/// buffers has to be under 2 MiB once they are made (`int3` when over), and the reservation was still the one for
+/// 3840x2160.
+pub(crate) const OUTPUT_ENV: &str = "LEONIDA_OUTPUT";
+
 /// The title's table of output modes in `.rdata` (width, height, refresh, 1 per row: 720p, 936p, 1080p, 1440p,
-/// 2160p, all 60 Hz); its last row, 3840x2160, made 2560x1440. The code that builds the mode list copies the rows,
-/// and the two checks for a 4K output look 3840x2160 up in that list.
-const OUTPUT_1440: Patch<'static> = Patch {
-    what: "output modes: 2560x1440 at most",
-    rva: 0x615c100,
-    expect: &[0x00, 0x0F, 0, 0, 0x70, 0x08, 0, 0],
-    new: &[0x00, 0x0A, 0, 0, 0xA0, 0x05, 0, 0],
-};
+/// 2160p, all 60 Hz): its last row, 3840x2160. The code that builds the mode list copies the rows, and the two
+/// checks for a 4K output look 3840x2160 up in that list.
+const OUTPUT_ROW: usize = 0x615c100;
+/// `mov ecx, 0x4000000`: the bytes reserved for the scanout buffers off Series S (Series S takes another
+/// immediate, by the `cmovne` after it).
+const SCANOUT_RESERVATION: usize = 0x247ad4a;
+/// `vmovsd xmm1, [rip + disp32]`: the Settings screen's viewport, read from a 3840x2160 pair of its own in `.data`.
+const SETTINGS_VIEWPORT: usize = 0x58048d4;
+
+/// The size [`OUTPUT_ENV`] asks for, if it is one the mode table can hold: even, 1280x720 to 7680x4320.
+fn parse_output(text: &str) -> Option<(u32, u32)> {
+    let (w, h) = text.trim().split_once(['x', 'X'])?;
+    let (w, h): (u32, u32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    ((1280..=7680).contains(&w) && (720..=4320).contains(&h) && w % 2 == 0 && h % 2 == 0).then_some((w, h))
+}
+
+/// The bytes the title reserves for its two scanout buffers of `width` x `height`: RGBA8 in the console's 64 KiB
+/// tiling (128x128 texels a tile), together rounded up to 2 MiB. 0x4000000 for 3840x2160, the title's own figure.
+fn scanout_pool_bytes(width: u32, height: u32) -> u32 {
+    const TWO_MIB: u64 = 2 << 20;
+    let tiles = u64::from(width.div_ceil(128)) * u64::from(height.div_ceil(128));
+    ((tiles * 65536 * 2).div_ceil(TWO_MIB) * TWO_MIB) as u32
+}
+
+/// The patches for an output of `width` x `height` in place of 3840x2160: the mode row, the scanout
+/// reservation that fits it, and the Settings viewport pointed at the mode row (it reads a pair of its own
+/// otherwise). All three or none ([`apply_all`]).
+fn output_patches(width: u32, height: u32) -> Vec<OwnedPatch> {
+    let pair = |w: u32, h: u32| [w.to_le_bytes(), h.to_le_bytes()].concat();
+    let reservation = |bytes: u32| [&[0xB9][..], &bytes.to_le_bytes()].concat();
+    let viewport = (OUTPUT_ROW as i64 - (SETTINGS_VIEWPORT as i64 + 8)) as i32;
+    vec![
+        OwnedPatch {
+            what: "output: the 3840x2160 mode row",
+            rva: OUTPUT_ROW,
+            expect: pair(3840, 2160),
+            new: pair(width, height),
+        },
+        OwnedPatch {
+            what: "output: the scanout buffers' reservation",
+            rva: SCANOUT_RESERVATION,
+            expect: reservation(scanout_pool_bytes(3840, 2160)),
+            new: reservation(scanout_pool_bytes(width, height)),
+        },
+        OwnedPatch {
+            what: "output: the Settings screen's viewport",
+            rva: SETTINGS_VIEWPORT,
+            expect: vec![0xC5, 0xFB, 0x10, 0x0D, 0x10, 0xF0, 0x13, 0x05],
+            new: [&[0xC5, 0xFB, 0x10, 0x0D][..], &viewport.to_le_bytes()].concat(),
+        },
+    ]
+}
 
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
@@ -215,7 +267,7 @@ fn parse_scale(text: &str) -> Option<f32> {
 }
 
 /// Applies the resolution levers asked for in the environment
-/// ([`RENDER_SCALE_ENV`], [`OWN_UPSCALER_ENV`], [`FSR_UPSCALER_ENV`]). Returns how many applied.
+/// ([`RENDER_SCALE_ENV`], [`OWN_UPSCALER_ENV`], [`FSR_UPSCALER_ENV`], [`OUTPUT_ENV`]). Returns how many applied.
 ///
 /// # Safety
 /// As `disarm_watchdog`.
@@ -223,8 +275,10 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
     let fsr = std::env::var_os(FSR_UPSCALER_ENV).is_some_and(|v| v == "1");
-    let output_1440 = std::env::var_os(OUTPUT_1440_ENV).is_some_and(|v| v == "1");
-    if scale.is_none() && !own && !fsr && !output_1440 {
+    let output = std::env::var(OUTPUT_ENV).ok().filter(|v| !v.trim().is_empty()).or_else(|| {
+        std::env::var_os(OUTPUT_1440_ENV).is_some_and(|v| v == "1").then(|| "2560x1440".to_owned())
+    });
+    if scale.is_none() && !own && !fsr && output.is_none() {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -234,9 +288,17 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         return 0;
     }
     let mut applied = 0;
-    if output_1440 {
-        // SAFETY: forwarded from this function's contract.
-        applied += usize::from(unsafe { apply(base, &OUTPUT_1440) });
+    if let Some(text) = output {
+        match parse_output(&text) {
+            // The title's own output.
+            Some((3840, 2160)) => {}
+            Some((width, height)) => {
+                tracing::warn!(width, height, "{OUTPUT_ENV}: experimental, the title's largest output mode is changed");
+                // SAFETY: forwarded from this function's contract.
+                applied += unsafe { apply_all(base, &output_patches(width, height)) };
+            }
+            None => tracing::warn!(text, "{OUTPUT_ENV} wants WIDTHxHEIGHT, even, from 1280x720 to 7680x4320"),
+        }
     }
     if own {
         if fsr {
@@ -261,6 +323,28 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         }
     }
     applied
+}
+
+/// Applies `patches` if every one of them finds its bytes, and none of them otherwise. Returns how many were
+/// written.
+///
+/// # Safety
+/// As `disarm_watchdog`.
+unsafe fn apply_all(base: usize, patches: &[OwnedPatch]) -> usize {
+    let there = |p: &OwnedPatch| {
+        // SAFETY: the offset is inside the mapped image of this exact build; only read here.
+        let now = unsafe { std::slice::from_raw_parts((base + p.rva) as *const u8, p.expect.len()) };
+        now == p.expect && p.new.len() == p.expect.len()
+    };
+    if let Some(missing) = patches.iter().find(|p| !there(p)) {
+        tracing::warn!(what = missing.what, "hooks skipped, all that go with it too: the bytes are not the expected ones");
+        return 0;
+    }
+    patches
+        .iter()
+        // SAFETY: forwarded from this function's contract.
+        .filter(|p| unsafe { apply(base, &p.borrowed()) })
+        .count()
 }
 
 /// Leonida: applies the game patches of `vipatch.rs` (after VI-Patch, `docs/vi_patch.md`) to the title's
@@ -341,12 +425,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_output_patch_turns_4k_into_1440p() {
+    fn the_output_patches_change_the_mode_row_the_reservation_and_the_settings_viewport() {
         let pair = |b: &[u8]| {
             (u32::from_le_bytes(b[0..4].try_into().unwrap()), u32::from_le_bytes(b[4..8].try_into().unwrap()))
         };
-        assert_eq!(pair(OUTPUT_1440.expect), (3840, 2160));
-        assert_eq!(pair(OUTPUT_1440.new), (2560, 1440));
+        let p = output_patches(2560, 1440);
+        assert_eq!(p.len(), 3);
+        assert_eq!((p[0].rva, pair(&p[0].expect), pair(&p[0].new)), (0x615c100, (3840, 2160), (2560, 1440)));
+        // mov ecx, imm32: the title's own 0x4000000 before, 240 tiles of 64 KiB twice, to 2 MiB, after.
+        assert_eq!(p[1].expect, [0xB9, 0, 0, 0, 0x04]);
+        assert_eq!(p[1].new, [0xB9, 0, 0, 0xE0, 0x01]);
+        // The viewport's load reads the mode row: its displacement from the next instruction.
+        assert_eq!(p[2].new, [0xC5, 0xFB, 0x10, 0x0D, 0x24, 0x78, 0x95, 0x00]);
+        assert_eq!(0x58048d4 + 8 + 0x957824, 0x615c100);
+        assert!(p.iter().all(|p| p.new.len() == p.expect.len() && p.new != p.expect));
+    }
+
+    #[test]
+    fn the_scanout_reservation_is_two_tiled_buffers_to_two_mib() {
+        assert_eq!(scanout_pool_bytes(3840, 2160), 0x400_0000);
+        assert_eq!(scanout_pool_bytes(2560, 1440), 0x1E0_0000);
+        // 21:9 and 32:9 at the title's height, and a 3440x1440 monitor.
+        assert_eq!(scanout_pool_bytes(5040, 2160), 0x560_0000);
+        assert_eq!(scanout_pool_bytes(7680, 2160), 0x800_0000);
+        assert_eq!(scanout_pool_bytes(3440, 1440), 0x2A0_0000);
+    }
+
+    #[test]
+    fn output_sizes_are_even_and_within_the_mode_table() {
+        assert_eq!(parse_output("5040x2160"), Some((5040, 2160)));
+        assert_eq!(parse_output(" 2560X1440 "), Some((2560, 1440)));
+        for wrong in ["", "2560", "2561x1440", "640x360", "9000x2160", "21:9", "x", "2560x"] {
+            assert_eq!(parse_output(wrong), None, "{wrong:?}");
+        }
     }
 
     #[test]
@@ -407,7 +518,7 @@ mod tests {
         }
         // The image's base does not matter to these: the vtable slot (a relocated pointer) is left out.
         let scales = render_scale_patches(0, 0.5, true);
-        for p in scales.iter().filter(|p| p.rva != 0x6300ba8) {
+        for p in output_patches(2560, 1440).iter().chain(scales.iter().filter(|p| p.rva != 0x6300ba8)) {
             assert_eq!(at(p.rva, p.expect.len()), p.expect, "{}", p.what);
         }
         for (value, rva) in FSR_SCALES {

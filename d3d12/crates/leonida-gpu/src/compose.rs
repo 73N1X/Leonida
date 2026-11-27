@@ -149,6 +149,7 @@ impl Composer {
         }
     }
 
+    /// Draws the two planes over `width` x `height` of `back` from (`left`, `top`).
     /// Each presenter command-list slot owns its own pair of SRVs. The swap
     /// chain may have several outstanding presents; the slot is selected by
     /// the completion fence, and its descriptors are only overwritten on reuse.
@@ -159,6 +160,7 @@ impl Composer {
         list: &ID3D12GraphicsCommandList,
         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
         back: &ID3D12Resource,
+        (left, top): (u32, u32),
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
         while self.views.len() <= slot {
@@ -208,17 +210,20 @@ impl Composer {
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
+            // Leonida: the picture's place in `back`, which is larger when bars go around it (`crate::aspect`).
             list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: left as f32,
+                TopLeftY: top as f32,
                 Width: width as f32,
                 Height: height as f32,
                 MaxDepth: 1.0,
                 ..Default::default()
             }]);
             list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
+                left: left as i32,
+                top: top as i32,
+                right: (left + width) as i32,
+                bottom: (top + height) as i32,
             }]);
             list.DrawInstanced(3, 1, 0, 0);
         }
@@ -328,6 +333,7 @@ mod tests {
                     cmds,
                     [(&base, format), (&overlay, format)],
                     &output,
+                    (0, 0),
                     (3, 1),
                 )
                 .unwrap();

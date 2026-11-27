@@ -53,6 +53,7 @@ pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic
 /// Leonida: the game window holds the mouse for mouse look (leonida-hle `gameinput`): its window procedures hide the
 /// cursor over the client area while this is set.
 pub static MOUSE_CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub mod aspect;
 #[cfg(windows)]
 pub mod streamline;
 #[cfg(windows)]

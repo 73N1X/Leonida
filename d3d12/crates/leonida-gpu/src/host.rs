@@ -10115,25 +10115,36 @@ impl Host {
                 }
             }
         }
-        if (p.width, p.height, p.format) != (width, height, format) {
+        // Leonida: the swap chain is the picture, which the window stretches. With `LEONIDA_PRESENT_SCALE=fit`
+        // and a window of another shape it is a frame of the window's shape with the picture in its middle
+        // (`crate::aspect`), which the window then scales evenly.
+        let placed = if crate::aspect::fit() {
+            crate::aspect::frame((width, height), client_size(p.hwnd))
+        } else {
+            crate::aspect::Frame::whole(width, height)
+        };
+        let whole = placed.is_whole((width, height));
+        if (p.width, p.height, p.format) != (placed.width, placed.height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, placed.width, placed.height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
                     if p.format != format {
                         p.composer = None;
                     }
-                    (p.width, p.height, p.format) = (width, height, format);
-                    // Leonida: the trainer menu is painted for the picture's height.
-                    leonida_menu::set_height(height);
+                    (p.width, p.height, p.format) = (placed.width, placed.height, format);
+                    // Leonida: the trainer menu is painted for the height of what is shown.
+                    leonida_menu::set_height(placed.height);
                     tracing::info!(
-                        width,
-                        height,
+                        width = placed.width,
+                        height = placed.height,
+                        picture = ?(width, height),
+                        at = ?(placed.left, placed.top),
                         format = format.0,
                         frame,
                         "the swap chain's buffers were made again for another size or format"
@@ -10210,6 +10221,10 @@ impl Host {
                     }
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
                     list.ResourceBarrier(&pre);
+                    if !whole {
+                        // The bars: black around the picture.
+                        list.ClearRenderTargetView(self.rtv(Some(&back), None), &[0.0, 0.0, 0.0, 1.0], None);
+                    }
                     let compose_slot = slot.map_or(0, |i| i + 1);
                     if let Err(err) = composer.record(
                         self,
@@ -10217,6 +10232,7 @@ impl Host {
                         list,
                         [(texture, base_fmt), (over, over_fmt)],
                         &back,
+                        (placed.left, placed.top),
                         (width, height),
                     ) {
                         copy.close();
@@ -10261,14 +10277,35 @@ impl Host {
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
                 }
-                pre.push(transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ));
-                list.ResourceBarrier(&pre);
-                list.CopyResource(&back, texture);
+                if whole {
+                    pre.push(transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ));
+                    list.ResourceBarrier(&pre);
+                    list.CopyResource(&back, texture);
+                } else {
+                    // Leonida: the bars (`crate::aspect`): the buffer cleared to black, then the picture copied
+                    // into its middle as it is.
+                    pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                    list.ResourceBarrier(&pre);
+                    list.ClearRenderTargetView(self.rtv(Some(&back), None), &[0.0, 0.0, 0.0, 1.0], None);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    let location = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(resource),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    list.CopyTextureRegion(&location(&back), placed.left, placed.top, 0, &location(texture), None);
+                }
             }
+            // What the overlays are laid over: the whole buffer, bars and all.
+            let shown = (placed.width, placed.height);
             // Leonida: the trainer menu's screenshot is this present's
             // read-back too: the title's picture, before the panel and the
             // menus are laid over it.
@@ -10308,15 +10345,15 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
-            p.panel.draw(self, copy, &back, (width, height), format);
-            p.menu.draw(self, copy, &back, (width, height), format);
+            p.panel.draw(self, copy, &back, shown, format);
+            p.menu.draw(self, copy, &back, shown, format);
             // Leonida: what the Lua mods draw, then the trainer menu, where the
             // panel and the F1 menu are put (so frame generation sees all alike).
             if trainer_work & leonida_menu::LUA_DRAW != 0 {
-                p.lua.draw_lua(self, copy, &back, (width, height), format);
+                p.lua.draw_lua(self, copy, &back, shown, format);
             }
             if trainer_work & leonida_menu::DRAW != 0 {
-                p.trainer.draw(self, copy, &back, (width, height), format);
+                p.trainer.draw(self, copy, &back, shown, format);
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -10369,6 +10406,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Leonida: with bars, frame generation is told where in the buffer the picture is.
+            crate::fg::picture_box((!whole).then_some([placed.left, placed.top, width, height]));
             crate::fg::present_start();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             crate::fg::present_end();
@@ -10393,7 +10432,14 @@ impl Host {
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            // Leonida: a window of our own takes the shape `LEONIDA_ASPECT` asks for, as the title's does.
+            None => match crate::aspect::asked() {
+                Some(aspect) => {
+                    let (w, h) = crate::aspect::widened(width as i32, height as i32, aspect);
+                    window(w as u32, h as u32)?
+                }
+                None => window(width, height)?,
+            },
         };
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
@@ -10438,6 +10484,16 @@ impl Host {
                 lua: trainer::Overlay::idle(),
             })
         }
+    }
+}
+
+/// The size of a window's client area ((0, 0) for a minimised one, or one that is gone).
+fn client_size(hwnd: HWND) -> (u32, u32) {
+    let mut rect = RECT::default();
+    // SAFETY: a plain query with room for the answer.
+    match unsafe { GetClientRect(hwnd, &mut rect) } {
+        Ok(()) => ((rect.right - rect.left).max(0) as u32, (rect.bottom - rect.top).max(0) as u32),
+        Err(_) => (0, 0),
     }
 }
 

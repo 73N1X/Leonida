@@ -234,6 +234,21 @@ pub(crate) fn note_titles(depth: u64, motion: u64) {
     }
 }
 
+/// Where the title's picture is in the swap chain's buffer when bars go around it (`crate::aspect`): left, top,
+/// width, height. None: it is the whole buffer.
+static PICTURE: Mutex<Option<[u32; 4]>> = Mutex::new(None);
+/// A box was given at some time: from then on every present says where the picture is, the whole buffer too.
+static BOXED: AtomicBool = AtomicBool::new(false);
+
+/// From the presenter, before [`present_start`]: where in the buffer about to be presented the picture is.
+pub(crate) fn picture_box(place: Option<[u32; 4]>) {
+    if place.is_none() && !BOXED.load(Ordering::Relaxed) {
+        return;
+    }
+    BOXED.store(true, Ordering::Relaxed);
+    *PICTURE.lock().unwrap_or_else(|e| e.into_inner()) = place;
+}
+
 fn constants(l: &Latest) -> sl::Constants {
     let (w, h) = (l.render[0].max(1) as f32, l.render[1].max(1) as f32);
     let inverted = l.near > l.far;
@@ -351,10 +366,16 @@ pub(crate) fn present_start() {
             let mut depth_res = sl::Resource::d3d12_tex2d(depth.texture.as_raw(), depth_state);
             let mut motion_res = sl::Resource::d3d12_tex2d(motion.texture.as_raw(), motion_state);
             let extent = Some(sl::Extent { top: 0, left: 0, width: l.render[0], height: l.render[1] });
-            let tags = [
+            let mut tags = vec![
                 sl::ResourceTag::new(&mut depth_res, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, extent),
                 sl::ResourceTag::new(&mut motion_res, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, extent),
             ];
+            // With bars around the picture: the part of the back buffer the depth and motion vectors are of
+            // (no resource, only the extent; all zero is the whole buffer again).
+            if BOXED.load(Ordering::Relaxed) {
+                let place = PICTURE.lock().unwrap_or_else(|e| e.into_inner()).map(|[left, top, width, height]| sl::Extent { top, left, width, height });
+                tags.push(sl::ResourceTag::new(std::ptr::null_mut(), sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, place));
+            }
             // SAFETY: live resources (their host copies are held through the call), in the
             // states they will be in at the present; no list needed for eValidUntilPresent.
             let t = unsafe { s.sl.set_tag_for_frame(token, &VIEWPORT, &tags, std::ptr::null_mut()) };
