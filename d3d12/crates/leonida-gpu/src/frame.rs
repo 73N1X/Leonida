@@ -25,8 +25,9 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
-/// LOCAL (11/26): `LEONIDA_FPS_CAP`. Unset: the title's own interval (30 frames a second on a
-/// Series S); `0`: none (ticks half a millisecond apart); `n`: n frames a second. The F1 menu
+/// LOCAL (11/26): `LEONIDA_FPS_CAP`. Unset: the title's own interval (60 frames a second with the
+/// loader's frame-rate patch, `leonida-loader`'s `vipatch.rs`, which is always on; 30 without it);
+/// `0`: none (ticks half a millisecond apart); `n`: n frames a second. The F1 menu
 /// changes it while running ([`set_cap`]). -1: not read yet; 0: the title's; else microseconds.
 static CAP_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 

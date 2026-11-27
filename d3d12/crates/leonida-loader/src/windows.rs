@@ -103,6 +103,17 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             crate::hooks::OWN_UPSCALER_ENV
         );
     }
+    // Leonida: the game patches after VI-Patch (`vipatch.rs`, docs/vi_patch.md), for the title's executable
+    // only (its DLLs come here too): 60 frames a second always, the others by their switches.
+    if !loaded.info.is_dll() {
+        // SAFETY: just mapped, and no title code has run.
+        let applied = unsafe { crate::hooks::game_patches(loaded.base(), &loaded.info) };
+        tracing::info!(
+            applied,
+            "game patches: places changed (60 fps always; {}=1)",
+            crate::vipatch::NO_VIGNETTE_ENV
+        );
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

@@ -55,7 +55,8 @@ const ITEMS: &[Item] = &[
     Item { var: "LEONIDA_UPSCALE", label: "UPSCALER", values: &[("dlss", "DLSS"), ("stretch", "STRETCH"), ("", "GAME FSR4 (SLOW)")], live: false },
     Item { var: "LEONIDA_FRAME_GEN", label: "FRAME GEN (NOT WITH RAY TR.)", values: &[("", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
     Item { var: "LEONIDA_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
-    Item { var: "LEONIDA_FPS_CAP", label: "FRAME RATE CAP", values: &[("", "GAME (30)"), ("60", "60"), ("120", "120"), ("0", "NONE")], live: true },
+    // The title's own pace is 60 with the loader's frame-rate patch (`leonida-loader`'s `vipatch.rs`), which is always on.
+    Item { var: "LEONIDA_FPS_CAP", label: "FRAME RATE CAP", values: &[("", "GAME (60)"), ("30", "30"), ("60", "60"), ("120", "120"), ("0", "NONE")], live: true },
     Item { var: "LEONIDA_BVH_BUILDER", label: "RAY TRACING (REAL LIGHTING)", values: &[("", "OFF"), ("1", "ON")], live: false },
     Item { var: "LEONIDA_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT (K)"), ("K", "K TRANSFORMER"), ("J", "J TRANSFORMER"), ("M", "M TRANSFORMER"), ("L", "L TRANSFORMER")], live: false },
     Item { var: "LEONIDA_DLSS_SHARPNESS", label: "DLSS SHARPNESS", values: &[("0", "0"), ("0.25", "0.25"), ("0.5", "0.5"), ("0.75", "0.75"), ("1", "1")], live: true },
@@ -90,6 +91,8 @@ const ITEMS: &[Item] = &[
     Item { var: "LEONIDA_CARD_BUFFERS_MB", label: "CARD BUFFERS MB", values: &[("1536", "1536"), ("1024", "1024"), ("2048", "2048"), ("512", "512"), ("0", "0 OFF")], live: false },
     Item { var: "LEONIDA_RENDER_SCALE", label: "RENDER SCALE", values: &[("", "GAME (720P)"), ("0.5", "0.5 (540P)"), ("0.75", "0.75")], live: false },
     Item { var: "LEONIDA_OWN_UPSCALER", label: "OWN UPSCALER", values: UNSET_ON, live: false },
+    // The game patches after VI-Patch that have a switch (docs/vi_patch.md); the loader reads them when it maps the title.
+    Item { var: "LEONIDA_VIPATCH_NO_VIGNETTE", label: "NO VIGNETTE (VI-PATCH)", values: UNSET_ON, live: false },
     Item { var: "LEONIDA_D3D12_DRED", label: "CRASH BREADCRUMBS", values: &[("light", "LIGHT"), ("", "OFF")], live: false },
 ];
 

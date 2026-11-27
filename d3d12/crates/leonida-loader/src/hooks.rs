@@ -225,6 +225,54 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     applied
 }
 
+/// Leonida: applies the game patches of `vipatch.rs` (after VI-Patch, `docs/vi_patch.md`) to the title's
+/// executable mapped at `base`: 60 frames a second always, the others by their switches. Each place is found by
+/// its pattern in the image's code (at the offset known for 1.0.2.1, or by a search in another build) and a patch
+/// is written only if all its places are found. Returns how many places were changed.
+///
+/// # Safety
+/// As `disarm_watchdog`; `info` is the image's.
+pub(crate) unsafe fn game_patches(base: usize, info: &leonida_pe::ImageInfo) -> usize {
+    use crate::vipatch;
+    let mut writes = Vec::new();
+    {
+        // The image's code as it is mapped. The slices end with this block, before anything is written.
+        let code: Vec<(usize, &[u8])> = info
+            .sections
+            .iter()
+            .filter(|s| s.characteristics & vipatch::SCN_MEM_EXECUTE != 0)
+            .filter(|s| {
+                u64::from(s.rva) + u64::from(s.virtual_size) <= u64::from(info.size_of_image)
+            })
+            .map(|s| {
+                let (start, len) = (s.rva as usize, s.virtual_size as usize);
+                // SAFETY: a section of the mapped image, readable, which nothing writes yet.
+                let bytes = unsafe { std::slice::from_raw_parts((base + start) as *const u8, len) };
+                (start, bytes)
+            })
+            .collect();
+        for patch in vipatch::PATCHES.iter().filter(|p| p.wanted()) {
+            match vipatch::plan(patch, &code) {
+                Ok(places) => writes.extend(places),
+                Err(miss) => tracing::warn!(patch = patch.name, "game patch not applied: {miss}"),
+            }
+        }
+    }
+    writes
+        .iter()
+        .filter(|w| {
+            let p = Patch {
+                what: w.what,
+                rva: w.rva,
+                expect: &w.expect,
+                new: w.new,
+            };
+            // SAFETY: forwarded from this function's contract; the place is in the image's code.
+            unsafe { apply(base, &p) }
+        })
+        .count()
+}
+
 /// # Safety
 /// See `disarm_watchdog`.
 unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
@@ -282,6 +330,71 @@ mod tests {
         assert_eq!(p[2].new, [0xC5, 0xFA, 0x10, 0x05, 0x22, 0x78, 0x6D, 0x03]);
         assert_eq!(p[3].new, ((base + 0x28ef680) as u64).to_le_bytes());
         assert!(p.iter().all(|p| p.new.len() == p.expect.len()));
+    }
+
+    #[test]
+    fn the_game_patches_are_written_into_the_code_of_an_image() {
+        use crate::vipatch::{PATCHES, SCN_MEM_EXECUTE};
+        // A made-up image: one section of code with the bytes each pattern names (its `??` as zeros), away
+        // from the offsets known for the title, so each place is found by the search.
+        let mut image = vec![0xCCu8; 0x3000];
+        let mut places = Vec::new();
+        for (i, (patch, site)) in PATCHES
+            .iter()
+            .flat_map(|p| p.sites.iter().map(move |s| (p, s)))
+            .enumerate()
+        {
+            let bytes: Vec<u8> = site
+                .pattern
+                .split_ascii_whitespace()
+                .map(|t| u8::from_str_radix(t, 16).unwrap_or(0))
+                .collect();
+            let at = 0x1010 + i * 0x100;
+            image[at..at + bytes.len()].copy_from_slice(&bytes);
+            let old = bytes[site.at..site.at + site.new.len()].to_vec();
+            places.push((patch.wanted(), at + site.at, old, site.new));
+        }
+        let info = leonida_pe::ImageInfo {
+            machine: leonida_pe::MACHINE_AMD64,
+            characteristics: 0,
+            timestamp: 0,
+            subsystem: 0,
+            dll_characteristics: 0,
+            image_base: 0,
+            size_of_image: image.len() as u32,
+            entry_rva: 0,
+            stack_reserve: 0,
+            stack_commit: 0,
+            sections: vec![leonida_pe::SectionInfo {
+                name: ".text".to_owned(),
+                rva: 0x1000,
+                virtual_size: 0x2000,
+                file_offset: 0,
+                file_size: 0,
+                characteristics: SCN_MEM_EXECUTE,
+            }],
+            imports: Vec::new(),
+            delay_imports: Vec::new(),
+            exports: Vec::new(),
+            tls: None,
+            has_relocations: false,
+            has_exception_table: false,
+            has_load_config: false,
+            codeview: None,
+        };
+        // SAFETY: `image` is memory of ours of the size `info` says, and nothing else uses it.
+        let applied = unsafe { game_patches(image.as_mut_ptr() as usize, &info) };
+        assert_eq!(applied, places.iter().filter(|p| p.0).count());
+        // The frame-rate patch has no switch: its two places at least.
+        assert!(applied >= 2);
+        for (wanted, at, old, new) in places {
+            let now = &image[at..at + new.len()];
+            assert_eq!(now, if wanted { new } else { &old[..] }, "{at:#x}");
+        }
+        // A second pass finds nothing to change: the patterns are gone where they were written.
+        // SAFETY: as above.
+        let again = unsafe { game_patches(image.as_mut_ptr() as usize, &info) };
+        assert_eq!(again, 0);
     }
 
     #[test]

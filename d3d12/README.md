@@ -266,8 +266,13 @@ still reaches.
 - **DLSS frame generation** (NVIDIA Streamline), 2x to 6x, from the menu. The
   amount changes while playing. Frames are only generated while the game's
   window has the focus.
-- **Frame rate cap**: the title asks for 30 frames a second; the menu's FRAME
-  RATE CAP lifts that (60, 120 or none).
+- **Frame rate cap**: the title asks for 30 frames a second on its own; the
+  loader's frame-rate patch, always on, makes that 60
+  ([docs/vi_patch.md](../docs/vi_patch.md)), and the menu's FRAME RATE CAP
+  changes it (30, 60, 120 or none).
+- **Game patches after VI-Patch** ([docs/vi_patch.md](../docs/vi_patch.md)):
+  60 frames a second always; no vignette by `LEONIDA_VIPATCH_NO_VIGNETTE=1`
+  or the menu.
 - **Real ray tracing**, off by default: `-RayTracing` or the menu. On this
   renderer the title's structure builder runs on NVIDIA (53 programs), and
   the draws dropped for it go from hundreds or thousands a frame to one.
