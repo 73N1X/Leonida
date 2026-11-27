@@ -1722,7 +1722,11 @@ The copies:
   write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
   over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
   writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
-  its pages stay guarded. Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
+  its pages stay guarded. The copy runs under the tracker's lock and can still fault on a page another guard keeps
+  read-only (the geometry watch, another view's shadow): the fault handler asks every tracker over the address, this
+  one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
+  recursive; on 621.40 the title's submitting thread hung there for good, the main loop frozen with no device loss).
+  Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
   reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range
   another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
