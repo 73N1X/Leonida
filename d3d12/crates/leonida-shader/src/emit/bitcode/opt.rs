@@ -27,6 +27,10 @@
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
 //!
+//! - [`GUARDS`]: a value kept for the lanes a guard leaves out (`select(g, new, old)`,
+//!   what a console instruction under EXEC writes) that is read only where `g` holds, or by
+//!   what is itself read only there, is its new value: the old one is never seen.
+//!
 //! Which passes run is `emit::shader_opt()` (`LEONIDA_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
@@ -47,6 +51,8 @@ pub const REUSE: u32 = 4;
 pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
+/// A select between a guard's new and old value that only guarded code reads.
+pub const GUARDS: u32 = 128;
 /// Not a pass over the module: the lowering of a first-lane read in a
 /// wave64 program run as two host waves skips the exchange that asks which
 /// half has a lane where every lane is in EXEC (`lower.rs`,
@@ -61,7 +67,7 @@ pub const FIRST: u32 = 32;
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | GUARDS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one but [`WIDE`],
@@ -229,7 +235,7 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | GUARDS) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
@@ -237,6 +243,9 @@ impl Module {
                 let mut changed = self.merge(passes);
                 if passes & FOLD != 0 {
                     changed |= self.prune();
+                }
+                if passes & GUARDS != 0 {
+                    changed |= self.guards();
                 }
                 if !changed {
                     break;
@@ -955,6 +964,113 @@ impl Module {
         true
     }
 
+    /// [`GUARDS`]. A value is needed "only when `g`" if everything that reads it is: a
+    /// `select(g, v, other)` takes `v` only where `g` holds, and a value without effect
+    /// (arithmetic, a comparison, a select, a pure call) needs its operands where its own
+    /// readers need it. A join, a store, an atomic, a load, a call with an effect or that reads
+    /// other lanes (a lane there is read whether `g` holds in it or not), and a branch
+    /// condition need their operands always. The select `s = select(g, a, b)` that is needed
+    /// only when `g` holds is `a` wherever it is read: the lanes where it is not are not
+    /// observed. Returns whether a select was replaced.
+    fn guards(&mut self) -> bool {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Need {
+            Unread,
+            When(V),
+            Always,
+        }
+        fn merge(a: Need, b: Need) -> Need {
+            match (a, b) {
+                (Need::Unread, x) | (x, Need::Unread) => x,
+                (Need::When(x), Need::When(y)) if x == y => a,
+                _ => Need::Always,
+            }
+        }
+        if self.blocks.is_empty() {
+            return false;
+        }
+        let effects = self.effects();
+        let tree = self.dominator_tree();
+        let n = self.insts.len();
+        let mut need = vec![Need::Unread; n];
+        let raise = |need: &mut [Need], v: V, by: Need| {
+            if let V::Inst(i) = v {
+                need[i as usize] = merge(need[i as usize], by);
+            }
+        };
+        // what the joins and the branch conditions read
+        for &b in &tree.order {
+            for &p in &self.blocks[b].phis {
+                for_each_operand(&self.insts[p as usize].op, |v| raise(&mut need, v, Need::Always));
+            }
+            if let Some(Term::CondBr(c, ..)) = self.blocks[b].term {
+                raise(&mut need, c, Need::Always);
+            }
+        }
+        let is_float = |t: Ty| matches!(self.types[t.0 as usize], TypeDef::Float | TypeDef::Double);
+        // (every definition comes before its readers in the order, apart from joins)
+        for &b in tree.order.iter().rev() {
+            for &i in self.blocks[b].body.iter().rev() {
+                let inst = &self.insts[i as usize];
+                let base = need[i as usize];
+                let pure = match &inst.op {
+                    // (an integer division the select kept away from zero is not one with the new value)
+                    Op::Bin(Bin::UDiv | Bin::SDiv | Bin::URem, ..) => is_float(inst.ty),
+                    Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+                    Op::Call(f, _) => effects[*f as usize] == Effect::Pure,
+                    _ => false,
+                };
+                if !pure {
+                    for_each_operand(&inst.op, |v| raise(&mut need, v, Need::Always));
+                    continue;
+                }
+                if base == Need::Unread {
+                    continue;
+                }
+                match &inst.op {
+                    Op::Select(c, t, f) => {
+                        let on_true = match base {
+                            Need::When(_) => base,
+                            _ => Need::When(*c),
+                        };
+                        raise(&mut need, *c, base);
+                        raise(&mut need, *t, on_true);
+                        raise(&mut need, *f, base);
+                    }
+                    op => for_each_operand(op, |v| raise(&mut need, v, base)),
+                }
+            }
+        }
+        let mut repl: Vec<Option<V>> = vec![None; n];
+        let mut changed = false;
+        for &b in &tree.order {
+            for &i in &self.blocks[b].body {
+                if let Op::Select(g, a, _) = self.insts[i as usize].op
+                    && need[i as usize] == Need::When(g)
+                    && a != V::Inst(i)
+                {
+                    repl[i as usize] = Some(a);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+        for blk in &mut self.blocks {
+            if let Some(Term::CondBr(c, t, f)) = blk.term {
+                blk.term = Some(Term::CondBr(resolve(&repl, c), t, f));
+            }
+        }
+        let (blocks, insts) = (&self.blocks, &mut self.insts);
+        for blk in blocks {
+            for &i in blk.phis.iter().chain(&blk.body) {
+                map_operands(&mut insts[i as usize].op, |v| resolve(&repl, v));
+            }
+        }
+        true
+    }
+
     /// [`FOLD`]: a branch on a constant goes one way. The side not taken
     /// loses the branching block's values at its joins, and so do the joins
     /// of blocks that nothing reaches any more. Returns whether a branch
@@ -1272,6 +1388,98 @@ mod tests {
         m.terminate(b, Term::Ret);
         m.optimise(DEAD);
         assert_eq!(body(&m, b), 3, "the load, the add and the store");
+        m.write();
+    }
+
+    /// What `select(g, new, old)` leaves for the lanes outside `g` is not seen by code that
+    /// only runs for the lanes in `g`: a chain of guarded writes needs no select but the last.
+    #[test]
+    fn a_guarded_value_read_only_where_the_guard_holds_is_its_new_value() {
+        let Kit {
+            mut m,
+            b,
+            pure,
+            reads,
+            writes,
+        } = kit();
+        let i32t = m.int(32);
+        let i1t = m.int(1);
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        let x = m.call(b, reads, vec![one, two]);
+        let old = m.call(b, reads, vec![two, one]);
+        let probe = m.call(b, reads, vec![zero, zero]);
+        let g = m.cmp(b, pred::NE, probe, zero);
+        let _ = i1t;
+        // r1 = g ? x + 1 : old; r2 = g ? r1 * 2 : old; the store takes r2 as it is
+        let new1 = m.bin(b, Bin::Add, x, one);
+        let r1 = m.select(b, g, new1, old);
+        let new2 = m.bin(b, Bin::Mul, r1, two);
+        let r2 = m.select(b, g, new2, old);
+        m.call(b, writes, vec![r2, one]);
+        m.terminate(b, Term::Ret);
+        let selects = |m: &Module| {
+            m.blocks[b]
+                .body
+                .iter()
+                .filter(|&&i| matches!(m.insts[i as usize].op, Op::Select(..)))
+                .count()
+        };
+        assert_eq!(selects(&m), 2);
+        m.optimise(GUARDS | DEAD);
+        assert_eq!(selects(&m), 1, "the one the store reads");
+        // the product reads the sum itself
+        let mul = m.blocks[b]
+            .body
+            .iter()
+            .find_map(|&i| match m.insts[i as usize].op {
+                Op::Bin(Bin::Mul, a, _) => Some(a),
+                _ => None,
+            })
+            .expect("the product");
+        assert!(matches!(mul, V::Inst(i) if matches!(m.insts[i as usize].op, Op::Bin(Bin::Add, ..))));
+        let _ = (pure, i32t);
+        m.write();
+    }
+
+    /// A reader that sees the lanes outside the guard keeps the select: a store, a join, a branch,
+    /// a select on another condition, a call that reads other lanes' values.
+    #[test]
+    fn a_guarded_value_that_every_lane_reads_keeps_its_select() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let void = m.void();
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let lane = m.function("dx.op.waveReadLaneFirst.i32", fty, Some(Attr::NoUnwind), false);
+        let _ = void;
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        let x = m.call(b, reads, vec![one, two]);
+        let old = m.call(b, reads, vec![two, one]);
+        let p1 = m.call(b, reads, vec![zero, zero]);
+        let p2 = m.call(b, reads, vec![zero, one]);
+        let (g, h) = (m.cmp(b, pred::NE, p1, zero), m.cmp(b, pred::NE, p2, zero));
+        // read by a store
+        let a = m.bin(b, Bin::Add, x, one);
+        let s1 = m.select(b, g, a, old);
+        m.call(b, writes, vec![s1, one]);
+        // read by a select on another condition
+        let s2 = m.select(b, g, x, old);
+        let t2 = m.select(b, h, s2, zero);
+        m.call(b, writes, vec![t2, two]);
+        // read by a wave operation
+        let s3 = m.select(b, g, a, old);
+        let w = m.call(b, lane, vec![s3, zero]);
+        m.call(b, writes, vec![w, zero]);
+        m.terminate(b, Term::Ret);
+        let before: Vec<Op> = m.blocks[b].body.iter().map(|&i| m.insts[i as usize].op.clone()).collect();
+        m.optimise(GUARDS);
+        let after: Vec<Op> = m.blocks[b].body.iter().map(|&i| m.insts[i as usize].op.clone()).collect();
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
         m.write();
     }
 
@@ -2208,6 +2416,8 @@ mod tests {
                 LOADS,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
+                GUARDS,
+                GUARDS | FOLD | DEAD,
                 ALL,
             ] {
                 let mut m = random_program(seed);

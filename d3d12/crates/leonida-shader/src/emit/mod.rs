@@ -207,7 +207,7 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `LEONIDA_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: every pass but the wide loads (191).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
@@ -215,7 +215,9 @@ pub fn builder_bounds() -> bool {
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked: `255` is every pass with it).
+///   128 a value kept for the lanes a guard leaves out, read only where the guard
+///   holds: its new value.
 ///
 /// Part of the translation: the shader cache keys on it (`leonida-gpu`'s
 /// does).
@@ -1218,12 +1220,13 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(usual, 191, "every pass but the wide loads");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("255")), all);
+        assert_eq!(parse_shader_opt(Some("63")), 63, "the passes of the builds before the guards");
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
