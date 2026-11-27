@@ -2928,6 +2928,15 @@ impl State {
                 served = false;
                 break;
             }
+            // The card had no room for its host texture a moment ago
+            // (`crate::resource::waits_for_room`): looked at again after 1,
+            // 2, 4, ... frames, not done with as a texture the host writes
+            // itself is. (Done with, nothing asked for it again until the
+            // title wrote the slot anew, and it read black until then.)
+            if texture.is_none() && crate::resource::waits_for_room(resource) {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
