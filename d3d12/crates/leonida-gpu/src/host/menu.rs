@@ -14,7 +14,7 @@
 //! Drawn as the stats panel is (`super::panel`): white text on a black box,
 //! copied onto the swap chain's buffer, in the middle of the picture.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::panel::{colours, glyph};
+use super::font::{colours, glyph};
 use super::{Host, HostList, transition};
 
 const GLYPH: (u32, u32) = (5, 7);
@@ -54,6 +54,7 @@ const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
 const ITEMS: &[Item] = &[
     Item { var: "LEONIDA_UPSCALE", label: "UPSCALER", values: &[("dlss", "DLSS"), ("stretch", "STRETCH"), ("", "GAME FSR4 (SLOW)")], live: false },
     Item { var: "LEONIDA_FRAME_GEN", label: "FRAME GEN (NOT WITH RAY TR.)", values: &[("", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    Item { var: "LEONIDA_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "LEONIDA_FPS_CAP", label: "FRAME RATE CAP", values: &[("", "GAME (30)"), ("60", "60"), ("120", "120"), ("0", "NONE")], live: true },
     Item { var: "LEONIDA_BVH_BUILDER", label: "RAY TRACING (REAL LIGHTING)", values: &[("", "OFF"), ("1", "ON")], live: false },
     Item { var: "LEONIDA_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT (K)"), ("K", "K TRANSFORMER"), ("J", "J TRANSFORMER"), ("M", "M TRANSFORMER"), ("L", "L TRANSFORMER")], live: false },
@@ -97,6 +98,36 @@ const ACTIONS: [&str; 4] = ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "RESE
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
+}
+
+/// Whether the frame-rate line is shown at the top while the menu is closed
+/// (`LEONIDA_FPS_LINE=0`: not; the menu changes it).
+fn fps_line_on() -> &'static AtomicBool {
+    static ON: OnceLock<AtomicBool> = OnceLock::new();
+    ON.get_or_init(|| AtomicBool::new(std::env::var_os("LEONIDA_FPS_LINE").is_none_or(|v| v != "0")))
+}
+
+/// That line: the frames rendered a second and, while frame generation shows more, those shown.
+fn fps_line() -> Option<String> {
+    if !fps_line_on().load(Ordering::Relaxed) {
+        return None;
+    }
+    // The stats panel has that corner (diagnostics builds, F3), and so has the trainer menu.
+    #[cfg(feature = "diagnostics")]
+    if super::panel::shown().load(Ordering::Relaxed) {
+        return None;
+    }
+    if leonida_menu::work() & leonida_menu::DRAW != 0 {
+        return None;
+    }
+    let fps = f64::from(super::METER_FPS_TENTHS.load(Ordering::Relaxed)) / 10.0;
+    if fps <= 0.0 {
+        return None;
+    }
+    Some(match crate::fg::shown_per_frame() {
+        1 => format!("FPS: {fps:.1}"),
+        per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
+    })
 }
 
 /// Whether a change of `item` shows at once.
@@ -239,6 +270,8 @@ pub(super) struct Menu {
     at: usize,
     note: String,
     changed: bool,
+    /// What the buffer holds: the frame-rate line, or (none) the menu's lines.
+    painted: Option<String>,
     buffers: Option<Buffers>,
     failed: bool,
 }
@@ -248,7 +281,7 @@ impl Menu {
         // Start the key thread now: F1 must be seen while the menu is closed.
         let _ = keys();
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, buffers: None, failed: false }
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
     }
 
     fn open() -> bool {
@@ -313,7 +346,11 @@ impl Menu {
         if var == "LEONIDA_FPS_CAP" {
             crate::frame::set_cap(value);
         }
+        if var == "LEONIDA_FPS_LINE" {
+            fps_line_on().store(value != "0", Ordering::Relaxed);
+        }
         if var == "LEONIDA_PANEL" {
+            #[cfg(feature = "diagnostics")]
             super::panel::shown().store(!value.is_empty(), Ordering::Relaxed);
         }
     }
@@ -327,6 +364,7 @@ impl Menu {
                 continue;
             }
             self.values[i] = match item.var {
+                #[cfg(feature = "diagnostics")]
                 "LEONIDA_PANEL" if super::panel::shown().load(Ordering::Relaxed) => "1".to_owned(),
                 "LEONIDA_PANEL" => String::new(),
                 var => get(var),
@@ -462,9 +500,17 @@ impl Menu {
 
     /// Records the copy of the box onto `back` (in the copy-destination state).
     pub(super) fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
-        if !Self::open() || self.failed {
+        if self.failed {
             return;
         }
+        // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
+        let open = Self::open();
+        let line = if open { None } else { fps_line() };
+        if !open && line.is_none() {
+            return;
+        }
+        // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = (height / 540).max(1);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -473,15 +519,23 @@ impl Menu {
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
-        let lines = if self.changed { Some(self.lines()) } else { None };
+        if self.painted != line {
+            self.painted = line.clone();
+            self.changed = true;
+        }
+        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
         let Some(buffers) = &mut self.buffers else { return };
         if let Some(lines) = lines {
             self.changed = false;
             buffers.write(&lines);
         }
-        let (w, h) = size(scale);
+        // The whole box in the middle, or of it the first line's part in the corner.
+        let (w, h) = match &line {
+            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
+            None => size(scale),
+        };
         let (w, h) = (w.min(width), h.min(height));
-        let (x, y) = ((width - w) / 2, (height - h) / 2);
+        let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -519,7 +573,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -534,7 +588,7 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {

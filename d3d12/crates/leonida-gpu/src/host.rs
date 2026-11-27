@@ -3751,9 +3751,11 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+// Leonida: the dot letters of the panel and the F1 settings menu.
+mod font;
 #[cfg(feature = "diagnostics")]
 mod panel;
-#[cfg(feature = "diagnostics")]
+// Leonida: the F1 settings menu and the frame-rate line, in every build.
 mod menu;
 // Leonida: the trainer menu laid over the picture (`leonida-menu`, F4).
 mod trainer;
@@ -8920,11 +8922,14 @@ struct Presenter {
     composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
-    #[cfg(feature = "diagnostics")]
     menu: menu::Menu,
     /// Leonida: the trainer menu (`trainer`).
     trainer: trainer::Overlay,
 }
+
+/// The frame rate the meter last counted, in tenths of a frame a second (0: none yet): for the
+/// line at the top of the picture (`menu.rs`).
+pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -8978,6 +8983,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
@@ -9506,7 +9512,6 @@ impl Host {
             };
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
-            #[cfg(feature = "diagnostics")]
             p.menu.draw(self, copy, &back, (width, height), format);
             // Leonida: the trainer menu, where the panel and the F1 menu
             // are put (so frame generation sees all three alike).
@@ -9570,7 +9575,6 @@ impl Host {
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
-            #[cfg(feature = "diagnostics")]
             p.menu.frame();
             p.meter.frame(p.hwnd);
             showing.end();
@@ -9629,7 +9633,6 @@ impl Host {
                 composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
-                #[cfg(feature = "diagnostics")]
                 menu: menu::Menu::new(),
                 trainer: trainer::Overlay::new(height),
             })
