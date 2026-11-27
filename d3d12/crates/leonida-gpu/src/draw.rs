@@ -3838,22 +3838,29 @@ impl State {
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
+                // (A table with a view of an aliased texture is gone
+                // through again: `list_alias_exact`.)
+                let mut again = None;
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
-                    if *depth {
-                        TESTED_DEPTH.set((reader.3, true));
+                    if !(known.aliased && list_alias_exact()) {
+                        if *depth {
+                            TESTED_DEPTH.set((reader.3, true));
+                        }
+                        made.push((slot, first * 32));
+                        continue;
                     }
-                    made.push((slot, first * 32));
-                    continue;
+                    again = Some((list.epoch(), list.deferred_steps()));
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                let mut aliased = false;
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        aliased |= readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -3864,11 +3871,22 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        aliased |= readable(list, kind, &view);
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                if let Some(before) = again {
+                    LIST_ALIAS[2].fetch_add(1, Ordering::Relaxed);
+                    if before != (list.epoch(), list.deferred_steps()) {
+                        LIST_ALIAS[3].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if aliased && let Some(known) = self.fresh_tables.get_mut(&key) {
+                    // (For every reader from here on: they read different
+                    // entries of it, and one flag says it of them all.)
+                    known.aliased = true;
+                }
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
@@ -3893,7 +3911,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), aliased: false });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3927,21 +3945,35 @@ impl State {
                         .entry(k)
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
-                    let was = (listed.ready, listed.tabled);
+                    let was = (listed.ready, listed.tabled, listed.aliased);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                        let ready = kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0;
+                        // A view of an aliased texture is not known ready by
+                        // the epoch: its copy follows its source's writes
+                        // (`list_alias_exact`).
+                        let again = ready && listed.aliased && list_alias_exact();
+                        if ready && !again {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
+                            let before = (list.epoch(), list.deferred_steps());
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            let aliased = readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
                                 listed.ready = (list.epoch(), tested.0, depth);
+                                listed.aliased = aliased;
+                            }
+                            if again {
+                                LIST_ALIAS[0].fetch_add(1, Ordering::Relaxed);
+                                if before != (list.epoch(), list.deferred_steps()) {
+                                    // Taken as ready, the draw read the copy as it was.
+                                    LIST_ALIAS[1].fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -3955,7 +3987,7 @@ impl State {
                             host.mirror_after(list, title + k, table + u64::from(k) * 32);
                         }
                     }
-                    if was != (listed.ready, listed.tabled) {
+                    if was != (listed.ready, listed.tabled, listed.aliased) {
                         crate::descriptor::host::note_listed(recording, words, listed);
                     }
                     continue;
@@ -4698,6 +4730,9 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+    /// Whether an entry a reader had brought up to date showed an aliased
+    /// texture ([`list_alias_exact`]): such a table is never left as it is.
+    aliased: bool,
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -4724,10 +4759,15 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// Brings what `view` shows up to date in `list` for a read (or a write) as
+/// `kind`. True if it shows an aliased texture
+/// (`crate::resource::alias_of`): its copy follows what the list does to
+/// its source, which no epoch of the list says ([`list_alias_exact`]).
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    let mut alias = false;
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
@@ -4753,8 +4793,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let source = crate::resource::alias_of(*resource as This);
+            alias = source.is_some();
+            let aliased = source.is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
@@ -4807,6 +4848,45 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+    alias
+}
+
+/// Whether a view of an aliased texture is made readable again each time a
+/// list reads it, where the list would take it as ready: a view of a new
+/// table the list made before ([`crate::descriptor::host::Listed::ready`]),
+/// or a table the same reader reads again ([`FreshTable::ready`]). Both go
+/// by the list's epoch, which changes when a texture changes state; but the
+/// copy into an aliased texture ([`crate::texture::alias`]) leaves its
+/// source in the state it was written in, so a draw that writes the source
+/// again changes no state, and the next read through the view was taken as
+/// ready and read the copy as it was (once a frame in the title's lighting
+/// filter). On by default; `LEONIDA_LIST_ALIAS_EXACT=0`: as before.
+fn list_alias_exact() -> bool {
+    crate::toggled!("LEONIDA_LIST_ALIAS_EXACT")
+}
+
+/// Since the last frame line ([`list_alias_exact`]): views of aliased
+/// textures taken as ready and made readable again, and those of them whose
+/// copy was made again (a stale read without the switch); and the same for
+/// tables read again that hold such a view.
+static LIST_ALIAS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// For the frame lines: what [`list_alias_exact`] did, if anything.
+pub(crate) fn list_alias_line(frames: f64) {
+    let [views, redone, tables, tables_redone] = [0, 1, 2, 3].map(|i| LIST_ALIAS[i].swap(0, Ordering::Relaxed));
+    if views + tables == 0 {
+        return;
+    }
+    let f = frames.max(1.0);
+    tracing::info!(
+        "aliased textures a list took as ready (LEONIDA_LIST_ALIAS_EXACT=0: left as they were), per frame: {:.1} views of new \
+         tables made readable again, {:.1} of them with their copy made again (a stale read before); {:.1} tables read again, \
+         {:.1} of them with a copy made again",
+        views as f64 / f,
+        redone as f64 / f,
+        tables as f64 / f,
+        tables_redone as f64 / f
+    );
 }
 
 /// The pixel shaders whose draws get their slots listed

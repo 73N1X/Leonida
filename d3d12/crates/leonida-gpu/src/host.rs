@@ -6521,6 +6521,12 @@ impl HostList {
         self.epoch.load(Ordering::Relaxed)
     }
 
+    /// How many deferred steps the list has queued: with the epoch, whether
+    /// bringing something up to date recorded anything.
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
     /// Whether any deferred steps or texture state transitions have been
     /// recorded into this list since creation or its last [`HostList::reset`].
     pub(crate) fn has_recorded_work(&self) -> bool {
@@ -8893,6 +8899,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::shadow::exact_line(frames);
+        crate::draw::list_alias_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);

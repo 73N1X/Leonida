@@ -3013,6 +3013,7 @@ impl HostHeap {
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
+                    aliased: false,
                 };
                 views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
             }
@@ -6479,6 +6480,10 @@ pub(crate) struct Listed {
     pub(crate) ready: (u64, usize, bool),
     /// The title's slot last noted for it, and whether the draw read it.
     pub(crate) tabled: Option<(u32, bool)>,
+    /// It showed an aliased texture when it was last brought up to date
+    /// (`crate::resource::alias_of`): `ready` does not hold for it, as its
+    /// copy follows its source's writes (`LEONIDA_LIST_ALIAS_EXACT`).
+    pub(crate) aliased: bool,
 }
 
 struct ListView {
