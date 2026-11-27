@@ -13,6 +13,7 @@ method, scope and caveats. No game data is included.
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |
+| [launcher.md](launcher.md) | The Leonida Launcher window (`Launcher.bat`, `tools/leonida_launcher.py`): Play, Settings, Mods, Tools and About pages over `scripts/play-d3d12.ps1`; where its settings are kept. |
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
 
 ## Archives and assets

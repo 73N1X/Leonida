@@ -238,6 +238,13 @@ These commands use the package in `game_path.txt`, the port's `overlay` for writ
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
 
+### Starting the game: the launcher
+
+Double-click **`Launcher.bat`** (Linux: `python3 tools/leonida_launcher.py`) for the Leonida Launcher: a window with a
+PLAY button, the game and data folders, the runtime's options (DLSS, ray tracing, Smooth Motion, and so on), the mod
+list and a few tools. PLAY runs `scripts\play-d3d12.ps1` for you. It needs only Python and Tkinter, and is described in
+[docs/launcher.md](docs/launcher.md).
+
 ## How it works
 
 | Piece | What it does | Where |
