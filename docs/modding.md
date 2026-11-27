@@ -73,6 +73,13 @@ are installed disabled so a copied folder cannot surprise anyone or silently fig
 | `monalisa_player_model` | `player_story000_00` -> `cs_monalisa` | disabled |
 | `mandy_to_monalisa` | `cs_mandy` -> `cs_monalisa` | disabled |
 
+## Lua mods
+
+The D3D12 runtime (`leonida.exe`) also runs a `"script": "main.lua"` that sits next to a `mod.json` in the same
+`mods/<folder>/`; `tools/leonida_mods.py` lists, enables, disables, installs and packs such a mod like any other (it
+shows `Lua main.lua` where an asset mod shows its swaps, and does not warn that it has none). What a script can do is
+in [lua-modding.md](lua-modding.md); `mods/example_lua` is the example, installed disabled.
+
 ## mod.json
 
 ```json

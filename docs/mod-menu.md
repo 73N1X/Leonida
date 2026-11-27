@@ -22,6 +22,10 @@ previews) and `d3d12/crates/leonida-gpu/src/host/trainer.rs` (the overlay drawn 
 the menu, screenshots); `d3d12/crates/leonida-hle/src/modules/gameinput.rs` keeps the menu's keys from the title
 and `modules/clock.rs` serves the title's clock.
 
+Lua mods (`docs/lua-modding.md`) add pages to this menu: the last item of the main menu, Mods, has "Reload Lua mods"
+and a page for each page a mod made. They are drawn and moved by this code (`leonida_menu::mods`), and a mod's
+callbacks run on the mods' own thread, never on the menu's.
+
 ## Controls
 
 | Key | Pad | Does |
