@@ -992,7 +992,15 @@ pub(crate) struct Upload {
 /// was (`Some(true)`), or it was detiled since the last copy (`Some(false)`).
 /// The copy is then the caller's, and the buffer counts as copied.
 fn claim_upload(uploaded: &std::sync::atomic::AtomicBool, dirty: &std::sync::atomic::AtomicBool) -> Option<bool> {
-    use std::sync::atomic::Ordering::AcqRel;
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    // After XaviFortes/VIctory-RDNA a5886a0 (GPL-3.0): a staging buffer that
+    // was uploaded and is clean needs no atomic writes at each list that
+    // samples it; the two swaps below bounce the cache line between the cores
+    // of the submitting threads. A change after the load is claimed by the
+    // next list. LEONIDA_CLAIM_READ_FIRST=0 restores the swaps.
+    if crate::toggled!("LEONIDA_CLAIM_READ_FIRST") && uploaded.load(Acquire) && !dirty.load(Acquire) {
+        return None;
+    }
     let was_uploaded = uploaded.swap(true, AcqRel);
     let was_dirty = dirty.swap(false, AcqRel);
     (!was_uploaded || was_dirty).then_some(!was_uploaded)
