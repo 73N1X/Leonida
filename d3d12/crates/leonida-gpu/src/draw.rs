@@ -17,12 +17,24 @@ use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+};
 use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+/// Whether a shader view description reads a texture's depth plane (the
+/// ambient resolve's stand-in binds one such view and no other).
+fn is_depth_srv(desc: &[u32; 10]) -> bool {
+    let format = DXGI_FORMAT(crate::resource::pc_format(desc[0]) as i32);
+    // In a Texture2D SRV, the union starts at word 4 and PlaneSlice is word 6.
+    desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        && desc[6] == 0
+        && !matches!(format, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT)
+}
 
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
@@ -3751,9 +3763,11 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
-                (ResourceType::Srv, View::Shader(r, _))
-                | (ResourceType::Uav, View::Unordered(r, ..)) => r,
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+            let resource = match (kind, view) {
+                (ResourceType::Srv, View::Shader(r, desc)) if desc.as_ref().is_none_or(is_depth_srv) => r,
+                (ResourceType::Uav, View::Unordered(r, ..)) => r,
                 _ => return None,
             };
             let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -3781,7 +3795,10 @@ impl State {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
-                if (seen.Width, seen.Height) != (of.Width, of.Height) {
+                if seen.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    || seen.SampleDesc.Count != 1
+                    || (seen.Width, seen.Height) != (of.Width, of.Height)
+                {
                     once!(?role, "no stand-in for the indirect light: depth dimensions differ");
                     return false;
                 }
@@ -5627,7 +5644,27 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{is_depth_srv, staging_budget_per_frame};
+
+    #[test]
+    fn depth_srv_checks_the_plane_not_the_number_of_levels() {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT};
+
+        let mut desc = [0; 10];
+        desc[0] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        desc[5] = 1;
+        assert!(is_depth_srv(&desc));
+        desc[6] = 1;
+        assert!(!is_depth_srv(&desc));
+        desc[6] = 0;
+        desc[0] = DXGI_FORMAT_X24_TYPELESS_G8_UINT.0 as u32;
+        assert!(!is_depth_srv(&desc));
+        desc[0] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32;
+        assert!(!is_depth_srv(&desc));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

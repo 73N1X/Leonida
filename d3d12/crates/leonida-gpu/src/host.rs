@@ -10175,6 +10175,12 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// PCI vendor ID of the adapter running the host device.
+    pub(crate) fn adapter_vendor_id(&self) -> Option<u32> {
+        // SAFETY: a plain query on the adapter kept with this device.
+        unsafe { self.adapter.as_ref()?.GetDesc1() }.ok().map(|desc| desc.VendorId)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
