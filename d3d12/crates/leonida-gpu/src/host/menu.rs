@@ -135,9 +135,15 @@ fn fps_line() -> Option<String> {
     if fps <= 0.0 {
         return None;
     }
-    Some(match crate::fg::shown_per_frame() {
+    let line = match crate::fg::shown_per_frame() {
         1 => format!("FPS: {fps:.1}"),
         per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
+    };
+    // While host pipelines are still being made (minutes after a change of the translator or the driver):
+    // frames wait for them and things drawn with them are missing, so the player is told how many are left.
+    Some(match crate::pipeline::making() {
+        0 => line,
+        left => format!("{line}  SHADERS COMPILING: {left} LEFT"),
     })
 }
 
