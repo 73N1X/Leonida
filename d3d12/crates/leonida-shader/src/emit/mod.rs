@@ -2232,7 +2232,7 @@ mod tests {
     /// (`LEONIDA_SHADER_OPT` with 64) a call for every four: also where a
     /// call's four dwords lie across the view's end (the dwords out of it
     /// are 0, the others are read). On the software adapter only: run the
-    /// test once plain and once with `LEONIDA_SHADER_OPT=127`.
+    /// test once plain and once with `LEONIDA_SHADER_OPT=511`.
     #[test]
     #[cfg(windows)]
     fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {

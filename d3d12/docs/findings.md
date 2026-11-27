@@ -70,7 +70,7 @@ in that order of size:
 - Unordered early pipelines for everything (AMD's compiler crashed).
 - Series S profile, smaller textures, a second drawing queue, `ASYNC_SUBMIT` off.
 - Mapping pages on sixteen threads: no more pages mapped, frames longer.
-- Scalar buffer loads four dwords a call (`LEONIDA_SHADER_OPT=127`): no gain on this card.
+- Scalar buffer loads four dwords a call (`LEONIDA_SHADER_OPT=511`): no gain on this card.
 - Wave sizes, fused multiply-adds, fast reciprocals, raw picked buffers, leaving out
   barriers: nothing to 0.1 ms each. Exact RDNA float rules (`LEONIDA_RDNA_FLOAT`): 0.8 ms.
 - Running the console's shader code natively on the card: the Windows driver takes no raw

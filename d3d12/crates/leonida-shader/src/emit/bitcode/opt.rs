@@ -78,7 +78,7 @@ pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | GUARDS | CHAINS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`LEONIDA_SHADER_OPT=127` asks
+/// which no card has shown a gain for yet (`LEONIDA_SHADER_OPT=511` asks
 /// for it).
 pub const DEFAULT: u32 = ALL & !WIDE;
 
