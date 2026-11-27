@@ -91,12 +91,19 @@ impl Default for GraphicsState {
     }
 }
 
-/// Integer render target formats: D3D12 cannot blend into them.
-/// Diagnostic, `LEONIDA_STATIC_SAMPLERS_LINEAR=1`: every immediate sampler of
-/// the title's shaders filters linearly in minification, magnification and
-/// mips (anisotropic ones and the reduction and comparison bits stay). A
-/// posterized picture is a table of colours read without filtering; if it
-/// stays posterized with this set, no sampler a shader carries is the cause.
+/// `LEONIDA_STATIC_SAMPLERS_LINEAR=1` (set by `scripts/play-nvidia.ps1`):
+/// every immediate sampler of the title's shaders filters linearly in
+/// minification, magnification and mips (anisotropic ones and the reduction
+/// and comparison bits stay).
+///
+/// The fix for the posterized picture of the merged renderer: the tonemap
+/// (`PS_CompositeNMB`) reads 33^3 identity grading tables at a log-encoded
+/// colour; read unfiltered they give 33 levels over 14.4 stops, about five
+/// flat bands per doubling of brightness. Run s1 with it: 28,000-32,000
+/// colours in a sky region where runs p3, p4 and c1 without it had 700 to
+/// 1,400. Which shader's sampler comes out as a point filter is not found yet
+/// (the tonemap's own 3D lookups decode to a linear one); until it is, all
+/// point filters become linear here.
 fn static_filter(filter: u32) -> u32 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var_os("LEONIDA_STATIC_SAMPLERS_LINEAR").is_some_and(|v| v == "1"));
