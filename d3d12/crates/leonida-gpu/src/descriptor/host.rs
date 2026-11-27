@@ -767,8 +767,9 @@ static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// `RECHECK_FRAMES`.
 static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
+/// Since the start: such ranges kept for a pass; ranges that were in the
+/// list when it was full and was made smaller ([`compact`]: none is dropped);
+/// slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
 /// the ones that kept the bytes from before, and the ones made due when
@@ -788,8 +789,8 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them (as many as [`remapped`] keeps).
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -804,7 +805,7 @@ pub(crate) fn page_written(at: usize, len: usize) {
     }
     if ranges.len() >= MOST {
         PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        compact(&mut ranges, MOST);
     }
     ranges.push((start, end));
 }
@@ -823,8 +824,9 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// ranges that were in the list when it was full and was made smaller
+/// ([`compact`]: none is dropped); slots made due by such ranges; and made
+/// slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -851,7 +853,9 @@ fn stale_rule() -> Rule {
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// (A world's first minutes note tens of thousands between two passes:
+    /// at 32,768 the list filled up.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -866,12 +870,27 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // No pass has taken them (no shader that picks textures by index is
+        // bound, or a burst of streaming between two passes): room is made,
+        // and every change is kept for the pass that comes.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        compact(&mut ranges, MOST);
     }
     ranges.push((start, end));
+}
+
+/// A full list of changed ranges made room in, keeping every change: those
+/// that touch or overlap made one, then, while more than half of `most` are
+/// left, each two neighbours one range over both (a pass looks at a little
+/// more memory than changed). Clearing the list here instead (as before) let
+/// a texture uploaded already keep old bytes after its memory changed: the
+/// intro's video frames went back during the streaming bursts.
+fn compact(ranges: &mut Vec<(u64, u64)>, most: usize) {
+    join(ranges);
+    while ranges.len() > most / 2 && ranges.len() > 1 {
+        let wide: Vec<(u64, u64)> = ranges.chunks(2).map(|pair| (pair[0].0, pair[pair.len() - 1].1)).collect();
+        *ranges = wide;
+    }
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -5451,6 +5470,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// A full list of changed ranges is made smaller, never emptied: every
+    /// change is still covered.
+    #[test]
+    fn a_full_change_list_keeps_every_change() {
+        let mut ranges: Vec<(u64, u64)> = (0..10u64).map(|i| (i * 10, i * 10 + 1)).collect();
+        compact(&mut ranges, 8);
+        assert!(ranges.len() <= 4);
+        for i in 0..10u64 {
+            assert!(ranges.iter().any(|r| r.0 <= i * 10 && i * 10 + 1 <= r.1), "change {i} lost");
+        }
+        let mut touching = vec![(0, 5), (5, 9), (20, 30)];
+        compact(&mut touching, 4);
+        assert_eq!(touching, [(0, 9), (20, 30)]);
+        // A cap too small to halve to: one range over everything, no loop
+        // without end.
+        let mut two = vec![(0, 1), (8, 9)];
+        compact(&mut two, 1);
+        assert_eq!(two, [(0, 9)]);
     }
 
     #[test]
