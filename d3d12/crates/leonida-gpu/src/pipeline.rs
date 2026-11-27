@@ -156,6 +156,8 @@ pub(crate) struct Translated {
     /// A compute program translated to run several console groups to a host group
     /// (`LEONIDA_GROUP_PACK`): where its console grid goes (`crate::draw::pack_of`).
     pub(crate) pack: Option<crate::draw::PackWords>,
+    /// Whether a bound packed program was logged (`crate::draw::pack_of`).
+    pub(crate) pack_logged: std::sync::atomic::AtomicBool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -245,6 +247,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
     let pack = crate::draw::pack_in(&host.user_data);
+    // A program that carries any of the console grid's words but not all of them (or no packing),
+    // would have every thread leave at once: it does not translate.
+    if pack.is_none() && crate::draw::has_pack_words(&host.user_data) {
+        return Err("a packed program without the console grid's three words (LEONIDA_GROUP_PACK)".to_owned());
+    }
     Ok(Translated {
         host,
         threads,
@@ -253,6 +260,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         pack,
+        pack_logged: Default::default(),
         picks: Default::default(),
     })
 }

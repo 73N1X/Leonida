@@ -3749,6 +3749,10 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        if pack_broken(p) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // A program translated to run several console groups to a host group (`LEONIDA_GROUP_PACK`):
         // the host runs the groups in fewer, told the console's grid.
         let [x, y, z] = match pack_of(p) {
@@ -4999,6 +5003,10 @@ impl State {
         }
         // A program run several console groups to a host group takes the console's grid from
         // root constants the records carry (`crate::indirect::bound_packed`).
+        if kind == DISPATCH && pack_broken(p) {
+            why("a packed program whose grid words cannot be set");
+            return false;
+        }
         let pack = if kind == DISPATCH { pack_of(p) } else { None };
         let pack_k = pack.map_or(0, |pack| pack.k);
         let len = u64::from(stride) * u64::from(max.max(1));
@@ -5214,9 +5222,35 @@ pub(crate) struct PackWords {
 /// The packing of the compute pipeline `p`'s program, if it has one.
 pub(crate) fn pack_of(p: &HostPipeline) -> Option<PackWords> {
     let stage = p.stages.first().filter(|_| p.compute)?;
+    let t = stage.translated();
     let (param, _) = stage.user_data?;
-    let pack = stage.translated().pack?;
+    let pack = t.pack?;
+    if !t.pack_logged.swap(true, Ordering::Relaxed) {
+        tracing::info!(pipeline = %p.name, k = pack.k, param, words = ?pack.words, "a packed program is bound (LEONIDA_GROUP_PACK)");
+    }
     Some(PackWords { param, ..pack })
+}
+
+/// Whether the compute pipeline `p`'s program is packed (it carries the console grid's words) but its
+/// dispatches cannot tell it the grid, so that every thread of it would leave at once: it is not run.
+/// Logged once for each pipeline.
+fn pack_broken(p: &HostPipeline) -> bool {
+    let Some(stage) = p.stages.first().filter(|_| p.compute) else {
+        return false;
+    };
+    let t = stage.translated();
+    if !has_pack_words(&t.host.user_data) || pack_of(p).is_some() {
+        return false;
+    }
+    if !t.pack_logged.swap(true, Ordering::Relaxed) {
+        tracing::warn!(pipeline = %p.name, user_data = stage.user_data.is_some(), "a packed program whose grid words cannot be set: its dispatches are dropped (LEONIDA_GROUP_PACK)");
+    }
+    true
+}
+
+/// Whether the user data has any of a packed program's grid words.
+pub(crate) fn has_pack_words(user_data: &[leonida_shader::emit::UserData]) -> bool {
+    user_data.iter().any(|u| matches!(u.root, RootType::Other(kind) if is_pack_word(kind)))
 }
 
 /// The packing of a program with these user-data words, found once (its parameter is the
@@ -5281,6 +5315,10 @@ mod pack_tests {
         assert_eq!(pack_words(&words[..3], 3, KINDS), None);
         assert_eq!(pack_words(&words[..1], 3, KINDS), None);
         assert_eq!(pack_words(&[word(USER_PACK_X, 5, 1), word(USER_PACK_Y, 6, 1), word(USER_PACK_GROUPS, 7, 1)], 3, KINDS), None);
+        // a program with some of the words and not all is told apart from one with none
+        assert!(has_pack_words(&words[..2]));
+        assert!(!has_pack_words(&words[..1]));
+        assert_eq!(pack_in(&words[..2]), None);
         assert!(KINDS.into_iter().all(is_pack_word));
         assert!(!is_pack_word(leonida_shader::emit::USER_DISPATCH_THREADS_X));
     }
