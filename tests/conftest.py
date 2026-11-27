@@ -144,6 +144,7 @@ SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_
                "gs_w64_a_ring": GS_TRI_DXBC, "gs_w64_c_lane_id": GS_TRI_DXBC,  # build.py gives every gs_* gs_tri's
                # vertex 64 comes from the second wave: 128 output vertices (scripts/run_gpu_tests.py)
                "ms_w64x_wave_votes": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
+               "ms_w64x_wave_loops": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 
