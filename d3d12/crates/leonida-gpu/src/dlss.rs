@@ -17,8 +17,10 @@
 //! `LEONIDA_DLSS_SDK`, and `nvngx_dlss.dll` is looked for in `LEONIDA_DLSS_DIR`
 //! (else beside the executable). Any failure leaves the caller to stretch.
 //!
-//! Switches: `LEONIDA_DLSS_QUALITY` (0 performance .. 2 quality, 5 DLAA; 2 by
-//! default), `LEONIDA_DLSS_MV_SIGN=-1` (motion vectors the other way),
+//! Switches: `LEONIDA_DLSS_QUALITY` (0 performance, 1 balanced, 2 quality, 3
+//! ultra performance, 5 DLAA; unset: by the sizes, `crate::list::dlss_mode`,
+//! which the render scale decides: `LEONIDA_RENDER_SCALE`),
+//! `LEONIDA_DLSS_MV_SIGN=-1` (motion vectors the other way),
 //! `LEONIDA_DLSS_JITTER_SIGN=-1`, `LEONIDA_DLSS_HDR=0|1` (default: by the colour
 //! format), `LEONIDA_DLSS_DEPTH_INVERTED=0|1` (default: by near > far),
 //! `LEONIDA_DLSS_SHARPNESS=<0..1>`.
@@ -224,7 +226,11 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
             // SAFETY: a handle the SDK made.
             unsafe { NVSDK_NGX_D3D12_ReleaseFeature(old.handle) };
         }
-        let quality = env_f("LEONIDA_DLSS_QUALITY", 2.0) as c_int;
+        // The mode: asked for, else the one whose ratio the sizes have (`crate::list::dlss_mode`).
+        let quality = std::env::var("LEONIDA_DLSS_QUALITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .map_or_else(|| crate::list::dlss_mode(render[1].min(in_h), out.Height), |q| q as c_int);
         let mut handle = std::ptr::null_mut();
         // SAFETY: live parameters and an open list.
         let r = unsafe {
