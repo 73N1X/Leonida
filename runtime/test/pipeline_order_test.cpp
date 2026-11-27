@@ -573,6 +573,110 @@ void test_unknown_session_version() {
     CHECK(read.bad_lines == 1);
 }
 
+// --- E lines (the names are made up) ---
+
+std::uint64_t hash_of(const char* name) { return po::entry_name_hash(name); }
+
+// A log as the recorder writes it for compute pipelines: a P line and its E line for each name, in this order.
+std::string log_of(const std::vector<const char*>& names) {
+    std::string text = po::format_header() + po::format_session(0x10de, 0x2504);
+    int n = 0;
+    for (const char* name : names) {
+        po::Record r;
+        r.key = key_of(++n);
+        r.first_ms = std::uint32_t(n);
+        text += po::format_record(r);
+        text += po::format_entry(r.key, 0, hash_of(name));
+    }
+    return text;
+}
+
+void test_entry_line_format() {
+    // "E <key> <variant hex> <16 hex digits> *<checksum>", the checksum over the text before " *".
+    const std::string line = po::format_entry(key_of(1), 0x1f, 0x0123456789abcdefull);
+    const std::string body = "E " + key_of(1) + " 1f 0123456789abcdef";
+    char sum[16];
+    std::snprintf(sum, sizeof(sum), " *%08x\n", po::checksum(body));
+    CHECK(line == body + sum);
+    const auto read = po::parse(line);
+    CHECK(read.bad_lines == 0 && read.sessions.empty());
+    CHECK(read.entries.size() == 1);
+    CHECK(read.entries[0].key == key_of(1) && read.entries[0].variant == 0x1f &&
+          read.entries[0].name_hash == 0x0123456789abcdefull);
+    // The hash is a stable function of the name, and always 16 digits.
+    CHECK(hash_of("blur_a") == hash_of("blur_a") && hash_of("blur_a") != hash_of("blur_b"));
+    // The disk format: FNV-1a 64 of the name, so the hash never changes under old logs.
+    CHECK(po::entry_name_hash("a") == 0xaf63dc4c8601ec8cull);
+    CHECK(po::format_entry(key_of(1), 0, 1).find(" 0000000000000001 ") != std::string::npos);
+}
+
+// A reader from before E lines skips them (counted as lines not read) and keeps the same sessions and records; this
+// reader reads them and counts no damaged line.
+void test_entry_lines_are_skipped_by_the_record_reader() {
+    const auto with = po::parse(log_of({"blur_a", "sky_c", "tile_d"}));
+    std::string without = po::format_header() + po::format_session(0x10de, 0x2504);
+    for (int n = 1; n <= 3; ++n) {
+        po::Record r;
+        r.key = key_of(n);
+        r.first_ms = std::uint32_t(n);
+        without += po::format_record(r);
+    }
+    const auto plain = po::parse(without);
+    CHECK(with.bad_lines == 0 && !with.cut_tail);
+    CHECK(with.sessions.size() == 1 && plain.sessions.size() == 1);
+    CHECK(with.sessions[0].records == plain.sessions[0].records);
+    CHECK(with.sessions[0].records.size() == 3);
+    CHECK(with.entries.size() == 3);
+}
+
+void test_malformed_entry_lines() {
+    const auto bad = [](const std::string& body) {
+        char sum[16];
+        std::snprintf(sum, sizeof(sum), " *%08x\n", po::checksum(body));
+        const auto read = po::parse(body + sum);
+        return read.entries.empty() && read.bad_lines == 1;
+    };
+    const std::string k = key_of(1);
+    CHECK(bad("E " + k + " 0 0123456789abcde"));     // 15 digits
+    CHECK(bad("E " + k + " 0 0123456789abcdef0"));   // 17 digits
+    CHECK(bad("E " + k + " 0 0123456789ABCDEF"));    // upper case
+    CHECK(bad("E " + k + " 0 0123456789abcdeg"));    // not hex
+    CHECK(bad("E " + k + " zz 0123456789abcdef"));   // the variant
+    CHECK(bad("E " + k + " 0"));                     // no hash
+    CHECK(bad("E " + k + " 0 0123456789abcdef x"));  // an extra field
+    CHECK(bad("E  0 0123456789abcdef"));             // no key
+    CHECK(!bad("E " + k + " 0 0123456789abcdef"));   // the good one
+    // A good line with a wrong checksum is damaged too.
+    std::string line = po::format_entry(k, 0, 5);
+    char& last_digit = line[line.size() - 2];
+    last_digit = last_digit == '0' ? '1' : '0';
+    const auto read = po::parse(line);
+    CHECK(read.entries.empty() && read.bad_lines == 1);
+}
+
+// The recorder writes the E line right after the P line of a compute pipeline, and none for a pipeline without a name.
+void test_recorder_writes_entry_lines() {
+    const auto path = scratch("entry.log");
+    {
+        po::Recorder r(config(path));
+        const std::string k1 = key_of(1), k2 = key_of(2);
+        r.publish(r.claim(po::key_hash(k1), 0), k1, 'c', false, 0, po::unknown_ms, hash_of("blur_a"));
+        r.publish(r.claim(po::key_hash(k2), 5), k2, 'g', false, 0, po::unknown_ms);
+        CHECK(r.flush() == 3);  // P, E, P
+    }
+    const std::string text = slurp(path);
+    const auto read = po::parse(text);
+    CHECK(read.bad_lines == 0);
+    CHECK(read.sessions.size() == 1 && read.sessions[0].records.size() == 2);
+    CHECK(read.entries.size() == 1);
+    CHECK(read.entries[0].key == key_of(1) && read.entries[0].name_hash == hash_of("blur_a"));
+    CHECK(text.find("\nE " + key_of(1)) != std::string::npos);
+    CHECK(text.find("\nE " + key_of(2)) == std::string::npos);
+    // The E line comes after the P line of its key and before the next P line.
+    CHECK(text.find("\nP c " + key_of(1)) < text.find("\nE " + key_of(1)));
+    CHECK(text.find("\nE " + key_of(1)) < text.find("\nP g " + key_of(2)));
+}
+
 }  // namespace
 
 int main() {
@@ -597,6 +701,10 @@ int main() {
     test_cut_file_then_new_session();
     test_flush_stops_at_unpublished();
     test_unknown_session_version();
+    test_entry_line_format();
+    test_entry_lines_are_skipped_by_the_record_reader();
+    test_malformed_entry_lines();
+    test_recorder_writes_entry_lines();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

@@ -2797,7 +2797,10 @@ Pipeline creation:
   times in milliseconds since the process started. The key is the SHA-256 of the title's own description of the PSO
   (`GetCachedBlob`'s key; a mesh pipeline's MS is folded in), not of the SPIR-V, so a translator change keeps it. A
   build that ends after its line was written adds `B <key> <variant hex> <build ms> *<checksum>`; a session starts
-  with `S 1 <vendor hex> <device hex>`. Each line ends with an FNV-1a checksum: a cut or damaged line is skipped on
+  with `S 1 <vendor hex> <device hex>`. A compute pipeline's `P` line is followed by
+  `E <key> <variant hex> <name hash hex> *<checksum>`: the name hash is 16 hex digits of FNV-1a 64 over the name of
+  the library entry the pipeline was made from (the name itself is not written). A reader from before `E` lines
+  skips them (counted as lines not read). Each line ends with an FNV-1a checksum: a cut or damaged line is skipped on
   read, never fatal. The hook sits in replay's `ComputePipeline::requested` / `GraphicsPipeline::requested`, called
   where a submission is prepared, also for a handle that exists already (a warm-up build, a cached one); the
   recorder decides "first" with one compare-and-swap in a table made at start, never blocks and allocates nothing (a non-blocking `try_lock` on the first request of a pipeline and of a variant),
