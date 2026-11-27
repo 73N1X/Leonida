@@ -2619,8 +2619,10 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   about 800 KB, and that with `LEONIDA_COMPILE_GATE=0` the same boot reached game state 3); and a PSO has one build
   running at a time, so
   `after_running` and the teardown rules hold as they were. `LEONIDA_COMPILE_THREADS=1` is the layout before the pool:
-  one general worker and the graphics-only one. A submission still waits at the compile gate for every create in
-  flight, so more workers do not shorten that wait (`SubmitMutex::CompileTurn`; `LEONIDA_COMPILE_GATE=0` turns it off).
+  one general worker and the graphics-only one; there too a PSO has one build running at a time (two variants of one
+  graphics PSO, one on each worker, let its last release delete it under the other build, qhukz13). A submission still
+  waits at the compile gate for every compute create in flight (graphics builds do not pass the gate), so more workers
+  do not shorten that wait (`SubmitMutex::CompileTurn`; `LEONIDA_COMPILE_GATE=0` turns it off).
 - **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
   submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
   past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s

@@ -5,7 +5,7 @@
 //   - large builds keep within the heavy count, and large and speculative ones together leave one worker free;
 //   - demanded jobs go first, in the order they came, then warm-ups by size, and a checkpoint only when nothing runs;
 //   - a checkpoint's second look sees a demanded build that started on another worker meanwhile;
-//   - one job of a PSO at a time;
+//   - one job of a PSO at a time, also with one worker plus the graphics-only one;
 //   - the last release with jobs running and queued: the queued ones are dropped, the running ones finish, the
 //     workers are joined; a device's cancel waits for its running jobs; stop_for_exit does not wait past its limit.
 #include "../shims/d3d12_pipeline_compile.h"
@@ -190,6 +190,45 @@ void test_one_worker_keeps_the_old_order() {
     long_build.release();
     EXPECT(log.wait_finished(2));
     EXPECT(pool.stats().threads == 1 && pool.stats().most_running == 1);
+    pool.release();
+}
+
+// One general worker plus the graphics-only one (LEONIDA_COMPILE_THREADS=1, the layout of main): two variants of one
+// graphics PSO must not build at once, one on each worker. A PSO's last release attaches its deletion to the job of
+// that PSO that is running (after_running); a second one still in build() on the other worker would use the deleted
+// PSO (qhukz13, #2233). Another PSO's graphics build still runs beside it on the graphics worker.
+void test_one_worker_and_the_graphics_worker_build_one_job_of_a_pso() {
+    auto& pool = make_pool(1, 1);
+    Log log;
+    Gate first;
+    Owners owner;
+    const auto graphics = [&](const void* who, const std::string& name, Gate* gate) {
+        EXPECT(pool.submit(who, device, 0, [&log, gate, name] {
+            log.start(name, false);
+            if (gate) gate->wait();
+            log.finish(name, false);
+        }, true));
+    };
+    graphics(owner[0], "variant 1", &first);
+    EXPECT(log.wait_started(1));
+    graphics(owner[0], "variant 2", nullptr);
+    std::this_thread::sleep_for(100ms);
+    EXPECT(!log.has_started("variant 2"));  // the other worker is free, but this PSO has a build running
+    graphics(owner[1], "other pso", nullptr);
+    EXPECT(log.wait_finished(1));            // the free worker takes another PSO's build meanwhile
+    EXPECT(log.has_started("other pso") && !log.has_started("variant 2"));
+    // The PSO's last release while "variant 1" runs: "variant 2" is dropped, and the deletion runs after "variant 1".
+    std::atomic<bool> deleted{false}, variant_running_at_delete{false};
+    EXPECT(pool.after_running(owner[0], [&] {
+        std::lock_guard lock(log.mutex);
+        variant_running_at_delete = log.running != 0;
+        deleted = true;
+    }));
+    first.release();
+    EXPECT(log.wait_finished(2));
+    pool.wait_idle();
+    EXPECT(deleted.load() && !variant_running_at_delete.load());
+    EXPECT(!log.has_started("variant 2"));
     pool.release();
 }
 
@@ -479,6 +518,7 @@ int main() {
     test_pool_settings();
     test_long_build_does_not_hold_up_a_small_demanded_one();
     test_one_worker_keeps_the_old_order();
+    test_one_worker_and_the_graphics_worker_build_one_job_of_a_pso();
     test_heavy_count_and_the_free_worker();
     test_one_warm_up_at_a_time();
     test_demanded_builds_go_before_warm_ups();
