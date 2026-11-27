@@ -3572,6 +3572,103 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// Whether the dynamic slots of a flight's descriptor tables are given back
+/// as soon as the card has run the flight: at the start of its landing, and
+/// by a recording thread that finds the ring without room
+/// ([`release_finished_tables`]). Only the card reads the slots, and what
+/// follows a flight (copies back, read-backs, telling the title) took
+/// milliseconds a flight during which a heavy frame's recording found the
+/// ring full. On by default; `LEONIDA_TABLES_EARLY=0`: at the end of the
+/// landing, as before.
+///
+/// From aki-gta6/aki-runtime d9d1341 (Aki-Developer), GPL-3.0.
+fn tables_early() -> bool {
+    crate::toggled!("LEONIDA_TABLES_EARLY")
+}
+
+/// Whether a table that still finds no dynamic slots waits for the flights
+/// in the air ([`settle_for_fence`]) before it is refused and its draw
+/// dropped. The wait holds up the thread that records the list, and under
+/// the relay every flight must have landed: aki-runtime measured frames of
+/// 90-120 ms against 55 with this and two other waits on, and runs with it
+/// off. On by default here, as before (a refused table is a dropped draw);
+/// `LEONIDA_SLOT_SETTLE=0`: refused without the wait. The frame line counts
+/// the waits (`crate::drops::tables_text`).
+fn slot_settle() -> bool {
+    crate::toggled!("LEONIDA_SLOT_SETTLE")
+}
+
+/// [`tables_early`], at a landing: gives the tables' slots of flights the
+/// card has run back before anything else is done for them. (Done again at
+/// the landing's end, where it finds nothing left.)
+fn release_flown_tables(items: &mut [Late]) {
+    if !tables_early() {
+        return;
+    }
+    for item in items {
+        if let Late::Run(flight) = item {
+            for detached in &mut flight.lists {
+                detached.release_tables();
+            }
+        }
+    }
+}
+
+/// [`tables_early`], for a recording thread that found no dynamic slots:
+/// gives back the tables' slots of the flights in the line the card has run
+/// already and the thread that lands them has not taken yet, without
+/// waiting for anything. Whether any were given back.
+pub(crate) fn release_finished_tables() -> bool {
+    if !tables_early() || !late() {
+        return false;
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: a plain query.
+    let done = unsafe { host.fence.GetCompletedValue() };
+    // (A removed device says `u64::MAX`: nothing has run.)
+    if done == u64::MAX {
+        return false;
+    }
+    // Taken under the line's lock, let go of after it: giving slots back
+    // takes the heaps' locks and may drop host copies.
+    let held: Vec<crate::draw::TablesHeld> = {
+        let mut line = line();
+        line.line
+            .iter_mut()
+            .filter_map(|item| match item {
+                Late::Run(flight) if flight.fence <= done => Some(flight),
+                _ => None,
+            })
+            .flat_map(|flight| flight.lists.iter_mut().filter_map(|detached| detached.take_tables()))
+            .collect()
+    };
+    !held.is_empty()
+}
+
+/// Dynamic slots for a table a draw cannot run without: when the ring has
+/// no room, first the slots of flights the card has run are given back
+/// ([`release_finished_tables`]), and only then the flights in the air are
+/// waited for ([`slot_settle`]). Before, the wait came at once.
+pub(crate) fn table_slots(heap: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+    if let Some(first) = heap.dynamic(n) {
+        return Some(first);
+    }
+    if release_finished_tables()
+        && let Some(first) = heap.dynamic(n)
+    {
+        crate::drops::table_helped(false);
+        return Some(first);
+    }
+    if !slot_settle() {
+        return None;
+    }
+    crate::drops::table_helped(true);
+    settle_for_fence();
+    heap.dynamic(n)
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
@@ -5280,8 +5377,10 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run them: the slots of their tables are free at once.
+        release_flown_tables(&mut items);
         // Leonida, an experiment (`tell_early`): the title is told first.
         let early = tell_early();
         if early {
@@ -5759,7 +5858,7 @@ impl Host {
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
         loop {
-            let items = {
+            let mut items = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -5791,6 +5890,7 @@ impl Host {
                             WaitForSingleObject(self.event, INFINITE);
                             stood(waiting);
                             working(true);
+                            release_flown_tables(&mut items);
                         }
                         Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
                     }

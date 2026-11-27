@@ -209,6 +209,13 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
+
+    /// As [`Detached::release_tables`], for a caller that holds a lock: what
+    /// the list held, to be dropped once the lock is let go
+    /// ([`crate::draw::State::tables_taken`]).
+    pub(crate) fn take_tables(&mut self) -> Option<crate::draw::TablesHeld> {
+        self._state.tables_taken()
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

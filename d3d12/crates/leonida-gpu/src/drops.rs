@@ -189,6 +189,29 @@ pub(crate) fn totals() -> (u64, u64) {
     })
 }
 
+/// Tables that found no dynamic slots at first, since the start: those that
+/// got them once the slots of flights the card had run were given back
+/// (nothing waited for), and those the flights in the air were waited for
+/// (`crate::host::table_slots`; a wait holds up the thread that records).
+static TABLES_HELPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A table got its slots from flights the card had run (`waited` false), or
+/// the flights in the air were waited for on its behalf.
+pub(crate) fn table_helped(waited: bool) {
+    TABLES_HELPED[usize::from(waited)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// What the frame line says of tables helped: `reaped` and `waited` per
+/// frame; nothing when there were none.
+pub(crate) fn tables_text(reaped: f64, waited: f64) -> String {
+    if reaped <= 0.0 && waited <= 0.0 {
+        return String::new();
+    }
+    format!(
+        "; tables without slots at first: {reaped:.1} got them from flights the card had run, {waited:.1} waited for the card (LEONIDA_SLOT_SETTLE=0: refused instead)"
+    )
+}
+
 /// What the frame line says of the last `frames` frames: the reasons that
 /// grew from `was` to `now`, per frame, those by design first.
 /// `"none"` when nothing was dropped.
@@ -233,7 +256,12 @@ pub(crate) fn line(frames: f64) -> (String, f64, f64) {
             .map(|(i, _)| now[i].saturating_sub(was[i]) as f64 / frames)
             .sum()
     };
-    (text(&was, &now, frames), sum(true), sum(false))
+    static HELPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let [reaped, waited] = [0, 1].map(|i| {
+        let now = TABLES_HELPED[i].load(Ordering::Relaxed);
+        now.saturating_sub(HELPED[i].swap(now, Ordering::Relaxed)) as f64 / frames
+    });
+    (text(&was, &now, frames) + &tables_text(reaped, waited), sum(true), sum(false))
 }
 
 #[cfg(test)]
@@ -292,6 +320,14 @@ mod tests {
         // A counter never goes back; if it did, nothing is said of it.
         was[Why::Other as usize] = 9;
         assert!(!text(&was, &now, 10.0).contains("other"));
+    }
+
+    #[test]
+    fn tables_helped_are_said_only_when_there_were_any() {
+        assert_eq!(tables_text(0.0, 0.0), "");
+        let text = tables_text(12.0, 0.5);
+        assert!(text.contains("12.0 got them from flights the card had run"));
+        assert!(text.contains("0.5 waited for the card"));
     }
 
     #[test]

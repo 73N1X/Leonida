@@ -903,6 +903,42 @@ fn mesh_kept(pipeline: usize) -> bool {
 }
 
 /// Draws recorded on the host GPU since the last frame line.
+/// What a list held for its descriptor tables ([`State::tables_taken`]):
+/// dropping it gives the dynamic slots back and lets go of the host copies
+/// its root views' slots showed.
+pub(crate) struct TablesHeld {
+    dynamic: Vec<(usize, u64, u32, u32)>,
+    _root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    _root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+}
+
+impl Drop for TablesHeld {
+    fn drop(&mut self) {
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+    }
+}
+
+impl State {
+    /// As [`State::tables_done`], with what the list held handed to the
+    /// caller instead of let go of here: one that holds a lock takes it
+    /// under the lock and drops it after (`crate::host::release_finished_tables`).
+    /// `None` if the list holds nothing.
+    pub(crate) fn tables_taken(&mut self) -> Option<TablesHeld> {
+        if self.tables_gone && self.dynamic.is_empty() {
+            return None;
+        }
+        let held = TablesHeld {
+            dynamic: std::mem::take(&mut self.dynamic),
+            _root_srv_slots: std::mem::take(&mut self.root_srv_slots),
+            _root_uav_slots: std::mem::take(&mut self.root_uav_slots),
+        };
+        self.fresh_tables.clear();
+        self.recording = 0;
+        self.tables_gone = true;
+        Some(held)
+    }
+}
+
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
 /// Draws run on the host so far.
@@ -2627,10 +2663,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = crate::host::table_slots(host, 1) else {
                     crate::drops::note(host.refusal(1));
                     return false;
                 };
@@ -2696,10 +2729,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = crate::host::table_slots(host, 1) else {
                     crate::drops::note(host.refusal(1));
                     return false;
                 };
@@ -4673,10 +4703,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = crate::host::table_slots(host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 crate::drops::note(host.refusal(n));
