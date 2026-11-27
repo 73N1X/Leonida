@@ -3328,7 +3328,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = loose_taking();
         if map.is_empty() {
             return;
         }
@@ -5433,6 +5433,103 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     });
 }
 
+/// Whether a thread also remembers what its asks for memory outside buffers
+/// found (`LEONIDA_QUICK_FIND_WINDOWS=1`; off by default, and only on the
+/// 4 MiB grid without tails: with finer windows the answer depends on the
+/// other windows).
+///
+/// Ported from gmanka/victory 32be36d (fork PR #1237), which remembers the
+/// asks of windows as well as of buffers: 89 % of its 540,000 asks a frame
+/// were answered without a lock, and the measured gain was about 14 ms a
+/// frame on a discrete card. [`FOUND`] holds buffers only; an ask outside
+/// every buffer still walks up to 64 buffers under their lock, then the
+/// windows' lock. Here the answer is kept while neither table has changed
+/// ([`BUFFERS_CHANGED`], [`LOOSE_CHANGED`]), by the same rule.
+/// Measure it with `LEONIDA_AB=<seconds>,LEONIDA_QUICK_FIND_WINDOWS`.
+fn quick_windows() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_QUICK_FIND_WINDOWS") {
+        return on && !fine();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_QUICK_FIND_WINDOWS").is_some_and(|v| v == "1")) && !fine()
+}
+
+/// How often [`LOOSE`] was taken to lose a window (before it is looked at).
+static LOOSE_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// [`LOOSE`] to take a window out of. As [`buffers`]: the count goes up once
+/// the lock is held and before anything is looked at, so a thread that took
+/// an answer out of its memory and finds the count as it was has an answer
+/// from before the window was counted as held by nobody else.
+fn loose_taking() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
+    let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    LOOSE_CHANGED.fetch_add(1, Ordering::SeqCst);
+    map
+}
+
+/// What a thread remembers of its asks: (address, bytes), the two counts
+/// they were answered at, and the answer, held weakly.
+struct Memory<T>(Vec<(u64, u64, (u64, u64), std::sync::Weak<T>)>);
+
+impl<T> Memory<T> {
+    const fn new() -> Self {
+        Memory(Vec::new())
+    }
+
+    fn slot(address: u64, len: u64) -> usize {
+        let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (h >> 54) as usize % FOUND_MOST
+    }
+
+    fn get(&self, address: u64, len: u64, counts: (u64, u64)) -> Option<Arc<T>> {
+        let (a, n, at, answer) = self.0.get(Self::slot(address, len))?;
+        ((*a, *n, *at) == (address, len, counts)).then(|| answer.upgrade()).flatten()
+    }
+
+    fn put(&mut self, address: u64, len: u64, counts: (u64, u64), answer: &Arc<T>) {
+        if self.0.is_empty() {
+            self.0.resize_with(FOUND_MOST, || (0, 0, (0, 0), std::sync::Weak::new()));
+        }
+        self.0[Self::slot(address, len)] = (address, len, counts, Arc::downgrade(answer));
+    }
+}
+
+thread_local! {
+    /// The answers of [`lookup`] that were windows ([`quick_windows`]).
+    static FOUND_WINDOWS: std::cell::RefCell<Memory<Shadow>> = const { std::cell::RefCell::new(Memory::new()) };
+}
+
+/// The two counts: of [`BUFFERS`] and of [`LOOSE`].
+fn table_counts() -> (u64, u64) {
+    (BUFFERS_CHANGED.load(Ordering::SeqCst), LOOSE_CHANGED.load(Ordering::SeqCst))
+}
+
+/// What this thread remembers of an ask of memory outside buffers, if
+/// neither table changed since `counts` (read before the ask was looked at).
+fn found_window(address: u64, len: u64, counts: (u64, u64)) -> Option<Arc<Shadow>> {
+    let shadow = FOUND_WINDOWS.with(|f| f.borrow().get(address, len, counts))?;
+    // As `found`: whoever takes a map to let a copy go that nobody holds
+    // finds it held now, or had counted before.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if table_counts() != counts {
+        return None;
+    }
+    // As `loose` notes an ask of a window it hands out.
+    note_ask(&shadow, address, address.saturating_add(len.max(1)), len <= 1);
+    Some(shadow)
+}
+
+/// `loose`, and a window it gives is remembered ([`quick_windows`]) at
+/// `counts`, which were read before the tables were looked at.
+fn loose_remembered(address: u64, len: u64, end: u64, any: bool, counts: Option<(u64, u64)>) -> Option<Arc<Shadow>> {
+    let shadow = loose(address, end, len <= 1, any)?;
+    if let Some(counts) = counts.filter(|_| shadow.window) {
+        FOUND_WINDOWS.with(|f| f.borrow_mut().put(address, len, counts, &shadow));
+    }
+    Some(shadow)
+}
+
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -5473,7 +5570,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = loose_taking();
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -5550,6 +5647,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
     }
+    // Read before either table is (a change since makes the answer old).
+    let counts = (quick && quick_windows()).then(table_counts);
+    if let Some(counts) = counts
+        && let Some(shadow) = found_window(address, len, counts)
+    {
+        return Some(shadow);
+    }
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
@@ -5565,7 +5669,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return loose_remembered(address, len, end, any, counts);
             }
         }
     }
@@ -5578,7 +5682,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose_remembered(address, len, end, any, counts);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5862,26 +5966,30 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// An ask of `[address, end)` was answered with a window: it was used now,
+/// and what was asked of it is noted.
+fn note_ask(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    // (Read first: the lines are shared by all recording threads.)
+    let now = crate::host::moment();
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    if shadow.asked[0].load(Ordering::Relaxed) > address {
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    }
+    if shadow.asked[1].load(Ordering::Relaxed) < end {
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    }
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
+    let note = |shadow: &Shadow| note_ask(shadow, address, end, unsized_ask);
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -6749,5 +6857,46 @@ mod refresh_dirty_tests {
             assert_eq!(&side_whole[from_off..to_off], &title_mem[from_off..to_off]);
             assert_eq!(joined(copy_whole.take_dirty()), [(from_off, to_off)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod window_memory_tests {
+    use super::Memory;
+    use std::sync::Arc;
+
+    #[test]
+    fn an_answer_is_given_back_only_at_the_counts_it_was_made_at() {
+        let mut memory = Memory::<u32>::new();
+        let answer = Arc::new(7u32);
+        assert!(memory.get(0x1000, 64, (1, 1)).is_none(), "an empty memory answers nothing");
+        memory.put(0x1000, 64, (1, 1), &answer);
+        assert_eq!(memory.get(0x1000, 64, (1, 1)).as_deref(), Some(&7));
+        // Either table changed: the answer is of before.
+        assert!(memory.get(0x1000, 64, (2, 1)).is_none());
+        assert!(memory.get(0x1000, 64, (1, 2)).is_none());
+        // Another ask is another answer, whatever shares its slot.
+        assert!(memory.get(0x1000, 65, (1, 1)).is_none());
+        assert!(memory.get(0x2000, 64, (1, 1)).is_none());
+    }
+
+    #[test]
+    fn a_copy_nothing_holds_any_more_is_not_given_back() {
+        let mut memory = Memory::<u32>::new();
+        let answer = Arc::new(9u32);
+        memory.put(0x4000_0000, 1, (3, 3), &answer);
+        assert!(memory.get(0x4000_0000, 1, (3, 3)).is_some());
+        drop(answer);
+        assert!(memory.get(0x4000_0000, 1, (3, 3)).is_none(), "weakly held");
+    }
+
+    #[test]
+    fn a_newer_ask_in_the_same_slot_replaces_the_older() {
+        let mut memory = Memory::<u32>::new();
+        let (a, b) = (Arc::new(1u32), Arc::new(2u32));
+        memory.put(0x1000, 8, (1, 1), &a);
+        memory.put(0x1000, 8, (2, 1), &b);
+        assert!(memory.get(0x1000, 8, (1, 1)).is_none());
+        assert_eq!(memory.get(0x1000, 8, (2, 1)).as_deref(), Some(&2));
     }
 }
