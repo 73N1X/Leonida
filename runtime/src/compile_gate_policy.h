@@ -331,12 +331,21 @@ inline std::optional<CacheEntry> parse_entry(std::string_view line) {
     return e;
 }
 
-// The entry for `key` in a cache file's text, if it has one.
+// Whether a calibration's verdict is written to the cache. Not an unclear one: a submission slowed by something else
+// on the GPU (another process, a driver background task) says nothing about this driver, and kept, it would hold
+// every later launch on the classic gate until the driver changes; the next launch measures again instead. A create
+// still too fast at kMostStatements is kept: that does not change from one launch to the next.
+inline bool cache_verdict(Outcome outcome) { return outcome != Outcome::unclear; }
+
+// The entry for `key` in a cache file's text, if it has one the cache keeps (an unclear one, written by an earlier
+// build, is not one: the next launch measures again).
 inline std::optional<CacheEntry> find_entry(std::string_view text, const CacheKey& key) {
     std::optional<CacheEntry> found;
     while (!text.empty()) {
         const std::size_t end = (std::min)(text.find('\n'), text.size());
-        if (const auto e = parse_entry(text.substr(0, end)); e && same_key(e->key, key)) found = e;  // the last wins
+        if (const auto e = parse_entry(text.substr(0, end));
+            e && same_key(e->key, key) && cache_verdict(e->verdict.outcome))
+            found = e;  // the last wins
         text.remove_prefix((std::min)(end + 1, text.size()));
     }
     return found;

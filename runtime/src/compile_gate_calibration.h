@@ -26,6 +26,9 @@ inline constexpr std::uint32_t kMostStatements = 32000;
 inline constexpr unsigned kMaxTrials = 4;
 inline constexpr double kStartTrialsWithinMs = 6000;   // no new trial after this long
 inline constexpr std::uint64_t kFenceTimeoutNs = 10'000'000'000ull;
+// After a wait that failed, how long the fence gets before the fence and command pool are destroyed: they must not be
+// destroyed while the submission is pending. Still not signalled after this, or the device lost: they are left alive.
+inline constexpr std::uint64_t kDrainTimeoutNs = 60'000'000'000ull;
 inline constexpr std::size_t kMostSamples = 4000;      // per trial; the create may outlast them
 
 struct Result {
@@ -102,9 +105,10 @@ inline Result calibrate(PFN_vkGetDeviceProcAddr get, VkDevice device, VkQueue qu
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    bool keep_queue_objects = false;  // a submission may still be pending: never destroy its fence or command pool
     const auto cleanup = [&] {
-        if (fence) vk.destroy_fence(device, fence, nullptr);
-        if (pool) vk.destroy_pool(device, pool, nullptr);
+        if (fence && !keep_queue_objects) vk.destroy_fence(device, fence, nullptr);
+        if (pool && !keep_queue_objects) vk.destroy_pool(device, pool, nullptr);
         if (layout) vk.destroy_layout(device, layout, nullptr);
         if (set_layout) vk.destroy_set_layout(device, set_layout, nullptr);
     };
@@ -189,15 +193,18 @@ inline Result calibrate(PFN_vkGetDeviceProcAddr get, VkDevice device, VkQueue qu
         const detail::clock::time_point start_mark = create_begin;
         policy::Trial t;
         VkResult submit_result = VK_SUCCESS;
+        bool in_flight = false;  // submitted, its fence not yet seen signalled
         // Let the create get into the driver before the first submission.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         while (!left.load(std::memory_order_acquire) && t.samples.size() < kMostSamples) {
             const auto s0 = detail::clock::now();
             submit_result = vk.queue_submit(queue, 1, &submit, fence);
             if (submit_result != VK_SUCCESS) break;
+            in_flight = true;
             submit_result = vk.wait_fences(device, 1, &fence, VK_TRUE, kFenceTimeoutNs);
             const auto s1 = detail::clock::now();
             if (submit_result != VK_SUCCESS) break;
+            in_flight = false;
             submit_result = vk.reset_fences(device, 1, &fence);
             if (submit_result != VK_SUCCESS) break;
             t.samples.push_back({detail::ms_between(start_mark, s0), detail::ms_between(start_mark, s1)});
@@ -206,7 +213,15 @@ inline Result calibrate(PFN_vkGetDeviceProcAddr get, VkDevice device, VkQueue qu
         worker.join();
         if (pipeline) vk.destroy_pipeline(device, pipeline, nullptr);
         vk.destroy_module(device, module, nullptr);
-        if (submit_result != VK_SUCCESS) return fail("an empty submission", submit_result);
+        if (submit_result != VK_SUCCESS) {
+            // A wait that timed out leaves the submission pending: the fence and the command buffer's pool are
+            // destroyed only once its fence signals. On a lost device, or if it still has not, they are left alive
+            // (a small leak, on a path that ends in the classic gate anyway).
+            if (submit_result == VK_ERROR_DEVICE_LOST) keep_queue_objects = true;
+            else if (in_flight && vk.wait_fences(device, 1, &fence, VK_TRUE, kDrainTimeoutNs) != VK_SUCCESS)
+                keep_queue_objects = true;
+            return fail("an empty submission", submit_result);
+        }
         if (create_result != VK_SUCCESS) return fail("vkCreateComputePipelines", create_result);
         t.create_ms = detail::ms_between(create_begin, create_end);
         result.verdict = policy::judge(t);

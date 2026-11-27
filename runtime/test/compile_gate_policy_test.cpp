@@ -183,12 +183,22 @@ void cache() {
     CacheKey unknown = key_a();
     unknown.uuid[3] ^= 1;
     CHECK(!find_entry(text, unknown));
+    // Only verdicts that say something about the driver are cached: an unclear one would hold every later launch
+    // on the classic gate.
+    CHECK(cache_verdict(Outcome::adaptive) && cache_verdict(Outcome::holds) && cache_verdict(Outcome::too_fast));
+    CHECK(!cache_verdict(Outcome::unclear));
     // Recalibrating writes over the entry for the key, keeping the others.
     CacheEntry again = e;
-    again.verdict.outcome = Outcome::unclear;
+    again.verdict.outcome = Outcome::holds;
     text = replace_entry(text, again);
-    CHECK(find_entry(text, e.key)->verdict.outcome == Outcome::unclear);
+    CHECK(find_entry(text, e.key)->verdict.outcome == Outcome::holds);
     CHECK(find_entry(text, other.key).has_value());
+    // An unclear line (written by an earlier build) is not a cached verdict: the next launch measures again.
+    CacheEntry unclear = e;
+    unclear.verdict.outcome = Outcome::unclear;
+    CHECK(parse_entry(format_entry(unclear)).has_value());
+    CHECK(!find_entry(replace_entry(text, unclear), e.key));
+    CHECK(find_entry(replace_entry(text, unclear), other.key).has_value());
     std::size_t lines = 0;
     for (const char c : text) lines += c == '\n';
     CHECK(lines == 2);

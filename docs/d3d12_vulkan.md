@@ -3003,7 +3003,10 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   within 200 ms of the create leaving: the driver holds submissions, classic. A create under 300 ms is tried again
   larger (up to 4 trials, none started after 6 s); a slow submission the create does not explain, too few samples
   or any failed call: classic. The verdict is kept per vendor, device, driver version and pipeline cache UUID in
-  `compile_gate_calibration.txt` beside the pipeline cache (failures are not kept), so it runs once per driver;
+  `compile_gate_calibration.txt` beside the pipeline cache, so it runs once per driver; a failed call or an unclear
+  verdict (a slow submission the create does not explain) is not kept, and the next launch measures again, so one
+  busy moment on the GPU does not hold every later launch on the classic gate. After a wait that times out, the fence
+  and command pool are destroyed only once the submission's fence signals (left alive on a lost device).
   `LEONIDA_COMPILE_GATE_RECALIBRATE=1` measures again. It is logged once, `[rt] compile-gate: auto: adaptive
   (calibrated on NVIDIA 621.40 in 0.7 s: 115 submissions came back in <= 0.5 ms beside a 722 ms create; cached in
   ...)` (`classic` and the reason otherwise). Only gta6rt's title process calibrates; `--precompile-pipelines`,

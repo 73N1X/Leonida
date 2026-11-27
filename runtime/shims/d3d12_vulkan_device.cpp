@@ -1771,7 +1771,9 @@ void decide_auto_compile_gate(const VulkanDeviceInfo& info, PFN_vkGetDeviceProcA
             return;
         }
         std::string where = "not cached (no pipeline cache folder)";
-        if (!path.empty()) {
+        if (!policy::cache_verdict(result.verdict.outcome)) {
+            where = "not cached: the next launch measures again";
+        } else if (!path.empty()) {
             const std::string updated = policy::replace_entry(text, {key, result.verdict});
             std::filesystem::path temp = path;
             temp += L".tmp";
