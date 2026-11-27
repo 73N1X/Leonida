@@ -1307,7 +1307,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<ByCopy<TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1371,10 +1371,9 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+/// By host copy, as every table of a list that is asked at each draw: the
+/// keys are addresses of ours ([`AddressHash`]).
+type States = ByCopy<(u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2522,9 +2521,9 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: ByCopy<usize>,
     /// Of them, those the list's prelude copies into their host copies if
     /// the submission finds them changed ([`HostList::upload_in_prelude`]).
     prelude_uploads: Vec<crate::texture::PreludeUpload>,
@@ -8177,6 +8176,72 @@ impl std::hash::Hasher for AddressHash {
     }
 }
 
+#[cfg(test)]
+mod address_hash_tests {
+    use super::AddressHash;
+    use std::hash::{BuildHasher, BuildHasherDefault};
+
+    fn hash<K: std::hash::Hash>(key: K) -> u64 {
+        BuildHasherDefault::<AddressHash>::default().hash_one(key)
+    }
+
+    /// What a table makes of `hashes`: its place from the low bits, its tag
+    /// from the top seven. No two the same, every tag in use, and with as many
+    /// places as keys no place crowded and the keys looked at to find one not
+    /// many more than chance leaves (which is 1.5: a key and half of the others
+    /// at its place).
+    ///
+    /// Measured 2026-11-27, 4,096 keys: host copies 16, 48 and 64 bytes apart
+    /// 2.1, 1.8 and 2.0 keys looked at (the fullest place 22, 15 and 12 keys),
+    /// 192 bytes apart 1.5, a page and 64 KiB apart 1.1 and 1.2; root views
+    /// 2.0, fills 1.5. Not as even as the standard hash for keys a few bytes
+    /// apart, and far from all in one place.
+    fn spread(what: &str, hashes: &[u64]) {
+        let places = hashes.len().next_power_of_two();
+        let mut at = vec![0u32; places];
+        let mut tags = [false; 128];
+        let mut seen = std::collections::BTreeSet::new();
+        for &h in hashes {
+            assert!(seen.insert(h), "{what}: two keys with one hash");
+            at[h as usize & (places - 1)] += 1;
+            tags[(h >> 57) as usize] = true;
+        }
+        let fullest = at.iter().copied().max().unwrap_or(0);
+        assert!(fullest <= 32, "{what}: {fullest} keys in one place of {places}");
+        let looked: u64 = at.iter().map(|&n| u64::from(n) * u64::from(n + 1) / 2).sum();
+        let looked = looked as f64 / hashes.len() as f64;
+        assert!(looked <= 2.5, "{what}: {looked:.2} keys looked at to find one");
+        let used = tags.iter().filter(|&&t| t).count();
+        assert!(used >= 120, "{what}: {used} tags of 128 in use");
+    }
+
+    /// The tables a list asks at every draw are keyed by addresses of ours
+    /// (host copies, title heaps, title addresses): keys that differ in few
+    /// bits, at even steps. This hash has to tell them apart as the standard
+    /// one did.
+    #[test]
+    fn the_keys_of_a_lists_per_draw_tables_spread() {
+        // Host copies by address: objects of one size, one after the other.
+        for step in [16usize, 48, 64, 192, 4096, 1 << 16] {
+            let keys: Vec<u64> = (0..4096).map(|i| hash(0x0000_01f4_8a20_0040usize + i * step)).collect();
+            spread(&format!("copies {step} bytes apart"), &keys);
+        }
+        // Root views: (title heap, title address), bit 63 for a view that
+        // begins early (`crate::draw::State::root_srv_table`).
+        let heap = 0x0000_0234_5678_9000usize;
+        let keys: Vec<u64> = (0..2048u64)
+            .flat_map(|i| {
+                let address = 0x4_2000_0000 + i * 0x140;
+                [hash((heap, address)), hash((heap, address | 1 << 63))]
+            })
+            .collect();
+        spread("root views", &keys);
+        // Fills of scratch memory: (source, bytes).
+        let keys: Vec<u64> = (0..4096usize).map(|i| hash((0x2_8000_0000usize + (i / 4) * 0x100, 0x100usize << (i % 4)))).collect();
+        spread("fills", &keys);
+    }
+}
+
 /// Since the last frame-rate line, nanoseconds of the submitting thread's
 /// preparing: the write-watch asking for a submission; the title's bytes put
 /// in under flights' writes; the lists' steps, the refreshes among them; the
@@ -8356,7 +8421,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
