@@ -1890,8 +1890,11 @@ fn workers() -> &'static Workers {
         for i in 0..workers.thread_count {
             let _ = std::thread::Builder::new().name(format!("leonida-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("leonida-wide");
+                // (`LEONIDA_HELPER_PRIORITY`: the submitting thread waits for its jobs.)
+                let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
+                    priority.keep();
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.

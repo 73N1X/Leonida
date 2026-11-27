@@ -92,6 +92,58 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`LEONIDA_HELPER_PRIORITY`, on unless `0`; `LEONIDA_AB` can flip it while
+/// the title runs): above normal, ahead of the title's threads and of the
+/// threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
+/// records and the one that passes over the heap's views beside the lists.
+///
+/// Ported from trustno1-coder/VIctory-NVIDIA 80c70b7 (Indy2l, pull request
+/// #22, after readmet3xt-lab's 002cf4a; GPL-3.0, as this). On a processor
+/// with six cores (i5-12400F, 12 threads; this PC's 7600X has six too) the
+/// title's threads and eight translating lists kept every core busy, and the
+/// submitting thread (above normal since `queue::behind`) stood waiting for
+/// helpers at normal priority that were not running. Measured there with the
+/// A/B switch in one run (run10, Series S at 540p, RTX 3060, medians of
+/// 5-second windows in the world, off / on): 8.6 / 9.6 fps, refreshes 23.1 /
+/// 17.6 ms a frame, waiting for the heaps' records 6.2 / 2.5 ms, the card
+/// idle behind the submitting thread 24.7 / 13.2 ms. Lowering the translating
+/// threads below normal as well made each list call about 5 % slower, with no
+/// clear gain of its own, so they are left as they are. Nothing the card is
+/// given changes: only when the work runs.
+fn helpers_raised() -> bool {
+    crate::toggled!("LEONIDA_HELPER_PRIORITY")
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +155,18 @@ mod tests {
         assert!(fast_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+    }
+
+    /// A helper's priority is asked for once, and again only when the switch changes.
+    #[test]
+    fn a_helper_priority_is_applied_once() {
+        std::thread::spawn(|| {
+            let mut priority = Priority::new();
+            assert_eq!(priority.applied, Some(helpers_raised()));
+            priority.keep();
+            assert_eq!(priority.applied, Some(helpers_raised()));
+        })
+        .join()
+        .unwrap();
     }
 }
