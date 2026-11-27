@@ -207,10 +207,10 @@ int gate_wait_limit() {
         return 0;
     }
     // The default with LEONIDA_COMPILE_GATE_WAIT_MS unset, whatever the title watchdog variables say: none with
-    // LEONIDA_COMPILE_GATE=1.
-    const bool always = SubmitMutex::compile_gate_mode() == SubmitMutex::GateMode::always;
+    // LEONIDA_COMPILE_GATE=1 or unset (classic), kDefaultGateWaitMs with LEONIDA_COMPILE_GATE=adaptive.
+    const bool adaptive = SubmitMutex::compile_gate_mode() == SubmitMutex::GateMode::adaptive;
     if (!std::getenv("LEONIDA_COMPILE_GATE_WAIT_MS"))
-        EXPECT(SubmitMutex::default_gate_wait_limit_ms() == (always ? 0 : SubmitMutex::kDefaultGateWaitMs));
+        EXPECT(SubmitMutex::default_gate_wait_limit_ms() == (adaptive ? SubmitMutex::kDefaultGateWaitMs : 0));
     SubmitMutex m;
     m.set_gate_adaptive(false);  // as LEONIDA_COMPILE_GATE=1: it never turns off
     m.set_gate_wait_limit_ms(150);
@@ -295,6 +295,7 @@ int gate_adapts() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);  // probes at the limit only: gate_probe_budget checks the budget
         std::atomic<bool> in{false}, release{false};
@@ -344,6 +345,7 @@ int gate_adapts() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);  // probes at the limit only: gate_probe_budget checks the budget
         std::atomic<bool> first_in{false}, first_release{false};
@@ -394,6 +396,7 @@ int gate_adapts() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);
         std::atomic<bool> in{false}, release{false};
@@ -431,6 +434,7 @@ int gate_probe_budget() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(0);
         m.set_gate_probe_budget_ms(300);
         EXPECT(m.gate_probe_budget_ms() == 300);
@@ -479,6 +483,7 @@ int gate_probe_budget() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(0);
         m.set_gate_probe_budget_ms(100);
         std::atomic<bool> in{false}, release{false};
@@ -532,6 +537,7 @@ int gate_per_kind() {
     using Kind = SubmitMutex::CreateKind;
     SubmitMutex m;
     m.set_gate_adaptive(true);
+    m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
     m.set_gate_wait_limit_ms(100);
     m.set_gate_probe_budget_ms(0);
     const SubmitMutex::CreateInfo compute{Kind::compute, "test compute", "test", 1000};
@@ -659,6 +665,7 @@ int gate_review_cases() {
     for (const bool a_first : {true, false}) {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);
         HeldCreate a(m, compute);
@@ -688,6 +695,7 @@ int gate_review_cases() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);
         HeldCreate a(m, compute);
@@ -708,6 +716,7 @@ int gate_review_cases() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);
         HeldCreate a(m, compute);
@@ -725,6 +734,7 @@ int gate_review_cases() {
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
+        m.set_gate_graphics(true);  // as LEONIDA_COMPILE_GATE=adaptive
         m.set_gate_wait_limit_ms(100);
         m.set_gate_probe_budget_ms(0);
         m.set_gate_held_limit_ms(400);
@@ -761,13 +771,76 @@ int gate_review_cases() {
     return 0;
 }
 
+// The classic gate (LEONIDA_COMPILE_GATE unset, the default): compute creates are waited for however long they take,
+// graphics creates do not pass the gate, nothing probes.
+int gate_classic() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): classic gate not checked\n");
+        return 0;
+    }
+    using Kind = SubmitMutex::CreateKind;
+    using Verdict = SubmitMutex::GateVerdict;
+    const SubmitMutex::GateMode mode = SubmitMutex::compile_gate_mode();
+    if (mode == SubmitMutex::GateMode::classic) {
+        EXPECT(!SubmitMutex::compile_gate_graphics());
+        if (!std::getenv("LEONIDA_COMPILE_GATE_PROBE_MS") && !std::getenv("LEONIDA_COMPILE_GATE_WAIT_MS"))
+            EXPECT(SubmitMutex::default_gate_wait_limit_ms() == 0 && SubmitMutex::default_gate_probe_budget_ms() == 0);
+    }
+    SubmitMutex m;
+    m.set_gate_adaptive(false);
+    m.set_gate_graphics(false);
+    m.set_gate_wait_limit_ms(0);
+    m.set_gate_probe_budget_ms(0);
+    // A graphics create in the driver holds no submission back.
+    std::atomic<bool> g_in{false}, g_release{false};
+    std::thread g([&] {
+        const SubmitMutex::CompileTurn turn(m, SubmitMutex::CreateInfo{Kind::graphics, "test mesh", "test", 2000});
+        g_in = true;
+        while (!g_release) std::this_thread::sleep_for(1ms);
+    });
+    const bool g_entered = eventually([&] { return g_in.load(); });
+    std::int64_t beside_graphics = 0;
+    {
+        const std::int64_t start = now_ms();
+        const SubmitMutex::SubmitTurn turn(m);
+        beside_graphics = now_ms() - start;
+    }
+    g_release = true;
+    g.join();
+    // A compute create is waited for until it leaves, well past the adaptive gate's 2.5 s budget, and decides nothing.
+    std::atomic<bool> c_in{false};
+    std::atomic<std::int64_t> c_left_at{0};
+    std::thread c([&] {
+        const SubmitMutex::CompileTurn turn(m, SubmitMutex::CreateInfo{Kind::compute, "test compute", "test", 1000});
+        c_in = true;
+        std::this_thread::sleep_for(3000ms);
+        c_left_at = now_ms();
+    });
+    const bool c_entered = eventually([&] { return c_in.load(); });
+    std::int64_t entered_at = 0;
+    bool ahead = true;
+    {
+        const SubmitMutex::SubmitTurn turn(m);
+        entered_at = now_ms();
+        ahead = turn.went_ahead();
+    }
+    c.join();
+    EXPECT(g_entered && c_entered);
+    EXPECT(beside_graphics < 50);
+    EXPECT(entered_at >= c_left_at.load() && !ahead);
+    EXPECT(m.gate_verdict(Kind::compute) == Verdict::pending && m.gate_verdict(Kind::graphics) == Verdict::pending);
+    std::printf("classic gate: %lld ms beside a graphics create; a submission waited out a 3 s compute create\n",
+                static_cast<long long>(beside_graphics));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
         compile_gate() || gate_wait_limit() || gate_adapts() ||
-        gate_probe_budget() || gate_per_kind() || gate_review_cases())
+        gate_probe_budget() || gate_per_kind() || gate_review_cases() || gate_classic())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;

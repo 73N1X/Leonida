@@ -12904,15 +12904,18 @@ private:
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
         // Through the compile gate as a graphics create (a mesh pipeline is one): on NVIDIA 621.40 a vkQueueSubmit
-        // sat in the driver for as long as a mesh create was in it (54 s) and lost the device.
+        // sat in the driver for as long as a mesh create was in it (54 s) and lost the device. Not with the classic
+        // gate (the default), which keeps graphics creates out of it as before.
         const char* gate_name = nullptr;
         for (const auto& source : sources_)
             if (source.entry && source.slot == 0) gate_name = source.entry->name.c_str();
         VkResult result = VK_ERROR_UNKNOWN;
         {
-            const DriverTurn turn(device_.context->submit_mutex(), trigger,
-                                  r.mesh ? "vkCreateGraphicsPipelines (mesh)" : "vkCreateGraphicsPipelines", true,
-                                  gate_name, leonida::SubmitMutex::CreateKind::graphics, bytes);
+            std::optional<DriverTurn> turn;
+            if (leonida::SubmitMutex::compile_gate_graphics())
+                turn.emplace(device_.context->submit_mutex(), trigger,
+                             r.mesh ? "vkCreateGraphicsPipelines (mesh)" : "vkCreateGraphicsPipelines", true, gate_name,
+                             leonida::SubmitMutex::CreateKind::graphics, bytes);
             result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
                 info.flags = f;
                 pipeline = VK_NULL_HANDLE;
