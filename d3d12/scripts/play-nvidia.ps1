@@ -122,12 +122,19 @@ $settings = @{
     LEONIDA_THIN = '1'; LEONIDA_JOIN_PARTS = '8'; LEONIDA_UPLOAD_AHEAD = '1'
     # Fog bounded by 1.5 times the light around; a NaN a shader writes is made 0 before blur and the upscaler spread it.
     LEONIDA_AMBIENT_AIR = '1.5'; LEONIDA_NAN_SCRUB = '1'
-    # Leonida: the samplers the title's shaders carry in their code filter linearly where they would point-sample.
-    # Without it the colour grading came out in bands (a 2000s camera look): the tonemap reads its 33^3 identity
-    # grading tables at a log-encoded colour, and read unfiltered they hand back 33 steps over 14 stops, about five
-    # flat levels per doubling of brightness (runs p3, p4, c1: 700-1,400 colours in a sky region; run s1 with this:
-    # 28,000-32,000). Comparison and anisotropic samplers keep their own filters (pipeline/host.rs static_filter).
-    LEONIDA_STATIC_SAMPLERS_LINEAR = '1'
+    # Leonida: the samplers the tonemap's programs (PS_Composite*) carry in their code filter linearly where they
+    # would point-sample. Without it the colour grading came out in bands (a 2000s camera look): the tonemap reads
+    # its 33^3 identity grading tables at a log-encoded colour, and read unfiltered they hand back 33 steps over 14
+    # stops, about five flat levels per doubling of brightness (runs p3, p4, c1: 700-1,400 colours in a sky region;
+    # run s1 with every program's made linear: 28,000-32,000). What read them unfiltered was a pipeline restored
+    # from the pipeline library with another run's sampler places, and such pipelines skip the library since
+    # (pipeline/library.rs allows_static_samplers), so this is a second guard for the tonemap alone.
+    # It was '1' (every program) until 2026-11-27. The title point-samples on purpose in 1,468 of its program names:
+    # the pass that puts the low-resolution fog on the picture picks its four texels by depth one by one, and read
+    # linearly each of them is a mix across the silhouette (pipeline/host.rs LinearScope; the expected cause of the
+    # light rim around trees, wires and signs in fog, not confirmed in a run yet). -More
+    # @{LEONIDA_STATIC_SAMPLERS_LINEAR='1'} is the setting from before, '0' none at all.
+    LEONIDA_STATIC_SAMPLERS_LINEAR = 'PS_Composite'
     # Wait for new shaders rather than skip their draws (each pipeline is waited for at most once). The F1 menu's
     # SHADER WAIT MS changes it: 0 never waits, things then show up as their shaders are done.
     LEONIDA_PIPELINE_WAIT_MS = '10000'

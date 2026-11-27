@@ -1770,35 +1770,115 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
+/// Leonida: how many more places of a texture's memory [`fingerprint`] reads,
+/// 256 bytes each, spread over its 64 KiB steps
+/// (`LEONIDA_HEAP_PRINT_SPREAD=<places>`, `1`: 64; unset or 0: none, as
+/// before).
+///
+/// The three windows of [`fingerprint`] are 48 KiB of a texture: of one of
+/// 2 MiB with all its levels, the smallest levels, and the largest twice (its
+/// middle and its end). The level between them (a fifth of the bytes) and
+/// most of the largest are never looked at, so what the title writes there
+/// after the upload with nothing to tell of it stays as it was on the card:
+/// zeros (black squares, for the console lays a texture out in square tiles)
+/// or what the memory held before. That such writes happen is counted: 200
+/// and more textures a run are found changed by the three windows (of the
+/// first 200 of run port15, 2026-11-27, about 2,000 frames: 95 within four
+/// frames of their upload, 73 within sixteen, 18 more than 176 frames after).
+/// How many only the spread places find is counted when this is on
+/// ([`spread_alone`]).
+///
+/// The same hole other forks closed their way: the start of every level
+/// (fxceless/victory-fork #559 by NickJBc, in Fayberr/Victory-United
+/// 262625e3), or all of a texture of up to 4 MiB whose pages the title has
+/// at another address too (kitty-core/Kitty6 ae3cce8, in LoverCatys/ruff-lab
+/// d843417: "black and blocky" faces and hair), both GPL-3.0; neither is
+/// ported, this reads less than the second and more evenly than the first.
+///
+/// Off unless asked for, as it has not run in the title yet. A look then
+/// makes up to that many more calls into the kernel (a look at 2 MiB: 3.4 us
+/// without, 6.4 us with its 32 places, in the test below), and every uploaded
+/// slot is looked at five times and then every 300 frames. A texture the
+/// title keeps repainting between the windows is then uploaded again at
+/// every look, where it stood still before.
+fn print_spread() -> usize {
+    static SPREAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SPREAD.get_or_init(|| {
+        match std::env::var("LEONIDA_HEAP_PRINT_SPREAD").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(1) => 64,
+            Some(places) => places.min(1024),
+            None => 0,
+        }
+    })
+}
+
+/// Bytes a spread place reads, and the step the places lie in.
+const SPREAD_BYTES: usize = 256;
+const SPREAD_STEP: usize = 64 << 10;
+
+/// Where [`fingerprint`]'s spread places read in a span of `len` bytes: the
+/// middle of each whole 64 KiB step, or of `most` steps at even distances
+/// where there are more.
+fn spread_places(len: usize, most: usize) -> impl Iterator<Item = usize> {
+    let steps = len / SPREAD_STEP;
+    let places = steps.min(most);
+    (0..places).map(move |i| i * steps / places * SPREAD_STEP + SPREAD_STEP / 2)
+}
+
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// (a texture streams in whole mips; the small ones lie first), and of the
+/// spread places if asked for ([`print_spread`]). Read through the kernel,
+/// so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    fingerprint_spread(at, len, print_spread())
+}
+
+/// [`fingerprint`] with up to `spread` spread places. With them the low half
+/// is the three windows' and the high half the places' ([`spread_alone`]).
+fn fingerprint_spread(at: u64, len: u64, spread: usize) -> u64 {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
     let mut print = 0u128;
+    let mut wide = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
         read.resize(3 * WINDOW, 0);
-        let mut take = |from: usize, bytes: usize| {
+        let mut take = |print: &mut u128, from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            *print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
         };
         if len <= 3 * WINDOW {
-            take(0, len);
+            take(&mut print, 0, len);
         } else {
-            take(0, WINDOW);
-            take((len / 2) & !0xfff, WINDOW);
-            take(len - WINDOW, WINDOW);
+            take(&mut print, 0, WINDOW);
+            take(&mut print, (len / 2) & !0xfff, WINDOW);
+            take(&mut print, len - WINDOW, WINDOW);
+            for from in spread_places(len, spread) {
+                take(&mut wide, from, SPREAD_BYTES);
+            }
         }
     });
-    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
-    u64::from_le_bytes(first) | 1
+    let fold = |print: u128| print as u64 ^ (print >> 64) as u64;
+    if spread == 0 {
+        fold(print) | 1
+    } else {
+        (fold(print) & 0xffff_ffff | fold(wide) << 32) | 1
+    }
+}
+
+/// Whether two fingerprints of one texture differ in what the spread places
+/// read alone ([`print_spread`]): a change the three windows did not see.
+pub(crate) fn spread_alone(now: u64, then: u64) -> bool {
+    print_spread() != 0 && spread_differs_alone(now, then)
+}
+
+fn spread_differs_alone(now: u64, then: u64) -> bool {
+    now as u32 == then as u32 && now >> 32 != then >> 32
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -2599,6 +2679,75 @@ mod allocation_costs {
         seen.dedup();
         assert_eq!(seen.len(), n);
         assert_eq!(digest(&text), digest(&text.clone()));
+    }
+
+    /// The spread places lie one in each whole 64 KiB step, inside the span,
+    /// and no more of them than asked for.
+    #[test]
+    fn spread_places_lie_in_every_step_or_at_even_distances() {
+        use super::{SPREAD_BYTES, SPREAD_STEP, spread_places};
+        // Under one whole step: none (the three windows read 48 KiB of it).
+        assert_eq!(spread_places(SPREAD_STEP - 1, 64).count(), 0);
+        assert_eq!(spread_places(2 << 20, 0).count(), 0);
+        // 2 MiB: 32 steps, one place in the middle of each.
+        let places: Vec<usize> = spread_places(2 << 20, 64).collect();
+        assert_eq!(places.len(), 32);
+        for (step, &at) in places.iter().enumerate() {
+            assert_eq!(at, step * SPREAD_STEP + SPREAD_STEP / 2);
+        }
+        // 22 MiB and a byte: 352 steps, 64 places, each in a step of its
+        // own, the first in the first step, all inside the span.
+        let len = (22 << 20) + 1;
+        let places: Vec<usize> = spread_places(len, 64).collect();
+        assert_eq!(places.len(), 64);
+        assert_eq!(places[0], SPREAD_STEP / 2);
+        assert!(places.windows(2).all(|w| w[1] >= w[0] + SPREAD_STEP));
+        assert!(places.iter().all(|&at| at + SPREAD_BYTES <= len));
+    }
+
+    /// A byte the title writes after the upload outside the three windows of
+    /// the fingerprint: not seen without the spread places, seen with them,
+    /// and told apart from a change the windows see.
+    #[test]
+    fn a_change_between_the_windows_is_seen_by_the_spread_places() {
+        use super::{SPREAD_STEP, fingerprint_spread, spread_differs_alone};
+        // 2 MiB, as a 2048x1024 block-compressed texture's levels.
+        let mut memory: Vec<u8> = (0..2usize << 20).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+        let (at, len) = (memory.as_ptr() as u64, memory.len() as u64);
+        let (plain, spread) = (fingerprint_spread(at, len, 0), fingerprint_spread(at, len, 64));
+        assert_ne!(plain, 0);
+        assert_ne!(spread, 0);
+        assert_eq!(fingerprint_spread(at, len, 64), spread);
+        // The middle of the fifth 64 KiB step: in the level below the
+        // largest, where none of the three windows reads.
+        let place = 4 * SPREAD_STEP + SPREAD_STEP / 2 + 100;
+        memory[place] ^= 0x40;
+        assert_eq!(fingerprint_spread(at, len, 0), plain, "the three windows do not read there");
+        let now = fingerprint_spread(at, len, 64);
+        assert_ne!(now, spread);
+        assert!(spread_differs_alone(now, spread));
+        memory[place] ^= 0x40;
+        assert_eq!(fingerprint_spread(at, len, 64), spread);
+        // A change in the first window: seen either way, and not the spread
+        // places' alone.
+        memory[5] ^= 1;
+        assert_ne!(fingerprint_spread(at, len, 0), plain);
+        let now = fingerprint_spread(at, len, 64);
+        assert_ne!(now, spread);
+        assert!(!spread_differs_alone(now, spread));
+        memory[5] ^= 1;
+        // What a look costs with and without them (printed, not checked).
+        for places in [0, 64] {
+            const N: u32 = 2000;
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(fingerprint_spread(at, len, places));
+            }
+            println!(
+                "a look at 2 MiB with {places} spread places: {:.1} us",
+                began.elapsed().as_secs_f64() * 1e6 / f64::from(N)
+            );
+        }
     }
 
     /// What a texture met for the first time costs, by step, in

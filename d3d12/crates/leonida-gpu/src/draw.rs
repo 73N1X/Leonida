@@ -1394,6 +1394,10 @@ fn reupload_when_full() -> bool {
 /// LOCAL (11/26): changes found by those later looks, since the start.
 pub(crate) static HEAP_TEXTURES_LATE: AtomicU64 = AtomicU64::new(0);
 
+/// Leonida: of the changes those looks found, the ones only the spread places
+/// of the fingerprint saw (`crate::texture::spread_alone`), since the start.
+pub(crate) static HEAP_TEXTURES_SPREAD: AtomicU64 = AtomicU64::new(0);
+
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEONIDA_HEAP_RECHECK").is_none_or(|v| v != "0"))
@@ -3361,7 +3365,24 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let now = crate::texture::fingerprint(at, len);
+                // Leonida: a change the look's three windows did not see
+                // (`LEONIDA_HEAP_PRINT_SPREAD`): counted, the first ones named.
+                if crate::texture::spread_alone(now, print) {
+                    let n = HEAP_TEXTURES_SPREAD.fetch_add(1, Ordering::Relaxed);
+                    if n < 100 || n.is_multiple_of(1000) {
+                        tracing::warn!(
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            so_far = n + 1,
+                            "a texture picked by index changed where only the spread places of the look read (LEONIDA_HEAP_PRINT_SPREAD): uploaded again"
+                        );
+                    }
+                }
+                if now == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match (RECHECK_FRAMES.get(usize::from(looks) + 1), recheck_every()) {
                         (Some(wait), _) => {

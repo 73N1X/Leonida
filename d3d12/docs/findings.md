@@ -297,6 +297,49 @@ consecutive thread ids, which `LEONIDA_GROUP_PACK=0` takes away again if a progr
 The translator already takes a console group-shared memory address as in bounds (a shortcut);
 packed, an address past the group's memory reaches the next slot's instead of the host's end.
 
+## Three picture faults looked into without the game (2026-11-27)
+
+From the code, the forks' histories, the frame listings of runs x2 and c1 and counts over a
+work folder's programs (26,503 disassembled, 12,101 of them pixel programs). Nothing here
+has run in the title yet: each line says what would show it.
+
+**A light rim around silhouettes in fog.** `LEONIDA_STATIC_SAMPLERS_LINEAR=1` made every
+immediate sampler linear. 21,876 sample instructions in 1,468 program names use a point
+one (gathers apart). The pass that puts the fog on the picture,
+`CS_ApplyCombinedDeferred` (960x540 ray-marched fog and depth onto 2560x1440), fetches the
+four low-resolution texels around a pixel through such a sampler, depth first, and keeps
+those within a quarter of the pixel's depth; `CS_TAA2_Resolve` has ten point taps.
+Filtered, each tap is a mix across the silhouette. The reason for the setting is gone:
+the bands in the colour grading were a pipeline restored from the pipeline library with
+another run's sampler places (trustno1-coder/VIctory-NVIDIA 7fa0e95), and such pipelines
+skip the library since f0606a744. The launcher now names the tonemap's programs alone
+(`PS_Composite`). To check: fog behind a tree or a wire, with the launcher as it is and
+with `-More @{LEONIDA_STATIC_SAMPLERS_LINEAR='1'}`; the sky's gradient for bands with
+`'0'`. Not the cause, though the frame line counts it once a frame ("depth planes ... used
+before the pass"): that use is `CS_Tiling_Generate_Opaque` reading the stencil plane of the
+material-class texture, which is copied at once; the plane's readers (the tiled lighting's
+draws with the test "equal") are in other lists, after the pass that runs when that list closes.
+
+**Square patches in a texture.** The look that finds a texture changed after its upload
+reads 48 KiB of it (`texture::fingerprint`): the smallest levels and two places of the
+largest. Such changes are common (200 and more a run found by those windows; 18 of the
+first 200 of run port15 more than 176 frames after the upload), so some fall between the
+windows and stay. `LEONIDA_HEAP_PRINT_SPREAD=1` (off) adds 256 bytes in each 64 KiB step,
+64 places at most, 3 us more a look at 2 MiB; the log names what only those places find
+("changed where only the spread places of the look read"). To check: a run with it, the
+count of that line, and whether the patches still come. The forks' BC7 rotation fix
+(fxceless 06702fe8) changes nothing here: none of the table's 512 control words and none of
+the 255 dictionary entries has rotation bits outside modes 4 and 5.
+
+**Black squares at a glass door's foot.** 3,023 pixel programs ask for the depth test
+before they run (`DB_SHADER_CONTROL` bit 12); the translator read the word and did not
+use it, so the 705 first programs of the transparent passes store their tile masks and
+nearest depth for pixels the test rejects. `LEONIDA_EARLY_DEPTH=1` (off; after trustno1
+41b4a05) declares the early test. To check: the same view with and without it, and the
+targets of `PS_AlphaVelocityDepthResolve` in a dump (`LEONIDA_DUMP_TARGETS=1`): the scene
+depth at an opaque edge in front of glass. Not ported: trustno1's stand-in for reflections
+after `CS_RayMiss` (2db59d4 and five more), which is where the blue comes from.
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask

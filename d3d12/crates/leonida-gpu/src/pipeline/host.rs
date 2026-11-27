@@ -91,27 +91,100 @@ impl Default for GraphicsState {
     }
 }
 
-/// `LEONIDA_STATIC_SAMPLERS_LINEAR=1` (set by `scripts/play-nvidia.ps1`):
-/// every immediate sampler of the title's shaders filters linearly in
-/// minification, magnification and mips (anisotropic ones and the reduction
-/// and comparison bits stay).
+/// `LEONIDA_STATIC_SAMPLERS_LINEAR`: immediate samplers of the title's shaders
+/// filter linearly in minification, magnification and mips (anisotropic ones
+/// keep their filter; the reduction and comparison bits stay, so a point
+/// comparison becomes a linear one).
+/// - unset, empty or `0`: none; every sampler filters as the title's code says.
+/// - `1`: those of every program (the launcher's setting until 2026-11-27).
+/// - a list (`PS_Composite,6318f669e4f17d65`): those of the programs whose
+///   container holds one of the names, or whose hash is one of the 16 digits
+///   (`scripts/play-nvidia.ps1` sets `PS_Composite`).
 ///
-/// The fix for the posterized picture of the merged renderer: the tonemap
+/// What it was for: the posterized picture of the merged renderer. The tonemap
 /// (`PS_CompositeNMB`) reads 33^3 identity grading tables at a log-encoded
 /// colour; read unfiltered they give 33 levels over 14.4 stops, about five
-/// flat bands per doubling of brightness. Run s1 with it: 28,000-32,000
+/// flat bands per doubling of brightness (run s1 with `1`: 28,000-32,000
 /// colours in a sky region where runs p3, p4 and c1 without it had 700 to
-/// 1,400. Which shader's sampler comes out as a point filter is not found yet
-/// (the tonemap's own 3D lookups decode to a linear one); until it is, all
-/// point filters become linear here.
-fn static_filter(filter: u32) -> u32 {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("LEONIDA_STATIC_SAMPLERS_LINEAR").is_some_and(|v| v == "1"));
-    if on && filter & 0x7f != 0x54 && filter & 0x7f != 0x55 {
+/// 1,400). The tonemap's own 3D lookups decode to linear samplers; what read
+/// them unfiltered was the NVIDIA driver, which restores a pipeline stored in
+/// the pipeline library with the places its static samplers had in the run
+/// that stored it (trustno1-coder/VIctory-NVIDIA 7fa0e95, reproduced there;
+/// Spaghetih/victory-sley-fork 63714f3 found the same: any change of the
+/// composite's root signature, or a new library, took the bands away). Such
+/// pipelines skip the library since ([`super::library::allows_static_samplers`]),
+/// so the setting is kept for the composite's programs alone, as a second
+/// guard.
+///
+/// Why not every program: the title point-samples on purpose. Counted over the
+/// 26,503 programs of a work folder's disassembly (2026-11-27), 21,876 sample
+/// instructions (gathers not counted: a gather takes no filter) in 1,468
+/// program names use a point immediate sampler. Among them the depth-aware
+/// upsamples: `CS_ApplyCombinedDeferred`, which puts the 960x540 ray-marched
+/// fog on the 2560x1440 picture, reads the four low-resolution texels around a
+/// pixel one by one (depth, then two colours), half a step to each side of
+/// the pixel's place, and keeps those whose depth is within a quarter of the
+/// pixel's; `CS_TAA2_Resolve` has ten such taps, and
+/// `PS_FogComposite*`, `PS_BlitTransparent*Bilateral*`,
+/// `PS_GaussianDepthAware*` more. Filtered linearly each of those taps is a
+/// mix of the four texels, the depths across a silhouette as well: the fog of
+/// what lies behind goes on the edge of what stands in front (expected cause
+/// of the light rim around trees, wires and signs in fog; not yet confirmed in
+/// a run).
+#[derive(Debug, PartialEq, Eq)]
+enum LinearScope {
+    None,
+    All,
+    /// Program names (anywhere in the container) and 16-digit shader hashes.
+    Named(Vec<String>),
+}
+
+impl LinearScope {
+    fn parse(set: &str) -> LinearScope {
+        match set.trim() {
+            "" | "0" => LinearScope::None,
+            "1" => LinearScope::All,
+            names => LinearScope::Named(
+                names.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect(),
+            ),
+        }
+    }
+
+    /// Whether the immediate samplers of the program with `hash` and
+    /// `container` are made linear.
+    fn takes(&self, hash: &str, container: &[u8]) -> bool {
+        match self {
+            LinearScope::None => false,
+            LinearScope::All => true,
+            LinearScope::Named(names) => names.iter().any(|name| {
+                name.eq_ignore_ascii_case(hash)
+                    || container.windows(name.len()).any(|w| w == name.as_bytes())
+            }),
+        }
+    }
+}
+
+/// `filter` (a `D3D12_FILTER`) with linear minification, magnification and
+/// mips, unless it is anisotropic.
+fn linear_filter(filter: u32) -> u32 {
+    if filter & 0x7f != 0x54 && filter & 0x7f != 0x55 {
         filter & 0x180 | 0x15
     } else {
         filter
     }
+}
+
+/// The filter of an immediate sampler of `shader` ([`LinearScope`]).
+fn static_filter(shader: &Shader, filter: u32) -> u32 {
+    static SCOPE: std::sync::OnceLock<LinearScope> = std::sync::OnceLock::new();
+    let scope = SCOPE.get_or_init(|| {
+        let scope = LinearScope::parse(&std::env::var("LEONIDA_STATIC_SAMPLERS_LINEAR").unwrap_or_default());
+        if scope != LinearScope::None {
+            tracing::info!(?scope, "LEONIDA_STATIC_SAMPLERS_LINEAR: immediate samplers made linear");
+        }
+        scope
+    });
+    if scope.takes(&shader.hash, &shader.container) { linear_filter(filter) } else { filter }
 }
 
 fn integer_format(f: DXGI_FORMAT) -> bool {
@@ -664,7 +737,7 @@ impl HostPipeline {
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(static_filter(s.filter_for_host(aniso_point_mip_supported)) as i32),
+                    Filter: D3D12_FILTER(static_filter(shader, s.filter_for_host(aniso_point_mip_supported)) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -1192,6 +1265,59 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// `LEONIDA_STATIC_SAMPLERS_LINEAR`: what each value takes, and what a
+    /// program outside it keeps.
+    #[test]
+    fn linear_static_samplers_only_for_the_programs_named() {
+        // Containers as the title's hold their names: bytes around a name
+        // (the byte before it is the name's length, which may be a letter).
+        let composite = b"\x01\x02 PS_CompositeNMB_00000001_Wrapped\0rest";
+        let fog = b"\x01\x02JCS_ApplyCombinedDeferred_00000002_Wrapped\0rest";
+        let fog_composite = b"\x01\x02)PS_FogCompositeTemporal_00000003_Wrapped\0";
+        let hash = "6318f669e4f17d65";
+
+        assert_eq!(LinearScope::parse(""), LinearScope::None);
+        assert_eq!(LinearScope::parse(" 0 "), LinearScope::None);
+        assert_eq!(LinearScope::parse("1"), LinearScope::All);
+        let named = LinearScope::parse(" PS_Composite , ,6318F669E4F17D65");
+        assert_eq!(
+            named,
+            LinearScope::Named(vec!["PS_Composite".to_owned(), "6318F669E4F17D65".to_owned()])
+        );
+
+        for container in [&composite[..], &fog[..], &fog_composite[..]] {
+            assert!(!LinearScope::None.takes(hash, container));
+            assert!(LinearScope::All.takes("0000000000000000", container));
+        }
+        let by_name = LinearScope::parse("PS_Composite");
+        assert!(by_name.takes("0000000000000000", composite));
+        // The fog's programs keep their point taps: neither the apply pass nor
+        // one whose name only ends alike.
+        assert!(!by_name.takes("0000000000000000", fog));
+        assert!(!by_name.takes("0000000000000000", fog_composite));
+        // By hash, whatever the container says, in either case of the digits.
+        assert!(named.takes(hash, fog));
+        assert!(!LinearScope::parse("6318f669e4f17d66").takes(hash, fog));
+        // A name longer than the container is not found (no panic).
+        assert!(!LinearScope::parse("PS_Composite").takes("0", b"PS_"));
+    }
+
+    #[test]
+    fn a_linear_static_sampler_keeps_comparison_reduction_and_anisotropy() {
+        // Point and mixed filters become MIN_MAG_MIP_LINEAR (0x15).
+        for filter in [0x00, 0x01, 0x04, 0x10, 0x14, 0x15] {
+            assert_eq!(linear_filter(filter), 0x15);
+            // Comparison (0x80), minimum (0x100) and maximum (0x180) stay.
+            for reduction in [0x80, 0x100, 0x180] {
+                assert_eq!(linear_filter(filter | reduction), 0x15 | reduction);
+            }
+        }
+        // Anisotropic filters stay as they are, with point mips or linear.
+        for filter in [0x54, 0x55, 0xd4, 0xd5, 0x154, 0x1d5] {
+            assert_eq!(linear_filter(filter), filter);
+        }
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
