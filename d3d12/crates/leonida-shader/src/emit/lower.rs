@@ -150,6 +150,28 @@ fn nan_scrub_holds_infinity() -> bool {
 /// The bits of 65504.0, the largest finite 16-bit float.
 const HALF_MAX: u32 = 0x477F_E000;
 
+/// Whether the float colours a pixel program writes are held to what every HDR format of the
+/// console can hold, [-65024, 65024] (on; `LEONIDA_HDR_CLAMP=0`: written as they are, as
+/// before). See `Lower::clamp_hdr`. Part of the shader cache key, as every switch read here.
+fn hdr_clamp() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HDR_CLAMP.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_HDR_CLAMP").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`hdr_clamp`], for its thread only.
+    pub(super) static TEST_HDR_CLAMP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The largest value [`hdr_clamp`] lets a colour be: R11G11B10_FLOAT's largest, the smallest
+/// maximum of the console's HDR formats (R9G9B9E5 ends at 65408, a 16-bit float at 65504).
+pub(super) const HDR_MAX: f32 = 65024.0;
+
 /// Whether the size fields a program reads from a descriptor count a view that shows nothing
 /// as one texel and one level, as the console's empty descriptor reads (on;
 /// `LEONIDA_NULL_VIEW_SIZE=0`: the host's zeros less one, as before). See
@@ -13580,6 +13602,30 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, nan, zero, x)
     }
 
+    /// A colour a pixel program writes, held to [-65024, 65024] ([`hdr_clamp`]). The title
+    /// renders light into R9G9B9E5 targets, which clamp at 65408 on the console; the host has
+    /// no such target and gives it a 16-bit float one (`leonida-gpu` `resource.rs`), where a
+    /// value past 65504 is stored as infinity. The title's tonemap makes black of an infinity:
+    /// the black sun, and black glitter on water and bright sky (aki-runtime's finding). A NaN
+    /// becomes the maximum here (an HDR value that overflowed is the brightest thing, not the
+    /// darkest); with `LEONIDA_NAN_SCRUB` it is 0 before it gets here, as that switch says.
+    /// The view's format is not known to the translation, so every float colour output is
+    /// held, a 32-bit float target's too.
+    ///
+    /// From aki-gta6/aki-runtime 01f6f31 (Aki-Developer), GPL-3.0.
+    fn clamp_hdr(&mut self, f: V) -> V {
+        if !hdr_clamp() {
+            return f;
+        }
+        let c = self.cur;
+        let min = self.s.m.f32((-HDR_MAX).to_bits());
+        let max = self.s.m.f32(HDR_MAX.to_bits());
+        let lo = self.binary(35, f, min); // FMax
+        let hi = self.binary(36, lo, max); // FMin
+        let nan = self.is_nan_f32(f);
+        self.s.m.select(c, nan, max, hi)
+    }
+
     /// [`Self::scrub_nan`] of the 32 bits an image store writes where no float instruction
     /// made them here (a copy, a join, a select, a load, integer code): they may be an
     /// integer's, as the console converts by the view's format, which is not known here, and
@@ -13832,7 +13878,8 @@ impl<'a> Lower<'a> {
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => {
                     let f = self.as_float(x);
-                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                    let f = if colour { self.scrub_nan(f) } else { f };
+                    (".f32", if colour { self.clamp_hdr(f) } else { f })
                 }
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -13843,6 +13890,8 @@ impl<'a> Lower<'a> {
                     // writes is 0 where it is NaN, so one bad value does not
                     // spread through the title's blur and temporal passes.
                     let f = if colour { self.scrub_nan(f) } else { f };
+                    // And held to the console's HDR range (`LEONIDA_HDR_CLAMP`).
+                    let f = if colour { self.clamp_hdr(f) } else { f };
                     (".f32", f)
                 }
                 _ => (".i32", x),
