@@ -1,13 +1,13 @@
 //! Leonida's pages, grouped as classic single-player trainers group them,
 //! and the backend behind them: the runtime's own settings for what the
-//! runtime can do itself (display, screenshots, recording, frame-rate cap,
-//! the title's clock rate), [`GameActions`] for what needs the title's
-//! scripts.
+//! runtime can do itself (DLSS's sharpness, the numbers panel, screenshots,
+//! recording, the frame-rate cap, the title's clock rate), [`GameActions`]
+//! for what needs the title's scripts.
 
 use std::sync::atomic::Ordering;
 
 use crate::actions::GameActions;
-use crate::knobs;
+use crate::knobs::{self, Cap};
 use crate::model::{Backend, Id, Item, Kind, Page, Value};
 
 const MAIN: usize = 0;
@@ -24,8 +24,8 @@ const SETTINGS: usize = 10;
 const DISPLAY: usize = 11;
 const MENU: usize = 12;
 
-/// Frame-rate caps offered.
-const CAPS: [&str; 7] = ["Off", "30", "40", "60", "90", "120", "144"];
+/// Frame-rate caps offered: the title's own pace, frames a second, none.
+const CAPS: [&str; 8] = ["Game", "30", "40", "60", "90", "120", "144", "None"];
 const WEATHERS: [&str; 9] = [
     "Extra sunny",
     "Clear",
@@ -354,12 +354,12 @@ pub fn pages() -> Vec<Page> {
             toggle(
                 "misc.record",
                 "Frame recording",
-                "Saves every presented frame into LEONIDA_CAPTURE while on.",
+                "Saves every presented frame into LEONIDA_CAPTURE while on (as a file named rec there does).",
             ),
             Item::new(
                 "misc.fps_cap",
                 "Frame-rate cap",
-                "Presents at most this many frames a second.",
+                "Frames a second at most (LEONIDA_FPS_CAP; the F1 menu's FRAME RATE CAP is the same setting). Game: the title's own pace. None: as fast as it renders.",
                 Kind::Choice(&CAPS),
             ),
             toggle("misc.hide_hud", "Hide HUD", "No HUD or radar."),
@@ -389,7 +389,7 @@ pub fn pages() -> Vec<Page> {
             Item::new(
                 "display.sharpen",
                 "Sharpen strength",
-                "How much the game plane is sharpened before the interface goes over it (LEONIDA_SHARPEN; 0 is off).",
+                "DLSS's sharpening of the game's picture, 0 to 1 (LEONIDA_DLSS_SHARPNESS; the F1 menu's DLSS SHARPNESS is the same setting).",
                 Kind::Number {
                     min: 0.0,
                     max: 1.0,
@@ -429,6 +429,9 @@ const NO_PANEL: &str =
 const NO_RECORD: &str =
     "Not available: frame recording needs a diagnostics build and LEONIDA_CAPTURE set to a folder.";
 const NO_CLOCK: &str = "Not available: the title's clock is not the runtime's in this run (LEONIDA_MENU=0, or no title loaded).";
+const NO_SHARPNESS: &str = "Not available: the title's upscale is not DLSS in this run (LEONIDA_UPSCALE=dlss and a build with the dlss feature).";
+const NO_CAP: &str = "Not available: nothing is presented by this runtime yet.";
+const NO_SHOT: &str = "Not in this build: screenshots are read back by the diagnostics builds' frame capture (--features diagnostics).";
 
 /// The backend: runtime settings, else the game's scripts.
 pub struct Leonida {
@@ -446,18 +449,42 @@ impl Leonida {
     }
 }
 
-fn fps_cap_index() -> usize {
-    let cap = knobs::FPS_CAP.load(Ordering::Relaxed).to_string();
-    CAPS.iter().position(|c| *c == cap).unwrap_or(0)
+/// The cap of `CAPS[index]`.
+fn cap_of(index: usize) -> Cap {
+    match CAPS.get(index) {
+        Some(&"None") => Cap::Unlimited,
+        Some(c) => c.parse().map_or(Cap::Title, Cap::Fps),
+        None => Cap::Title,
+    }
+}
+
+/// Where `cap` is among `CAPS`; a rate that is not offered (set with
+/// `LEONIDA_FPS_CAP` or in the F1 menu) shows as the nearest that is.
+fn cap_index(cap: Cap) -> usize {
+    match cap {
+        Cap::Title => 0,
+        Cap::Unlimited => CAPS.len() - 1,
+        Cap::Fps(n) => CAPS
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| Some((i, c.parse::<u32>().ok()?)))
+            .min_by_key(|(_, c)| c.abs_diff(n))
+            .map_or(0, |(i, _)| i),
+    }
 }
 
 impl Backend for Leonida {
     fn value(&self, id: Id) -> Value {
         match id {
-            "display.sharpen" => Value::Number(f64::from(knobs::sharpen())),
-            "display.panel" => Value::Bool(knobs::PANEL.get()),
-            "misc.record" => Value::Bool(knobs::RECORD.get()),
-            "misc.fps_cap" => Value::Index(fps_cap_index()),
+            "display.sharpen" => {
+                // Rounded to the item's two decimals: the owner keeps it as
+                // a text read as an f32.
+                let v = f64::from(knobs::SHARPNESS.get().unwrap_or(0.0));
+                Value::Number((v.clamp(0.0, 1.0) * 100.0).round() / 100.0)
+            }
+            "display.panel" => Value::Bool(knobs::PANEL.get().unwrap_or(false)),
+            "misc.record" => Value::Bool(knobs::RECORD.get().unwrap_or(false)),
+            "misc.fps_cap" => Value::Index(cap_index(knobs::FPS_CAP.get().unwrap_or(Cap::Title))),
             "menu.scale" => Value::Number(f64::from(knobs::MENU_SCALE.get())),
             "world.speed" => Value::Number(knobs::clock::rate()),
             "world.slow_motion" => Value::Bool((knobs::clock::rate() - 1.0 / 3.0).abs() < 1e-6),
@@ -470,10 +497,12 @@ impl Backend for Leonida {
 
     fn set(&mut self, id: Id, value: Value) -> Result<Option<String>, String> {
         match (id, value) {
-            ("display.sharpen", Value::Number(v)) => knobs::set_sharpen(v as f32),
-            ("display.panel", Value::Bool(on)) => knobs::PANEL.set(on),
+            ("display.sharpen", Value::Number(v)) => {
+                knobs::SHARPNESS.set((v as f32).clamp(0.0, 1.0))?
+            }
+            ("display.panel", Value::Bool(on)) => knobs::PANEL.set(on)?,
             ("misc.record", Value::Bool(on)) => {
-                knobs::RECORD.set(on);
+                knobs::RECORD.set(on)?;
                 return Ok(Some(
                     if on {
                         "Recording every frame."
@@ -483,12 +512,7 @@ impl Backend for Leonida {
                     .into(),
                 ));
             }
-            ("misc.fps_cap", Value::Index(i)) => {
-                knobs::FPS_CAP.store(
-                    CAPS.get(i).and_then(|c| c.parse().ok()).unwrap_or(0),
-                    Ordering::Relaxed,
-                );
-            }
+            ("misc.fps_cap", Value::Index(i)) => knobs::FPS_CAP.set(cap_of(i))?,
             ("menu.scale", Value::Number(v)) => knobs::MENU_SCALE.set(v as f32),
             ("world.speed", Value::Number(v)) => {
                 knobs::clock::set_rate(v, knobs::clock::host_now())
@@ -523,11 +547,14 @@ impl Backend for Leonida {
     fn available(&self, id: Id) -> Result<(), String> {
         match id {
             id if id.starts_with("go.") => Ok(()),
-            "display.sharpen" | "misc.fps_cap" | "menu.scale" | "misc.screenshot"
-            | "settings.about" => Ok(()),
+            "menu.scale" | "settings.about" => Ok(()),
+            "display.sharpen" if !knobs::SHARPNESS.there() => Err(NO_SHARPNESS.into()),
+            "misc.fps_cap" if !knobs::FPS_CAP.there() => Err(NO_CAP.into()),
+            "misc.screenshot" if !knobs::screenshots_there() => Err(NO_SHOT.into()),
             "display.panel" if !knobs::PANEL.there() => Err(NO_PANEL.into()),
             "misc.record" if !knobs::RECORD.there() => Err(NO_RECORD.into()),
-            "display.panel" | "misc.record" => Ok(()),
+            "display.sharpen" | "misc.fps_cap" | "misc.screenshot" | "display.panel"
+            | "misc.record" => Ok(()),
             "world.speed" | "world.slow_motion"
                 if !knobs::clock::HOOKED.load(Ordering::Relaxed) =>
             {
@@ -609,9 +636,37 @@ mod tests {
         assert!(m.view(&b).footer.starts_with("Not available yet"));
     }
 
+    /// Stand-ins for the renderer's settings: the owned settings are
+    /// provided once a process, so every test that needs them asks here.
+    mod owner {
+        use super::*;
+        use std::sync::Mutex;
+
+        pub static SHARPNESS: knobs::F32 = knobs::F32::new(0.0);
+        pub static CAP: Mutex<Cap> = Mutex::new(Cap::Title);
+
+        pub fn provide() {
+            knobs::SHARPNESS.provide(
+                || SHARPNESS.get(),
+                |v| {
+                    SHARPNESS.set(v);
+                    Ok(())
+                },
+            );
+            knobs::FPS_CAP.provide(
+                || *CAP.lock().unwrap_or_else(|e| e.into_inner()),
+                |cap| {
+                    *CAP.lock().unwrap_or_else(|e| e.into_inner()) = cap;
+                    Ok(())
+                },
+            );
+        }
+    }
+
     #[test]
     fn runtime_settings_change_for_real() {
         let _one = knobs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        owner::provide();
         let mut b = Leonida::new(Box::new(NotYet));
         let mut m = Menu::new(pages(), 11);
         m.handle(Input::Toggle, &mut b);
@@ -621,26 +676,67 @@ mod tests {
         }
         m.handle(Input::Select, &mut b);
         m.handle(Input::Select, &mut b);
-        knobs::set_sharpen(0.4);
+        owner::SHARPNESS.set(0.4);
         m.handle(Input::Right, &mut b);
-        assert!((knobs::sharpen() - 0.45).abs() < 1e-6);
+        assert!((owner::SHARPNESS.get() - 0.45).abs() < 1e-6);
         m.handle(Input::Left, &mut b);
         m.handle(Input::Left, &mut b);
-        assert!((knobs::sharpen() - 0.35).abs() < 1e-6);
+        assert!((owner::SHARPNESS.get() - 0.35).abs() < 1e-6);
         assert_eq!(m.view(&b).rows[0].right, Right::Value("0.35".into()));
         // The panel is not there in a test: dimmed.
         assert!(!m.view(&b).rows[1].enabled);
     }
 
     #[test]
-    fn the_frame_rate_cap_is_a_choice() {
+    fn the_frame_rate_cap_is_the_renderers() {
         let _one = knobs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        owner::provide();
+        let cap = || *owner::CAP.lock().unwrap_or_else(|e| e.into_inner());
         let mut b = Leonida::new(Box::new(NotYet));
+        assert!(b.available("misc.fps_cap").is_ok());
         b.set("misc.fps_cap", Value::Index(3)).unwrap();
-        assert_eq!(knobs::FPS_CAP.load(Ordering::Relaxed), 60);
+        assert_eq!(cap(), Cap::Fps(60));
         assert_eq!(b.value("misc.fps_cap"), Value::Index(3));
+        b.set("misc.fps_cap", Value::Index(CAPS.len() - 1)).unwrap();
+        assert_eq!(cap(), Cap::Unlimited);
+        assert_eq!(b.value("misc.fps_cap"), Value::Index(CAPS.len() - 1));
         b.set("misc.fps_cap", Value::Index(0)).unwrap();
-        assert_eq!(knobs::FPS_CAP.load(Ordering::Relaxed), 0);
+        assert_eq!(cap(), Cap::Title);
+        // A rate set elsewhere that is not offered shows as the nearest.
+        *owner::CAP.lock().unwrap_or_else(|e| e.into_inner()) = Cap::Fps(80);
+        assert_eq!(b.value("misc.fps_cap"), Value::Index(4));
+        *owner::CAP.lock().unwrap_or_else(|e| e.into_inner()) = Cap::Title;
+    }
+
+    #[test]
+    fn caps_map_both_ways() {
+        for (i, name) in CAPS.iter().enumerate() {
+            assert_eq!(cap_index(cap_of(i)), i, "{name}");
+        }
+        assert_eq!(cap_of(0), Cap::Title);
+        assert_eq!(cap_of(1), Cap::Fps(30));
+        assert_eq!(cap_of(7), Cap::Unlimited);
+        assert_eq!(cap_index(Cap::Fps(1000)), 6);
+    }
+
+    #[test]
+    fn what_no_one_provides_says_why() {
+        let _one = knobs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Nothing provides the panel, the recorder or screenshots in a test.
+        let mut b = Leonida::new(Box::new(NotYet));
+        for id in ["display.panel", "misc.record", "misc.screenshot"] {
+            assert!(b.available(id).is_err(), "{id}");
+        }
+        let mut m = Menu::new(pages(), 11);
+        m.handle(Input::Toggle, &mut b);
+        for _ in 0..7 {
+            m.handle(Input::Down, &mut b);
+        }
+        m.handle(Input::Select, &mut b); // Misc
+        assert_eq!(m.view(&b).caption, "MISC");
+        m.handle(Input::Select, &mut b); // Save screenshot
+        assert!(m.view(&b).footer_warns);
+        assert_eq!(knobs::work() & knobs::SHOT, 0, "nothing was asked for");
     }
 
     #[test]

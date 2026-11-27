@@ -1,7 +1,10 @@
-//! Run-time settings the menu changes and the rest of the runtime reads:
-//! plain atomics, so a reader pays a load. The GPU side reads the sharpen
-//! strength, the frame-rate cap, the panel switch, the frame recorder and
-//! asked-for screenshots; the HLE side reads the title's clock rate.
+//! Run-time settings the menu changes and the rest of the runtime reads.
+//! What the menu keeps itself is a plain atomic (the menu's size, the
+//! title's clock rate). What something else owns already (the renderer's
+//! frame-rate cap, DLSS's sharpness, the numbers panel, the frame recorder)
+//! is an [`Owned`] setting: its owner says how it is read and set, and both
+//! menus (this one and the renderer's F1 settings) then show and change the
+//! same thing. What a present has to do for the menu is one word ([`work`]).
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -23,44 +26,65 @@ impl F32 {
     }
 }
 
-/// An on/off switch something else owns: it says it is there
-/// ([`Switch::provide`]) and reads it every frame; until then the menu
-/// shows it as unavailable.
-pub struct Switch {
-    there: AtomicBool,
-    on: AtomicBool,
+/// What a present has to do for the menu, as bits ([`DRAW`], [`SHOT`]).
+static WORK: AtomicU32 = AtomicU32::new(0);
+/// [`work`]: the menu is open and to be drawn.
+pub const DRAW: u32 = 1;
+/// [`work`]: a screenshot is asked for.
+pub const SHOT: u32 = 2;
+
+/// What a present has to do for the menu: 0 while it is closed and no
+/// screenshot is asked for, so that such a present pays this one load.
+pub fn work() -> u32 {
+    WORK.load(Ordering::Relaxed)
 }
 
-impl Switch {
-    pub const fn new() -> Switch {
-        Switch {
-            there: AtomicBool::new(false),
-            on: AtomicBool::new(false),
+pub(crate) fn set_work(bit: u32, on: bool) {
+    if on {
+        WORK.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        WORK.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// How an [`Owned`] setting is read and set; a setter says why it could not.
+type Access<T> = (fn() -> T, fn(T) -> Result<(), String>);
+
+/// A setting something else owns: the owner says how it is read and set
+/// ([`Owned::provide`]); until then the menu shows it as unavailable. The
+/// functions are called on the menu's thread.
+pub struct Owned<T: 'static> {
+    access: OnceLock<Access<T>>,
+}
+
+impl<T> Owned<T> {
+    pub const fn new() -> Owned<T> {
+        Owned {
+            access: OnceLock::new(),
         }
     }
-    /// The owner is there, and starts `on` (once; later calls change nothing).
-    pub fn provide(&self, on: bool) {
-        if !self.there() && !self.there.swap(true, Ordering::AcqRel) {
-            self.on.store(on, Ordering::Relaxed);
-        }
+    /// The owner is there (once; later calls change nothing).
+    pub fn provide(&self, get: fn() -> T, set: fn(T) -> Result<(), String>) {
+        let _ = self.access.set((get, set));
     }
     pub fn there(&self) -> bool {
-        self.there.load(Ordering::Acquire)
+        self.access.get().is_some()
     }
-    pub fn get(&self) -> bool {
-        self.on.load(Ordering::Relaxed)
+    /// The value now; `None` without an owner.
+    pub fn get(&self) -> Option<T> {
+        self.access.get().map(|(get, _)| get())
     }
-    pub fn set(&self, on: bool) {
-        self.on.store(on, Ordering::Relaxed);
-    }
-    pub fn flip(&self) {
-        self.on.fetch_xor(true, Ordering::Relaxed);
+    pub fn set(&self, value: T) -> Result<(), String> {
+        match self.access.get() {
+            Some((_, set)) => set(value),
+            None => Err("Not available in this run.".into()),
+        }
     }
 }
 
-impl Default for Switch {
+impl<T> Default for Owned<T> {
     fn default() -> Self {
-        Switch::new()
+        Owned::new()
     }
 }
 
@@ -68,60 +92,69 @@ impl Default for Switch {
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// The frame-rate cap (`LEONIDA_FPS_CAP`, the renderer's frame clock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    /// The title's own pace (the variable unset).
+    Title,
+    /// None (`0`).
+    Unlimited,
+    /// This many frames a second at most.
+    Fps(u32),
+}
+
 /// The FPS and memory panel (diagnostics builds; F3 flips it too).
-pub static PANEL: Switch = Switch::new();
+pub static PANEL: Owned<bool> = Owned::new();
 /// The frame recorder (diagnostics builds with `LEONIDA_CAPTURE`): every
 /// presented frame saved while on.
-pub static RECORD: Switch = Switch::new();
+pub static RECORD: Owned<bool> = Owned::new();
+/// The frame-rate cap: the renderer's own, which its F1 menu changes too.
+pub static FPS_CAP: Owned<Cap> = Owned::new();
+/// DLSS's sharpness, 0 to 1 (`LEONIDA_DLSS_SHARPNESS`): there when the
+/// title's upscale is DLSS.
+pub static SHARPNESS: Owned<f32> = Owned::new();
 
-/// How much the game plane is sharpened, 0 to 1: `LEONIDA_SHARPEN` at the
-/// start (0.4 if unset), then what the menu sets.
-pub fn sharpen() -> f32 {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let v = std::env::var("LEONIDA_SHARPEN")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite())
-            .map_or(0.4, |v| v.clamp(0.0, 1.0));
-        SHARPEN.set(v);
-    });
-    SHARPEN.get()
+/// Whether something else has the keyboard now (the renderer's F1 settings
+/// menu while it is shown): the menu then reads the pads only.
+static KEYBOARD_ELSEWHERE: OnceLock<fn() -> bool> = OnceLock::new();
+
+pub fn provide_keyboard_elsewhere(taken: fn() -> bool) {
+    let _ = KEYBOARD_ELSEWHERE.set(taken);
 }
 
-static SHARPEN: F32 = F32::new(0.4);
-
-pub fn set_sharpen(v: f32) {
-    sharpen();
-    SHARPEN.set(v.clamp(0.0, 1.0));
+pub fn keyboard_elsewhere() -> bool {
+    KEYBOARD_ELSEWHERE.get().is_some_and(|taken| taken())
 }
-
-/// Frames a second at most (0: no cap): presents wait for their turn.
-pub static FPS_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// The menu's size against its 1080-line layout.
 pub static MENU_SCALE: F32 = F32::new(1.0);
 
 /// A screenshot of the next frame, to be saved at this path.
 static SCREENSHOT: Mutex<Option<PathBuf>> = Mutex::new(None);
-static SCREENSHOT_ASKED: AtomicBool = AtomicBool::new(false);
+/// Whether presents take the screenshots asked for (the renderer says so).
+static SCREENSHOTS_THERE: AtomicBool = AtomicBool::new(false);
 
-pub fn ask_screenshot(path: PathBuf) {
-    *SCREENSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
-    SCREENSHOT_ASKED.store(true, Ordering::Release);
+/// Presents take the screenshots asked for from here on.
+pub fn provide_screenshots() {
+    SCREENSHOTS_THERE.store(true, Ordering::Release);
 }
 
-/// Whether one is asked for: a load (the present asks every frame).
-pub fn screenshot_asked() -> bool {
-    SCREENSHOT_ASKED.load(Ordering::Acquire)
+pub fn screenshots_there() -> bool {
+    SCREENSHOTS_THERE.load(Ordering::Acquire)
+}
+
+/// Asks for a screenshot of the next frame ([`work`] says [`SHOT`] until a
+/// present takes it).
+pub fn ask_screenshot(path: PathBuf) {
+    *SCREENSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    set_work(SHOT, true);
 }
 
 /// The path of the screenshot asked for, taken.
 pub fn take_screenshot() -> Option<PathBuf> {
-    if !SCREENSHOT_ASKED.swap(false, Ordering::AcqRel) {
-        return None;
-    }
-    SCREENSHOT.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let mut asked = SCREENSHOT.lock().unwrap_or_else(|e| e.into_inner());
+    set_work(SHOT, false);
+    asked.take()
 }
 
 /// The folder screenshots go to: `LEONIDA_SCREENSHOTS`, else `screenshots`
@@ -257,22 +290,49 @@ mod tests {
     }
 
     #[test]
-    fn switches_start_unavailable_and_keep_their_first_state() {
-        let s = Switch::new();
-        assert!(!s.there());
-        s.provide(true);
-        s.provide(false);
-        assert!(s.there() && s.get());
-        s.flip();
-        assert!(!s.get());
+    fn owned_settings_are_unavailable_until_provided_and_keep_their_first_owner() {
+        static VALUE: AtomicU32 = AtomicU32::new(7);
+        let s: Owned<u32> = Owned::new();
+        assert!(!s.there() && s.get().is_none() && s.set(1).is_err());
+        s.provide(
+            || VALUE.load(Ordering::Relaxed),
+            |v| {
+                if v > 100 {
+                    return Err("too much".into());
+                }
+                VALUE.store(v, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        s.provide(|| 0, |_| Ok(()));
+        assert!(s.there());
+        assert_eq!(s.get(), Some(7));
+        assert_eq!(s.set(9), Ok(()));
+        assert_eq!(s.get(), Some(9));
+        assert_eq!(s.set(101), Err("too much".into()));
     }
 
     #[test]
-    fn sharpen_is_clamped() {
+    fn a_screenshot_asked_for_is_work_until_taken() {
         let _one = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_sharpen(3.0);
-        assert_eq!(sharpen(), 1.0);
-        set_sharpen(0.25);
-        assert_eq!(sharpen(), 0.25);
+        assert_eq!(work() & SHOT, 0);
+        assert!(take_screenshot().is_none());
+        ask_screenshot(PathBuf::from("a.png"));
+        assert_eq!(work() & SHOT, SHOT);
+        assert_eq!(take_screenshot(), Some(PathBuf::from("a.png")));
+        assert_eq!(work() & SHOT, 0);
+        assert!(take_screenshot().is_none());
+    }
+
+    #[test]
+    fn work_bits_are_set_and_cleared_apart() {
+        let _one = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_work(DRAW, true);
+        ask_screenshot(PathBuf::from("b.png"));
+        assert_eq!(work(), DRAW | SHOT);
+        set_work(DRAW, false);
+        assert_eq!(work(), SHOT);
+        take_screenshot();
+        assert_eq!(work(), 0);
     }
 }

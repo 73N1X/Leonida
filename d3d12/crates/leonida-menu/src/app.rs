@@ -1,9 +1,12 @@
 //! The running menu: a thread of its own reads the keys and the pads,
-//! moves the menu and paints it when it changes; the present takes the
-//! newest picture ([`frame`]). Closed, the present pays one atomic load
-//! and the thread looks at F4 and the pads sixty times a second.
+//! moves the menu and paints it when it changes; a present asks what there
+//! is to do ([`knobs::work`], one atomic load, all a present pays while the
+//! menu is closed) and takes the newest picture when it is open
+//! ([`frame`]). Closed, the thread looks at F4 and the pads sixty times a
+//! second. `LEONIDA_MENU_OPEN=1` starts it open, for a test with no
+//! keyboard.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,7 +27,13 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_MENU").is_none_or(|v| v != "0"))
 }
 
-static OPEN: AtomicBool = AtomicBool::new(false);
+/// Whether the menu starts open on its first page: `LEONIDA_MENU_OPEN=1`
+/// (a test that cannot press F4 sees it, and what it keeps from the title,
+/// from the first present).
+fn opens_at_start(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 /// Keys (bits of `input::KEYS`) and pad buttons (XInput's) kept from the title.
 static WITHHELD_KEYS: AtomicU16 = AtomicU16::new(0);
 static WITHHELD_PAD: AtomicU16 = AtomicU16::new(0);
@@ -36,7 +45,7 @@ static PAINTED: Mutex<(u64, Option<Arc<Layers>>)> = Mutex::new((0, None));
 
 /// Whether the menu is open.
 pub fn is_open() -> bool {
-    OPEN.load(Ordering::Relaxed)
+    knobs::work() & knobs::DRAW != 0
 }
 
 /// Whether the title must not see virtual key `vk` now.
@@ -57,16 +66,19 @@ pub struct Frame {
     pub layers: Arc<Layers>,
 }
 
-/// Called by every present with its picture's height: the menu's picture
-/// while it is open. Starts the menu's thread on the first call.
-pub fn frame(height: u32) -> Option<Frame> {
-    if !enabled() {
-        return None;
-    }
-    start();
+/// The height of the picture presented: the menu is painted for it. Told
+/// when the presenter is made or its size changes, and by [`frame`].
+pub fn set_height(height: u32) {
     if HEIGHT.load(Ordering::Relaxed) != height {
         HEIGHT.store(height, Ordering::Relaxed);
     }
+}
+
+/// The menu's picture while it is open, for a present of a picture
+/// `height` lines high. A present asks [`knobs::work`] first and comes here
+/// only when that says [`knobs::DRAW`].
+pub fn frame(height: u32) -> Option<Frame> {
+    set_height(height);
     if !is_open() {
         return None;
     }
@@ -84,6 +96,7 @@ pub fn scale_for(height: u32) -> f32 {
 }
 
 /// Starts the menu's thread (once; nothing when disabled or off Windows).
+/// The presenter calls it when it is made.
 pub fn start() {
     static STARTED: Once = Once::new();
     if !enabled() {
@@ -169,13 +182,18 @@ pub fn preview(inputs: &[Input], scale: f32) -> Layers {
 #[cfg(windows)]
 fn run() {
     let mut app = App::new(system_fonts());
+    if opens_at_start(std::env::var_os("LEONIDA_MENU_OPEN").as_deref()) {
+        app.handle(Input::Toggle);
+    }
     let mut keys = Keys::default();
     let mut withheld = Withheld::default();
     let mut pads = crate::poll::Pads::default();
     let mut version = 0u64;
     loop {
         let now = Instant::now();
-        let focused = crate::poll::focused();
+        // The keyboard is read with one of our windows in front, and not
+        // while something else of ours has it (the F1 settings menu).
+        let focused = crate::poll::focused() && !knobs::keyboard_elsewhere();
         let pad = pads.buttons();
         let held = if focused {
             Held::of_keys(crate::poll::held_keys())
@@ -188,7 +206,11 @@ fn run() {
             changed |= app.handle(input);
         }
         let open = app.menu.is_open();
-        OPEN.store(open, Ordering::Relaxed);
+        // Closed: presents stop drawing at once. Opened: once its picture
+        // is painted (below), so no present shows the one from last time.
+        if !open && is_open() {
+            knobs::set_work(knobs::DRAW, false);
+        }
         let mask = withheld.update(open, |vk| focused && crate::poll::down(vk));
         WITHHELD_KEYS.store(mask, Ordering::Relaxed);
         WITHHELD_PAD.store(
@@ -216,6 +238,9 @@ fn run() {
                     app.painted_at = Some(Instant::now());
                 }
             }
+            if !is_open() {
+                knobs::set_work(knobs::DRAW, true);
+            }
         }
         std::thread::sleep(Duration::from_millis(if open { 8 } else { 16 }));
     }
@@ -235,6 +260,20 @@ mod tests {
         let l = app.repaint(1.0).unwrap();
         assert_eq!((l.highlight, l.rows), (1, 9));
         assert!(app.repaint(1.5).is_some(), "a new scale paints again");
+    }
+
+    #[test]
+    fn only_one_asks_for_the_menu_open_at_start() {
+        use std::ffi::OsStr;
+        assert!(opens_at_start(Some(OsStr::new("1"))));
+        assert!(!opens_at_start(Some(OsStr::new("0"))));
+        assert!(!opens_at_start(Some(OsStr::new(""))));
+        assert!(!opens_at_start(None));
+        // What the thread does then: the first page, open, painted.
+        let mut app = App::new(Box::new(crate::font::Dots));
+        app.handle(Input::Toggle);
+        assert!(app.menu.is_open() && app.menu.depth() == 0);
+        assert_eq!(app.repaint(1.0).map(|l| l.page), Some(0));
     }
 
     #[test]
