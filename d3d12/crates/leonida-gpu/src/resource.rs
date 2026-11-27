@@ -1223,6 +1223,9 @@ struct Hosted {
     no_room: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
+    /// How many times its host copy was made again after it was let go
+    /// ([`favour_reused`]).
+    remade: std::sync::atomic::AtomicU32,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
     /// The lowest level a view asked for since it had no host copy
@@ -1712,6 +1715,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
+            r.host.remade.fetch_add(1, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
@@ -2185,7 +2189,8 @@ pub(crate) fn let_go_idle() {
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                let remade = if favour_reused() { r.host.remade.load(Relaxed) } else { 0 };
+                by_age.push((idle_rank(used, remade), at));
             }
         }
         by_age.sort_unstable();
@@ -2264,6 +2269,36 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Whether textures whose host copy was made again after the sweep let it
+/// go are let go later than others as long idle ([`let_go_idle`], where the
+/// card's room sets a limit; `LEONIDA_TEXTURE_FAVOR_REUSED=1`; off by default;
+/// `LEONIDA_AB` can name it). Which idle textures go changes, not what is
+/// drawn: one that goes and is asked for again is made and sent up again.
+///
+/// After felicienradio/cold-project-vi 6b1a183 (edupode, GPL-3.0-or-later;
+/// `VICTORY_TEXTURE_FAVOR_REUSED`, on there). Measured there, on a 12 GB RTX
+/// 5070 Ti laptop: of a long play, 34 % of the copies let go came back
+/// (40,796 of 121,015; 14 GB sent up again, and textures in the distance
+/// blinking). What the order saves was not measured, so it is off here.
+#[cfg(windows)]
+fn favour_reused() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_TEXTURE_FAVOR_REUSED") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_TEXTURE_FAVOR_REUSED"))
+}
+
+/// Where a texture last used at `used` (`crate::host::moment`) stands among
+/// those the sweep lets go, the lowest first: its tenths of a second, and for
+/// each time its host copy was made again after it was let go (`remade`, 8
+/// counted at most) 20 seconds later.
+#[cfg(windows)]
+fn idle_rank(used: u64, remade: u32) -> u64 {
+    (used & 0xffff_ffff) + u64::from(remade.min(8)) * 200
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2861,6 +2896,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             no_room: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
+            remade: std::sync::atomic::AtomicU32::new(0),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
@@ -3480,6 +3516,28 @@ pub(crate) fn test_buffer(width: u64) -> This {
     );
     assert_eq!(hr, S_OK);
     out
+}
+
+#[cfg(all(test, windows))]
+mod idle_rank_tests {
+    use super::idle_rank;
+
+    /// A texture made again after it was let go stands behind one idle as
+    /// long that was not, 20 seconds for each time and 160 at most; the
+    /// frame in the moment does not count.
+    #[test]
+    fn textures_made_again_are_let_go_later() {
+        let moment = |frame: u64, tenths: u64| frame << 32 | tenths;
+        assert_eq!(idle_rank(moment(7, 1000), 0), 1000);
+        assert_eq!(idle_rank(moment(900, 1000), 0), 1000);
+        assert_eq!(idle_rank(moment(7, 1000), 1), 1200);
+        assert_eq!(idle_rank(moment(7, 1000), 8), 2600);
+        assert_eq!(idle_rank(moment(7, 1000), 500), 2600);
+        // Used 15 s earlier and made again once: still let go after the other.
+        assert!(idle_rank(moment(7, 850), 1) > idle_rank(moment(7, 1000), 0));
+        // Used 25 s earlier: before it.
+        assert!(idle_rank(moment(7, 750), 1) < idle_rank(moment(7, 1000), 0));
+    }
 }
 
 #[cfg(test)]

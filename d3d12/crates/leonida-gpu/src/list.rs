@@ -785,6 +785,16 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     }
 }
 
+/// Whether a wait for every earlier shader write that the title asks for is
+/// recorded into its host list (`crate::draw::State::wait_for_writes`; always,
+/// unless `LEONIDA_BARRIER_MERGE=1`).
+#[cfg(windows)]
+fn wait_for_writes(this: This) -> bool {
+    let mut needed = true;
+    with_state(this, |list, state| needed = state.wait_for_writes(list));
+    needed
+}
+
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
 const UAV_BARRIER: Barrier = Barrier {
@@ -811,10 +821,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .filter_map(|b| host_barrier(list, b))
             .collect();
         // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
+        // a barrier on one waits for every shader write before it (unless
+        // the list has nothing to wait for: `State::wait_for_writes`).
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        }) && wait_for_writes(this)
+        {
             host.push(UAV_BARRIER);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
@@ -1741,6 +1753,9 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // (Not where the list has nothing to wait for:
+            // `State::wait_for_writes`.)
+            let needed = wait_for_writes(this);
             #[cfg(feature = "diagnostics")]
             {
                 // The shapes of the title's calls, each once.
@@ -1759,10 +1774,12 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-            // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            if needed {
+                // SAFETY: the same layout; no resource named.
+                let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2332,10 +2349,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // (Not where the list has nothing to wait for:
+        // `State::wait_for_writes`.)
+        if wait_for_writes(this) {
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, count);

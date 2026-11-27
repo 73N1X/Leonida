@@ -1875,9 +1875,68 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many helper threads work for [`wide`] and [`wide_each`] on a PC of
+/// `cores` logical processors: `fixed` if given (1 to 32), else half of them
+/// with `half` (2 to 12), else a quarter (2 to 6, as before).
+fn helpers_for(cores: usize, fixed: Option<usize>, half: bool) -> usize {
+    match fixed {
+        Some(n) => n.clamp(1, 32),
+        None if half => (cores / 2).clamp(2, 12),
+        None => (cores / 4).clamp(2, 6),
+    }
+}
+
+/// The PC's logical processors, asked once.
+fn logical_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(16, std::num::NonZero::get))
+}
+
+/// `LEONIDA_WIDE_THREADS=<n>`: that many helper threads, whatever the PC has.
+fn wide_fixed() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("LEONIDA_WIDE_THREADS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// Whether half of the logical processors help with work spread over
+/// threads, not a quarter of them (`LEONIDA_WIDE_HALF=1`; off by default;
+/// `LEONIDA_AB` can name it: the threads are all kept then, and half of them
+/// are left asleep while it is off).
+///
+/// The refreshes of a submission's host copies are most of what the
+/// submitting thread does (14 to 28 ms of a frame here), and a quarter of 12
+/// logical processors is 3 helpers.
+///
+/// After felicienradio/cold-project-vi 9069257 and dd9dffd (edupode,
+/// GPL-3.0-or-later): `VICTORY_WIDE_THREADS`, and a launcher option that sets
+/// it to half the logical processors (2 to 12). There: 9.4 of ~27 ms a frame
+/// of the submitting thread in 7,435 refreshes on 6 helpers of a 24-thread
+/// Core Ultra 9 275HX, and "+1 FPS on the author's PC" (22-26 fps, Series S
+/// profile at 720p, RTX 5070 Ti laptop) with 12. Off here: that PC had the
+/// processor as its limit and twice the threads; on 12, beside the title's
+/// own, more helpers may only take turns. The bytes copied are the same.
+fn wide_half() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_WIDE_HALF") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_WIDE_HALF"))
+}
+
+/// How many threads are kept for [`wide`]: as many as [`wide_threads`] may
+/// come to say in this run.
+fn wide_kept() -> usize {
+    #[cfg(feature = "diagnostics")]
+    let changes = crate::ab::bit("LEONIDA_WIDE_HALF").is_some();
+    #[cfg(not(feature = "diagnostics"))]
+    let changes = false;
+    helpers_for(logical_cores(), wide_fixed(), changes || crate::switch::on("LEONIDA_WIDE_HALF"))
+}
+
+/// How many of the threads kept for [`wide`] work now.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    helpers_for(logical_cores(), wide_fixed(), wide_half())
 }
 
 fn workers() -> &'static Workers {
@@ -1886,7 +1945,7 @@ fn workers() -> &'static Workers {
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
-        thread_count: wide_threads(),
+        thread_count: wide_kept(),
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
@@ -1950,7 +2009,8 @@ fn wide(jobs: Vec<Job>) {
     }
     // The calling thread also drains the queue. Wake helpers only for the
     // jobs it can share; a busy helper checks for more work before sleeping.
-    let helpers = job_count - 1;
+    // (No more of them than work now: `wide_half`.)
+    let helpers = (job_count - 1).min(wide_threads());
     if helpers >= workers.thread_count {
         workers.more.notify_all();
     } else {
@@ -2194,9 +2254,28 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, helpers_for, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A quarter of the logical processors help, or half of them, or as
+    /// many as were asked for.
+    #[test]
+    fn helpers_are_a_quarter_or_half_of_the_processors_or_as_asked() {
+        assert_eq!(helpers_for(12, None, false), 3);
+        assert_eq!(helpers_for(12, None, true), 6);
+        assert_eq!(helpers_for(24, None, false), 6);
+        assert_eq!(helpers_for(24, None, true), 12);
+        assert_eq!(helpers_for(64, None, false), 6);
+        assert_eq!(helpers_for(64, None, true), 12);
+        assert_eq!(helpers_for(4, None, false), 2);
+        assert_eq!(helpers_for(2, None, true), 2);
+        for half in [false, true] {
+            assert_eq!(helpers_for(12, Some(10), half), 10);
+            assert_eq!(helpers_for(12, Some(0), half), 1);
+            assert_eq!(helpers_for(12, Some(99), half), 32);
+        }
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
