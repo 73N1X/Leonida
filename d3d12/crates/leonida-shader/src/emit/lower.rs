@@ -964,9 +964,20 @@ fn meeting_mode() -> u32 {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused, unless the region only raises a
+/// flag ([`super::lds_flags`]), which needs no order inside it.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+    lds_meetings_or_why(p, st, all).ok()
+}
+
+/// [`lds_meetings`], or for each region it cannot order: its blocks and why it is not a flag
+/// region.
+fn lds_meetings_or_why(
+    p: &crate::ir::Program,
+    st: &Structured,
+    all: &[bool],
+) -> Result<Vec<(bool, bool)>, Vec<(Vec<usize>, Why)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -1012,8 +1023,25 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) && !LDS_LOOSE.get() {
-        return None;
+    // A region that reads and writes LDS is still taken when it only raises a flag: a read
+    // that misses the other host wave's write changes nothing the region leaves behind.
+    let mut refused = Vec::new();
+    for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
+        if LDS_LOOSE.get() {
+            continue;
+        }
+        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        let flag = if super::lds_flags::on() {
+            super::lds_flags::flag_region(p, st, &blocks)
+        } else {
+            Err("flag regions are off")
+        };
+        if let Err(why) = flag {
+            refused.push((blocks, why));
+        }
+    }
+    if !refused.is_empty() {
+        return Err(refused);
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -1027,7 +1055,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    Some(meet)
+    Ok(meet)
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
@@ -1589,12 +1617,21 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
+                        match all_lane_blocks(x.st).map(|all| lds_meetings_or_why(p, x.st, &all)) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
-                                why.push("an LDS read and write in one lane-branch region")
+                            Some(Err(regions)) => {
+                                why.push("an LDS read and write in one lane-branch region");
+                                // (and what keeps each from being a flag region)
+                                for (blocks, what) in regions {
+                                    eprintln!(
+                                        "WAVE64-LDS-REGION B{} ({} blocks): {what} [{}]",
+                                        blocks.first().copied().unwrap_or(0),
+                                        blocks.len(),
+                                        super::lds_flags::describe(p, &blocks),
+                                    );
+                                }
                             }
-                            Some(_) => {}
+                            Some(Ok(_)) => {}
                         }
                     }
                     why.sort_unstable();
