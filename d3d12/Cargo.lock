@@ -277,6 +277,7 @@ dependencies = [
  "leonida-hle",
  "leonida-loader",
  "leonida-lua",
+ "leonida-menu",
  "leonida-pe",
  "leonida-shader",
  "memchr",

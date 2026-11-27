@@ -75,6 +75,8 @@ pub fn run(
     // Where the Lua mods' memory scan looks (`LEONIDA_LUA=0`: nothing reads it).
     leonida_lua::set_image(image.base(), image.info().size_of_image as usize);
     leonida_hle::runtime::set_image_path(image.base(), exe);
+    // The Teleport page and `leonida.teleport` (player.rs).
+    crate::player::install(image.base(), image.info().size_of_image as usize);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -238,6 +240,8 @@ fn diagnostics(image: &leonida_loader::LoadedImage, cfg: &leonida_core::Config) 
     watch(image.base(), image.info().size_of_image as usize);
     // `LEONIDA_NATIVE_SCAN=<seconds>`: looks for the script engine's handler tables (docs/mod-menu.md).
     crate::native_scan::start(image.base(), image.info());
+    // `LEONIDA_FIND_PLAYER=<start s>,<seconds>`: finds the player's position in memory (player_find.rs).
+    crate::player_find::start(image.base(), image.info());
     poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `LEONIDA_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.

@@ -10,6 +10,10 @@ mod leonida;
 mod native_scan;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
+#[cfg(windows)]
+mod player;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod player_find;
 mod run;
 mod shader;
 mod translate;
