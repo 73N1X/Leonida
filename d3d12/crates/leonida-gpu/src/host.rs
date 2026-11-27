@@ -1961,10 +1961,15 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping, and its address on the card. A buffer has one address for as
+/// long as it lives, so it is asked once, when the chunk is made: a list
+/// asked the buffer each time it took scratch memory (every constant buffer
+/// of a table made afresh, every root constant buffer copied), and took a
+/// reference to the buffer for the asking.
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2203,9 +2208,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     Some(Chunk {
         buffer,
         data: data as usize,
+        gpu,
     })
 }
 
@@ -7729,31 +7737,39 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+        let (base, at, data, _) = self.scratch_piece(len, false)?;
+        Some((base + at, data))
     }
 
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
     /// slot to hold: the slot outlives the list's use of it.
     pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
+        let (base, at, data, buffer) = self.scratch_piece(len, true)?;
+        Some((buffer?, base + at, data))
     }
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (_, at, data, buffer) = self.scratch_piece(len, true)?;
+        Some((buffer?, at, data))
+    }
+
+    /// A piece of the list's scratch memory: its buffer's address on the
+    /// card ([`Chunk`]: not asked of the buffer each time), the offset in
+    /// the buffer, the CPU pointer and, with `held`, the buffer.
+    fn scratch_piece(&self, len: u64, held: bool) -> Option<(u64, u64, *mut u8, Option<ID3D12Resource>)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
-            self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            // SAFETY: a live buffer.
+            let base = unsafe { buffer.GetGPUVirtualAddress() };
+            let kept = held.then(|| buffer.clone());
+            self.deferred().hold_upload(buffer, len);
+            return Some((base, 0, data, kept));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -7770,10 +7786,11 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
         let at = s.used;
+        let chunk = &s.chunks[s.current].0;
+        let found = (chunk.gpu, at, (chunk.data + at as usize) as *mut u8, held.then(|| chunk.buffer.clone()));
         s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some(found)
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -8343,6 +8360,40 @@ impl std::hash::Hasher for AddressHash {
     }
     fn write_u32(&mut self, n: u32) {
         self.write_usize(n as usize);
+    }
+}
+
+#[cfg(test)]
+mod scratch_address_tests {
+    use super::*;
+
+    /// A list's scratch memory is where its buffer is: the address kept
+    /// with a chunk is the buffer's own, pieces follow each other in whole
+    /// 256 bytes on the card as in the mapping, and a piece bigger than a
+    /// chunk has a buffer to itself.
+    #[test]
+    fn a_lists_scratch_memory_is_at_its_buffers_address() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; scratch addresses not tested");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (first, first_data) = list.scratch(100).unwrap();
+        let (buffer, held, held_data) = list.scratch_held(300).unwrap();
+        // SAFETY: a live buffer.
+        let base = unsafe { buffer.GetGPUVirtualAddress() };
+        assert_eq!(first, base);
+        assert_eq!(held, base + 256);
+        assert_eq!(held_data as usize, first_data as usize + 256);
+        let (third, third_data) = list.scratch(1).unwrap();
+        assert_eq!(third, base + 256 + 512);
+        assert_eq!(third_data as usize, first_data as usize + 256 + 512);
+        let (big, big_at, _) = list.scratch_held(SCRATCH_CHUNK + 1).unwrap();
+        // SAFETY: a live buffer.
+        assert_eq!(big_at, unsafe { big.GetGPUVirtualAddress() });
+        assert_ne!(big_at, base);
+        list.close();
+        list.reset();
     }
 }
 
