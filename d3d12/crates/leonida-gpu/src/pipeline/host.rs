@@ -602,6 +602,7 @@ impl HostPipeline {
                         slot == leonida_shader::emit::SLOT_FAULTS
                     } else {
                         slot == leonida_shader::emit::SLOT_STRIDES
+                            || slot == leonida_shader::emit::SLOT_TABLE_STRIDES
                             || slot == leonida_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {

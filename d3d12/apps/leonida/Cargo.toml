@@ -12,6 +12,7 @@ leonida-core.workspace = true
 leonida-pe.workspace = true
 leonida-loader.workspace = true
 leonida-hle.workspace = true
+leonida-gpu.workspace = true
 leonida-shader = { workspace = true, features = ["host"] }
 leonida-game.workspace = true
 anyhow.workspace = true
@@ -21,6 +22,8 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+# NVIDIA DLSS for the title's upscale (LEONIDA_UPSCALE=dlss); needs LEONIDA_DLSS_SDK.
+dlss = ["leonida-gpu/dlss"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

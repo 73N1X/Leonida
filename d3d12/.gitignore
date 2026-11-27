@@ -77,3 +77,8 @@
 Thumbs.db
 .DS_Store
 /target-next
+
+# NVIDIA's own files (scripts/get-nvidia-sdks.ps1 fetches them from NVIDIA; never part of this repository)
+/nvidia-sdk/
+# What the F1 menu saved
+/leonida-settings.txt

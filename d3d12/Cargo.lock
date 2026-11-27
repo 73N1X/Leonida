@@ -251,6 +251,7 @@ dependencies = [
  "clap",
  "leonida-core",
  "leonida-game",
+ "leonida-gpu",
  "leonida-hle",
  "leonida-loader",
  "leonida-pe",
