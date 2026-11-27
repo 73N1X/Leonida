@@ -216,6 +216,48 @@ fn asynchronous() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_TEXBACK_ASYNC").is_none_or(|v| v != "0"))
 }
 
+/// Whether read-backs go the light way (`LEONIDA_TEXBACK_LIGHT=0`: as
+/// before): a read-back is tiled outside the tickets' lock, which is taken
+/// for the write into title memory alone, into memory its thread keeps; and
+/// of a list's read-backs of one texture only the last has its texels taken
+/// out of its buffer ([`land_many`]).
+///
+/// The tickets' lock is what everyone waits for who lets a texture go,
+/// replaces one or maps other memory where one lies ([`released`],
+/// [`replaced`], [`remapped`]: the title's own threads) and who records a
+/// read-back ([`Target::new`]); it was held while a texture was read out of
+/// title memory and tiled, some hundred kilobytes each. A ticket made
+/// invalid meanwhile is found so under the lock, before anything is
+/// written, as before; mappings do not change while the texture is read
+/// ([`crate::watch::title_memory_reading`]).
+///
+/// (After XaviFortes/VIctory-RDNA e4250eb. That commit also tiles a
+/// flight's read-backs on several threads; here they have left the landing
+/// thread already, [`asynchronous`].)
+fn light() -> bool {
+    crate::toggled!("LEONIDA_TEXBACK_LIGHT")
+}
+
+/// Of read-backs with these ranges, in order: those that are landed, the
+/// last of each range ([`light`]). A read-back holds every subresource of
+/// its texture, so a later one of the same texture leaves nothing of an
+/// earlier one.
+fn last_of_each(ranges: &[(usize, usize)]) -> Vec<usize> {
+    (0..ranges.len()).filter(|&i| !ranges[i + 1..].contains(&ranges[i])).collect()
+}
+
+/// [`land`] for a list's read-backs, in order.
+pub(crate) fn land_many(backs: &[Back]) {
+    if backs.len() < 2 || !light() {
+        backs.iter().for_each(land);
+        return;
+    }
+    let ranges: Vec<(usize, usize)> = backs.iter().map(Back::range).collect();
+    for i in last_of_each(&ranges) {
+        land(&backs[i]);
+    }
+}
+
 /// A read-back's texels taken out of its buffer, to be tiled into title memory.
 struct Landing {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -278,9 +320,16 @@ fn stale() {
 fn write(landing: &Landing) {
     use crate::land::{count, spent, stat};
     static COPIED: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        /// The texture as it is tiled, kept from one to the next ([`light`]).
+        static TILED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    /// Memory kept for the next up to this size.
+    const KEPT: usize = 32 << 20;
     let asked = std::time::Instant::now();
+    let light = light();
     let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let _ticket_guard = (!light).then(|| TICKETS.lock().unwrap_or_else(|e| e.into_inner()));
     let working = spent(stat::TB_WAIT, asked);
     if !landing.ticket.valid.load(Ordering::Acquire) {
         stale();
@@ -288,24 +337,59 @@ fn write(landing: &Landing) {
     }
     let (at, end) = (landing.ticket.at, landing.ticket.end);
     let size = end - at;
-    let mut tiled = vec![0u8; size];
-    // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
-        return;
-    }
-    for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
-        let (mip, slice) = (i as u32 % landing.mips, i as u32 / landing.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let from = footprint.Offset as usize;
-        let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
-        if let Err(e) = landing.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+    // The texture as it will be, in `tiled` (`size` bytes); whether it is.
+    let tile = |tiled: &mut [u8]| {
+        // Keep title bytes the subresources do not cover.
+        if !crate::host::read_into(at as *const u8, tiled) {
+            return false;
+        }
+        for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
+            let (mip, slice) = (i as u32 % landing.mips, i as u32 / landing.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let from = footprint.Offset as usize;
+            let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
+            if let Err(e) = landing.layout.tile(tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+                return false;
+            }
+        }
+        true
+    };
+    if light {
+        let written = TILED.with_borrow_mut(|kept| {
+            if kept.len() < size {
+                kept.resize(size, 0);
+            }
+            let written = tile(&mut kept[..size]) && {
+                // The lock for the write alone: who lets the allocation go
+                // or maps other memory there waits for a copy, not for the
+                // tiling, and what it made invalid meanwhile is not written.
+                let _tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+                let valid = landing.ticket.valid.load(Ordering::Acquire);
+                if valid {
+                    crate::host::copy_mapped(at as *mut u8, kept.as_ptr(), size, true);
+                } else {
+                    stale();
+                }
+                valid
+            };
+            if kept.capacity() > KEPT {
+                *kept = Vec::new();
+            }
+            written
+        });
+        if !written {
             return;
         }
+    } else {
+        let mut tiled = vec![0u8; size];
+        if !tile(&mut tiled) {
+            return;
+        }
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     }
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     spent(stat::TB_WORK, working);
     count(stat::TB_WRITTEN, 1);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -382,5 +466,80 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    /// Of a list's read-backs of one texture the last is landed, the others
+    /// each in their place.
+    #[test]
+    fn the_last_readback_of_each_texture_is_landed() {
+        let (a, b, c) = ((0x1000, 0x2000), (0x2000, 0x3000), (0x1000, 0x1800));
+        assert_eq!(last_of_each(&[]), [0usize; 0]);
+        assert_eq!(last_of_each(&[a]), [0]);
+        assert_eq!(last_of_each(&[a, b, a, c, b, b]), [2, 3, 5]);
+        assert_eq!(last_of_each(&[a, c, b]), [0, 1, 2]);
+    }
+
+    /// A read-back's texels are tiled into the title's allocation, the bytes
+    /// no subresource covers staying; one whose allocation went meanwhile is
+    /// not written.
+    #[test]
+    fn a_readback_is_written_unless_its_allocation_went() {
+        use leonida_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        const OWNER: usize = 0x7e57_bac0;
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 16,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        // The title's texture, and some bytes behind it in the allocation.
+        let size = layout.size as usize + 64;
+        let mut title = vec![0xEEu8; size];
+        let at = title.as_mut_ptr() as usize;
+        // Rows of 256 bytes at a pitch of 320 in the read-back buffer.
+        let (pitch, rows) = (320usize, 16u32);
+        let texels = |seed: usize| -> Vec<u8> { (0..pitch * rows as usize).map(|i| (i * 7 + seed) as u8).collect() };
+        let landing = |seed: usize| Landing {
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Width: 64, Height: 16, Depth: 1, RowPitch: pitch as u32, ..Default::default() },
+            }],
+            rows: vec![rows],
+            mips: 1,
+            layout: layout.clone(),
+            ticket: track(OWNER, at, at + size),
+            data: texels(seed),
+        };
+        let expected = |seed: usize, before: &[u8]| {
+            let mut tiled = before.to_vec();
+            layout.tile(&mut tiled, 0, 0, &texels(seed), pitch, pitch * rows as usize).unwrap();
+            tiled
+        };
+        // (Written behind the vector's back: read the same way.)
+        // SAFETY: the vector's bytes, which live to the end of the test.
+        let now = || unsafe { std::slice::from_raw_parts(at as *const u8, size) }.to_vec();
+        let before = now();
+        let first = expected(1, &before);
+        assert_ne!(first, before);
+        assert_eq!(first[layout.size as usize..], [0xEE; 64], "the bytes behind the texture are no subresource's");
+        write(&landing(1));
+        assert_eq!(now(), first);
+        // Again, into the memory the thread kept; then one whose texture was
+        // let go before it is written.
+        let second = expected(2, &first);
+        assert_ne!(second, first);
+        write(&landing(2));
+        assert_eq!(now(), second);
+        let late = landing(3);
+        released(OWNER);
+        write(&late);
+        assert_eq!(now(), second, "a read-back was written into an allocation that went");
+        drop(title);
     }
 }

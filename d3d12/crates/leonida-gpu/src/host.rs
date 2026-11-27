@@ -3969,9 +3969,10 @@ fn read_backs(list: &HostList) {
     let started = std::time::Instant::now();
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
-        count(stat::RB_TEXTURE_COUNT, 1);
+    {
+        let deferred = list.deferred();
+        crate::texback::land_many(&deferred.texture_backs);
+        count(stat::RB_TEXTURE_COUNT, deferred.texture_backs.len() as u64);
     }
     let textures_done = spent(stat::RB_TEXTURES, started);
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
