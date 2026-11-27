@@ -2820,6 +2820,17 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
+    /// Two planes are composed into 10 bits only while Streamline presents,
+    /// the switch is on and the swap chain took the format.
+    #[test]
+    fn two_planes_are_composed_into_10_bits_under_streamline_only() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM};
+        assert_eq!(super::planes_format(true, true, false), DXGI_FORMAT_R10G10B10A2_UNORM);
+        assert_eq!(super::planes_format(false, true, false), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(super::planes_format(true, false, false), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(super::planes_format(true, true, true), DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+
     /// A removed device's fence value is not a value reached.
     #[test]
     fn a_removed_devices_fence_value_is_not_reached() {
@@ -9944,6 +9955,31 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// The format two presented planes are composed into: 8 bits a channel, or
+/// 10 while Streamline presents (`streamline`) unless `ten` is off. DLSS
+/// frame generation makes its frames from the swap chain's picture, and
+/// from an 8-bit one they came out in bands (sky, skin: aki-runtime's runs
+/// of 2026-11-27, gone with 10 bits). `refused`: the swap chain did not take
+/// the 10-bit format, and 8 bits are composed as before.
+///
+/// From aki-gta6/aki-runtime 2f43f8b and bdcb503 (Aki-Developer), GPL-3.0.
+/// A single plane is not converted as there: it is copied in the title's
+/// own format, 10 bits or more where the title has them.
+fn planes_format(streamline: bool, ten: bool, refused: bool) -> DXGI_FORMAT {
+    if streamline && ten && !refused { DXGI_FORMAT_R10G10B10A2_UNORM } else { DXGI_FORMAT_R8G8B8A8_UNORM }
+}
+
+/// Whether two planes are composed into 10 bits under Streamline
+/// ([`planes_format`]). On by default; `LEONIDA_PRESENT_10BIT=0`: 8 bits, as
+/// before.
+fn present_tenbit() -> bool {
+    static TEN: OnceLock<bool> = OnceLock::new();
+    *TEN.get_or_init(|| std::env::var_os("LEONIDA_PRESENT_10BIT").is_none_or(|v| v != "0"))
+}
+
+/// The swap chain refused the 10-bit format once ([`planes_format`]).
+static TEN_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -10349,7 +10385,7 @@ impl Host {
             ))
         });
         let format = if planes.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
+            planes_format(crate::fg::active(), present_tenbit(), TEN_REFUSED.load(Ordering::Relaxed))
         } else {
             let Some(format) = swap_format(desc.Format) else {
                 tracing::warn!(format = desc.Format.0, "cannot present this format");
@@ -10415,6 +10451,15 @@ impl Host {
                         "the swap chain's buffers were made again for another size or format"
                     );
                     self.log_video_memory("right after the swap chain's buffers were made again");
+                }
+                Err(e) if planes.is_some()
+                    && format == DXGI_FORMAT_R10G10B10A2_UNORM
+                    && !TEN_REFUSED.swap(true, Ordering::Relaxed) =>
+                {
+                    // Once: the planes are composed into 8 bits from now on.
+                    tracing::warn!(error = %e, "the swap chain does not take 10 bits a channel: the two planes are composed into 8, as before");
+                    drop(presenter);
+                    return self.present_planes(texture, state_u32, overlay, frame);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
