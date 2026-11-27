@@ -90,6 +90,11 @@ pub enum Layout {
     T34,
     /// Four rows of three floats, packed: three axes and the position.
     R43,
+    /// Three f32 (x, y, z) at the start of a 16-byte vector whose fourth float is
+    /// not a position (a flag word, 0 or 1): no axes.
+    V4,
+    /// Three f64 (x, y, z): no axes.
+    D3,
 }
 
 impl Layout {
@@ -98,13 +103,21 @@ impl Layout {
             Layout::R4 => "R4",
             Layout::T34 => "T34",
             Layout::R43 => "R43",
+            Layout::V4 => "V4",
+            Layout::D3 => "D3",
         }
+    }
+    /// Whether the layout has axes (a transform) and not just a position.
+    pub fn has_axes(self) -> bool {
+        !matches!(self, Layout::V4 | Layout::D3)
     }
     pub fn parse(s: &str) -> Option<Layout> {
         Some(match s {
             "R4" => Layout::R4,
             "T34" => Layout::T34,
             "R43" => Layout::R43,
+            "V4" => Layout::V4,
+            "D3" => Layout::D3,
             _ => return None,
         })
     }
@@ -112,6 +125,8 @@ impl Layout {
     pub fn size(self) -> usize {
         match self {
             Layout::R4 => 64,
+            Layout::V4 => 16,
+            Layout::D3 => 24,
             _ => 48,
         }
     }
@@ -128,6 +143,9 @@ impl Layout {
             Layout::R4 => [12, 13, 14],
             Layout::T34 => [3, 7, 11],
             Layout::R43 => [9, 10, 11],
+            Layout::V4 => [0, 1, 2],
+            // Doubles: see `decode` and `write_pos`.
+            Layout::D3 => [0, 2, 4],
         }
     }
 }
@@ -145,6 +163,16 @@ fn float(b: &[u8], i: usize) -> f32 {
 
 /// Decodes `b` (at least `layout.size()` bytes).
 pub fn decode(b: &[u8], layout: Layout) -> Mat {
+    if !layout.has_axes() {
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let pos = if layout == Layout::D3 {
+            let d = |i: usize| f64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()) as f32;
+            [d(0), d(1), d(2)]
+        } else {
+            [float(b, 0), float(b, 1), float(b, 2)]
+        };
+        return Mat { axes: identity, pos };
+    }
     let mut axes = [[0.0; 3]; 3];
     for (r, axis) in axes.iter_mut().enumerate() {
         for (c, v) in axis.iter_mut().enumerate() {
@@ -179,6 +207,13 @@ pub fn read_mat(address: usize, layout: Layout) -> Option<Mat> {
 }
 
 fn write_pos(address: usize, layout: Layout, p: [f32; 3]) -> bool {
+    if layout == Layout::D3 {
+        let mut b = [0u8; 24];
+        for (i, v) in p.iter().enumerate() {
+            b[i * 8..i * 8 + 8].copy_from_slice(&f64::from(*v).to_le_bytes());
+        }
+        return mem::write(address, &b);
+    }
     let at = layout.pos_at();
     if at[1] == at[0] + 1 && at[2] == at[0] + 2 {
         let mut b = [0u8; 12];
@@ -389,8 +424,11 @@ fn position() -> Result<[f32; 3], String> {
 }
 
 fn heading() -> Option<[f32; 2]> {
-    let (_, _, m) = primary().ok()?;
-    let (axis, sign) = known()?.forward.unwrap_or((1, 1.0));
+    // The forward axis was measured on the first group that has axes.
+    let k = known()?;
+    let (address, layout, _) = resolved(&k).into_iter().find(|g| g.1.has_axes())?;
+    let m = read_mat(address, layout)?;
+    let (axis, sign) = k.forward.unwrap_or((1, 1.0));
     let v = m.axes[axis];
     let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
     (len > 1.0e-3).then(|| [sign * v[0] / len, sign * v[1] / len])

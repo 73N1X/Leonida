@@ -148,6 +148,9 @@ fall through ground that is not loaded yet. The menu items work only when a posi
 1. **Find it once** (diagnostics build): `LEONIDA_FIND_PLAYER=<start s>,<seconds>` (`player_find.rs`) lists every
    candidate transform at `<start>`, samples their positions every 250 ms while the test script's keys
    (`LEONIDA_KEYS_FILE`) are held, and ranks the ones that stay put when no key is held and move with W/S/D and Shift.
+   `LEONIDA_FIND_PLAYER` alone means `90,240`. Besides transforms (strict forms only, so props with an
+   identity-like matrix drop out) it tracks position vectors (a float4 whose w is a flag word, or three
+   doubles) in the map's bounds, scans on several threads, and drops candidates that never move while keys are held.
    Then it searches for pointers to the best ones from the title's image (up to `LEONIDA_PLAYER_LEVELS` = 3 levels).
    Everything is written under `%TEMP%\leonida-player\`: `summary.txt`, `candidates.txt`, `tracks.csv`,
    `comovers.txt`, `best.txt`, `pointers.txt` and `paths.txt`. The run that found them can teleport at once.

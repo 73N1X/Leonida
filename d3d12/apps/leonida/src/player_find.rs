@@ -23,9 +23,19 @@
 //!    that start in a writable section of the title's image are written to
 //!    `paths.txt`, which `player.rs` follows in later runs.
 //!
+//! `LEONIDA_FIND_PLAYER` alone is `90,240`; one number is the start. Besides the
+//! transforms it also tracks position vectors: 16-byte aligned float4s whose xyz lie in
+//! the map and whose w is not a float in range (`V4`, `LEONIDA_PLAYER_VEC_W=flag|plain|any|off`)
+//! and triples of doubles in the map (`D3`, `LEONIDA_PLAYER_F64=0` to skip). The scan runs
+//! on `LEONIDA_PLAYER_THREADS` threads (default 8 at most). `LEONIDA_PLAYER_FILTER=loose` turns the
+//! strict filters off (strict: a 4x4's w column exactly 0 and corner 1, a position that is not a
+//! whole number of metres on every axis, axes that are not exactly the world's); `summary.txt`
+//! counts what survives each. A candidate that never moves once movement keys have been held
+//! for `LEONIDA_PLAYER_PRUNE_STABLE` (6) samples, or that jumps more than 25 m/s, is dropped.
+//!
 //! Tuning, all optional: `LEONIDA_PLAYER_ALIGN` (4; 16 is faster),
-//! `LEONIDA_PLAYER_MAX_CANDIDATES` (4000000), `LEONIDA_PLAYER_MAX_TRACKS`
-//! (300000), `LEONIDA_PLAYER_TOP` (100), `LEONIDA_PLAYER_GROUPS` (6),
+//! `LEONIDA_PLAYER_MAX_CANDIDATES` (6000000), `LEONIDA_PLAYER_MAX_TRACKS`
+//! (2000000), `LEONIDA_PLAYER_TOP` (100), `LEONIDA_PLAYER_GROUPS` (6),
 //! `LEONIDA_PLAYER_POINTERS=0` (no pointer search).
 //!
 //! Output goes under `%TEMP%\leonida-player\` (addresses of the title: never
@@ -39,6 +49,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::player::{self, Group, Known, Layout, Mat, mem};
@@ -108,6 +119,24 @@ struct Config {
     groups: usize,
     levels: usize,
     pointers: bool,
+    /// Drop the forms and values static props have (see `admit`).
+    strict: bool,
+    vec_w: VecW,
+    f64s: bool,
+    threads: usize,
+    /// Stable held-key samples after which a candidate that never moved is dropped.
+    prune_after: u32,
+}
+
+/// Which fourth floats a position vector (`V4`) may have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VecW {
+    Off,
+    /// Not an ordinary float: a flag word (a denormal, NaN, infinity or above 2^31).
+    Flag,
+    /// 0.0 or 1.0.
+    Plain,
+    Any,
 }
 
 /// Starts the finder thread when `LEONIDA_FIND_PLAYER` is set.
@@ -115,10 +144,12 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
     let Ok(spec) = std::env::var("LEONIDA_FIND_PLAYER") else {
         return;
     };
+    // Defaults for one run: the scan starts at 90 s and sampling lasts 240 s.
     let numbers: Vec<f64> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-    let [delay, seconds] = numbers[..] else {
-        eprintln!("Leonida: LEONIDA_FIND_PLAYER={spec}: expected <start s>,<seconds>, e.g. 120,90");
-        return;
+    let (delay, seconds) = match numbers[..] {
+        [] => (90.0, 240.0),
+        [delay] => (delay, 240.0),
+        [delay, seconds, ..] => (delay, seconds),
     };
     let num = |name: &str, default: usize| {
         std::env::var(name)
@@ -144,8 +175,8 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
         seconds,
         align: if num("LEONIDA_PLAYER_ALIGN", 4) >= 16 { 16 } else { 4 },
         interval: Duration::from_millis(num("LEONIDA_PLAYER_INTERVAL_MS", 250).max(20) as u64),
-        max_candidates: num("LEONIDA_PLAYER_MAX_CANDIDATES", 4_000_000),
-        max_tracks: num("LEONIDA_PLAYER_MAX_TRACKS", 300_000),
+        max_candidates: num("LEONIDA_PLAYER_MAX_CANDIDATES", 6_000_000),
+        max_tracks: num("LEONIDA_PLAYER_MAX_TRACKS", 2_000_000),
         idle_tol: std::env::var("LEONIDA_PLAYER_IDLE_TOL")
             .ok()
             .and_then(|v| v.trim().parse().ok())
@@ -155,6 +186,20 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
         groups: num("LEONIDA_PLAYER_GROUPS", 6).clamp(1, 16),
         levels: num("LEONIDA_PLAYER_LEVELS", 3).clamp(1, 4),
         pointers: std::env::var("LEONIDA_PLAYER_POINTERS").map_or(true, |v| v != "0"),
+        strict: std::env::var("LEONIDA_PLAYER_FILTER").map_or(true, |v| v != "loose"),
+        vec_w: match std::env::var("LEONIDA_PLAYER_VEC_W").as_deref() {
+            Ok("off") => VecW::Off,
+            Ok("plain") => VecW::Plain,
+            Ok("any") => VecW::Any,
+            _ => VecW::Flag,
+        },
+        f64s: std::env::var("LEONIDA_PLAYER_F64").map_or(true, |v| v != "0"),
+        threads: num(
+            "LEONIDA_PLAYER_THREADS",
+            std::thread::available_parallelism().map_or(4, |n| n.get()).min(8),
+        )
+        .max(1),
+        prune_after: num("LEONIDA_PLAYER_PRUNE_STABLE", 6) as u32,
     };
     eprintln!(
         "Leonida: find player at {delay} s for {seconds} s (keys file {:?}); output {}",
@@ -182,7 +227,7 @@ struct Region {
 
 /// Committed writable memory (the title's image and private or mapped memory,
 /// not other libraries' images), minus the scan's own buffer.
-fn regions(config: &Config, skip: (usize, usize)) -> Vec<Region> {
+fn regions(config: &Config, skips: &[(usize, usize)]) -> Vec<Region> {
     let mut out = Vec::new();
     let mut at = 0x1_0000usize;
     loop {
@@ -213,17 +258,21 @@ fn regions(config: &Config, skip: (usize, usize)) -> Vec<Region> {
         if mbi.kind == MEM_IMAGE && !in_title {
             continue;
         }
-        let end = start + size;
-        if skip.0 < end && skip.1 > start {
-            if skip.0 > start {
-                out.push(Region { start, size: skip.0 - start });
-            }
-            if skip.1 < end {
-                out.push(Region { start: skip.1, size: end - skip.1 });
-            }
-        } else {
-            out.push(Region { start, size });
+        let mut parts = vec![(start, start + size)];
+        for &(lo, hi) in skips {
+            parts = parts
+                .into_iter()
+                .flat_map(|(a, b)| {
+                    if lo < b && hi > a {
+                        [(a, lo.max(a)), (hi.min(b), b)]
+                    } else {
+                        [(a, b), (0, 0)]
+                    }
+                })
+                .filter(|&(a, b)| b > a)
+                .collect();
         }
+        out.extend(parts.into_iter().map(|(a, b)| Region { start: a, size: b - a }));
     }
     out
 }
@@ -299,9 +348,13 @@ struct Slot {
 /// What happened to a candidate that moved.
 #[derive(Default)]
 struct Track {
-    /// Sample index of `pos[0]`.
+    /// Sample index of `pos[0]`; `pos` stays empty until the candidate has also
+    /// stayed put while no key was held (`quiet`), so that the many things that only
+    /// look like the player do not each hold a path.
     first: usize,
     pos: Vec<[f32; 3]>,
+    /// Idle samples (no key for a second) at which it stayed put.
+    quiet: u8,
     /// Samples with the same movement keys held as the one before.
     steady: u32,
     /// Of those, the ones that moved at a walking to sprinting speed.
@@ -312,10 +365,27 @@ struct Track {
     /// Sum of cosines between the movement and each axis, for W, S, D, A alone.
     cos_sum: [[f32; 3]; 4],
     cos_n: [u32; 4],
+    /// Sum of the horizontal movement directions, for W, S, D, A alone.
+    dir_sum: [[f32; 2]; 4],
 }
 
 fn pos_ok(x: f32, y: f32, z: f32) -> bool {
     x.abs() < 20000.0 && y.abs() < 20000.0 && z > -500.0 && z < 3000.0 && x.abs() + y.abs() + z.abs() > 1.0e-3
+}
+
+/// A position vector inside the world (the map's rectangle and heights with a margin).
+fn world_ok(x: f32, y: f32, z: f32) -> bool {
+    x > -14000.0 && x < 6000.0 && y > -10500.0 && y < 12000.0 && z > -150.0 && z < 1000.0 && x.abs() + y.abs() > 1.0
+}
+
+#[inline]
+fn frac(v: f32) -> bool {
+    (v - v.round()).abs() > 1.0e-3
+}
+
+/// At least two of the three are not a whole number of metres.
+fn fractional(p: [f32; 3]) -> bool {
+    p.iter().filter(|&&v| frac(v)).count() >= 2
 }
 
 #[inline]
@@ -329,47 +399,195 @@ fn dot(f: &[f32], i: usize, j: usize) -> f32 {
     f[i] * f[j] + f[i + 1] * f[j + 1] + f[i + 2] * f[j + 2]
 }
 
-fn scan_candidates(config: &Config, regions: &[Region], buffer: &mut [u8], out: &mut Vec<Slot>) -> (usize, [usize; 3]) {
-    let mut unreadable = 0;
-    let mut by_layout = [0usize; 3];
+/// What the scan counted: each stage of the filters, per layout (R4, T34, R43).
+#[derive(Default, Clone)]
+struct Counts {
+    raw: [usize; 3],
+    form: [usize; 3],
+    not_integer: [usize; 3],
+    kept: [usize; 3],
+    v4_raw: usize,
+    v4_kept: usize,
+    d3_raw: usize,
+    d3_kept: usize,
+    unreadable: usize,
+}
+
+impl Counts {
+    fn add(&mut self, o: &Counts) {
+        for k in 0..3 {
+            self.raw[k] += o.raw[k];
+            self.form[k] += o.form[k];
+            self.not_integer[k] += o.not_integer[k];
+            self.kept[k] += o.kept[k];
+        }
+        self.v4_raw += o.v4_raw;
+        self.v4_kept += o.v4_kept;
+        self.d3_raw += o.d3_raw;
+        self.d3_kept += o.d3_kept;
+        self.unreadable += o.unreadable;
+    }
+}
+
+/// The filters a transform passes to be kept: a strict form (the unused
+/// fourth floats exactly 0 and the corner exactly 1), a position that is not a
+/// whole number of metres on every axis, and axes that are not exactly the
+/// world's (identity-like props).
+fn admit(strict: bool, c: &mut Counts, k: usize, form_ok: bool, axes: [f32; 9], pos: [f32; 3]) -> bool {
+    c.raw[k] += 1;
+    if strict && !form_ok {
+        return false;
+    }
+    c.form[k] += 1;
+    if strict && pos.iter().all(|&v| !frac(v)) {
+        return false;
+    }
+    c.not_integer[k] += 1;
+    if strict && axes.iter().all(|&v| v == 0.0 || v == 1.0 || v == -1.0) {
+        return false;
+    }
+    c.kept[k] += 1;
+    true
+}
+
+fn w_ok(mode: VecW, w: f32) -> bool {
+    let bits = w.to_bits();
+    let exp = (bits >> 23) & 0xFF;
+    match mode {
+        VecW::Off => false,
+        VecW::Any => true,
+        VecW::Plain => w == 0.0 || w == 1.0,
+        VecW::Flag => (exp == 0 && bits & 0x7F_FFFF != 0) || exp == 0xFF || exp >= 0x9E,
+    }
+}
+
+/// Candidates in one block of memory of which `limit` bytes are this block's.
+fn scan_block(config: &Config, address: usize, bytes: &[u8], limit: usize, out: &mut Vec<Slot>, c: &mut Counts, caps: &[AtomicUsize; 3]) {
+    let limits = [config.max_candidates, config.max_candidates, config.max_candidates / 4];
+    // SAFETY: the buffer is page aligned; `bytes` is a prefix of it.
+    let f = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
+    let count = f.len();
     let step = config.align / 4;
-    let max = config.max_candidates;
-    unreadable += for_each_chunk(regions, buffer, OVERLAP, |_, address, bytes, limit| {
-        // SAFETY: the buffer is page aligned; `bytes` is a prefix of it.
-        let f = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
-        let count = f.len();
+    let m0 = out.len();
+    if caps[0].load(Ordering::Relaxed) < limits[0] {
         let mut j = 0;
         while j < limit / 4 {
-            if out.len() >= max {
-                return;
-            }
             let here = address + j * 4;
             // Rows of four floats (R4, T34).
             if j + 12 <= count && unit(f[j], f[j + 1], f[j + 2]) && unit(f[j + 4], f[j + 5], f[j + 6]) && unit(f[j + 8], f[j + 9], f[j + 10]) {
                 let ortho = dot(f, j, j + 4).abs() < 1.0e-3 && dot(f, j, j + 8).abs() < 1.0e-3 && dot(f, j + 4, j + 8).abs() < 1.0e-3;
                 if ortho {
+                    let axes = [f[j], f[j + 1], f[j + 2], f[j + 4], f[j + 5], f[j + 6], f[j + 8], f[j + 9], f[j + 10]];
                     if j + 16 <= count && pos_ok(f[j + 12], f[j + 13], f[j + 14]) {
-                        out.push(slot(here, Layout::R4, f[j + 15]));
-                        by_layout[0] += 1;
+                        let form = f[j + 3] == 0.0 && f[j + 7] == 0.0 && f[j + 11] == 0.0 && f[j + 15] == 1.0;
+                        if admit(config.strict, c, 0, form, axes, [f[j + 12], f[j + 13], f[j + 14]]) {
+                            out.push(slot(here, Layout::R4, f[j + 15]));
+                        }
                     }
                     if pos_ok(f[j + 3], f[j + 7], f[j + 11]) {
-                        out.push(slot(here, Layout::T34, 0.0));
-                        by_layout[1] += 1;
+                        let form = j + 16 <= count && f[j + 12] == 0.0 && f[j + 13] == 0.0 && f[j + 14] == 0.0 && f[j + 15] == 1.0;
+                        if admit(config.strict, c, 1, form, axes, [f[j + 3], f[j + 7], f[j + 11]]) {
+                            out.push(slot(here, Layout::T34, 0.0));
+                        }
                     }
                 }
             }
             // Packed rows of three floats (R43).
             if j + 12 <= count && unit(f[j], f[j + 1], f[j + 2]) && unit(f[j + 3], f[j + 4], f[j + 5]) && unit(f[j + 6], f[j + 7], f[j + 8]) {
                 let ortho = dot(f, j, j + 3).abs() < 1.0e-3 && dot(f, j, j + 6).abs() < 1.0e-3 && dot(f, j + 3, j + 6).abs() < 1.0e-3;
-                if ortho && pos_ok(f[j + 9], f[j + 10], f[j + 11]) {
+                let axes = [f[j], f[j + 1], f[j + 2], f[j + 3], f[j + 4], f[j + 5], f[j + 6], f[j + 7], f[j + 8]];
+                if ortho && pos_ok(f[j + 9], f[j + 10], f[j + 11]) && admit(config.strict, c, 2, true, axes, [f[j + 9], f[j + 10], f[j + 11]]) {
                     out.push(slot(here, Layout::R43, 0.0));
-                    by_layout[2] += 1;
                 }
             }
             j += step;
         }
+    }
+    caps[0].fetch_add(out.len() - m0, Ordering::Relaxed);
+    // Position vectors: 16-byte aligned (x, y, z, w) with w not a position.
+    if config.vec_w != VecW::Off && caps[1].load(Ordering::Relaxed) < limits[1] {
+        let before = out.len();
+        let mut j = 0;
+        while j + 4 <= count && j < limit / 4 {
+            let (x, y, z) = (f[j], f[j + 1], f[j + 2]);
+            if world_ok(x, y, z) && w_ok(config.vec_w, f[j + 3]) {
+                c.v4_raw += 1;
+                if !config.strict || fractional([x, y, z]) {
+                    c.v4_kept += 1;
+                    out.push(slot(address + j * 4, Layout::V4, f[j + 3]));
+                }
+            }
+            j += 4;
+        }
+        caps[1].fetch_add(out.len() - before, Ordering::Relaxed);
+    }
+    // Doubles (x, y, z), 8-byte aligned.
+    if config.f64s && caps[2].load(Ordering::Relaxed) < limits[2] {
+        let before = out.len();
+        // SAFETY: as above; 8-byte aligned.
+        let d = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, bytes.len() / 8) };
+        let mut i = 0;
+        while i + 3 <= d.len() && i < limit / 8 {
+            // Cheap test first: most doubles are far outside the world.
+            if d[i] > -14000.0 && d[i] < 6000.0 && d[i + 1] > -10500.0 && d[i + 1] < 12000.0 {
+                let (x, y, z) = (d[i] as f32, d[i + 1] as f32, d[i + 2] as f32);
+                if world_ok(x, y, z) {
+                    c.d3_raw += 1;
+                    if !config.strict || fractional([x, y, z]) {
+                        c.d3_kept += 1;
+                        out.push(slot(address + i * 8, Layout::D3, 0.0));
+                    }
+                }
+            }
+            i += 1;
+        }
+        caps[2].fetch_add(out.len() - before, Ordering::Relaxed);
+    }
+}
+
+/// Scans every region with `buffers.len()` threads; the candidates, sorted by address.
+fn scan_candidates(config: &Config, regions: &[Region], buffers: &mut [&'static mut [u8]]) -> (Vec<Slot>, Counts) {
+    const SPAN: usize = 2 << 20;
+    let mut tasks: Vec<(usize, usize)> = Vec::new();
+    for r in regions {
+        let mut at = r.start;
+        while at < r.start + r.size {
+            tasks.push((at, r.start + r.size));
+            at += SPAN;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let caps = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+    let results: Vec<(Vec<Slot>, Counts)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = buffers
+            .iter_mut()
+            .map(|buffer| {
+                let (tasks, next, caps) = (&tasks, &next, &caps);
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut c = Counts::default();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(at, end)) = tasks.get(i) else { break };
+                        let limit = SPAN.min(end - at);
+                        let want = (limit + OVERLAP).min(end - at);
+                        c.unreadable += read_robust(at, &mut buffer[..want]);
+                        scan_block(config, at, &buffer[..want], limit, &mut out, &mut c, caps);
+                    }
+                    (out, c)
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
-    (unreadable, by_layout)
+    let mut counts = Counts::default();
+    let mut all: Vec<Slot> = Vec::new();
+    for (out, c) in results {
+        counts.add(&c);
+        all.extend(out);
+    }
+    all.sort_by_key(|s| s.addr);
+    (all, counts)
 }
 
 fn slot(address: usize, layout: Layout, w: f32) -> Slot {
@@ -457,37 +675,57 @@ struct Tick {
     prev_keys: u8,
     idle: bool,
     prev_idle: bool,
+    /// Samples so far, over the whole run, at which the same movement keys were held as before.
+    held_stable: u32,
 }
 
 fn observe(s: &mut Slot, m: &Mat, tick: &Tick, config: &Config, tracks: &mut usize) {
+    let kill = |s: &mut Slot, tracks: &mut usize| {
+        s.alive = false;
+        if s.track.take().is_some() {
+            *tracks -= 1;
+        }
+    };
     let finite = m.pos.iter().all(|v| v.is_finite() && v.abs() < 1.0e5);
     if !finite || !m.orthonormal(0.05) {
-        s.alive = false;
-        s.track = None;
+        kill(s, tracks);
         return;
     }
     let d = [m.pos[0] - s.prev[0], m.pos[1] - s.prev[1], m.pos[2] - s.prev[2]];
     let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let speed3 = if tick.dt > 0.0 { dist / tick.dt } else { 0.0 };
+    // A jump no one walks or runs is something else being written there.
+    if speed3 > 25.0 {
+        kill(s, tracks);
+        return;
+    }
     if tick.idle && tick.prev_idle && dist > config.idle_tol {
         s.violations += 1;
         if s.violations > config.idle_max {
-            s.alive = false;
-            if s.track.take().is_some() {
-                *tracks -= 1;
-            }
+            kill(s, tracks);
             return;
         }
     }
-    if s.track.is_none() && dist > 0.005 && *tracks < config.max_tracks {
+    // Never moved although movement keys have been held for a while: static.
+    if s.track.is_none() && tick.held_stable >= config.prune_after && dist <= 0.02 {
+        kill(s, tracks);
+        return;
+    }
+    if s.track.is_none() && tick.keys & WASD != 0 && (0.15..=25.0).contains(&speed3) && *tracks < config.max_tracks {
         *tracks += 1;
-        s.track = Some(Box::new(Track {
-            first: tick.index - 1,
-            pos: vec![s.prev],
-            ..Track::default()
-        }));
+        s.track = Some(Box::<Track>::default());
     }
     if let Some(t) = s.track.as_mut() {
-        t.pos.push(m.pos);
+        if tick.idle && tick.prev_idle && dist <= config.idle_tol {
+            t.quiet = t.quiet.saturating_add(1);
+            if t.pos.is_empty() && t.quiet >= 3 {
+                t.first = tick.index - 1;
+                t.pos.push(s.prev);
+            }
+        }
+        if !t.pos.is_empty() {
+            t.pos.push(m.pos);
+        }
         let stable = tick.keys & WASD != 0 && tick.keys == tick.prev_keys;
         if stable && tick.dt > 0.0 {
             let dxy = (d[0] * d[0] + d[1] * d[1]).sqrt();
@@ -507,6 +745,8 @@ fn observe(s: &mut Slot, m: &Mat, tick: &Tick, config: &Config, tracks: &mut usi
                 }
                 if speed > 0.3 {
                     let dir = [d[0] / dxy, d[1] / dxy];
+                    t.dir_sum[c][0] += dir[0];
+                    t.dir_sum[c][1] += dir[1];
                     for (k, axis) in m.axes.iter().enumerate() {
                         let len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
                         if len > 0.1 {
@@ -546,7 +786,7 @@ struct Rank {
     sign: f32,
 }
 
-fn rank(t: &Track, violations: u8) -> Rank {
+fn rank(t: &Track, violations: u8, has_axes: bool) -> Rank {
     let mean = |c: usize| -> [f32; 3] {
         let n = t.cos_n[c].max(1) as f32;
         t.cos_sum[c].map(|v| v / n)
@@ -558,14 +798,27 @@ fn rank(t: &Track, violations: u8) -> Rank {
     let med_w = median(&t.speeds_w);
     let mut score = 0.0;
     if t.steady >= 3 && t.held_dist >= 1.0 {
-        score = 2.0 * follow + cos_w[axis].abs();
-        if t.cos_n[1] > 0 && cos_s[axis] * sign < -0.5 {
+        // W and S walk back and forth: the mean directions are opposite.
+        let mean_dir = |c: usize| {
+            let n = t.cos_n[c].max(1) as f32;
+            [t.dir_sum[c][0] / n, t.dir_sum[c][1] / n]
+        };
+        let (dw, ds) = (mean_dir(0), mean_dir(1));
+        let back_and_forth = t.cos_n[0] > 0 && t.cos_n[1] > 0 && dw[0] * ds[0] + dw[1] * ds[1] < -0.2;
+        score = 2.0 * follow;
+        if has_axes {
+            score += cos_w[axis].abs();
+        }
+        if back_and_forth {
+            score += 0.5;
+        }
+        if has_axes && t.cos_n[1] > 0 && cos_s[axis] * sign < -0.5 {
             score += 0.5;
         }
         if (0.8..=4.0).contains(&med_w) {
             score += 0.5;
         }
-        if t.cos_n[2] > 0 && (0..3).any(|j| j != axis && cos_d[j].abs() > 0.6) {
+        if has_axes && t.cos_n[2] > 0 && (0..3).any(|j| j != axis && cos_d[j].abs() > 0.6) {
             score += 0.25;
         }
         score -= 0.25 * f32::from(violations);
@@ -626,29 +879,54 @@ fn run(config: &Config) -> Result<String, String> {
     let dir = player::out_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let buffer = alloc_buffer()?;
-    let skip = (buffer.as_ptr() as usize, buffer.as_ptr() as usize + CHUNK);
-    let regions = regions(config, skip);
+    let mut workers = Vec::new();
+    for _ in 0..config.threads {
+        workers.push(alloc_buffer()?);
+    }
+    let mut skips = vec![(buffer.as_ptr() as usize, buffer.as_ptr() as usize + CHUNK)];
+    skips.extend(workers.iter().map(|b| (b.as_ptr() as usize, b.as_ptr() as usize + CHUNK)));
+    let regions = regions(config, &skips);
     let total: usize = regions.iter().map(|r| r.size).sum();
     let started = Instant::now();
 
-    let mut slots: Vec<Slot> = Vec::new();
-    let (unreadable, by_layout) = scan_candidates(config, &regions, buffer, &mut slots);
+    let (mut slots, counts) = scan_candidates(config, &regions, &mut workers);
     let found_in = started.elapsed().as_secs_f32();
     let mut summary = String::new();
+    let names = ["R4", "T34", "R43"];
     let _ = writeln!(
         summary,
-        "memory scanned: {} regions, {} MiB, {} KiB unreadable, {found_in:.1} s; candidates {} (R4 {}, T34 {}, R43 {}; R4 with w == 1: {}){}",
+        "memory scanned: {} regions, {} MiB, {} KiB unreadable, {found_in:.1} s on {} threads; filter {}",
         regions.len(),
         total >> 20,
-        unreadable >> 10,
+        counts.unreadable >> 10,
+        config.threads,
+        if config.strict { "strict" } else { "loose" },
+    );
+    for k in 0..3 {
+        let _ = writeln!(
+            summary,
+            "  {}: {} unit orthogonal axes with a position; {} with the exact form (w column 0, corner 1); {} with a fractional position; {} not axis-aligned = kept",
+            names[k], counts.raw[k], counts.form[k], counts.not_integer[k], counts.kept[k]
+        );
+    }
+    let _ = writeln!(
+        summary,
+        "  V4 (xyz in the world, w mode {}): {} found, {} kept; D3 (doubles): {} found, {} kept; candidates in all {}; R4 kept with w == 1: {}",
+        match config.vec_w {
+            VecW::Off => "off",
+            VecW::Flag => "flag",
+            VecW::Plain => "plain",
+            VecW::Any => "any",
+        },
+        counts.v4_raw,
+        counts.v4_kept,
+        counts.d3_raw,
+        counts.d3_kept,
         slots.len(),
-        by_layout[0],
-        by_layout[1],
-        by_layout[2],
         slots.iter().filter(|s| s.layout == Layout::R4 && (s.w - 1.0).abs() < 1.0e-4).count(),
-        if slots.len() >= config.max_candidates { " (limit reached)" } else { "" },
     );
     eprintln!("Leonida: find player: {}", summary.trim_end());
+    slots.shrink_to_fit();
 
     // Sampling.
     let unix = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
@@ -662,6 +940,14 @@ fn run(config: &Config) -> Result<String, String> {
     let mut prev_idle = false;
     let mut read_buf = vec![0u8; 1 << 17];
     let mut next = t0;
+    let mut held_stable = 0u32;
+    eprintln!(
+        "Leonida: find player: sampling starts now ({} candidates, {} s, every {} ms, keys file {:?}); unix ms at t=0: {wall0}",
+        slots.len(),
+        config.seconds,
+        config.interval.as_millis(),
+        std::env::var("LEONIDA_KEYS_FILE").ok()
+    );
     loop {
         let now = Instant::now();
         let t = now.duration_since(t0).as_secs_f64();
@@ -672,23 +958,30 @@ fn run(config: &Config) -> Result<String, String> {
         let idle = keys == 0 && t - last_key_t >= 1.0;
         let index = samples.len();
         let dt = index.checked_sub(1).map_or(0.0, |p| (t - samples[p].t) as f32);
+        let prev_keys = samples.last().map_or(0, |s| s.keys);
+        if keys & WASD != 0 && keys == prev_keys {
+            held_stable += 1;
+        }
         let tick = Tick {
             index,
             dt,
             keys,
-            prev_keys: samples.last().map_or(0, |s| s.keys),
+            prev_keys,
             idle,
             prev_idle,
+            held_stable,
         };
         for b in &blocks {
             let ok = b.len <= read_buf.len() && mem::read(b.start, &mut read_buf[..b.len]);
             for &i in &alive[b.from..b.to] {
                 let s = &mut slots[i as usize];
                 let (a, size) = (dec(s.addr), s.layout.size());
-                let bytes = if ok {
-                    Some(read_buf[a - b.start..a - b.start + size].to_vec())
+                let fresh;
+                let bytes: Option<&[u8]> = if ok {
+                    Some(&read_buf[a - b.start..a - b.start + size])
                 } else {
-                    mem::read_vec(a, size)
+                    fresh = mem::read_vec(a, size);
+                    fresh.as_deref()
                 };
                 let Some(bytes) = bytes else {
                     s.alive = false;
@@ -697,7 +990,7 @@ fn run(config: &Config) -> Result<String, String> {
                     }
                     continue;
                 };
-                let m = player::decode(&bytes, s.layout);
+                let m = player::decode(bytes, s.layout);
                 if index == 0 {
                     s.prev = m.pos;
                 } else {
@@ -741,10 +1034,12 @@ fn run(config: &Config) -> Result<String, String> {
         .iter()
         .enumerate()
         .filter(|(_, s)| s.alive)
-        .filter_map(|(i, s)| Some((i, rank(s.track.as_ref()?, s.violations))))
+        .filter_map(|(i, s)| Some((i, rank(s.track.as_ref()?, s.violations, s.layout.has_axes()))))
         .filter(|(_, r)| r.score > 0.0)
         .collect();
-    ranked.sort_by(|a, b| b.1.score.total_cmp(&a.1.score));
+    // Ones that also stayed put at the idle samples (their positions were kept) first.
+    let verified = |i: usize| !slots[i].track.as_ref().is_none_or(|t| t.pos.is_empty());
+    ranked.sort_by(|a, b| verified(b.0).cmp(&verified(a.0)).then(b.1.score.total_cmp(&a.1.score)));
     let _ = writeln!(summary, "ranked (moved with the keys): {}", ranked.len());
 
     let mut text = String::new();
@@ -784,7 +1079,7 @@ fn run(config: &Config) -> Result<String, String> {
     let best = &slots[best_i];
     let best_track = best.track.as_ref().expect("ranked slots have tracks");
     let (best_addr, best_layout) = (dec(best.addr), best.layout);
-    let best_rank = rank(best_track, best.violations);
+    let best_rank = rank(best_track, best.violations, best_layout.has_axes());
     write(
         &dir,
         "best.txt",
@@ -881,7 +1176,13 @@ fn run(config: &Config) -> Result<String, String> {
             picked.push((enc(a), l));
         }
     }
-    let forward = Some((best_rank.axis, best_rank.sign));
+    // The direction the player walks along its own axes was measured on the
+    // first transform with axes (a position vector has none).
+    let forward = picked.iter().find(|&&(_, l)| l.has_axes()).and_then(|&(a, _)| {
+        let s = slots.iter().find(|s| s.addr == a)?;
+        let r = rank(s.track.as_ref()?, s.violations, true);
+        Some((r.axis, r.sign))
+    });
     let _ = writeln!(summary, "groups for the teleport: {} (addresses in comovers.txt)", picked.len());
     let best_line = format!(
         "best {best_addr:#x} {} ({}); {} co-movers",
