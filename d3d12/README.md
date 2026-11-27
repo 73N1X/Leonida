@@ -245,6 +245,29 @@ everything on NVIDIA cards and run fastest there**, using the Series S profile.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
+## New on 2026-11-27: DLSS and frame generation on Series X, a window of another shape
+
+Written without a run of the game (the card was busy): the places changed in the title are checked against the
+1.0.2.1 executable by a unit test, the rest by unit tests and the launcher's `-DryRun`. Nothing changes unless one
+of the parameters below, or its line in the F1 menu, is used.
+
+- **Why DLSS was Series S only.** DLSS (and the stretch) stand in for one call, the title's FidelityFX upscale
+  (`ffxDispatch`), and the title only upscales through FidelityFX when its device type is a Series S. On Series X
+  its own temporal upscaler runs instead, as passes of its own that hand nothing over. Frame generation was tied
+  to the same call: its depth and motion vectors are the ones that upscale is given.
+- **DLSS on Series X**: `-Dlss quality|balanced|performance|ultra` (UPSCALER and RENDER SCALE in the F1 menu).
+  The loader makes the title upscale through FidelityFX there too (`LEONIDA_FSR_UPSCALER=1`), at the mode's
+  render scale (2/3, 0.6, 1/2 or 1/3 of the 2160 lines: 1440, 1296, 1080 or 720), and DLSS makes the 3840x2160
+  output. DLSS's own mode follows those sizes.
+- **Frame generation on Series X**: `-FrameGen 2` (FRAME GEN in the menu). It needs the DLSS upscale there, so the
+  launcher turns DLSS on with it (quality unless a mode is given) and says so. The log says `frame generation: the
+  first upscale's numbers` once its inputs arrive, and after 600 presents without any says that too.
+- **A window of another shape**: `-Aspect 21:9|32:9|W:H|auto` with `-PresentScale fit|stretch` (WINDOW SHAPE and
+  PICTURE IN ANOTHER SHAPE in the menu). The game still draws 16:9: `fit` shows it centred with black bars,
+  `stretch` fills the window. What a real ultrawide picture needs, and the experimental `LEONIDA_OUTPUT`, are in
+  [docs/ultrawide.md](../docs/ultrawide.md).
+- `-DryRun` prints the settings a start would run with, after the menu's saved ones, and stops.
+
 ## New on 2026-11-26: another renderer, DLSS, a settings menu
 
 The default of `scripts\play-nvidia.ps1` changed. What is below this section
@@ -356,7 +379,7 @@ generation. Nothing is downloaded unless you run that file.
 `scripts\play-nvidia.ps1` starts a copy of the build named `leonida_sm.exe`, so
 NVIDIA Smooth Motion applies every time once it is turned on for that exe in the
 NVIDIA App. `-NoSmoothMotion` runs `leonida.exe` itself; `-SeriesX` uses the
-Series X profile (sharper, much slower, no DLSS); `-Quality` gives fewer
+Series X profile (sharper, much slower; DLSS there with `-Dlss`); `-Quality` gives fewer
 stretched bodies, slower; `-RayTracing` turns the title's real ray tracing on.
 The fork's own `scripts\play.ps1` is still there for AMD cards.
 

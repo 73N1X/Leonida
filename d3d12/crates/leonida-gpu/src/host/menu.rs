@@ -52,8 +52,17 @@ const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
 
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
-    Item { var: "LEONIDA_UPSCALE", label: "UPSCALER", values: &[("dlss", "DLSS"), ("stretch", "STRETCH"), ("", "GAME FSR4 (SLOW)")], live: false },
+    // Series S: the game's own is FSR, slow here. Series X: its own temporal upscaler; with DLSS (or the stretch) the
+    // launcher makes the title upscale through FidelityFX there (LEONIDA_FSR_UPSCALER), where DLSS takes over.
+    Item { var: "LEONIDA_UPSCALE", label: "UPSCALER", values: &[("dlss", "DLSS"), ("stretch", "STRETCH"), ("", "GAME OWN (S: FSR SLOW)")], live: false },
+    // DLSS's mode is its render height: of the output's lines 2/3 (quality), 0.6 (balanced), 1/2 (performance), 1/3
+    // (ultra performance). Unset: Series S renders its own 2/3; the launcher gives Series X 2/3 with DLSS.
+    Item { var: "LEONIDA_RENDER_SCALE", label: "RENDER SCALE (DLSS MODE)", values: &[("", "GAME"), ("0.6667", "0.667 QUALITY"), ("0.6", "0.6 BALANCED"), ("0.5", "0.5 PERFORMANCE"), ("0.3333", "0.333 ULTRA PERF."), ("0.75", "0.75")], live: false },
+    // On Series X the launcher turns DLSS on with it: the generator's depth and motion vectors come from that upscale.
     Item { var: "LEONIDA_FRAME_GEN", label: "FRAME GEN (NOT WITH RAY TR.)", values: &[("", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    // The window's shape, and the game's 16:9 picture in a window of another shape (`crate::aspect`).
+    Item { var: "LEONIDA_ASPECT", label: "WINDOW SHAPE", values: &[("", "16:9 (GAME)"), ("21:9", "21:9"), ("32:9", "32:9"), ("auto", "AS THE SCREEN")], live: false },
+    Item { var: "LEONIDA_PRESENT_SCALE", label: "PICTURE IN ANOTHER SHAPE", values: &[("", "BY WINDOW SHAPE"), ("fit", "BARS"), ("stretch", "STRETCH")], live: true },
     Item { var: "LEONIDA_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     // The title's own pace is 60 with the loader's frame-rate patch (`leonida-loader`'s `vipatch.rs`), which is always on.
     Item { var: "LEONIDA_FPS_CAP", label: "FRAME RATE CAP", values: &[("", "GAME (60)"), ("30", "30"), ("60", "60"), ("120", "120"), ("0", "NONE")], live: true },
@@ -89,7 +98,6 @@ const ITEMS: &[Item] = &[
     Item { var: "LEONIDA_PIPELINE_WAIT_MS", label: "SHADER WAIT MS", values: &[("10000", "10000"), ("30000", "30000"), ("1000", "1000"), ("0", "0 SKIP")], live: false },
     Item { var: "LEONIDA_DYNAMIC_SLOTS", label: "DESCRIPTOR SLOTS", values: &[("524288", "524288"), ("262144", "262144"), ("1000000", "1000000")], live: false },
     Item { var: "LEONIDA_CARD_BUFFERS_MB", label: "CARD BUFFERS MB", values: &[("1536", "1536"), ("1024", "1024"), ("2048", "2048"), ("512", "512"), ("0", "0 OFF")], live: false },
-    Item { var: "LEONIDA_RENDER_SCALE", label: "RENDER SCALE", values: &[("", "GAME (720P)"), ("0.5", "0.5 (540P)"), ("0.75", "0.75")], live: false },
     Item { var: "LEONIDA_OWN_UPSCALER", label: "OWN UPSCALER", values: UNSET_ON, live: false },
     // The game patches after VI-Patch that have a switch (docs/vi_patch.md); the loader reads them when it maps the title.
     Item { var: "LEONIDA_VIPATCH_NO_VIGNETTE", label: "NO VIGNETTE (VI-PATCH)", values: UNSET_ON, live: false },
@@ -351,6 +359,9 @@ impl Menu {
         }
         if var == "LEONIDA_FPS_LINE" {
             fps_line_on().store(value != "0", Ordering::Relaxed);
+        }
+        if var == "LEONIDA_PRESENT_SCALE" {
+            crate::aspect::changed();
         }
         if var == "LEONIDA_PANEL" {
             #[cfg(feature = "diagnostics")]
