@@ -180,10 +180,34 @@ with at least `LEONIDA_NATIVE_MIN_DISTINCT` (200) distinct handlers are listed (
 the share of the union of handlers each covers and, for strided runs, per slot how many distinct values and how
 many look like a 64-bit hash. `LEONIDA_NATIVE_ALL=1` also scans read-only and DLL-backed memory.
 
+Stage 1 (a first run, 100 s into the world) was noise: with every integer below the image's code size counted as an
+RVA, the union was 2.5 million "handlers" over every MiB of code. Stage 2 makes the scan specific:
+
+- A pointer (or an offset) only counts when its target is a function start: a `.pdata` function begin (299,257 of
+  them in the title's `.pdata`), or a 16-aligned byte after `int3` padding (a leaf function has no unwind entry).
+  `LEONIDA_NATIVE_LOOSE=1` drops this. 99.6 % of the `.pdata` functions are 16-aligned.
+- 32-bit values are off unless `LEONIDA_NATIVE_U32=1`. Then it looks for arrays of offsets from an unknown base:
+  handlers are 16-aligned, so offsets from one base share their low four bits; a run of at least 12 non-zero values
+  with the same low nibble is checked against the function starts by trying every function start as the target of
+  one of its first two values, and kept when at least 90 % of the run lands on function starts. This finds the base
+  (the global the interpreter adds the offset to) without finding the interpreter, and base 0 would be an RVA table.
+  Per base, the summary lists the arrays, the distinct handlers and the qword slots of the title's writable sections
+  that hold the base as an address (the global itself).
+- Defaults are now a run of 32 and 64 distinct handlers (`LEONIDA_NATIVE_MIN_RUN`, `LEONIDA_NATIVE_MIN_DISTINCT`).
+
 Output, kept out of the repository because it holds addresses of the title: `%TEMP%\leonida-natives\scan-<s>s\`
-with `summary.txt` (memory scanned, runs by distinct count, the union and its RVA histogram per MiB),
-`candidates.txt`, `targets.txt` (handler RVAs per candidate) and `union.txt`. Results of a real run go here next,
-as counts and method only.
+with `summary.txt` (memory scanned, function starts, runs by distinct count, the union and its RVA histogram per
+MiB, the bases), `candidates.txt`, `targets.txt` (handler RVAs per candidate), `union.txt`, and in 32-bit mode
+`offset-arrays.txt` and `offset-handlers.txt` (the handlers per base). Results of a real run go here next, as counts
+and method only.
+
+Finding the interpreter statically (to read which global it adds the offset to) was tried on the file and did not
+get anywhere, counted over `.text`: 10,789 `jmp reg`, 2,759 of them after a `cmp` and bounds check with a
+`lea`-addressed table; only about 20 tables have 200 or more cases, and those are id-to-id maps (`mov eax, imm; ret`
+cases), an entity-type switch and parsers on a byte with at most 97 cases; no function of the 161 over 12 KB has a
+dispatch on an opcode byte of 150 or more cases, and no `add reg, [rip+global]` before a `call reg` sits in a large
+function (the 14 such globals have 1 to 3 sites each, all in small functions). Nothing was de-obfuscated; the
+interpreter is simply not found by these signatures, which is why the run-time search above does not need it.
 
 ## Tests
 
