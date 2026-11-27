@@ -9091,6 +9091,38 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// The Lua mods' read of title memory (`leonida-lua`): false where a page of
+/// it is not readable, as [`read_into`].
+pub(crate) fn lua_read(address: usize, out: &mut [u8]) -> bool {
+    read_into(address as *const u8, out)
+}
+
+/// The Lua mods' write into title memory: false where a page of the range is
+/// not mapped or not writable (nothing faults: a fault in the copy is taken by
+/// the handler of [`crate::watch`], and the copy then fails). Memory that is
+/// guarded for the card's writes is opened as the title's own writes open it.
+pub(crate) fn lua_write(address: usize, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    if crate::safecopy::on() {
+        // SAFETY: the source is ours; a destination page that is not there,
+        // or not writable, fails the copy.
+        return unsafe { crate::safecopy::copy(address as *mut u8, data.as_ptr(), data.len()) };
+    }
+    let mut done = 0;
+    // SAFETY: the kernel checks the destination and writes nothing it cannot.
+    unsafe {
+        NtWriteVirtualMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            address as _,
+            data.as_ptr().cast(),
+            data.len(),
+            &mut done,
+        ) >= 0
+    }
+}
+
 /// Reads what is there of the `dst.len()` bytes of title memory at `src`,
 /// zeros for the rest; returns how many bytes were there. Safe while the
 /// runtime remaps title memory (the kernel, or a copy that takes the fault,
@@ -9371,6 +9403,8 @@ struct Presenter {
     menu: menu::Menu,
     /// Leonida: the trainer menu (`trainer`).
     trainer: trainer::Overlay,
+    /// What the Lua mods draw (`leonida-lua`): the same overlay, with a place of its own.
+    lua: trainer::Overlay,
 }
 
 /// The frame rate the meter last counted, in tenths of a frame a second (0: none yet): for the
@@ -9819,6 +9853,9 @@ impl Host {
             // (`trainer`): one atomic load, and nothing more while the menu
             // is closed and no screenshot is asked for.
             let trainer_work = leonida_menu::work();
+            // Leonida: the Lua mods are told a frame is presented (one load
+            // with LEONIDA_LUA=0; never waits for them).
+            leonida_lua::tick();
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
@@ -9959,8 +9996,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
-            // Leonida: the trainer menu, where the panel and the F1 menu
-            // are put (so frame generation sees all three alike).
+            // Leonida: what the Lua mods draw, then the trainer menu, where the
+            // panel and the F1 menu are put (so frame generation sees all alike).
+            if trainer_work & leonida_menu::LUA_DRAW != 0 {
+                p.lua.draw_lua(self, copy, &back, (width, height), format);
+            }
             if trainer_work & leonida_menu::DRAW != 0 {
                 p.trainer.draw(self, copy, &back, (width, height), format);
             }
@@ -10081,6 +10121,7 @@ impl Host {
                 panel: panel::Panel::new(),
                 menu: menu::Menu::new(),
                 trainer: trainer::Overlay::new(height),
+                lua: trainer::Overlay::idle(),
             })
         }
     }

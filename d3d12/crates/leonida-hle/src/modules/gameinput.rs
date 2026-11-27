@@ -1420,6 +1420,8 @@ mod host {
             .map(|&(_, _, vk)| vk)
             .collect();
         down.extend(held_from_file());
+        // Leonida: the keys Lua mods hold for the title (`leonida-lua`).
+        down.extend(leonida_menu::knobs::injected_keys());
         down
     }
 

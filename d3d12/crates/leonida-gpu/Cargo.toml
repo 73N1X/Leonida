@@ -16,6 +16,7 @@ leonida-formats.workspace = true
 leonida-pipeline.workspace = true
 leonida-shader.workspace = true
 leonida-menu.workspace = true
+leonida-lua.workspace = true
 
 [build-dependencies]
 blake3.workspace = true

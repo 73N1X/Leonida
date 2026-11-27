@@ -72,6 +72,8 @@ pub fn run(
     drop(prepared);
     drop(original);
     leonida_hle::runtime::set_main_image(image.base());
+    // Where the Lua mods' memory scan looks (`LEONIDA_LUA=0`: nothing reads it).
+    leonida_lua::set_image(image.base(), image.info().size_of_image as usize);
     leonida_hle::runtime::set_image_path(image.base(), exe);
     println!(
         "mapped at      {:#x} (preferred {:#x})",

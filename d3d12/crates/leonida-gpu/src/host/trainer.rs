@@ -320,11 +320,13 @@ impl Overlay {
     pub(super) fn new(height: u32) -> Overlay {
         provide();
         leonida_menu::set_height(height);
+        // The Lua mods first: the menu then has its Mods page from the start.
+        leonida_lua::start();
         leonida_menu::start();
         Overlay::idle()
     }
 
-    fn idle() -> Overlay {
+    pub(super) fn idle() -> Overlay {
         Overlay {
             pipeline: None,
             picture: None,
@@ -353,14 +355,50 @@ impl Overlay {
         let Some(frame) = leonida_menu::frame(height) else {
             return;
         };
+        self.draw_frame(host, list, back, (width, height), format, frame, true);
+    }
+
+    /// Records what the Lua mods draw (`leonida_menu::overlay`) onto `back`,
+    /// as [`Overlay::draw`] does the menu, at the place the drawing says.
+    pub(super) fn draw_lua(
+        &mut self,
+        host: &Host,
+        list: &HostList,
+        back: &ID3D12Resource,
+        size: (u32, u32),
+        format: DXGI_FORMAT,
+    ) {
+        if self.failed {
+            return;
+        }
+        let Some(frame) = leonida_menu::overlay::frame() else {
+            return;
+        };
+        self.draw_frame(host, list, back, size, format, frame, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_frame(
+        &mut self,
+        host: &Host,
+        list: &HostList,
+        back: &ID3D12Resource,
+        (width, height): (u32, u32),
+        format: DXGI_FORMAT,
+        frame: leonida_menu::Frame,
+        is_menu: bool,
+    ) {
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
-        // Below the numbers panel while that is shown.
+        // Below the numbers panel while that is shown (the menu only).
         #[cfg(feature = "diagnostics")]
-        let under = super::panel::lines_taken(height);
+        let under = if is_menu { super::panel::lines_taken(height) } else { 0 };
         #[cfg(not(feature = "diagnostics"))]
-        let under = 0;
+        let under = {
+            let _ = is_menu;
+            0
+        };
         let target = host.rtv(Some(back), None);
         let drawn = self.record(
             &host.device,
@@ -499,7 +537,11 @@ impl Overlay {
             } else {
                 top.max(under as f32 + (UNDER_PANEL * layers.scale).round())
             };
-            let origin = ((LEFT * layers.scale).round(), top);
+            let origin = match frame.origin {
+                // A drawing of the mods' stands where it says.
+                Some((x, y)) => (x as f32, y as f32),
+                None => ((LEFT * layers.scale).round(), top),
+            };
             let band = if layers.rows == 0 {
                 (-1.0, -1.0)
             } else {
@@ -656,6 +698,11 @@ fn provide() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         knobs::FPS_CAP.provide(cap, set_cap);
+        // The Lua mods' checked reads and writes of the title's memory.
+        leonida_lua::set_memory_host(leonida_lua::MemoryHost {
+            read: super::lua_read,
+            write: super::lua_write,
+        });
         if dlss_asked() {
             knobs::SHARPNESS.provide(sharpness, set_sharpness);
         }
@@ -938,6 +985,7 @@ mod tests {
             let frame = leonida_menu::Frame {
                 version: 1,
                 layers: std::sync::Arc::new(layers),
+                origin: None,
             };
             let kept = std::cell::RefCell::new(Vec::new());
             let mut overlay = Overlay::idle();
