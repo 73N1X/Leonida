@@ -169,9 +169,11 @@ if ($RayTracing) {
 # Its dispatches were dropped for that. With the paired-lane form (emit/paired.rs, after Vice-Tay 5e588e8: a host
 # thread runs two console lanes, so the halves never exchange) it has 5 group barriers, none in a loop, and is no
 # longer among the 40 costliest commands of the timing run (under 0.3 ms a frame), so it runs again.
-# LEONIDA_WATER_TRANSMISSION=0 drops its dispatches as before (how the water looks with it has not been compared
-# on open water yet: the save in use stands in a street).
-if ($env:LEONIDA_WATER_TRANSMISSION -eq '0') {
+# It is dropped again all the same, until its picture is right: within the hour it ran by default, a dark band
+# with a hard horizontal edge and blocky fringes covered the lower third of the screen near water (the user's
+# screenshot, 2026-11-27), as if everything under a water line were inside the volume. LEONIDA_WATER_TRANSMISSION=1
+# runs it.
+if ($env:LEONIDA_WATER_TRANSMISSION -ne '1') {
     $skip = @('6f225b641c5b0708')
     if ($settings.LEONIDA_SKIP_PIPELINES) { $skip = @($settings.LEONIDA_SKIP_PIPELINES) + $skip }
     $settings.LEONIDA_SKIP_PIPELINES = $skip -join ','
