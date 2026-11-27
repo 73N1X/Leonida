@@ -140,7 +140,8 @@ struct Config {
     prune_after: u32,
     /// Seconds after the title started at which the write probe begins (default: after sampling).
     probe_at: Option<f64>,
-    probe_max: usize,
+    /// The most seconds the write probe may take.
+    probe_seconds: u64,
     started: Instant,
 }
 
@@ -217,7 +218,7 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
         .max(1),
         prune_after: num("LEONIDA_PLAYER_PRUNE_STABLE", 6) as u32,
         probe_at: std::env::var("LEONIDA_PLAYER_PROBE").ok().and_then(|v| v.trim().parse().ok()),
-        probe_max: num("LEONIDA_PLAYER_PROBE_MAX", 600),
+        probe_seconds: num("LEONIDA_PLAYER_PROBE_SECONDS", 900) as u64,
         started: Instant::now(),
     };
     player::find_started();
@@ -229,6 +230,14 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
     std::thread::Builder::new()
         .name("leonida-find-player".into())
         .spawn(move || {
+            // However this ends, a teleport waiting for it goes on.
+            struct Done;
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    player::find_finished();
+                }
+            }
+            let _done = Done;
             std::thread::sleep(Duration::from_secs_f64(delay.max(0.0)));
             match run(&config) {
                 Ok(headline) => eprintln!("Leonida: find player done: {headline}"),
@@ -1193,8 +1202,11 @@ fn run(config: &Config) -> Result<String, String> {
     let mut probed = false;
     match probe(config, &regions, &mut workers, derived, &dir) {
         Ok(Some(found)) => {
+            probed = found.drives;
+            if !found.drives {
+                let _ = writeln!(summary, "write probe: no triple moved the derived position; the group is triples that move other copies");
+            }
             groups = found.group;
-            probed = true;
         }
         Ok(None) => {}
         Err(e) => eprintln!("Leonida: find player: probe failed: {e}"),
@@ -1307,26 +1319,65 @@ struct Near {
     layout: Layout,
     /// What it held when found.
     value: [f32; 3],
+    /// Added to x and y to get the world position (a multiple of the cell size for
+    /// a sector-relative value; zero otherwise).
+    shift: [f32; 2],
+    /// 0 for world coordinates, else the cell size the position is relative to.
+    frame: u16,
 }
 
-/// Every f32 triple (4-byte aligned) and f64 triple (8-byte aligned) within
-/// `radius` metres of `p` on every axis.
+/// Cell sizes of the sector-relative frames that are tried.
+const CELLS: [f32; 4] = [512.0, 1024.0, 2048.0, 4096.0];
+
+/// Every f32 triple (4-byte aligned) and f64 triple (8-byte aligned) with x and y
+/// within `radius` metres of `p`, or of `p` minus a multiple of a cell size, and z
+/// in a window: f32 from `p.z - 0.5` to `p.z + 2.5` (root, centre, head), f64 from
+/// `p.z - 1` to `p.z + 3`.
 fn scan_near(regions: &[Region], workers: &mut [&'static mut [u8]], p: [f32; 3], radius: f32) -> Vec<Near> {
+    // Which frame an (x, y) pair of `p` is in: the shift to the world, and the cell (0 = world).
+    fn frame_of(x: f64, y: f64, p: [f32; 3], radius: f64) -> Option<([f32; 2], u16)> {
+        let (px, py) = (f64::from(p[0]), f64::from(p[1]));
+        if (x - px).abs() < radius && (y - py).abs() < radius {
+            return Some(([0.0, 0.0], 0));
+        }
+        for cell in CELLS {
+            let c = f64::from(cell);
+            if x.abs() > c || y.abs() > c {
+                continue;
+            }
+            let (mx, my) = (((px - x) / c).round(), ((py - y) / c).round());
+            if mx == 0.0 || my == 0.0 || (px - x - mx * c).abs() >= radius || (py - y - my * c).abs() >= radius {
+                // Only one axis shifted is not a sector origin.
+                continue;
+            }
+            return Some(([(mx * c) as f32, (my * c) as f32], cell as u16));
+        }
+        None
+    }
+    let radius64 = f64::from(radius);
     let (parts, _) = scan_parallel::<Vec<Near>>(regions, workers, 32, |address, bytes, limit, out| {
         // SAFETY: the buffer is page aligned; `bytes` is a prefix of it.
         let f = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
-        let near = |v: f32, c: f32| (v - c).abs() < radius;
+        let (lo, hi) = (p[2] - 0.5, p[2] + 2.5);
         for j in 0..(limit / 4).min(f.len().saturating_sub(2)) {
-            if near(f[j], p[0]) && near(f[j + 1], p[1]) && near(f[j + 2], p[2]) {
-                out.push(Near { addr: address + j * 4, layout: Layout::V4, value: [f[j], f[j + 1], f[j + 2]] });
+            let z = f[j + 2];
+            if !(z >= lo && z <= hi) {
+                continue;
+            }
+            if let Some((shift, frame)) = frame_of(f64::from(f[j]), f64::from(f[j + 1]), p, radius64) {
+                out.push(Near { addr: address + j * 4, layout: Layout::V4, value: [f[j], f[j + 1], z], shift, frame });
             }
         }
         // SAFETY: as above; 8-byte aligned.
         let d = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, bytes.len() / 8) };
-        let r = f64::from(radius);
+        let (lo, hi) = (f64::from(p[2]) - 1.0, f64::from(p[2]) + 3.0);
         for i in 0..(limit / 8).min(d.len().saturating_sub(2)) {
-            if (d[i] - f64::from(p[0])).abs() < r && (d[i + 1] - f64::from(p[1])).abs() < r && (d[i + 2] - f64::from(p[2])).abs() < r {
-                out.push(Near { addr: address + i * 8, layout: Layout::D3, value: [d[i] as f32, d[i + 1] as f32, d[i + 2] as f32] });
+            let z = d[i + 2];
+            if !(z >= lo && z <= hi) {
+                continue;
+            }
+            if let Some((shift, frame)) = frame_of(d[i], d[i + 1], p, radius64) {
+                out.push(Near { addr: address + i * 8, layout: Layout::D3, value: [d[i] as f32, d[i + 1] as f32, z as f32], shift, frame });
             }
         }
     });
@@ -1353,10 +1404,11 @@ fn matrix_before(address: usize) -> Option<(usize, Layout)> {
     None
 }
 
-/// What the probe found: the candidate that drives the derived position first,
-/// then the others that changed together with it.
+/// What the probe found: the group to write to (the authoritative one first).
 struct Probed {
     group: Vec<(usize, Layout)>,
+    /// Whether a write drove the derived position (else: only candidates upstream of other copies).
+    drives: bool,
 }
 
 fn wait_still(config: &Config, derived: (usize, Layout)) -> [f32; 3] {
@@ -1379,6 +1431,176 @@ fn wait_still(config: &Config, derived: (usize, Layout)) -> [f32; 3] {
     }
 }
 
+/// Batch size of the first level of the probe.
+const BATCH: usize = 32;
+
+/// What writing +3 m in z to some triples did.
+#[derive(Default)]
+struct Effect {
+    /// The most the derived position rose.
+    derived: f32,
+    /// Triples that were not written and rose (index, rise).
+    moved: Vec<(usize, f32)>,
+    written: usize,
+    kept: usize,
+}
+
+impl Effect {
+    fn drove(&self) -> bool {
+        (2.5..=3.5).contains(&self.derived)
+    }
+    fn upstream(&self) -> Vec<usize> {
+        self.moved.iter().filter(|m| (2.0..=3.6).contains(&m.1)).map(|m| m.0).collect()
+    }
+    fn effective(&self) -> bool {
+        self.drove() || !self.upstream().is_empty()
+    }
+}
+
+/// The triple's position in the world (its frame's shift added).
+fn world_of(h: &Near, v: [f32; 3]) -> [f32; 3] {
+    [v[0] + h.shift[0], v[1] + h.shift[1], v[2]]
+}
+
+struct Cx<'a> {
+    hits: &'a [Near],
+    derived: (usize, Layout),
+    log: String,
+    trials: usize,
+    deadline: Instant,
+    /// Leaves that moved other triples but not the derived one (leaf, the ones it moved).
+    upstream: Vec<(usize, Vec<usize>)>,
+}
+
+/// Writes the value + 3 m in z to every member that is still near the player, every
+/// 5 ms for 300 ms, and watches the derived position and every other triple.
+fn trial(cx: &mut Cx, members: &[usize]) -> Effect {
+    let hits = cx.hits;
+    let Some(b0) = pos_of(cx.derived.0, cx.derived.1) else { return Effect::default() };
+    let mut live: Vec<(usize, [f32; 3])> = Vec::new();
+    for &m in members {
+        let h = &hits[m];
+        let Some(c0) = pos_of(h.addr, h.layout) else { continue };
+        let w = world_of(h, c0);
+        // Still where the player is: x and y within 1 m, z from 1.5 m below to 3.5 m above.
+        if (w[0] - b0[0]).abs() <= 1.0 && (w[1] - b0[1]).abs() <= 1.0 && w[2] >= b0[2] - 1.5 && w[2] <= b0[2] + 3.5 {
+            live.push((m, c0));
+        }
+    }
+    let mut e = Effect { written: live.len(), derived: f32::MIN, ..Effect::default() };
+    if live.is_empty() {
+        return e;
+    }
+    let mut is_member = vec![false; hits.len()];
+    for &(m, _) in &live {
+        is_member[m] = true;
+    }
+    let others: Vec<usize> = (0..hits.len()).filter(|&k| !is_member[k]).collect();
+    let base: Vec<Option<f32>> = others.iter().map(|&k| pos_of(hits[k].addr, hits[k].layout).map(|v| v[2])).collect();
+    let mut rise = vec![f32::MIN; others.len()];
+    let poll_others = |rise: &mut Vec<f32>| {
+        for (n, &k) in others.iter().enumerate() {
+            if let (Some(b), Some(v)) = (base[n], pos_of(hits[k].addr, hits[k].layout)) {
+                rise[n] = rise[n].max(v[2] - b);
+            }
+        }
+    };
+    let end = Instant::now() + Duration::from_millis(300);
+    let mut round = 0u32;
+    // The only writes the probe makes: these triples, +3 m in z, every 5 ms for 300 ms.
+    while Instant::now() < end {
+        for &(m, c0) in &live {
+            player::write_pos(hits[m].addr, hits[m].layout, [c0[0], c0[1], c0[2] + 3.0]);
+        }
+        if let Some(b) = pos_of(cx.derived.0, cx.derived.1) {
+            e.derived = e.derived.max(b[2] - b0[2]);
+        }
+        if round % 3 == 2 {
+            poll_others(&mut rise);
+        }
+        round += 1;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A short grace: copies may follow a frame later.
+    let grace = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < grace {
+        if let Some(b) = pos_of(cx.derived.0, cx.derived.1) {
+            e.derived = e.derived.max(b[2] - b0[2]);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    poll_others(&mut rise);
+    e.kept = live
+        .iter()
+        .filter(|&&(m, c0)| pos_of(hits[m].addr, hits[m].layout).is_some_and(|a| (a[2] - (c0[2] + 3.0)).abs() < 0.2))
+        .count();
+    e.moved = others.iter().zip(&rise).filter(|(_, r)| **r > 0.5).map(|(&k, &r)| (k, r)).collect();
+    cx.trials += 1;
+    e
+}
+
+struct Found {
+    members: Vec<usize>,
+    moved: Vec<usize>,
+}
+
+fn describe(hits: &[Near], members: &[usize]) -> String {
+    let first = &hits[members[0]];
+    format!("{} x {} (first {:#x} {})", members.len(), "triples", first.addr, first.layout.name())
+}
+
+/// Tests the halves of an effective set of triples; the first single triple (or
+/// set that only works together) that drives the derived position is returned.
+fn bisect(cx: &mut Cx, members: &[usize], path: &str, whole: &Effect) -> Option<Found> {
+    if members.len() == 1 {
+        let h = &cx.hits[members[0]];
+        if whole.drove() {
+            return Some(Found { members: members.to_vec(), moved: whole.upstream() });
+        }
+        let up = whole.upstream();
+        let _ = writeln!(
+            cx.log,
+            "UPSTREAM {:#x} {} frame {}: writing it moved {} other triples by 2-3.6 m: {:x?}",
+            h.addr,
+            h.layout.name(),
+            h.frame,
+            up.len(),
+            up.iter().take(12).map(|&k| cx.hits[k].addr).collect::<Vec<_>>()
+        );
+        cx.upstream.push((members[0], up));
+        return None;
+    }
+    let (left, right) = members.split_at(members.len() / 2);
+    let mut any = false;
+    for (name, half) in [("L", left), ("R", right)] {
+        if Instant::now() > cx.deadline {
+            return None;
+        }
+        let e = trial(cx, half);
+        let path = format!("{path} > {name}[{}]", half.len());
+        let _ = writeln!(
+            cx.log,
+            "  {path}: {}; wrote {} kept {} derived rose {:.2} m, {} others moved 2-3.6 m",
+            describe(cx.hits, half),
+            e.written,
+            e.kept,
+            e.derived,
+            e.upstream().len()
+        );
+        if e.effective() {
+            any = true;
+            if let Some(f) = bisect(cx, half, &path, &e) {
+                return Some(f);
+            }
+        }
+    }
+    if !any && whole.drove() {
+        let _ = writeln!(cx.log, "  {path}: neither half alone moves it, so the set works together");
+        return Some(Found { members: members.to_vec(), moved: whole.upstream() });
+    }
+    None
+}
+
 fn probe(
     config: &Config,
     regions: &[Region],
@@ -1386,7 +1608,6 @@ fn probe(
     derived: (usize, Layout),
     dir: &Path,
 ) -> Result<Option<Probed>, String> {
-    let mut log = String::new();
     if let Some(at) = config.probe_at {
         let wait = at - config.started.elapsed().as_secs_f64();
         if wait > 0.0 {
@@ -1403,7 +1624,7 @@ fn probe(
         let now = pos_of(derived.0, derived.1).unwrap_or(p);
         let drift = (0..3).map(|i| (now[i] - p[i]).abs()).fold(0.0, f32::max);
         eprintln!(
-            "Leonida: find player: probe scan {attempt}: {} triples within 0.5 m of ({:.2}, {:.2}, {:.2}) in {:.1} s; the player moved {drift:.2} m meanwhile",
+            "Leonida: find player: probe scan {attempt}: {} triples near ({:.2}, {:.2}, {:.2}) in {:.1} s; the player moved {drift:.2} m meanwhile",
             hits.len(),
             p[0],
             p[1],
@@ -1417,6 +1638,21 @@ fn probe(
     }
     // The derived one's own address is the reference, not a candidate.
     hits.retain(|h| !(h.addr >= derived.0 && h.addr < derived.0 + 64) && !(derived.0 >= h.addr && derived.0 < h.addr + 24));
+    // How many of each kind.
+    let mut by_kind: std::collections::BTreeMap<(u8, u16), usize> = std::collections::BTreeMap::new();
+    for h in &hits {
+        *by_kind.entry((h.layout as u8, h.frame)).or_default() += 1;
+    }
+    let mut kinds = String::new();
+    for ((layout, frame), n) in &by_kind {
+        let _ = write!(
+            kinds,
+            "{} {} {n}; ",
+            if *layout == Layout::V4 as u8 { "f32" } else { "f64" },
+            if *frame == 0 { "world".to_string() } else { format!("relative to {frame} m cells") }
+        );
+    }
+    eprintln!("Leonida: find player: probe candidates: {kinds}");
     // Same triple at the same moment: one group.
     let key = |h: &Near| h.value.map(f32::to_bits);
     let mut sizes = std::collections::HashMap::new();
@@ -1427,17 +1663,17 @@ fn probe(
     let mut order: Vec<(bool, usize, usize)> = hits
         .iter()
         .enumerate()
-        .map(|(i, h)| (h.layout == Layout::V4 && matrix_before(h.addr).is_some(), sizes[&key(h)], i))
+        .map(|(i, h)| (h.layout == Layout::V4 && h.frame == 0 && matrix_before(h.addr).is_some(), sizes[&key(h)], i))
         .collect();
     order.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
-    let total = hits.len();
-    let mut text = String::new();
+    let mut text = format!("# {kinds}\n");
     for h in &hits {
         let _ = writeln!(
             text,
-            "{:#x} {} ({:.3}, {:.3}, {:.3}) group of {}; matrix before: {}; {}",
+            "{:#x} {} frame {} ({:.3}, {:.3}, {:.3}) group of {}; matrix before: {}; {}",
             h.addr,
             h.layout.name(),
+            h.frame,
             h.value[0],
             h.value[1],
             h.value[2],
@@ -1447,101 +1683,95 @@ fn probe(
         );
     }
     write(dir, "probe-candidates.txt", &text)?;
-    let derived_pos = |d: (usize, Layout)| pos_of(d.0, d.1);
-    let mut found: Option<usize> = None;
-    let mut rises: Vec<f32> = Vec::new();
-    for (n, &(_, _, i)) in order.iter().take(config.probe_max).enumerate() {
-        let h = &hits[i];
-        // Still where the player is now?
-        let (Some(c0), Some(b0)) = (pos_of(h.addr, h.layout), derived_pos(derived)) else { continue };
-        if (0..3).any(|k| (c0[k] - b0[k]).abs() > 1.0) {
-            let _ = writeln!(log, "{:#x} {}: skipped, it is no longer near the player ({:.2}, {:.2}, {:.2})", h.addr, h.layout.name(), c0[0], c0[1], c0[2]);
-            continue;
-        }
-        let target = [c0[0], c0[1], c0[2] + 3.0];
-        let mut rise = [f32::MIN; 1];
-        let mut others = vec![f32::MIN; hits.len()];
-        let end = Instant::now() + Duration::from_millis(400);
-        let mut round = 0u32;
-        // The only writes the probe makes: this one triple, +3 m in z, every 5 ms for 400 ms.
-        while Instant::now() < end {
-            player::write_pos(h.addr, h.layout, target);
-            if let Some(b) = derived_pos(derived) {
-                rise[0] = rise[0].max(b[2] - b0[2]);
-            }
-            if round % 2 == 0 {
-                for (k, o) in hits.iter().enumerate() {
-                    if k != i && let Some(v) = pos_of(o.addr, o.layout) {
-                        // Where it was when found plus the rise, as far as it has risen from its own start.
-                        others[k] = others[k].max(v[2] - o.value[2]);
-                    }
-                }
-            }
-            round += 1;
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // A short grace: the derived copy may follow a frame later.
-        let grace = Instant::now() + Duration::from_millis(150);
-        while Instant::now() < grace {
-            if let Some(b) = derived_pos(derived) {
-                rise[0] = rise[0].max(b[2] - b0[2]);
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let after = pos_of(h.addr, h.layout);
-        let kept = after.is_some_and(|a| (a[2] - target[2]).abs() < 0.2);
-        let back = after.is_some_and(|a| (a[2] - c0[2]).abs() < 0.5);
-        let drove = (2.5..=3.5).contains(&rise[0]);
-        let _ = writeln!(
-            log,
-            "{:#x} {} before ({:.3}, {:.3}, {:.3}) derived rose {:.2} m -> {}; the triple itself then: {}",
-            h.addr,
-            h.layout.name(),
-            c0[0],
-            c0[1],
-            c0[2],
-            rise[0],
-            if drove { "DRIVES the derived position" } else { "no" },
-            if kept { "kept" } else if back { "put back by the game" } else { "changed otherwise" },
-        );
-        if n % 25 == 0 {
-            eprintln!("Leonida: find player: probe {n}/{}: {:#x} derived rose {:.2} m", total.min(config.probe_max), h.addr, rise[0]);
-        }
-        if drove {
-            rises = others.iter().map(|&r| r).collect();
-            found = Some(i);
+
+    let ids: Vec<usize> = order.iter().map(|o| o.2).collect();
+    let started = Instant::now();
+    let mut cx = Cx {
+        hits: &hits,
+        derived,
+        log: String::new(),
+        trials: 0,
+        deadline: started + Duration::from_secs(config.probe_seconds),
+        upstream: Vec::new(),
+    };
+    let batches = ids.len().div_ceil(BATCH);
+    let mut found: Option<Found> = None;
+    for (n, batch) in ids.chunks(BATCH).enumerate() {
+        if Instant::now() > cx.deadline {
+            let _ = writeln!(cx.log, "stopped after {n} of {batches} batches: LEONIDA_PLAYER_PROBE_SECONDS reached");
             break;
         }
+        let e = trial(&mut cx, batch);
+        let path = format!("batch {n}");
+        let _ = writeln!(
+            cx.log,
+            "{path}: {}; wrote {} kept {} derived rose {:.2} m, {} others moved 2-3.6 m",
+            describe(&hits, batch),
+            e.written,
+            e.kept,
+            e.derived,
+            e.upstream().len()
+        );
+        if e.effective() {
+            found = bisect(&mut cx, batch, &path, &e);
+            if found.is_some() {
+                break;
+            }
+        }
+        if n % 10 == 0 {
+            eprintln!("Leonida: find player: probe batch {n}/{batches} ({:.0} s), {} upstream so far", started.elapsed().as_secs_f32(), cx.upstream.len());
+            let _ = write(dir, "probe.txt", &cx.log);
+        }
     }
-    write(dir, "probe.txt", &log)?;
-    let Some(i) = found else {
-        eprintln!("Leonida: find player: probe: none of {total} triples drove the derived position (probe.txt)");
-        return Ok(None);
-    };
-    // The authoritative one first, a transform instead when its position row is what was written.
-    let h = &hits[i];
-    let mut group: Vec<(usize, Layout)> = Vec::new();
+    let _ = writeln!(cx.log, "{} trials in {:.0} s", cx.trials, started.elapsed().as_secs_f32());
+    write(dir, "probe.txt", &cx.log)?;
+
+    // Turns a triple into what the teleport should write: the transform whose position row it is, if any.
     let add = |a: usize, l: Layout, group: &mut Vec<(usize, Layout)>| {
         if group.iter().all(|&(g, _)| g.abs_diff(a) >= 0x10) {
             group.push((a, l));
         }
     };
-    match matrix_before(h.addr) {
-        Some((a, l)) => add(a, l, &mut group),
-        None => add(h.addr, h.layout, &mut group),
+    let add_hit = |k: usize, group: &mut Vec<(usize, Layout)>| {
+        let h = &hits[k];
+        match matrix_before(h.addr).filter(|_| h.frame == 0) {
+            Some((a, l)) => add(a, l, group),
+            None => add(h.addr, h.layout, group),
+        }
+    };
+    let mut group: Vec<(usize, Layout)> = Vec::new();
+    if let Some(f) = &found {
+        for &m in &f.members {
+            add_hit(m, &mut group);
+        }
+        add(derived.0, derived.1, &mut group);
+        for &k in &f.moved {
+            add_hit(k, &mut group);
+        }
+        eprintln!(
+            "Leonida: find player: probe: {} triple(s) drive the derived position ({:#x}...); {} transform(s)/vector(s) change together",
+            f.members.len(),
+            hits[f.members[0]].addr,
+            group.len()
+        );
+        return Ok(Some(Probed { group, drives: true }));
     }
-    // The derived copy and every triple that rose together with it.
-    add(derived.0, derived.1, &mut group);
-    for (k, &r) in rises.iter().enumerate() {
-        if k != i && (2.0..=3.6).contains(&r) {
-            match matrix_before(hits[k].addr) {
-                Some((a, l)) => add(a, l, &mut group),
-                None => add(hits[k].addr, hits[k].layout, &mut group),
+    if !cx.upstream.is_empty() {
+        // Nothing moved the derived copy, but some triples move others: the most upstream first.
+        let mut up = cx.upstream.clone();
+        up.sort_by_key(|u| std::cmp::Reverse(u.1.len()));
+        for (leaf, moved) in up.iter().take(4) {
+            add_hit(*leaf, &mut group);
+            for &k in moved.iter().take(6) {
+                add_hit(k, &mut group);
             }
         }
+        add(derived.0, derived.1, &mut group);
+        eprintln!("Leonida: find player: probe: nothing drove the derived position; {} upstream triples move others (probe.txt); group of {}", cx.upstream.len(), group.len());
+        return Ok(Some(Probed { group, drives: false }));
     }
-    eprintln!("Leonida: find player: probe: {:#x} drives it; {} transform(s)/vector(s) change together", h.addr, group.len());
-    Ok(Some(Probed { group }))
+    eprintln!("Leonida: find player: probe: none of {} triples drove the derived position or any other (probe.txt)", hits.len());
+    Ok(None)
 }
 
 // ------------------------------------------------------------- pointers

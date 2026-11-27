@@ -568,10 +568,12 @@ pub fn install(base: usize, size: usize) {
             .name("leonida-teleport".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_secs_f32(delay));
-                // A finder in this run decides what is written to: wait for it.
-                let deadline = std::time::Instant::now() + Duration::from_secs(120);
-                while FINDING.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(500));
+                // A finder in this run decides what is written to: wait until it says it is done.
+                if FINDING.load(Ordering::Acquire) {
+                    eprintln!("Leonida: teleport: waiting for the player finder (LEONIDA_FIND_PLAYER) to finish");
+                    while FINDING.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
                 }
                 match ready().and_then(|()| teleport(to, hold)) {
                     Ok(line) => eprintln!("Leonida: teleport: {line}"),
