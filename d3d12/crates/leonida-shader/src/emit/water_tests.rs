@@ -60,7 +60,7 @@ const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
 ///
 /// `max_start` replaces the 0; `stray`: a write at an address that is not a constant;
 /// `atomics: false` leaves them out.
-fn tile_program(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
+pub(super) fn tile_program(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
     let mut after = vec![
         vop2(0x1C, 3, V + 1, 0), // v_or_b32 v3, v1, v0
         SAVE_EXEC_14,

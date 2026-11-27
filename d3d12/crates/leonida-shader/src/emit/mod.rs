@@ -106,6 +106,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod pack_tests;
 #[cfg(all(test, windows))]
+mod paired_tests;
+#[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
@@ -310,7 +312,61 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(paired_lanes() as u8);
     out
+}
+
+/// When a console wave64 compute program on a host of 32-lane waves is tried in the paired form
+/// (`lower::with_paired_lanes`, `paired.rs`: one host wave of 32 threads for each console wave of
+/// 64, each thread two console lanes, every per-lane branch taken by the whole wave). Its
+/// wave-wide values are the host wave's own, so it needs none of the exchanges through LDS of the
+/// wave-wide form ([`widen`]), whose two group barriers each cost the water's
+/// `CS_TransmissionVolumetrics` (`6f225b641c5b0708`) 76-80 ms of an RTX 4060 Ti's frame.
+/// `LEONIDA_PAIRED_LANES`:
+/// - unset or `1`: right before the wave-wide form, for the programs that form is tried for
+///   (every other form refused them; the 2-D tile groups of one console wave unless
+///   `LEONIDA_WAVE_WIDE_LAST` says otherwise, and with `LEONIDA_WAVE_WIDE=1`). No program another
+///   form takes changes.
+/// - `first`: first of all the forms for every console wave64 compute program that does not
+///   translate as it is (for trying it on programs another form takes).
+/// - `0`: never.
+///
+/// Part of the translation: the shader cache keys on it ([`translation_fingerprint`]).
+/// From TaynanGT/Vice-Tay 5e588e8 (GPL-3.0), whose `VICTORY_WAVE_PAIRS_ONLY` names programs by
+/// hash instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairedLanes {
+    Off = 0,
+    BeforeWide = 1,
+    First = 2,
+}
+
+/// `LEONIDA_PAIRED_LANES` ([`PairedLanes`]), read once.
+pub fn paired_lanes() -> PairedLanes {
+    #[cfg(test)]
+    if let Some(mode) = TEST_PAIRED_LANES.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<PairedLanes> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_paired_lanes(std::env::var("LEONIDA_PAIRED_LANES").ok().as_deref()))
+}
+
+/// `LEONIDA_PAIRED_LANES`'s value. Pure, for testing.
+fn parse_paired_lanes(value: Option<&str>) -> PairedLanes {
+    match value.map(str::trim) {
+        Some("0") => PairedLanes::Off,
+        Some("first") => PairedLanes::First,
+        _ => PairedLanes::BeforeWide,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`paired_lanes`], for its thread only.
+    pub(super) static TEST_PAIRED_LANES: std::cell::Cell<Option<PairedLanes>> =
+        const { std::cell::Cell::new(None) };
+    /// How many programs [`paired`] translated on this thread.
+    pub(super) static TEST_PAIRED_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// `LEONIDA_SHADER_OPT`'s value; every pass when it is unset or
@@ -490,6 +546,16 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // The paired form (`paired`): with `LEONIDA_PAIRED_LANES=first` before every other form,
+        // else right before the wave-wide one.
+        let pairs = paired_lanes();
+        if pairs == PairedLanes::First {
+            let again = paired(c, native, p, why);
+            report("paired lanes (first)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("LEONIDA_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -603,6 +669,13 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
+                if wide_on && pairs == PairedLanes::BeforeWide {
+                    let again = paired(c, native, p, why);
+                    report("paired lanes", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 if wide_on || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
@@ -701,6 +774,15 @@ pub fn emit(
         let last = std::env::var("LEONIDA_WAVE_WIDE_LAST").ok();
         let tile = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads[0] > 1 && cs.threads[1] > 1);
         if wide_option.is_none() && !wide_on && !driver_loop && (last.as_deref() == Some("all") || tile && last.as_deref() != Some("0")) {
+            // First the paired form, which takes these programs without the wave-wide form's
+            // exchanges (the water's `CS_TransmissionVolumetrics` family).
+            if pairs == PairedLanes::BeforeWide {
+                let again = paired(c, native, p, why);
+                report("paired lanes", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
             let deep = if std::env::var_os("LEONIDA_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0") {
                 form("without skips, scalars followed", ir::without_skips(p, true))
             } else {
@@ -893,6 +975,98 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form
+/// (`lower::with_paired_lanes`): one host wave of 32 threads for each console wave of 64, each
+/// thread lowering two console lanes, with every per-lane branch taken by the whole wave
+/// ([`structure::structure_wide`]), so that both lanes of a thread always go the same way and
+/// every lane of the host wave is at every place. Refused for what the form does not take: a
+/// program of the structure builder (spilled; its dispatches are counted in threads), a group
+/// that does not fill its console waves, LDS operations other than dword reads, writes and
+/// order-free atomics, and a group of several console waves whose host waves would have to meet
+/// at a barrier after they went their own ways (a barrier needs every wave of the group). From
+/// TaynanGT/Vice-Tay 5e588e8 (GPL-3.0; Geckomacabre and fxceless, after ByFxbian's
+/// fxceless/victory-fork #1397, PiloteCode #854 and darkworldhm 840243e2).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let no = |what: &'static str| {
+        if why {
+            eprintln!("WAVE64-PAIRED not tried: {what}");
+        }
+        Err(ShaderError::Unsupported { offset: 0, what })
+    };
+    if !(native.wave64 && lower::host_max_wave() == 32) {
+        return no("the paired form outside a console wave64 program on 32-lane host waves");
+    }
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return no("the paired form outside compute");
+    };
+    if crate::spill::is_spilled(native) {
+        return no("the paired form for a spilled program");
+    }
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || !threads.is_multiple_of(64) {
+        return no("the paired form in a thread group that does not fill its console waves");
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return no("the paired form with a loop back to the entry");
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return no("the paired form past the group's 32 KiB of shared memory");
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    let unsupported = |i: &&ir::Inst| lower::accesses_lds(i) && !lower::supports_paired_lds(i.name());
+    if accesses_lds && (lds == 0 || insts().any(|i| unsupported(&i))) {
+        return no("an LDS operation the paired form does not take");
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // (host waves of one group that went their own ways cannot meet again at a barrier; and
+    // without the wait for the group, `LEONIDA_GROUP_SYNC=0`, nothing orders the lanes' LDS)
+    let several = threads > 64;
+    if several && p.blocks.len() > 1 && waits || group_sync() == 0 && (several || waits) {
+        return no("the paired form where host waves would have to meet");
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::take_needs();
+    let r = lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res));
+    lower::take_needs();
+    if why {
+        match &r {
+            Ok((_, wave)) => {
+                eprintln!("WAVE64-PAIRED {} branches taken wave-wide: wave {wave:?}", wide.len())
+            }
+            Err(e) => eprintln!("WAVE64-PAIRED refused: {e}"),
+        }
+    }
+    #[cfg(test)]
+    if matches!(r, Ok((_, Some(32)))) {
+        TEST_PAIRED_TAKEN.set(TEST_PAIRED_TAKEN.get() + 1);
+    }
+    r
 }
 
 /// The translated program, and the wave size it requires of the host.

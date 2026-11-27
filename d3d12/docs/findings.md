@@ -215,6 +215,40 @@ show is the water without it. The NVIDIA launcher drops its dispatches again
 dwords used by turns), and no exchange for a branch whose condition the console wave already holds
 in an SGPR (uniform by construction).
 
+**Paired lanes (`paired.rs`, `LEONIDA_PAIRED_LANES`).** Ported from TaynanGT/Vice-Tay 5e588e8
+(Geckomacabre with fxceless, after ByFxbian's fxceless/victory-fork #1397 and #1419, PiloteCode #854
+and darkworldhm 840243e2; GPL-3.0). One host wave of 32 threads runs one console wave of 64: each
+thread lowers console lane `n` and lane `n + 32`, every instruction for the lower lane and then the
+upper one, every per-lane branch taken by the whole wave (as in the wave-wide form). A reduction, a
+ballot, a first-lane or lane read and a wave-wide branch ask the host wave for both lanes of every
+thread, so nothing is exchanged between host waves; the DPP rows, swizzles, `v_permlane(x)16` and
+`ds_bpermute` stay in their 32-lane half, which is the lower or the upper lanes of the host wave. LDS
+is the program's own, each access bounded by it, behind a group barrier where a write or the first
+read of a block comes (the host's lanes of a wave are not in step). The form takes dword reads and
+writes (`2` forms too) and the order-free atomics (`ds_min_u32`, `ds_max_u32`, `ds_add_u32`, ...); it
+refuses spilled programs, groups that do not fill their console waves, and several console waves
+of a group that would have to meet after they went their own ways. Not taken from Vice-Tay: its
+replay of the console's order for 32-bit float sums (`paired_fp32.rs`; sums are joined as the
+wave-wide form joins two host waves', exact for the water's counts), the programs by hash
+(`VICTORY_WAVE_PAIRS_ONLY`) and its loop-exit change to the wave-wide form.
+
+It is tried right before the wave-wide form (`LEONIDA_PAIRED_LANES` unset or `1`; `0` never;
+`first` first of all the forms, for trying it on programs another form takes). Over the 2,734
+compute programs (`translate_cdxil --census`, `dxil.dll`'s validator on every translation): the
+seven programs of the `CS_TransmissionVolumetrics` family change and no other, none invalid, the
+same 22 refused. Group barriers (all of them outside loops now; `dxc -dumpbin`) and DXIL instructions,
+wave-wide form -> paired: `6f225b641c5b0708` 125 (76 in loops) -> 5, 12,072 -> 22,288;
+`5dc3b25986622949` 111 (58) -> 5, 7,966 -> 14,129; `926c46bab3b86bd6` 703 (376) -> 10, 38,260 ->
+70,226; `2889c21328c69e58` and `888af37a584acf98` 138 -> 2, `6871d6e4b3ac9a10` and
+`a10179ab7eda0dc3` 293 -> 9. Each thread does two lanes' work, in half as many threads. With
+`first` 172 programs change (none invalid, two more of the refused translate). Hand-written fixtures
+run on an RTX 4060 Ti (`paired_tests`): counts, first lanes and ranks after a loop lanes leave apart,
+LDS one half writes and the other reads with no barrier (one and two console waves), the tile's
+minimum and maximum and an LDS count over the lanes that go on, a wave OR and `v_readlane` of lane
+37, `ds_bpermute` with EXEC per half, the 16-bit tree sum with lanes gone, a mask's "some lane" as
+data, the console threads of an 8 x 8 group: all as the console computes them. Not yet measured in
+the game (`LEONIDA_WATER_TRANSMISSION=1` with GPU timing).
+
 ## Group packing (`LEONIDA_GROUP_PACK`, off by default)
 
 The card's time barely moves between 1080p and 1440p and is far above what the instructions of
