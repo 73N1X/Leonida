@@ -471,11 +471,62 @@ pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
 
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
-    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
-    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
-        recent.pop_front();
+    let raw = texture.as_raw() as usize;
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+            recent.pop_front();
+        }
+        recent.push_back((raw, now));
     }
-    recent.push_back((texture.as_raw() as usize, now));
+    let begun = crate::host::submissions().0;
+    NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
+    let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    note_unseen(&mut unseen, raw, begun, crate::host::submissions().1);
+}
+
+/// Texture `raw` was made with `begun` submissions begun, of which all up to
+/// `finished` have run.
+fn note_unseen(unseen: &mut std::collections::HashMap<usize, u64>, raw: usize, begun: u64, finished: u64) {
+    // Those every submission begun before them has left behind are no
+    // one's concern any more (and a raw pointer may come again).
+    unseen.retain(|_, b| *b > finished);
+    unseen.insert(raw, begun);
+}
+
+/// The submissions begun when texture `raw` was made, if one of them may
+/// still run now that all up to `finished` have.
+fn unseen_begun(unseen: &std::collections::HashMap<usize, u64>, raw: usize, finished: u64) -> Option<u64> {
+    unseen.get(&raw).copied().filter(|&begun| begun > finished)
+}
+
+/// Pooled textures made while submissions begun before them may still run:
+/// the submissions begun when each was made.
+static UNSEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> = std::sync::LazyLock::new(Default::default);
+/// The newest of those numbers (nothing to look up once it has finished).
+static NEWEST_BEGUN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture was made in a block while a submission begun before
+/// it may still run ([`begun_before`]).
+pub(crate) fn any_unseen() -> bool {
+    NEWEST_BEGUN.load(Ordering::Relaxed) > crate::host::submissions().1
+}
+
+/// The submissions begun when `texture` was made in a block, if one of
+/// those may still be on the card: lists already sent then must not find it
+/// in a slot they read by index ([`crate::descriptor::host::show_new_later`]).
+/// Every device loss with the pool in the report (runs n08, n11, n15,
+/// steps-ab2, start-3 and the user's play-1125-2107) was a page fault at the
+/// first byte of a texture made that very millisecond, its title slot
+/// changed "at once" while lists sent before it read that slot by index.
+pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
+    if !any_unseen() {
+        return None;
+    }
+    let finished = crate::host::submissions().1;
+    let raw = texture.as_raw() as usize;
+    let unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    unseen_begun(&unseen, raw, finished)
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
@@ -706,6 +757,30 @@ mod tests {
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
         assert_eq!(made.get(), n);
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+    }
+
+    /// A texture made while submissions begun before it may still run is
+    /// told with how many were begun then, until they have all run; one made
+    /// with none in flight is not, and a pointer that comes again is the new
+    /// texture's.
+    #[test]
+    fn a_texture_made_under_running_submissions_is_told_until_they_ran() {
+        let mut unseen = std::collections::HashMap::new();
+        // Made with 7 begun and 4 finished: 5, 6 and 7 may still run.
+        note_unseen(&mut unseen, 0x1000, 7, 4);
+        assert_eq!(unseen_begun(&unseen, 0x1000, 4), Some(7));
+        assert_eq!(unseen_begun(&unseen, 0x1000, 6), Some(7));
+        assert_eq!(unseen_begun(&unseen, 0x1000, 7), None);
+        assert_eq!(unseen_begun(&unseen, 0x2000, 4), None);
+        // Made with nothing in flight: at once.
+        note_unseen(&mut unseen, 0x2000, 7, 7);
+        assert_eq!(unseen_begun(&unseen, 0x2000, 7), None);
+        // The first is forgotten once its submissions ran (the next texture
+        // made says so), and its pointer may be another texture's.
+        assert!(!unseen.contains_key(&0x1000));
+        note_unseen(&mut unseen, 0x1000, 9, 8);
+        assert_eq!(unseen_begun(&unseen, 0x1000, 8), Some(9));
+        assert_eq!(unseen.len(), 1);
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
