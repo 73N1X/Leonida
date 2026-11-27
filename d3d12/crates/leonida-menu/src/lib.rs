@@ -15,6 +15,8 @@
 //! - [`font`], `gdi`, [`paint`]: glyphs from the system's fonts and the
 //!   menu painted on the CPU; the GPU side lays it over the frame at
 //!   present (`leonida-gpu`, `host/trainer.rs`).
+//! - [`overlay`], [`mods`]: what the Lua mods (`leonida-lua`) draw over the
+//!   picture, and the "Mods" page they add to the menu.
 //! - [`png`]: an encoder for the previews.
 //!
 //! Single player only: nothing here reaches other players or anything
@@ -28,6 +30,8 @@ pub mod gdi;
 pub mod input;
 pub mod knobs;
 pub mod model;
+pub mod mods;
+pub mod overlay;
 pub mod paint;
 pub mod png;
 #[cfg(windows)]
@@ -38,4 +42,4 @@ pub use app::{
     App, Frame, VISIBLE, enabled, frame, is_open, preview, scale_for, set_height, start,
     system_fonts, withheld_key, withheld_pad,
 };
-pub use knobs::{DRAW, SHOT, work};
+pub use knobs::{DRAW, LUA_DRAW, SHOT, work};

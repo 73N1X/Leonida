@@ -32,6 +32,8 @@ static WORK: AtomicU32 = AtomicU32::new(0);
 pub const DRAW: u32 = 1;
 /// [`work`]: a screenshot is asked for.
 pub const SHOT: u32 = 2;
+/// [`work`]: a Lua mod's overlay (`crate::overlay`) has something to draw.
+pub const LUA_DRAW: u32 = 4;
 
 /// What a present has to do for the menu: 0 while it is closed and no
 /// screenshot is asked for, so that such a present pays this one load.
@@ -46,6 +48,40 @@ pub(crate) fn set_work(bit: u32, on: bool) {
     } else {
         WORK.fetch_and(!bit, Ordering::AcqRel);
     }
+}
+
+/// Keys (virtual-key codes 0 to 255) the Lua modding API holds down for the
+/// title, as `LEONIDA_KEYS_FILE` does for a test; the input shim adds them
+/// to what it reports ([`injected_keys`]).
+static INJECTED: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static INJECTING: AtomicBool = AtomicBool::new(false);
+
+/// Holds exactly these keys down for the title (virtual-key codes); an empty
+/// list lets them all go.
+pub fn set_injected_keys(keys: &[u8]) {
+    let mut mask = [0u64; 4];
+    for &vk in keys {
+        mask[usize::from(vk >> 6)] |= 1 << (vk & 63);
+    }
+    for (slot, bits) in INJECTED.iter().zip(mask) {
+        slot.store(bits, Ordering::Release);
+    }
+    INJECTING.store(mask != [0; 4], Ordering::Release);
+}
+
+/// The keys held down for the title now (none unless a mod holds some).
+pub fn injected_keys() -> Vec<u8> {
+    if !INJECTING.load(Ordering::Acquire) {
+        return Vec::new();
+    }
+    (0..=255u8)
+        .filter(|&vk| INJECTED[usize::from(vk >> 6)].load(Ordering::Acquire) >> (vk & 63) & 1 != 0)
+        .collect()
 }
 
 /// How an [`Owned`] setting is read and set; a setter says why it could not.
@@ -323,6 +359,18 @@ mod tests {
         assert_eq!(take_screenshot(), Some(PathBuf::from("a.png")));
         assert_eq!(work() & SHOT, 0);
         assert!(take_screenshot().is_none());
+    }
+
+    #[test]
+    fn injected_keys_are_held_until_released() {
+        let _one = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(injected_keys().is_empty());
+        set_injected_keys(&[b'W', 0x20, 0xA0, b'W']);
+        assert_eq!(injected_keys(), [0x20, b'W', 0xA0]);
+        set_injected_keys(&[b'D']);
+        assert_eq!(injected_keys(), [b'D']);
+        set_injected_keys(&[]);
+        assert!(injected_keys().is_empty());
     }
 
     #[test]

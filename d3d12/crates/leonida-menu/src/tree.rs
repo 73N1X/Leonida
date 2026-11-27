@@ -24,6 +24,10 @@ const SETTINGS: usize = 10;
 const DISPLAY: usize = 11;
 const MENU: usize = 12;
 
+/// The Lua mods' page, when the mods run (`crate::mods`): the first page
+/// after Leonida's own, and the mods' pages follow it.
+pub const MODS: usize = MENU + 1;
+
 /// Frame-rate caps offered: the title's own pace, frames a second, none.
 const CAPS: [&str; 8] = ["Game", "30", "40", "60", "90", "120", "144", "None"];
 const WEATHERS: [&str; 9] = [
@@ -423,6 +427,25 @@ pub fn pages() -> Vec<Page> {
     pages
 }
 
+/// Leonida's pages and, while the Lua mods run, the Mods page and theirs
+/// (a "Mods" item last on the main page).
+pub fn pages_with_mods() -> Vec<Page> {
+    with_mods(pages(), crate::mods::enabled())
+}
+
+fn with_mods(mut all: Vec<Page>, on: bool) -> Vec<Page> {
+    if on {
+        all[MAIN].items.push(page(
+            "go.mods",
+            "Mods",
+            "Pages the Lua mods add, and a reload of them.",
+            MODS,
+        ));
+        all.extend(crate::mods::pages(MODS));
+    }
+    all
+}
+
 /// Why a runtime feature is missing.
 const NO_PANEL: &str =
     "Not in this build: the FPS panel is part of diagnostics builds (--features diagnostics).";
@@ -486,6 +509,7 @@ impl Backend for Leonida {
             "misc.record" => Value::Bool(knobs::RECORD.get().unwrap_or(false)),
             "misc.fps_cap" => Value::Index(cap_index(knobs::FPS_CAP.get().unwrap_or(Cap::Title))),
             "menu.scale" => Value::Number(f64::from(knobs::MENU_SCALE.get())),
+            id if id.starts_with("mod.") => crate::mods::value(id),
             "world.speed" => Value::Number(knobs::clock::rate()),
             "world.slow_motion" => Value::Bool((knobs::clock::rate() - 1.0 / 3.0).abs() < 1e-6),
             id if id.starts_with("go.") || id == "misc.screenshot" || id == "settings.about" => {
@@ -538,6 +562,7 @@ impl Backend for Leonida {
                     env!("CARGO_PKG_VERSION")
                 )));
             }
+            (id, value) if id.starts_with("mod.") => return crate::mods::apply(id, value),
             (id, value) if !id.starts_with("go.") => return self.game.apply(id, value),
             _ => {}
         }
@@ -548,6 +573,7 @@ impl Backend for Leonida {
         match id {
             id if id.starts_with("go.") => Ok(()),
             "menu.scale" | "settings.about" => Ok(()),
+            id if id.starts_with("mod.") => Ok(()),
             "display.sharpen" if !knobs::SHARPNESS.there() => Err(NO_SHARPNESS.into()),
             "misc.fps_cap" if !knobs::FPS_CAP.there() => Err(NO_CAP.into()),
             "misc.screenshot" if !knobs::screenshots_there() => Err(NO_SHOT.into()),
@@ -620,6 +646,41 @@ mod tests {
                 "Settings"
             ]
         );
+    }
+
+    #[test]
+    fn the_mods_page_is_last_and_reachable_from_the_main_menu() {
+        let _one = knobs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::mods::set_pages(vec![crate::mods::ModPage {
+            title: "Mine".into(),
+            items: vec![crate::mods::ModItem {
+                label: "Go".into(),
+                help: String::new(),
+                kind: crate::mods::ModKind::Action,
+            }],
+        }]);
+        assert_eq!(with_mods(pages(), false).len(), MODS);
+        let all = with_mods(pages(), true);
+        assert_eq!(all.len(), MODS + 2);
+        assert_eq!(all[MAIN].items.last().unwrap().kind, Kind::Submenu(MODS));
+        assert_eq!(all[MODS].title, "Mods");
+        assert_eq!(all[MODS + 1].title, "Mine");
+        // Through the menu: Mods > Mine > Go reaches the mods' queue.
+        let mut b = Leonida::new(Box::new(NotYet));
+        let mut m = Menu::new(all, 11);
+        m.handle(Input::Toggle, &mut b);
+        m.handle(Input::Up, &mut b); // Mods, the last item
+        m.handle(Input::Select, &mut b);
+        assert_eq!(m.view(&b).caption, "MODS");
+        m.handle(Input::Down, &mut b);
+        m.handle(Input::Select, &mut b);
+        assert_eq!(m.view(&b).caption, "MINE");
+        crate::mods::take_events();
+        m.handle(Input::Select, &mut b);
+        let events = crate::mods::take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].page, events[0].item), (0, 0));
+        crate::mods::set_pages(vec![]);
     }
 
     #[test]

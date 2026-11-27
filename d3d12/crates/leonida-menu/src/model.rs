@@ -179,6 +179,30 @@ impl Menu {
         self.open
     }
 
+    /// Replaces the pages (the Lua mods' pages come and go at a reload).
+    /// Cursors on pages from `volatile` on are left (the stack pops back to
+    /// the first page that is not one of those); the others stay where
+    /// they were, kept inside their page.
+    pub fn replace_pages(&mut self, pages: Vec<Page>, volatile: usize) {
+        assert!(!pages.is_empty(), "a menu has a first page");
+        self.pages = pages;
+        while self.stack.len() > 1
+            && self
+                .stack
+                .last()
+                .is_some_and(|c| c.page >= volatile || c.page >= self.pages.len())
+        {
+            self.stack.pop();
+        }
+        for c in &mut self.stack {
+            let count = self.pages.get(c.page).map_or(0, |p| p.items.len());
+            c.selected = c.selected.min(count.saturating_sub(1));
+            c.scroll = c.scroll.min(c.selected);
+        }
+        self.scroll_to_selection();
+        self.message = None;
+    }
+
     pub fn visible(&self) -> usize {
         self.visible
     }
@@ -607,6 +631,42 @@ mod tests {
         assert_eq!((v.footer.as_str(), v.footer_warns), ("not yet", true));
         m.handle(Input::Select, &mut b);
         assert_eq!(b.done.len(), 1, "an unavailable item is not run");
+    }
+
+    #[test]
+    fn replaced_pages_pop_the_volatile_ones_and_keep_cursors_inside() {
+        let (mut m, mut b) = (menu(), Fake::default());
+        m.handle(Input::Select, &mut b);
+        assert_eq!((m.depth(), m.page().title), (1, "Sub"));
+        for _ in 0..9 {
+            m.handle(Input::Down, &mut b);
+        }
+        // Page 1 is volatile and now shorter: back to the first page.
+        let main = Page {
+            title: "Main",
+            items: vec![Item::new("sub", "Sub", "", Kind::Submenu(1))],
+        };
+        let sub = Page {
+            title: "Sub",
+            items: vec![Item::new("s", "Row", "", Kind::Action)],
+        };
+        m.replace_pages(vec![main.clone(), sub.clone()], 1);
+        assert_eq!((m.depth(), m.page().title), (0, "Main"));
+        assert_eq!(m.selected().unwrap().id, "sub");
+        // A page that is not volatile stays, and the cursor is clamped.
+        m.handle(Input::Select, &mut b);
+        m.replace_pages(vec![main, sub], 5);
+        assert_eq!((m.depth(), m.page().title), (1, "Sub"));
+        // A page that is gone is popped whatever.
+        let only = Page {
+            title: "Only",
+            items: vec![],
+        };
+        m.replace_pages(vec![only], 5);
+        assert_eq!((m.depth(), m.page().title), (0, "Only"));
+        assert!(m.selected().is_none());
+        assert!(!m.handle(Input::Down, &mut b));
+        assert_eq!(m.view(&b).counter, "0 / 0");
     }
 
     #[test]

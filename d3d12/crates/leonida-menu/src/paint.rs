@@ -30,7 +30,7 @@ const CAPTION_PX: f32 = 18.0;
 const HELP_LINES: usize = 3;
 
 /// Straight RGBA.
-type Colour = [u8; 4];
+pub(crate) type Colour = [u8; 4];
 
 const BANNER_TOP: Colour = [44, 112, 222, 255];
 const BANNER_BOTTOM: Colour = [10, 38, 118, 255];
@@ -119,14 +119,14 @@ impl Layers {
 }
 
 /// A premultiplied RGBA picture.
-struct Canvas {
-    w: i32,
-    h: i32,
-    px: Vec<u8>,
+pub(crate) struct Canvas {
+    pub(crate) w: i32,
+    pub(crate) h: i32,
+    pub(crate) px: Vec<u8>,
 }
 
 impl Canvas {
-    fn new(w: u32, h: u32) -> Canvas {
+    pub(crate) fn new(w: u32, h: u32) -> Canvas {
         Canvas {
             w: w as i32,
             h: h as i32,
@@ -149,7 +149,7 @@ impl Canvas {
         p[3] = (a + u32::from(p[3]) * (255 - a) / 255).min(255) as u8;
     }
 
-    fn fill(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, colour: Colour) {
+    pub(crate) fn fill(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, colour: Colour) {
         for y in y0.max(0)..y1.min(self.h) {
             for x in x0.max(0)..x1.min(self.w) {
                 self.blend(x, y, colour, 255);
@@ -192,7 +192,7 @@ impl Canvas {
     }
 
     /// `text` with its pen at `x` on baseline `y`.
-    fn text(&mut self, atlas: &Atlas, x: i32, y: i32, text: &str, colour: Colour) {
+    pub(crate) fn text(&mut self, atlas: &Atlas, x: i32, y: i32, text: &str, colour: Colour) {
         let mut pen = x;
         for c in text.chars() {
             let Some(g) = atlas.glyph(c) else { continue };

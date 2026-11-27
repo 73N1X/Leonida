@@ -16,7 +16,7 @@ use crate::input::{Held, Keys, Withheld};
 use crate::knobs;
 use crate::model::{Input, Menu, View};
 use crate::paint::{Fonts, Layers, paint};
-use crate::tree::{Leonida, pages};
+use crate::tree::{Leonida, MODS, pages_with_mods};
 
 /// Rows shown at once.
 pub const VISIBLE: usize = 11;
@@ -64,6 +64,9 @@ pub struct Frame {
     /// Changes whenever the picture does.
     pub version: u64,
     pub layers: Arc<Layers>,
+    /// Where its top-left corner goes on the picture, for an overlay that
+    /// has its own place (the Lua mods'); `None`: the menu's corner.
+    pub origin: Option<(i32, i32)>,
 }
 
 /// The height of the picture presented: the menu is painted for it. Told
@@ -87,7 +90,13 @@ pub fn frame(height: u32) -> Option<Frame> {
     Some(Frame {
         version: painted.0,
         layers,
+        origin: None,
     })
+}
+
+/// The height of the picture presented last told to [`set_height`].
+pub(crate) fn height() -> u32 {
+    HEIGHT.load(Ordering::Relaxed)
 }
 
 /// The scale for a picture `height` lines high.
@@ -120,18 +129,32 @@ pub struct App {
     source: Box<dyn FontSource + Send>,
     last: Option<(View, f32)>,
     painted_at: Option<Instant>,
+    /// The generation of the Lua mods' pages the menu was made from.
+    mods_seen: u64,
 }
 
 impl App {
     pub fn new(source: Box<dyn FontSource + Send>) -> App {
         App {
-            menu: Menu::new(pages(), VISIBLE),
+            mods_seen: crate::mods::generation(),
+            menu: Menu::new(pages_with_mods(), VISIBLE),
             backend: Leonida::new(Box::new(NotYet)),
             fonts: None,
             source,
             last: None,
             painted_at: None,
         }
+    }
+
+    /// Takes in the Lua mods' pages if they changed; whether they did.
+    pub fn refresh_mods(&mut self) -> bool {
+        let now = crate::mods::generation();
+        if now == self.mods_seen {
+            return false;
+        }
+        self.mods_seen = now;
+        self.menu.replace_pages(pages_with_mods(), MODS + 1);
+        true
     }
 
     /// Applies `input`; whether something changed.
@@ -205,6 +228,7 @@ fn run() {
         for input in keys.step(held, now) {
             changed |= app.handle(input);
         }
+        changed |= app.refresh_mods();
         let open = app.menu.is_open();
         // Closed: presents stop drawing at once. Opened: once its picture
         // is painted (below), so no present shows the one from last time.
