@@ -1234,6 +1234,22 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    // The calls the host lists were given and the ones left out because the
+    // list had that value already (`rootcache`, `LEONIDA_STATE_CACHE`). The
+    // counts of a list come in when it is let go, a frame or so late.
+    let (issued, skipped) = crate::rootcache::take();
+    let kinds = crate::rootcache::KINDS
+        .iter()
+        .zip(issued.iter().zip(&skipped))
+        .map(|(kind, (i, s))| format!("{kind} {:.0} recorded {:.0} left out", *i as f64 / frames, *s as f64 / frames))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(
+        "state cache per frame ({}): {kinds}; {:.0} of {:.0} calls left out",
+        if crate::rootcache::on() { "on" } else { "off" },
+        skipped.iter().sum::<u64>() as f64 / frames,
+        (issued.iter().sum::<u64>() + skipped.iter().sum::<u64>()) as f64 / frames,
+    );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     let [runs, runs_failed] = [0, 1].map(|n| crate::watch::UNGUARD_RUNS[n].load(std::sync::atomic::Ordering::Relaxed));

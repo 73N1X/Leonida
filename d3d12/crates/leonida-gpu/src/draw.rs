@@ -678,6 +678,9 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The root arguments and the vertex and index buffers the host list
+    /// has, so that equal ones are not recorded again (`crate::rootcache`).
+    cache: crate::rootcache::Cache,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1784,6 +1787,7 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.cache.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -2013,10 +2017,14 @@ impl State {
                 StrideInBytes: v.stride,
             };
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
+        if count > 0 {
+            let mut keys = [(0u64, 0u32, 0u32); 32];
+            for (key, view) in keys.iter_mut().zip(&views[..count]) {
+                *key = (view.BufferLocation, view.SizeInBytes, view.StrideInBytes);
+            }
+            if self.cache.vertex(&keys[..count]) {
+                // SAFETY: an open list; the views name live host buffers.
+                unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
             }
         }
         if indexed {
@@ -2030,8 +2038,10 @@ impl State {
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if self.cache.index((view.BufferLocation, view.SizeInBytes, view.Format.0)) {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -2069,6 +2079,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // (Clears the cache if the switch changed since the last call.)
+        self.cache.sync();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -2123,6 +2135,7 @@ impl State {
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
             self.host_roots = [0; 2];
+            self.cache.heaps_changed();
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -2143,6 +2156,8 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            // A root signature set drops the arguments of its side.
+            self.cache.side_changed(compute);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -2220,12 +2235,14 @@ impl State {
                     self.user.clear();
                     self.user.extend_from_slice(values);
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if self.cache.constants(compute, param, values) {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -2234,15 +2251,9 @@ impl State {
                     if srv && slot == leonida_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            // An open list; the directory lives as long as
+                            // the process and the list holds it.
+                            self.put_view(l, compute, crate::rootcache::Kind::Srv, param, m.directory);
                         }
                         continue;
                     }
@@ -2250,15 +2261,9 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            // An open list; the table lives as long as the
+                            // heap the list holds.
+                            Some(gpu) => self.put_view(l, compute, crate::rootcache::Kind::Srv, param, gpu),
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -2268,15 +2273,9 @@ impl State {
                         // descriptor tables only (already mirrored by `tables`),
                         // so bind the strides buffer without sweeping the heap.
                         match self.heap_strides(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            // An open list; the table lives as long as the
+                            // heap the list holds.
+                            Some(gpu) => self.put_view(l, compute, crate::rootcache::Kind::Srv, param, gpu),
                             None => once!("a shader inspects table view kinds without a view heap set"),
                         }
                         continue;
@@ -2315,30 +2314,17 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    // An open list; the address is in live memory.
+                    self.put_view(l, compute, if srv { crate::rootcache::Kind::Srv } else { crate::rootcache::Kind::Cbv }, param, gpu);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == leonida_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        // An open list; the buffer lives as long as the
+                        // process and the list holds it.
+                        self.put_view(l, compute, crate::rootcache::Kind::Uav, param, m.faults);
                     }
                     continue;
                 }
@@ -2358,6 +2344,52 @@ impl State {
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    /// The clamp of indirect records ran on the list (`crate::indirect`):
+    /// it set a compute root signature and pipeline of its own, so the
+    /// compute side has no root arguments the cache knows and the next
+    /// bind sets its pipeline and root signature again. The graphics side
+    /// stays as it was.
+    fn clamped(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        self.cache.side_changed(true);
+    }
+
+    /// Sets a root view (`kind`: constant buffer, shader resource or
+    /// unordered access), unless the host list has that address there.
+    fn put_view(&mut self, l: &ID3D12GraphicsCommandList, compute: bool, kind: crate::rootcache::Kind, param: u32, gpu: u64) {
+        use crate::rootcache::Kind;
+        if !self.cache.descriptor(compute, kind, param, gpu) {
+            return;
+        }
+        // SAFETY: an open list; the caller's address is in live memory.
+        unsafe {
+            match (compute, kind) {
+                (false, Kind::Cbv) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, Kind::Srv) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                (true, Kind::Cbv) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, Kind::Srv) => l.SetComputeRootShaderResourceView(param, gpu),
+                (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+            }
+        }
+    }
+
+    /// Sets a root descriptor table, unless the host list has it there.
+    fn put_table(&mut self, l: &ID3D12GraphicsCommandList, compute: bool, param: u32, handle: D3D12_GPU_DESCRIPTOR_HANDLE) {
+        if !self.cache.descriptor(compute, crate::rootcache::Kind::Table, param, handle.ptr) {
+            return;
+        }
+        // SAFETY: an open list; the handle is in the bound view heap.
+        unsafe {
+            if compute {
+                l.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                l.SetGraphicsRootDescriptorTable(param, handle);
+            }
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -2416,14 +2448,8 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            // An open list; the address is in a live buffer.
+            self.put_view(&list.list, compute, crate::rootcache::Kind::Uav, param, gpu);
             return true;
         }
         let heap = match self.heaps[0] {
@@ -2470,14 +2496,8 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        // An open list; the slot is in the bound view heap.
+        self.put_table(&list.list, compute, param, handle);
         true
     }
 
@@ -2556,14 +2576,8 @@ impl State {
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        // An open list; the slot is in the bound view heap.
+        self.put_table(&list.list, compute, param, handle);
         true
     }
 
@@ -3718,6 +3732,8 @@ impl State {
             if let Some((param, word)) = compute_word(p, leonida_shader::emit::USER_DISPATCH_THREADS_X) {
                 // SAFETY: an open list; the root signature has the word.
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+                // (One word of a parameter's constants: the cache has them whole.)
+                self.cache.constant_set(true, param);
             }
         }
         // SAFETY: an open list with everything set.
@@ -3726,10 +3742,14 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
-            && self.ambient(list, p, role)
         {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            let recorded = self.ambient(list, p, role);
+            // Its passes set a compute root signature and pipeline of their own.
+            self.cache.side_changed(true);
+            if recorded {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         }
     }
 
@@ -4683,7 +4703,7 @@ impl State {
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -4737,6 +4757,8 @@ impl State {
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
                 StrideInBytes: v.stride,
             };
+            // (Not what the cache holds for the slot; the next draw sets its own.)
+            self.cache.vertex_set(slot);
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
         }
@@ -4839,9 +4861,9 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        let opened = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args));
+        self.clamped();
+        let (mut table, scratch) = opened?;
         let at = table.place(id, offset, kind)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
@@ -5010,13 +5032,13 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
+                // (A clamp that gave up may have set its root signature too.)
+                self.clamped();
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -5116,6 +5138,89 @@ mod thread_tests {
         assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// A state whose cache holds a constant and a root view on each side.
+    fn held() -> State {
+        let mut s = State::default();
+        s.cache.on_for_test();
+        for compute in [false, true] {
+            assert!(s.cache.constants(compute, 0, &[1, 2]));
+            assert!(s.cache.descriptor(compute, crate::rootcache::Kind::Srv, 1, 0x100));
+        }
+        s.host_pipeline = 7;
+        s.host_roots = [8, 9];
+        s
+    }
+
+    fn graphics_kept(s: &mut State) -> bool {
+        !s.cache.constants(false, 0, &[1, 2]) && !s.cache.descriptor(false, crate::rootcache::Kind::Srv, 1, 0x100)
+    }
+
+    fn compute_dropped(s: &mut State) -> bool {
+        s.cache.constants(true, 0, &[1, 2]) && s.cache.descriptor(true, crate::rootcache::Kind::Srv, 1, 0x100)
+    }
+
+    #[test]
+    fn the_indirect_clamp_drops_the_compute_side_and_leaves_graphics() {
+        let mut s = held();
+        s.clamped();
+        assert!(graphics_kept(&mut s));
+        assert!(compute_dropped(&mut s));
+        assert_eq!((s.host_pipeline, s.host_roots), (0, [8, 0]));
+    }
+
+    #[test]
+    fn a_pass_of_ours_with_its_own_root_signature_drops_that_side() {
+        let mut s = held();
+        s.cache.side_changed(true);
+        assert!(graphics_kept(&mut s));
+        assert!(compute_dropped(&mut s));
+        let mut s = held();
+        s.cache.side_changed(false);
+        assert!(s.cache.constants(false, 0, &[1, 2]));
+        assert!(!s.cache.constants(true, 0, &[1, 2]));
+    }
+
+    #[test]
+    fn heaps_set_drop_both_sides() {
+        let mut s = held();
+        s.cache.heaps_changed();
+        assert!(compute_dropped(&mut s));
+        assert!(s.cache.constants(false, 0, &[1, 2]));
+    }
+
+    /// A host list that continues the title's (`replay`) has nothing set.
+    #[test]
+    fn a_new_host_list_after_a_cut_has_nothing_cached() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = host.new_list().expect("a host list");
+        let mut s = held();
+        s.cache.vertex(&[(1, 2, 3)]);
+        s.cache.index((1, 2, 3));
+        s.replay(&list);
+        assert!(compute_dropped(&mut s));
+        assert!(s.cache.constants(false, 0, &[1, 2]));
+        assert!(s.cache.descriptor(false, crate::rootcache::Kind::Srv, 1, 0x100));
+        assert!(s.cache.vertex(&[(1, 2, 3)]));
+        assert!(s.cache.index((1, 2, 3)));
+        assert_eq!((s.host_pipeline, s.host_roots, s.host_heaps_set), (0, [0; 2], false));
+    }
+
+    #[test]
+    fn a_state_reset_for_a_new_host_list_has_nothing_cached() {
+        let mut s = held();
+        s.reset(std::ptr::null());
+        s.cache.on_for_test();
+        assert!(s.cache.constants(false, 0, &[1, 2]));
+        assert_eq!(s.host_roots, [0; 2]);
     }
 }
 
