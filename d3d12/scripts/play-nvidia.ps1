@@ -263,20 +263,19 @@ if ($settings.LEONIDA_FRAME_GEN -and -not $StreamlineDir) {
     $settings.Remove('LEONIDA_FRAME_GEN')
 }
 # Series X: the title upscales with its own upscaler, as passes that hand nothing over. DLSS (or the stretch)
-# stands in for its FidelityFX upscale instead, which the title is made to use (LEONIDA_FSR_UPSCALER, the loader's
-# hooks.rs), and frame generation takes its depth and motion vectors from that same upscale: it needs it too.
+# can stand in for its FidelityFX upscale instead, which the title is then made to use (LEONIDA_FSR_UPSCALER, the
+# loader's hooks.rs): only when -Dlss asks for it, because that path lights nothing yet (the world is black with
+# the HUD over it, 2026-11-27). Frame generation alone keeps the title's own upscaler: its depth and motion
+# vectors are the G-buffer pass's (leonida-gpu's fg.rs, LEONIDA_FG_GBUFFER).
 if ($console -eq 'series-x') {
-    $generating = $settings.LEONIDA_FRAME_GEN -and $settings.LEONIDA_FRAME_GEN -ne '1'
-    if ($generating -and $settings.LEONIDA_UPSCALE -notin 'dlss', 'stretch') {
-        if ($dlssCan) {
-            Write-Host 'Series X: frame generation takes depth and motion vectors from the DLSS upscale, so DLSS makes the picture.'
-            $settings.LEONIDA_UPSCALE = 'dlss'
-        } else {
-            Write-Host 'Series X: frame generation needs the DLSS upscale (its files and a build with it): left off.'
-            $settings.Remove('LEONIDA_FRAME_GEN')
-        }
+    if ($settings.LEONIDA_UPSCALE -eq 'dlss' -and -not $Dlss -and -not $More.ContainsKey('LEONIDA_UPSCALE')) {
+        # Asked for by -FrameGen alone ($wantDlss above), not by -Dlss: the title's own upscaler stays.
+        $settings.Remove('LEONIDA_UPSCALE')
+        if (-not $settings.LEONIDA_RENDER_SCALE) { $settings.LEONIDA_RENDER_SCALE = $dlssScale.quality }
+        $settings.LEONIDA_OWN_UPSCALER = '1'
     }
     if ($settings.LEONIDA_UPSCALE -in 'dlss', 'stretch') {
+        Write-Host 'Series X with DLSS: experimental, the world is not lit on this path yet (leave -Dlss out for the picture).'
         $settings.LEONIDA_FSR_UPSCALER = '1'; $settings.Remove('LEONIDA_OWN_UPSCALER')
         # Through FidelityFX the title renders 1.0 of its output there: 1440 lines (quality) unless a scale is set.
         if (-not $settings.LEONIDA_RENDER_SCALE) { $settings.LEONIDA_RENDER_SCALE = $dlssScale.quality }

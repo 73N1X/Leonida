@@ -229,7 +229,9 @@ pub(crate) fn tag(render: [u32; 2], jitter: [f32; 2], mv_pixels: [f32; 2], near:
     if latest.is_none() {
         tracing::info!(?render, ?jitter, ?mv_pixels, near, far, "frame generation: the first upscale's numbers (its depth and motion vectors are tagged from now on)");
     }
-    let (depth, motion) = latest.as_ref().map_or((0, 0), |l| (l.depth, l.motion));
+    // The first upscale after the G-buffer's were taken: its own resources come with `note_titles`.
+    let first = !UPSCALE_TAGS.swap(true, Ordering::Relaxed);
+    let (depth, motion) = latest.as_ref().filter(|_| !first).map_or((0, 0), |l| (l.depth, l.motion));
     *latest = Some(Latest { depth, motion, render, jitter, mv_pixels, near, far, reset });
     TAGGED.store(true, Ordering::Relaxed);
 }
@@ -259,6 +261,49 @@ pub(crate) fn note_titles(depth: u64, motion: u64) {
     if let Some(l) = latest.as_mut() {
         (l.depth, l.motion) = (depth as usize, motion as usize);
     }
+}
+
+/// An upscale has handed its numbers over ([`tag`] from the upscale's side): the G-buffer's are then left alone.
+static UPSCALE_TAGS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the G-buffer pass's depth and velocity targets are frame generation's inputs where no upscale
+/// hands any over (`LEONIDA_FG_GBUFFER=0`: not, as before).
+fn gbuffer_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_FG_GBUFFER").is_none_or(|v| v != "0"))
+}
+
+/// With frame generation on and the title upscaling by itself (Series X: its own upscaler's passes hand
+/// nothing over, and its FidelityFX path made to run there lights nothing: the scene colour stays black, dump
+/// of 2026-11-27): the depth and the velocity target of the pass that fills the G-buffer
+/// (`crate::draw::State::set_targets` finds it: four or more targets, one of them two 16-bit floats, with a
+/// depth target of the same size). They are what the FidelityFX upscale is given on that path (the probe of
+/// the same run: depth 2560x1440 format 19, motion vectors 2560x1440 format 34, in pixels, depth from 10000
+/// down to 0.15), so its numbers are used: no jitter is known here, and none is told.
+pub(crate) fn gbuffer(depth: u64, motion: u64, size: [u32; 2]) {
+    if state().is_none() || !gbuffer_on() || UPSCALE_TAGS.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+    if latest.is_none() {
+        tracing::info!(
+            ?size,
+            depth = format_args!("{depth:#x}"),
+            motion = format_args!("{motion:#x}"),
+            "frame generation: depth and motion vectors are the G-buffer pass's from now on (LEONIDA_FG_GBUFFER=0: only an upscale's)"
+        );
+    }
+    *latest = Some(Latest {
+        depth: depth as usize,
+        motion: motion as usize,
+        render: size,
+        jitter: [0.0; 2],
+        mv_pixels: [1.0; 2],
+        near: 10000.0,
+        far: 0.15,
+        reset: false,
+    });
+    TAGGED.store(true, Ordering::Relaxed);
 }
 
 /// Where the title's picture is in the swap chain's buffer when bars go around it (`crate::aspect`): left, top,
@@ -369,7 +414,7 @@ pub(crate) fn present_start() {
         // Said once: generation is on and nothing has come from an upscale yet.
         if latest.is_none() && index == 600 {
             tracing::warn!(
-                "frame generation: no upscale has handed over depth and motion vectors in 600 presents, and no frame is generated until one does. In the world that means the title is not upscaling through FidelityFX (Series X: LEONIDA_FSR_UPSCALER=1 with LEONIDA_UPSCALE=dlss)"
+                "frame generation: neither an upscale nor a G-buffer pass has handed over depth and motion vectors in 600 presents, and no frame is generated until one does (menus and loading screens have neither)"
             );
         }
         let found = latest.as_ref().and_then(|l| {

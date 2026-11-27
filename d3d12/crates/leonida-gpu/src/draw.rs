@@ -1758,6 +1758,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        // The title resource of each view in `views` (0: none), for frame generation below.
+        let mut titles: Vec<usize> = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1779,10 +1781,12 @@ impl State {
                 if let Some(desc) = null {
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
+                    titles.push(0);
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
+            titles.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             views.push((Some(texture), record.desc()));
@@ -1811,6 +1815,22 @@ impl State {
             formats[8] = bound_format(Some(*texture), record.depth_desc().as_ref().map(|d| d.Format));
         }
         self.target_formats = formats;
+        // Frame generation where the title upscales by itself: the G-buffer pass's depth and velocity
+        // (`crate::fg::gbuffer`). The pass is the one with four or more targets, one of them two 16-bit floats
+        // (DXGI format 34), and a depth target of that size.
+        const VELOCITY: u32 = 34;
+        if crate::fg::active() && views.len() >= 4 && self.depth != 0 {
+            let velocity = (0..views.len().min(8)).find(|&i| formats[i] == VELOCITY && titles[i] != 0);
+            if let (Some(i), Some((depth, _))) = (velocity, dsv.as_ref())
+                && let Some(motion) = views[i].0
+            {
+                // SAFETY: live host resources.
+                let (m, d) = unsafe { (motion.GetDesc(), depth.GetDesc()) };
+                if (m.Width, m.Height) == (d.Width, d.Height) {
+                    crate::fg::gbuffer(self.depth as u64, titles[i] as u64, [m.Width as u32, m.Height]);
+                }
+            }
+        }
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("LEONIDA_BIND_CACHE").map_or(true, |v| v != "0"))
