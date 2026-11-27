@@ -882,14 +882,14 @@ if(BUILD_TESTING)
   add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
   add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
 
+  add_executable(heavy_pipeline_cache_test test/heavy_pipeline_cache_test.cpp)
+  add_test(NAME heavy_pipeline_cache COMMAND heavy_pipeline_cache_test)
+
   # RT-PIPELINE-PREWARM-ORDER phase 1: the file format and the recorder of src/pipeline_order.h (pure stdlib, no GPU).
   add_executable(pipeline_order_test test/pipeline_order_test.cpp)
   target_link_libraries(pipeline_order_test PRIVATE Threads::Threads)
   add_test(NAME pipeline_order COMMAND pipeline_order_test)
   set_tests_properties(pipeline_order PROPERTIES TIMEOUT 120)
-
-  add_executable(heavy_pipeline_cache_test test/heavy_pipeline_cache_test.cpp)
-  add_test(NAME heavy_pipeline_cache COMMAND heavy_pipeline_cache_test)
 
   # The per-pipeline journal files compute pipelines are kept in: naming, header check, atomic replacement.
   add_executable(pipeline_cache_journal_test test/pipeline_cache_journal_test.cpp)
@@ -2625,6 +2625,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_compile_pool_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_compile_pool COMMAND d3d12_compile_pool_test)
     set_tests_properties(d3d12_compile_pool PROPERTIES TIMEOUT 120)
+    # RT-PIPELINE-PREWARM-ORDER phase 2: the plan read from an order log (src/pipeline_prewarm.h) and its warm-ups on the
+    # compile workers, with jobs that wait at gates; no device.
+    add_executable(pipeline_prewarm_test test/pipeline_prewarm_test.cpp)
+    target_link_libraries(pipeline_prewarm_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(pipeline_prewarm_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pipeline_prewarm_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME pipeline_prewarm COMMAND pipeline_prewarm_test)
+    set_tests_properties(pipeline_prewarm PROPERTIES TIMEOUT 120)
     add_executable(d3d12_pipeline_workers_test test/d3d12_pipeline_workers_test.cpp)
     target_link_libraries(d3d12_pipeline_workers_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_pipeline_workers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
