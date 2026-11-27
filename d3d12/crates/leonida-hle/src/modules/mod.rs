@@ -11,6 +11,9 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+// Leonida: the title's clock at the trainer menu's rate.
+#[cfg(windows)]
+pub mod clock;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -58,6 +61,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     ];
     #[cfg(windows)]
     all.push(apu::module());
+    #[cfg(windows)]
+    all.push(clock::module());
     #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]

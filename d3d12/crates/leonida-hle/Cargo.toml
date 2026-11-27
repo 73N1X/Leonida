@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 leonida-gpu.workspace = true
 leonida-loader.workspace = true
+leonida-menu.workspace = true
 leonida-pe.workspace = true
 leonida-formats.workspace = true
 opus-pure.workspace = true
@@ -29,6 +30,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

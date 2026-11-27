@@ -308,6 +308,7 @@ dependencies = [
  "leonida-formats",
  "leonida-gpu",
  "leonida-loader",
+ "leonida-menu",
  "leonida-pe",
  "opus-pure",
  "tempfile",

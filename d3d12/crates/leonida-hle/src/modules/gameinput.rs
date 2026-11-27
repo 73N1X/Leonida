@@ -1261,6 +1261,9 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            // Leonida: while the trainer menu (`leonida-menu`, F4) is open,
+            // the buttons it reads are kept from the title.
+            state.Gamepad.wButtons &= !leonida_menu::withheld_pad();
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`LEONIDA_KEYS`) also press the first
@@ -1288,6 +1291,9 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // Leonida: the keys the trainer menu reads, while it is open
+                    // (and so from the stand-in pad, which is made of these).
+                    .filter(|&vk| !leonida_menu::withheld_key(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
