@@ -228,10 +228,18 @@ fn most() -> f32 {
 /// this is set to.)
 fn reflect_most() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
+    let set = *SET.get_or_init(|| {
         let set = std::env::var("LEONIDA_REFLECT_MOST").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(0.0)
-    })
+    });
+    // Leonida: `LEONIDA_AB=<s>,LEONIDA_REFLECT_MOST` turns it on (the value
+    // asked, or 0.5 as maren-halv/VIctory-DXR 6c30d58 had it) and off by turns,
+    // to compare the same place both ways in one run.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_REFLECT_MOST") {
+        return if !on { 0.0 } else if set > 0.0 { set } else { 0.5 };
+    }
+    set
 }
 
 /// Strength and radius of the creases' shade.

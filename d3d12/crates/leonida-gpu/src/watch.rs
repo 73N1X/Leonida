@@ -3540,7 +3540,14 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    std::time::Instant,
+    /// The thread's priority before [`remap_boost`] raised it.
+    Option<i32>,
+    /// Who took it.
+    &'static std::panic::Location<'static>,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3549,8 +3556,44 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let held = self.1.elapsed().as_micros() as u64;
+        REMAP_TIMES[2].fetch_add(held, std::sync::atomic::Ordering::Relaxed);
+        REMAP_TIMES[3].fetch_max(held, std::sync::atomic::Ordering::Relaxed);
+        if held >= 20_000 {
+            // Said at the 1st, 2nd, 4th and so on: where the long holds come from.
+            static LONG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LONG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, held_ms = held / 1000, at = %self.3, "a change of mapping held title memory still for long");
+            }
+        }
+        if let Some(before) = self.2 {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+            // SAFETY: a plain call on this thread.
+            unsafe { SetThreadPriority(GetCurrentThread(), before) };
+        }
     }
 }
+
+/// Whether the thread that changes a mapping runs at the highest priority
+/// while it holds title memory still (`LEONIDA_REMAP_BOOST=0`: at its own).
+///
+/// Every texture refresh waits while a change holds it, and the submitting
+/// thread waits for the refreshes. The holds were 0.7-0.8 ms a change in the
+/// world's load, the longest single hold 8-22 ms in 5 frame lines out of 5:
+/// a scheduler's quantum, which is what a thread that the processor's twelve
+/// busy threads take turns with loses when it is put aside (run x33). Raised,
+/// the holder is not put aside for a thread of normal priority. The workers
+/// that do its system calls ([`remap_worker_priority`]) go with it.
+pub fn remap_boost() -> bool {
+    crate::toggled!("LEONIDA_REMAP_BOOST")
+}
+
+/// Since the last frame-rate line: the changes of mapping the runtime made
+/// ([`title_memory_remapping`]), in microseconds the time they waited for
+/// the reads in place to end, the time they held title memory still (no
+/// read in place began meanwhile), and the longest hold.
+pub(crate) static REMAP_TIMES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// How often the runtime began or ended a change of what title memory
 /// shows: odd while one is under way.
@@ -3689,6 +3732,7 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
+#[track_caller]
 pub fn title_memory_remapping() -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
@@ -3700,10 +3744,35 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    // Raised before the lock is asked for: once it is asked for, new reads
+    // in place wait behind it as well.
+    let before = remap_boost().then(|| {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+        };
+        // SAFETY: plain calls on this thread.
+        unsafe {
+            let thread = GetCurrentThread();
+            let before = GetThreadPriority(thread);
+            if before < THREAD_PRIORITY_HIGHEST {
+                SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST);
+            }
+            before
+        }
+    });
+    let asked = std::time::Instant::now();
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let got = std::time::Instant::now();
+    REMAP_TIMES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    REMAP_TIMES[1].fetch_add((got - asked).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(
+        changing,
+        got,
+        before.filter(|&b| b < windows_sys::Win32::System::Threading::THREAD_PRIORITY_HIGHEST),
+        std::panic::Location::caller(),
+    )
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).

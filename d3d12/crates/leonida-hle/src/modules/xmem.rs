@@ -1295,22 +1295,59 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = leonida_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
+    let step = match alias_chunk() {
+        0 => len.max(PAGE),
+        pages => pages * PAGE,
+    };
+    let mut done = 0;
+    loop {
+        let n = step.min(len - done);
+        // As in `XMemMapPhysicalPages`: no read in place meets the gap. Taken
+        // for a chunk at a time ([`alias_chunk`]).
+        let _changing = leonida_gpu::title_memory_remapping();
+        unmap(&mut physical, to + done, n);
+        for k in (done..done + n).step_by(PAGE) {
+            if from == 0 {
+                break;
+            }
+            let at = from + k;
+            let Some(slice) = physical.slice_at(at) else {
+                return false;
+            };
+            if !map(&mut physical, to + k, PAGE, slice) {
+                return false;
+            }
         }
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
-            return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+        done += n;
+        if done >= len {
+            return true;
         }
     }
-    true
+}
+
+/// Pages [`map_alias`] changes under one taking of the change of mapping
+/// (`leonida_gpu::title_memory_remapping`): `LEONIDA_ALIAS_CHUNK=<pages>`, 16
+/// unless set; 0: the whole range at once, as before.
+///
+/// Each texture refresh and texture read-back waits while a change holds
+/// title memory still, and the submitting thread waits for the refreshes.
+/// With `LEONIDA_MAP_THREADS=1` (the NVIDIA launcher's) the GPU's page
+/// mappings came here range by range, a page after the other at 0.2-4 ms
+/// each in the world: single holds of 23-69 ms from this function, and 110
+/// ms a frame held in all on a frame of 182 ms while the player turned (run
+/// x33 and the A/B run after it; refreshes waited 116 ms of it). Between two
+/// chunks a page is either what it showed or what it shows now, both mapped:
+/// a read in place never meets an unmapped gap, which is what the lock is
+/// for. (A read between two chunks sees the range half changed; whether the
+/// title reads it before its GPU copy is done is not measured.)
+fn alias_chunk() -> usize {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if leonida_gpu::switched("LEONIDA_ALIAS_CHUNK") == Some(false) {
+        return 0;
+    }
+    static ASKED: LazyLock<usize> =
+        LazyLock::new(|| std::env::var("LEONIDA_ALIAS_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16));
+    *ASKED
 }
 
 /// [`map_alias`] of many ranges, in order.
@@ -1640,10 +1677,13 @@ mod pool {
 
     fn serve(pool: &Pool) {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
         };
+        // They work only while a change holds title memory still, which every
+        // texture refresh waits for (`leonida_gpu::remap_boost`).
+        let priority = if leonida_gpu::remap_boost() { THREAD_PRIORITY_HIGHEST } else { THREAD_PRIORITY_ABOVE_NORMAL };
         // SAFETY: a plain call on our own thread.
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
         let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let Some(batch) = batches.front().cloned() else {

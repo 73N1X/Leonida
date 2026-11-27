@@ -3049,6 +3049,9 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var_os("LEONIDA_FILL_TITLE").is_some_and(|v| v == "1"));
+    // Leonida: `LEONIDA_AB=<s>,LEONIDA_FILL_TITLE` turns it on and off by turns in one run.
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("LEONIDA_FILL_TITLE").unwrap_or(on);
     on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
 }
 
@@ -9543,6 +9546,17 @@ impl Meter {
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                );
+            }
+            let [changes, waiting, held] =
+                [0, 1, 2].map(|i| crate::watch::REMAP_TIMES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let longest = crate::watch::REMAP_TIMES[3].swap(0, Ordering::Relaxed) as f64 / 1000.0;
+            if changes > 0.0 {
+                tracing::info!(
+                    "the runtime's changes of mapping per frame: {changes:.1}, {:.2} ms waiting for reads in place to end, \
+                     {:.2} ms holding title memory still (longest {longest:.2} ms)",
+                    waiting / 1000.0,
+                    held / 1000.0
                 );
             }
             let [through, left, filled, short] =
