@@ -368,6 +368,25 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 # could be measured at the save (three minutes of the idle camera each, 2026-11-27: 92.5 ms a frame and 6,353
 # draws with the console's settings, 90.9-101.7 ms and 6,636-7,079 draws with the lighter set) and 338-350 draws a
 # frame were dropped for want of a pipeline against 191.
+# With another output size than the console's (LEONIDA_OUTPUT), the title's settings file is told that size as its
+# UI and fullscreen resolution: left at 0x0 ("as the console") it lays the UI out for 3840x2160 and the weapon wheel
+# and menus come out half again too big in a 2560x1440 picture (2026-11-27).
+if (-not $DryRun -and $env:LEONIDA_DATA_DIR -and "$($settings.LEONIDA_OUTPUT)" -match '^(\d+)x(\d+)$') {
+    $outW = $Matches[1]; $outH = $Matches[2]
+    Get-ChildItem (Join-Path $env:LEONIDA_DATA_DIR '*\storage\settings\settings.xml') -ErrorAction SilentlyContinue | ForEach-Object {
+        $file = $_.FullName
+        $text = [IO.File]::ReadAllText($file)
+        $new = $text
+        foreach ($block in 'uiResolution', 'resolutionFullscreen') {
+            $new = [regex]::Replace($new, "(<$block>\s*<width value=`")[^`"]*(`" />\s*<height value=`")[^`"]*(`" />)", "`${1}$outW`${2}$outH`${3}")
+        }
+        if ($new -ne $text) {
+            if (-not (Test-Path "$file.original")) { Copy-Item $file "$file.original" }
+            [IO.File]::WriteAllText($file, $new, (New-Object Text.UTF8Encoding $false))
+            Write-Host "The title's UI and fullscreen resolution: ${outW}x$outH written to its settings (the first file is $file.original)."
+        }
+    }
+}
 $titleGraphics = if ($settings.LEONIDA_TITLE_GRAPHICS) { "$($settings.LEONIDA_TITLE_GRAPHICS)" } else { 'keep' }
 if (-not $DryRun -and $titleGraphics -eq 'performance' -and $env:LEONIDA_DATA_DIR) {
     $lighter = [ordered]@{
