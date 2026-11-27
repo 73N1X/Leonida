@@ -141,8 +141,13 @@ if ($RayTracing) {
     # run with every ray a miss they made rooms white or black and took the card 33-50 ms a frame (about 10 without).
     # The screen-probe and visibility traces keep running: skipping those too left their outputs as garbage.
     $settings.LEONIDA_BVH_MISS = '1'
+    # Leonida: the resolve and ray-activation passes run again (every ray a miss), as klbf-lab 64ff6a0 found: with
+    # them skipped, foliage in shade, blinds and the deck at the save showed magenta blocks and stair-stepped bars.
+    # Series X 1440p, the standard moves: magenta 0.00 per mille in 316 frames (bars in every turn before), frames
+    # 60-91 ms, brightness as before (2026-11-27). LEONIDA_SKIP_RT_RESOLVE=1 skips them as before (rt_off_hashes.txt).
+    $settings.LEONIDA_RT_RESOLVE = '1'; $settings.LEONIDA_ACTIVATE_RAYS = '1'
     $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
-    if (Test-Path $rtList) { $settings.LEONIDA_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim() }
+    if ($env:LEONIDA_SKIP_RT_RESOLVE -eq '1' -and (Test-Path $rtList)) { $settings.LEONIDA_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim() }
 }
 if ($Adapter) { $settings.LEONIDA_ADAPTER = $Adapter }
 if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
