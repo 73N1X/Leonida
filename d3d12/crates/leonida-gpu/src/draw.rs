@@ -3832,6 +3832,11 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // Timing experiment (`crate::indirect::batch::experiments`): the title's dispatches are left out.
+        #[cfg(feature = "diagnostics")]
+        if crate::indirect::batch::experiments() & 4 != 0 {
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -6114,6 +6119,16 @@ pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    // Timing experiment (`LEONIDA_AB=<s>,LEONIDA_EXP_NO_PIXELS`): every scissor is empty while it is on,
+    // so the title's draws run their vertex and mesh programs and shade no pixel: a phase's frame time
+    // against the next one's is what the pixels cost the card. For timing only.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("LEONIDA_EXP_NO_PIXELS").unwrap_or(false) {
+        let empty = vec![RECT::default(); rects.len().max(1)];
+        // SAFETY: an open list.
+        unsafe { list.list.RSSetScissorRects(&empty) };
+        return;
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }

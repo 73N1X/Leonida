@@ -35,7 +35,8 @@ ByteAddressBuffer src0 : register(t0);
 ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
-// The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
+// The count, the timing experiments' bits (`experiments`: 1 mesh records run empty, 2 draw records,
+// 4 dispatch records), 8 bytes of nothing, then per job: source (bits 0-1), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
 // record's offset in the source; its place in the scratch buffer; for a
 // dispatch, the console groups a host group runs of a packed program (0: one).
@@ -104,6 +105,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[1] = min(record[1], 1u);
             record[2] = min(record[2], 1u);
             cost = record[0] * record[1] * record[2] * 128u;
+        }
+        uint empty = jobs.Load(4);
+        if (((empty & 1u) != 0 && kind > 2) || ((empty & 2u) != 0 && kind <= 1) || ((empty & 4u) != 0 && kind == 2)) {
+            record[0] = 0;
+            record[1] = 0;
+            record[2] = 0;
+            cost = 0;
+            asked = 0;
         }
         cost *= job.x >> 16;
     }
@@ -191,6 +200,26 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
+/// Timing experiments, each a switch of `LEONIDA_AB` and off otherwise: the bits the pass reads
+/// from its table. With one on, the title's indirect executions of that kind are still recorded and
+/// run, but with nothing to do, so a phase's frame time against the next one's says what their work
+/// costs the card apart from what executing them at all costs:
+/// `LEONIDA_EXP_EMPTY_MESH` (bit 0: mesh dispatches of no group; the world's geometry is gone),
+/// `LEONIDA_EXP_EMPTY_DRAWS` (bit 1: draws of no vertex), `LEONIDA_EXP_EMPTY_DISPATCHES` (bit 2:
+/// indirect dispatches of no group; what the title's compute passes make is stale or missing).
+/// For timing only: the picture is wrong while one is on.
+pub(crate) fn experiments() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    {
+        let on = |name: &str| crate::ab::pick(name).unwrap_or(false);
+        u32::from(on("LEONIDA_EXP_EMPTY_MESH"))
+            | u32::from(on("LEONIDA_EXP_EMPTY_DRAWS")) << 1
+            | u32::from(on("LEONIDA_EXP_EMPTY_DISPATCHES")) << 2
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    0
+}
+
 /// The words of a record of `kind` (PC argument numbering).
 pub(crate) fn words(kind: u32) -> Option<u32> {
     super::min_stride(kind).map(|bytes| bytes / 4)
@@ -228,7 +257,10 @@ impl Table {
     /// before.
     pub(crate) unsafe fn new(at: *mut u8, base: u32, sources: [u64; SOURCES]) -> Table {
         // SAFETY: the caller's.
-        unsafe { at.cast::<u32>().write_volatile(0) };
+        unsafe {
+            at.cast::<u32>().write_volatile(0);
+            at.cast::<u32>().add(1).write_volatile(experiments());
+        }
         Table { at: at as usize, base, sources, ..Table::default() }
     }
 
