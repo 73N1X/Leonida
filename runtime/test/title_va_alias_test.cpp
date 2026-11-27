@@ -159,14 +159,17 @@ int main() {
 
     a.remove(title, 0x5000000);
     EXPECT(a.add(title + size / 2, size, 0x7000000));
-    EXPECT(a.reuse_pool_mapping(title, twin, size, to) && to == 0x5000000);
+    EXPECT(!a.reuse_pool_mapping(title, twin, size, size, to));
+    EXPECT(a.shader_va(title) == title);
+    EXPECT(a.reuse_pool_mapping(title, twin, size / 2, size, to) && to == 0x5000000);
+    EXPECT(!a.reuse_pool_mapping(title, twin, size / 2 + 1, size, to));
     EXPECT(a.range_of(title, to, room) && room == size / 2);
     EXPECT(a.shader_va(title + size / 2) == 0x7000000);
-    EXPECT(a.reuse_pool_mapping(title + size / 2, twin + size / 2, size, to) && to == 0x7000000);
+    EXPECT(a.reuse_pool_mapping(title + size / 2, twin + size / 2, size, size, to) && to == 0x7000000);
     EXPECT(!a.add_twin(title + 4 * size, title + 5 * size, size * 2, arena));
     EXPECT(a.add(title + 4 * size, size, 0x8000000));
     EXPECT(a.add(twin + 5 * size - 16, 16, 0x9000000));
-    EXPECT(a.reuse_pool_mapping(twin + 4 * size + 16, title + 4 * size + 16, size, to) && to == 0x8000010);
+    EXPECT(a.reuse_pool_mapping(twin + 4 * size + 16, title + 4 * size + 16, size - 32, size, to) && to == 0x8000010);
     a.remove(title + 4 * size, 0x8000000);
     EXPECT(a.shader_side(0x8000010));
     a.forget_copy(twin + 4 * size, size, 0x8000000);

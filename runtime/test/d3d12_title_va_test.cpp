@@ -963,6 +963,18 @@ int check_stream_pool(Context& c, int& checks) {
     aliases.add_title_memory(gpu_va, pool_bytes);
     EXPECT(leonida::title_gpu_views::to_host_view(gpu_va + 0x2000, 0x100) == cpu_va + 0x2000);
 
+    constexpr UINT64 seam = pool_bytes / 2;
+    constexpr UINT64 existing = 0x100000;
+    const auto root = leonida::TitleVaAliases::root_view;
+    EXPECT(aliases.add(cpu_va + seam, 0x1000, existing));
+    const auto ranges_at_seam = aliases.size();
+    EXPECT(aliases.resolve(gpu_va + seam - 0x100, 0x200, root) == 0);
+    EXPECT(aliases.resolve(gpu_va + seam, 0x2000, root) == 0);
+    EXPECT(aliases.resolve(cpu_va + seam, 0x2000, root) == 0);
+    EXPECT(aliases.size() == ranges_at_seam);
+    EXPECT(aliases.shader_va(cpu_va + seam) == existing);
+    aliases.remove(cpu_va + seam, existing);
+
     const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
                                                D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     Ref<ID3D12DescriptorHeap> heap;
@@ -983,6 +995,8 @@ int check_stream_pool(Context& c, int& checks) {
     EXPECT(alias_base == (aliases.shader_va(gpu_va + 0x2000) & 0xFFFFFFFFFFFFull));
     EXPECT(aliases.shader_va(gpu_va + 0x2000) == aliases.shader_va(cpu_va + 0x2000));
     // Two ranges (the two views' addresses), each a page-aligned run of the pool: one mapping, not one per view.
+    EXPECT(aliases.size() == ranges_before + 2);
+    EXPECT(aliases.resolve(gpu_va + pool_bytes - 0x100, 0x200, root) == 0);
     EXPECT(aliases.size() == ranges_before + 2);
     std::printf("stream pool: GPU-only alias 0x%llx and CPU view 0x%llx share one %llu KiB mapping (V# base "
                 "0x%llx); a second view naming the twin made no mapping\n",

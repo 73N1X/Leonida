@@ -76,12 +76,15 @@ public:
         return true;
     }
 
-    bool reuse_pool_mapping(std::uint64_t va, std::uint64_t twin, std::uint64_t max_size, std::uint64_t& shader_va) {
+    bool reuse_pool_mapping(std::uint64_t va, std::uint64_t twin, std::uint64_t want, std::uint64_t max_size,
+                            std::uint64_t& shader_va) {
+        if (!want) return false;
         std::unique_lock lock(mutex_);
         const auto next = ranges_.upper_bound(va);
         if (next != ranges_.begin()) {
             const auto existing = std::prev(next);
             if (va < existing->second.end) {
+                if (want > existing->second.end - va) return false;
                 shader_va = existing->second.shader_va + (va - existing->first);
                 return true;
             }
@@ -92,7 +95,7 @@ public:
         if (twin >= other->second.end) return false;
         const auto end = next == ranges_.end() ? UINT64_MAX : next->first;
         const auto bytes = std::min({max_size, other->second.end - twin, end - va});
-        if (!bytes) return false;
+        if (bytes < want) return false;
         const auto shader = other->second.shader_va + (twin - other->first);
         decltype(ranges_) pending;
         pending.try_emplace(va, Range{va + bytes, shader});
@@ -218,11 +221,12 @@ public:
     // read or write). Counted by kind: translated, or in the title's memory and left as it was.
     std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
         if (!va) return va;
-        std::uint64_t to = shader_va(va);
-        if (to != va) {
+        std::uint64_t mapped = va, available = 0;
+        const bool has_mapping = range_of(va, mapped, available) && mapped != va;
+        if (has_mapping && bytes <= available) {
             translated_[kind].fetch_add(1, std::memory_order_relaxed);
             note_reached(va, bytes);
-            return to;
+            return mapped;
         }
         Resolver resolver;
         void* context;
@@ -231,9 +235,13 @@ public:
             resolver = resolver_;
             context = hook_context_;
         }
-        if (!resolver || !resolver(context, va, bytes, to)) return va;
+        std::uint64_t to = va;
+        if (!resolver || !resolver(context, va, bytes, to)) {
+            if (!has_mapping) return va;
+            to = mapped;
+        }
         (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
-        if (to != va) note_reached(va, bytes);
+        if (to && to != va) note_reached(va, bytes);
         return to;
     }
 

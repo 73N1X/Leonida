@@ -3366,26 +3366,24 @@ struct DeviceState {
     // held.
     bool resolve_pool_memory(std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
         leonida::title_gpu_views::Range view{};
-        if (!leonida::title_gpu_views::view_at(static_cast<std::uintptr_t>(va),
-                                               static_cast<std::uintptr_t>(std::max<std::uint64_t>(bytes, 1)), view))
-            return false;
-        const std::uint64_t offset = va >= view.gpu && va - view.gpu < view.size ? va - view.gpu : va - view.cpu;
-        // Rule B: the CPU view where the host reads the frames, the GPU-only pages only when that view has none.
-        const std::uint64_t source = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
-                                                                           static_cast<std::uintptr_t>(
-                                                                               std::max<std::uint64_t>(bytes, 1)));
-        const std::uint64_t twin = leonida::title_gpu_views::other_view(static_cast<std::uintptr_t>(source));
-        const std::uint64_t twin_view = twin ? twin : source;  // the pair always has two addresses
-        auto& aliases = leonida::title_va_aliases();
-        const auto other = source == va ? twin_view : source;
-        const auto max_size = std::min<std::uint64_t>(view.size - offset, kPoolExtentMax);
-        const auto reuse = [&] { return aliases.reuse_pool_mapping(va, other, max_size, out); };
+        if (!leonida::title_gpu_views::view_at(static_cast<std::uintptr_t>(va), 1, view)) return false;
+        const auto want = std::max<std::uint64_t>(bytes, 1);
         const auto unbacked = [&] {
             out = 0;
             ++unbacked_requests;
             note_unbacked("stream pool", va, bytes);
             return true;
         };
+        const std::uint64_t offset = va >= view.gpu && va - view.gpu < view.size ? va - view.gpu : va - view.cpu;
+        if (want > view.size - offset) return unbacked();
+        // Rule B: the CPU view where the host reads the frames, the GPU-only pages only when that view has none.
+        const std::uint64_t source = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va), want);
+        const std::uint64_t twin = leonida::title_gpu_views::other_view(static_cast<std::uintptr_t>(source));
+        const std::uint64_t twin_view = twin ? twin : source;  // the pair always has two addresses
+        auto& aliases = leonida::title_va_aliases();
+        const auto other = source == va ? twin_view : source;
+        const auto max_size = std::min<std::uint64_t>(view.size - offset, kPoolExtentMax);
+        const auto reuse = [&] { return aliases.reuse_pool_mapping(va, other, want, max_size, out); };
         if (reuse()) return true;
         if (!readable_page(source)) return unbacked();
         const std::uint64_t pool_end = (source >= view.gpu && source - view.gpu < view.size ? view.gpu : view.cpu) +
@@ -3401,6 +3399,7 @@ struct DeviceState {
         aliases.gap(twin_view, twin_lo, twin_hi);
         if (!leonida::clip_title_pool_extent(extent, source, twin_view, source_lo, source_hi, twin_lo, twin_hi))
             return reuse() || unbacked();
+        if (want > std::min(extent.size - (source - extent.start), run_end - source)) return reuse() || unbacked();
         const auto twin_start = twin_view - (source - extent.start);
         std::uint64_t shader = 0;
         if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
@@ -3490,12 +3489,18 @@ struct DeviceState {
         }
         const std::uint64_t want = std::max<std::uint64_t>(bytes, 1);
         std::lock_guard lock(title_window_mutex);
-        if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
+        std::uint64_t made = 0, available = 0;
+        const bool has_mapping = aliases.range_of(va, made, available) && made != va;
+        if (has_mapping && available >= want) {
             out = made;
             return true;
         }
         // A stream pool's address: one mapping for its readable run, shared by both of its views.
         if (resolve_pool_memory(va, bytes, out)) return true;
+        if (has_mapping) {
+            out = made;
+            return true;
+        }
         if (readable_page(va)) {
             std::uint64_t lo = 0, hi = UINT64_MAX;
             aliases.gap(va, lo, hi);  // never over a slot-133 buffer's range or another window
