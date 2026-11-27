@@ -24,7 +24,7 @@
 //!   is the place the menu's "To Vice City" item goes to.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -206,7 +206,7 @@ pub fn read_mat(address: usize, layout: Layout) -> Option<Mat> {
     (sane && m.orthonormal(0.02)).then_some(m)
 }
 
-fn write_pos(address: usize, layout: Layout, p: [f32; 3]) -> bool {
+pub fn write_pos(address: usize, layout: Layout, p: [f32; 3]) -> bool {
     if layout == Layout::D3 {
         let mut b = [0u8; 24];
         for (i, v) in p.iter().enumerate() {
@@ -338,6 +338,22 @@ impl Known {
 /// The title's image: base and size.
 static IMAGE: OnceLock<(usize, usize)> = OnceLock::new();
 static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
+/// A `LEONIDA_FIND_PLAYER` run is under way and has not got to the point where it
+/// knows what to write to (or has given up): a `LEONIDA_TELEPORT` waits for it.
+static FINDING: AtomicBool = AtomicBool::new(false);
+
+/// The finder starts (`player_find.rs`).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub fn find_started() {
+    FINDING.store(true, Ordering::Release);
+}
+
+/// The finder has set what it found (or found nothing).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub fn find_finished() {
+    FINDING.store(false, Ordering::Release);
+}
+
 /// Bumped by every teleport: an older hold stops when it sees a newer number.
 static TELEPORTS: AtomicU64 = AtomicU64::new(0);
 
@@ -552,6 +568,11 @@ pub fn install(base: usize, size: usize) {
             .name("leonida-teleport".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_secs_f32(delay));
+                // A finder in this run decides what is written to: wait for it.
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                while FINDING.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
                 match ready().and_then(|()| teleport(to, hold)) {
                     Ok(line) => eprintln!("Leonida: teleport: {line}"),
                     Err(e) => eprintln!("Leonida: teleport failed: {e}"),

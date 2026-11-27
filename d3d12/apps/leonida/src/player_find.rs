@@ -33,6 +33,18 @@
 //! counts what survives each. A candidate that never moves once movement keys have been held
 //! for `LEONIDA_PLAYER_PRUNE_STABLE` (6) samples, or that jumps more than 25 m/s, is dropped.
 //!
+//! After sampling, a **write probe** finds what the derived position follows: the
+//! best candidate is usually a copy the game rewrites (a camera target, a history
+//! entry), so every f32 triple (4-byte aligned) and f64 triple (8-byte aligned) within
+//! 0.5 m of it is tried in turn (transform positions first): +3 m in z is written to that one
+//! triple every 5 ms for 400 ms, and if the derived position rises by 2.5 to 3.5 m the triple
+//! drives it; the others that rose with it join it as the teleport group (`probe.txt`,
+//! `probe-candidates.txt`). The player must stand still (hold no keys) when it starts, which is
+//! waited for; `LEONIDA_PLAYER_PROBE=<s>` starts it that many seconds after the title started,
+//! `LEONIDA_PLAYER_PROBE_MAX` (600) bounds the tries. The pointer search then looks only at that struct
+//! (`LEONIDA_PLAYER_LEVELS`, 4 by default, pointers up to 0x2000 bytes into a block). A
+//! `LEONIDA_TELEPORT` in the same run waits for the probe.
+//!
 //! Tuning, all optional: `LEONIDA_PLAYER_ALIGN` (4; 16 is faster),
 //! `LEONIDA_PLAYER_MAX_CANDIDATES` (6000000), `LEONIDA_PLAYER_MAX_TRACKS`
 //! (2000000), `LEONIDA_PLAYER_TOP` (100), `LEONIDA_PLAYER_GROUPS` (6),
@@ -126,6 +138,10 @@ struct Config {
     threads: usize,
     /// Stable held-key samples after which a candidate that never moved is dropped.
     prune_after: u32,
+    /// Seconds after the title started at which the write probe begins (default: after sampling).
+    probe_at: Option<f64>,
+    probe_max: usize,
+    started: Instant,
 }
 
 /// Which fourth floats a position vector (`V4`) may have.
@@ -184,7 +200,7 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
         idle_max: num("LEONIDA_PLAYER_IDLE_MAX", 2) as u8,
         top: num("LEONIDA_PLAYER_TOP", 100),
         groups: num("LEONIDA_PLAYER_GROUPS", 6).clamp(1, 16),
-        levels: num("LEONIDA_PLAYER_LEVELS", 3).clamp(1, 4),
+        levels: num("LEONIDA_PLAYER_LEVELS", 4).clamp(1, 5),
         pointers: std::env::var("LEONIDA_PLAYER_POINTERS").map_or(true, |v| v != "0"),
         strict: std::env::var("LEONIDA_PLAYER_FILTER").map_or(true, |v| v != "loose"),
         vec_w: match std::env::var("LEONIDA_PLAYER_VEC_W").as_deref() {
@@ -200,7 +216,11 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
         )
         .max(1),
         prune_after: num("LEONIDA_PLAYER_PRUNE_STABLE", 6) as u32,
+        probe_at: std::env::var("LEONIDA_PLAYER_PROBE").ok().and_then(|v| v.trim().parse().ok()),
+        probe_max: num("LEONIDA_PLAYER_PROBE_MAX", 600),
+        started: Instant::now(),
     };
+    player::find_started();
     eprintln!(
         "Leonida: find player at {delay} s for {seconds} s (keys file {:?}); output {}",
         std::env::var("LEONIDA_KEYS_FILE").ok(),
@@ -214,6 +234,7 @@ pub fn start(base: usize, info: &leonida_pe::ImageInfo) {
                 Ok(headline) => eprintln!("Leonida: find player done: {headline}"),
                 Err(e) => eprintln!("Leonida: find player failed: {e}"),
             }
+            player::find_finished();
         })
         .ok();
 }
@@ -288,33 +309,6 @@ fn read_robust(address: usize, out: &mut [u8]) -> usize {
         if !mem::read(address + i * 0x1000, page) {
             page.fill(0);
             lost += page.len();
-        }
-    }
-    lost
-}
-
-/// Calls `f(address of the chunk, bytes, limit)` for every chunk of every region;
-/// positions below `limit` belong to this chunk (the rest is the overlap into
-/// the next). Returns the bytes that could not be read.
-fn for_each_chunk(
-    regions: &[Region],
-    buffer: &mut [u8],
-    overlap: usize,
-    mut f: impl FnMut(&Region, usize, &[u8], usize),
-) -> usize {
-    let mut lost = 0;
-    for region in regions {
-        let mut offset = 0;
-        while offset < region.size {
-            let want = buffer.len().min(region.size - offset);
-            lost += read_robust(region.start + offset, &mut buffer[..want]);
-            let last = offset + want >= region.size;
-            let limit = if last { want } else { want.saturating_sub(overlap) };
-            f(region, region.start + offset, &buffer[..want], limit);
-            if last || limit == 0 {
-                break;
-            }
-            offset += limit;
         }
     }
     lost
@@ -1191,24 +1185,44 @@ fn run(config: &Config) -> Result<String, String> {
         movers.len()
     );
 
-    // Free what holds addresses, then look for pointers.
+    // Free what holds addresses (the candidates hold coordinates the probe would find).
+    let derived = (best_addr, best_layout);
     drop(slots);
     drop(ranked);
+    let mut groups: Vec<(usize, Layout)> = picked.iter().map(|&(a, l)| (dec(a), l)).collect();
+    let mut probed = false;
+    match probe(config, &regions, &mut workers, derived, &dir) {
+        Ok(Some(found)) => {
+            groups = found.group;
+            probed = true;
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("Leonida: find player: probe failed: {e}"),
+    }
+    let _ = writeln!(summary, "write probe: {}", if probed { "found what drives the derived position (probe.txt)" } else { "found nothing (probe.txt)" });
     let mut known = Known {
-        groups: picked
+        groups: groups
             .iter()
             .enumerate()
             .map(|(n, &(a, l))| Group {
                 layout: l,
                 primary: n == 0,
                 paths: Vec::new(),
-                fixed: Some(enc(a)),
+                fixed: Some(a),
             })
             .collect(),
-        forward,
+        forward: if probed { None } else { forward },
     };
+    // The teleport can go ahead now; the paths come later.
+    player::set_known(known.clone());
+    player::find_finished();
+    write(&dir, "summary.txt", &summary)?;
     if config.pointers {
-        let report = pointer_scan(config, &regions, buffer, &mut known, &dir)?;
+        // Only the struct that was written to (or the best candidate's, when nothing was).
+        for g in &mut known.groups {
+            g.fixed = g.fixed.map(enc);
+        }
+        let report = pointer_scan(config, &regions, &mut workers, &mut known, &[0], &dir)?;
         let _ = writeln!(summary, "{report}");
     }
     for g in &mut known.groups {
@@ -1237,6 +1251,299 @@ fn write(dir: &Path, name: &str, text: &str) -> Result<(), String> {
     std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"))
 }
 
+// ----------------------------------------------------- parallel scans
+
+/// Runs `f(address, bytes, limit, &mut T)` over every 2 MiB block of `regions` on
+/// `buffers.len()` threads (positions below `limit` belong to the block; `overlap`
+/// more bytes are readable after them). One `T` per thread, and the bytes that
+/// could not be read.
+fn scan_parallel<T: Default + Send>(
+    regions: &[Region],
+    buffers: &mut [&'static mut [u8]],
+    overlap: usize,
+    f: impl Fn(usize, &[u8], usize, &mut T) + Sync,
+) -> (Vec<T>, usize) {
+    const SPAN: usize = 2 << 20;
+    let mut tasks: Vec<(usize, usize)> = Vec::new();
+    for r in regions {
+        let mut at = r.start;
+        while at < r.start + r.size {
+            tasks.push((at, r.start + r.size));
+            at += SPAN;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let lost = AtomicUsize::new(0);
+    let parts: Vec<T> = std::thread::scope(|scope| {
+        let handles: Vec<_> = buffers
+            .iter_mut()
+            .map(|buffer| {
+                let (tasks, next, lost, f) = (&tasks, &next, &lost, &f);
+                scope.spawn(move || {
+                    let mut out = T::default();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(at, end)) = tasks.get(i) else { break };
+                        let limit = SPAN.min(end - at);
+                        let want = (limit + overlap).min(end - at);
+                        lost.fetch_add(read_robust(at, &mut buffer[..want]), Ordering::Relaxed);
+                        f(at, &buffer[..want], limit, &mut out);
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    (parts, lost.load(Ordering::Relaxed))
+}
+
+// ----------------------------------------------------------- write probe
+
+/// A triple of numbers near the player's derived position.
+#[derive(Clone)]
+struct Near {
+    addr: usize,
+    layout: Layout,
+    /// What it held when found.
+    value: [f32; 3],
+}
+
+/// Every f32 triple (4-byte aligned) and f64 triple (8-byte aligned) within
+/// `radius` metres of `p` on every axis.
+fn scan_near(regions: &[Region], workers: &mut [&'static mut [u8]], p: [f32; 3], radius: f32) -> Vec<Near> {
+    let (parts, _) = scan_parallel::<Vec<Near>>(regions, workers, 32, |address, bytes, limit, out| {
+        // SAFETY: the buffer is page aligned; `bytes` is a prefix of it.
+        let f = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
+        let near = |v: f32, c: f32| (v - c).abs() < radius;
+        for j in 0..(limit / 4).min(f.len().saturating_sub(2)) {
+            if near(f[j], p[0]) && near(f[j + 1], p[1]) && near(f[j + 2], p[2]) {
+                out.push(Near { addr: address + j * 4, layout: Layout::V4, value: [f[j], f[j + 1], f[j + 2]] });
+            }
+        }
+        // SAFETY: as above; 8-byte aligned.
+        let d = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, bytes.len() / 8) };
+        let r = f64::from(radius);
+        for i in 0..(limit / 8).min(d.len().saturating_sub(2)) {
+            if (d[i] - f64::from(p[0])).abs() < r && (d[i + 1] - f64::from(p[1])).abs() < r && (d[i + 2] - f64::from(p[2])).abs() < r {
+                out.push(Near { addr: address + i * 8, layout: Layout::D3, value: [d[i] as f32, d[i + 1] as f32, d[i + 2] as f32] });
+            }
+        }
+    });
+    let mut all: Vec<Near> = parts.into_iter().flatten().collect();
+    all.sort_by_key(|n| (n.addr, n.layout as u8));
+    all
+}
+
+fn pos_of(address: usize, layout: Layout) -> Option<[f32; 3]> {
+    let b = mem::read_vec(address, layout.size())?;
+    let p = player::decode(&b, layout).pos;
+    p.iter().all(|v| v.is_finite()).then_some(p)
+}
+
+/// The transform whose position row a triple is, when it follows a 4x4 or a packed 4x3.
+fn matrix_before(address: usize) -> Option<(usize, Layout)> {
+    for (back, layout) in [(48, Layout::R4), (36, Layout::R43)] {
+        if let Some(a) = address.checked_sub(back)
+            && player::read_mat(a, layout).is_some()
+        {
+            return Some((a, layout));
+        }
+    }
+    None
+}
+
+/// What the probe found: the candidate that drives the derived position first,
+/// then the others that changed together with it.
+struct Probed {
+    group: Vec<(usize, Layout)>,
+}
+
+fn wait_still(config: &Config, derived: (usize, Layout)) -> [f32; 3] {
+    // The candidates are looked for around where the player is at the start of the
+    // scan: wait until no key is held and the derived position has stopped.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last: Option<([f32; 3], Instant)> = None;
+    loop {
+        let p = pos_of(derived.0, derived.1).unwrap_or([0.0; 3]);
+        let moved = last.is_none_or(|(q, _)| (0..3).any(|i| (p[i] - q[i]).abs() > 0.02));
+        if moved || keys_now() != 0 {
+            last = Some((p, Instant::now()));
+        }
+        let still = last.is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(2));
+        if still || Instant::now() > deadline {
+            let _ = config;
+            return p;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn probe(
+    config: &Config,
+    regions: &[Region],
+    workers: &mut [&'static mut [u8]],
+    derived: (usize, Layout),
+    dir: &Path,
+) -> Result<Option<Probed>, String> {
+    let mut log = String::new();
+    if let Some(at) = config.probe_at {
+        let wait = at - config.started.elapsed().as_secs_f64();
+        if wait > 0.0 {
+            eprintln!("Leonida: find player: probe waits {wait:.0} s (LEONIDA_PLAYER_PROBE={at})");
+            std::thread::sleep(Duration::from_secs_f64(wait));
+        }
+    }
+    eprintln!("Leonida: find player: probe: waiting for the player to stand still (hold no keys)");
+    let mut p = wait_still(config, derived);
+    let mut hits = Vec::new();
+    for attempt in 0..3 {
+        let t = Instant::now();
+        hits = scan_near(regions, workers, p, 0.5);
+        let now = pos_of(derived.0, derived.1).unwrap_or(p);
+        let drift = (0..3).map(|i| (now[i] - p[i]).abs()).fold(0.0, f32::max);
+        eprintln!(
+            "Leonida: find player: probe scan {attempt}: {} triples within 0.5 m of ({:.2}, {:.2}, {:.2}) in {:.1} s; the player moved {drift:.2} m meanwhile",
+            hits.len(),
+            p[0],
+            p[1],
+            p[2],
+            t.elapsed().as_secs_f32()
+        );
+        if drift < 0.3 {
+            break;
+        }
+        p = wait_still(config, derived);
+    }
+    // The derived one's own address is the reference, not a candidate.
+    hits.retain(|h| !(h.addr >= derived.0 && h.addr < derived.0 + 64) && !(derived.0 >= h.addr && derived.0 < h.addr + 24));
+    // Same triple at the same moment: one group.
+    let key = |h: &Near| h.value.map(f32::to_bits);
+    let mut sizes = std::collections::HashMap::new();
+    for h in &hits {
+        *sizes.entry(key(h)).or_insert(0usize) += 1;
+    }
+    // Transform positions first, then the larger groups, then by address.
+    let mut order: Vec<(bool, usize, usize)> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.layout == Layout::V4 && matrix_before(h.addr).is_some(), sizes[&key(h)], i))
+        .collect();
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let total = hits.len();
+    let mut text = String::new();
+    for h in &hits {
+        let _ = writeln!(
+            text,
+            "{:#x} {} ({:.3}, {:.3}, {:.3}) group of {}; matrix before: {}; {}",
+            h.addr,
+            h.layout.name(),
+            h.value[0],
+            h.value[1],
+            h.value[2],
+            sizes[&key(h)],
+            matrix_before(h.addr).map_or("no".to_string(), |(a, l)| format!("{} at {a:#x}", l.name())),
+            region_note(config, h.addr)
+        );
+    }
+    write(dir, "probe-candidates.txt", &text)?;
+    let derived_pos = |d: (usize, Layout)| pos_of(d.0, d.1);
+    let mut found: Option<usize> = None;
+    let mut rises: Vec<f32> = Vec::new();
+    for (n, &(_, _, i)) in order.iter().take(config.probe_max).enumerate() {
+        let h = &hits[i];
+        // Still where the player is now?
+        let (Some(c0), Some(b0)) = (pos_of(h.addr, h.layout), derived_pos(derived)) else { continue };
+        if (0..3).any(|k| (c0[k] - b0[k]).abs() > 1.0) {
+            let _ = writeln!(log, "{:#x} {}: skipped, it is no longer near the player ({:.2}, {:.2}, {:.2})", h.addr, h.layout.name(), c0[0], c0[1], c0[2]);
+            continue;
+        }
+        let target = [c0[0], c0[1], c0[2] + 3.0];
+        let mut rise = [f32::MIN; 1];
+        let mut others = vec![f32::MIN; hits.len()];
+        let end = Instant::now() + Duration::from_millis(400);
+        let mut round = 0u32;
+        // The only writes the probe makes: this one triple, +3 m in z, every 5 ms for 400 ms.
+        while Instant::now() < end {
+            player::write_pos(h.addr, h.layout, target);
+            if let Some(b) = derived_pos(derived) {
+                rise[0] = rise[0].max(b[2] - b0[2]);
+            }
+            if round % 2 == 0 {
+                for (k, o) in hits.iter().enumerate() {
+                    if k != i && let Some(v) = pos_of(o.addr, o.layout) {
+                        // Where it was when found plus the rise, as far as it has risen from its own start.
+                        others[k] = others[k].max(v[2] - o.value[2]);
+                    }
+                }
+            }
+            round += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A short grace: the derived copy may follow a frame later.
+        let grace = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < grace {
+            if let Some(b) = derived_pos(derived) {
+                rise[0] = rise[0].max(b[2] - b0[2]);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = pos_of(h.addr, h.layout);
+        let kept = after.is_some_and(|a| (a[2] - target[2]).abs() < 0.2);
+        let back = after.is_some_and(|a| (a[2] - c0[2]).abs() < 0.5);
+        let drove = (2.5..=3.5).contains(&rise[0]);
+        let _ = writeln!(
+            log,
+            "{:#x} {} before ({:.3}, {:.3}, {:.3}) derived rose {:.2} m -> {}; the triple itself then: {}",
+            h.addr,
+            h.layout.name(),
+            c0[0],
+            c0[1],
+            c0[2],
+            rise[0],
+            if drove { "DRIVES the derived position" } else { "no" },
+            if kept { "kept" } else if back { "put back by the game" } else { "changed otherwise" },
+        );
+        if n % 25 == 0 {
+            eprintln!("Leonida: find player: probe {n}/{}: {:#x} derived rose {:.2} m", total.min(config.probe_max), h.addr, rise[0]);
+        }
+        if drove {
+            rises = others.iter().map(|&r| r).collect();
+            found = Some(i);
+            break;
+        }
+    }
+    write(dir, "probe.txt", &log)?;
+    let Some(i) = found else {
+        eprintln!("Leonida: find player: probe: none of {total} triples drove the derived position (probe.txt)");
+        return Ok(None);
+    };
+    // The authoritative one first, a transform instead when its position row is what was written.
+    let h = &hits[i];
+    let mut group: Vec<(usize, Layout)> = Vec::new();
+    let add = |a: usize, l: Layout, group: &mut Vec<(usize, Layout)>| {
+        if group.iter().all(|&(g, _)| g.abs_diff(a) >= 0x10) {
+            group.push((a, l));
+        }
+    };
+    match matrix_before(h.addr) {
+        Some((a, l)) => add(a, l, &mut group),
+        None => add(h.addr, h.layout, &mut group),
+    }
+    // The derived copy and every triple that rose together with it.
+    add(derived.0, derived.1, &mut group);
+    for (k, &r) in rises.iter().enumerate() {
+        if k != i && (2.0..=3.6).contains(&r) {
+            match matrix_before(hits[k].addr) {
+                Some((a, l)) => add(a, l, &mut group),
+                None => add(hits[k].addr, hits[k].layout, &mut group),
+            }
+        }
+    }
+    eprintln!("Leonida: find player: probe: {:#x} drives it; {} transform(s)/vector(s) change together", h.addr, group.len());
+    Ok(Some(Probed { group }))
+}
+
 // ------------------------------------------------------------- pointers
 
 /// A qword in memory that points, directly or through blocks, to a struct.
@@ -1253,7 +1560,9 @@ struct Node {
 }
 
 const NO_PARENT: u32 = u32::MAX;
-const NODE_CAP: usize = 300_000;
+const NODE_CAP: usize = 400_000;
+/// How far into a block a pointer may sit.
+const WINDOW: usize = 0x2000;
 const LOWER_BITS: u32 = 22;
 
 fn bloom_slot(key: u64) -> (usize, u64) {
@@ -1264,21 +1573,28 @@ fn bloom_slot(key: u64) -> (usize, u64) {
 fn pointer_scan(
     config: &Config,
     regions: &[Region],
-    buffer: &mut [u8],
+    workers: &mut [&'static mut [u8]],
     known: &mut Known,
+    only: &[usize],
     dir: &Path,
 ) -> Result<String, String> {
     let started = Instant::now();
     let mut report = String::new();
-    // Struct start candidates of each group.
+    // Struct start candidates of each group, up to 0x400 bytes before the position.
     let mut targets: Vec<(usize, u16, u8)> = Vec::new();
     for (g, group) in known.groups.iter().enumerate() {
+        if !only.contains(&g) {
+            continue;
+        }
         let matrix = group.fixed.map_or(0, dec);
-        for k in 0..=32u8 {
+        for k in 0..=64u8 {
             if let Some(start) = matrix.checked_sub(16 * usize::from(k)) {
                 targets.push((enc(start), g as u16, k));
             }
         }
+    }
+    if targets.is_empty() {
+        return Ok(String::new());
     }
     targets.sort_unstable();
     let (min_t, max_t) = (dec(targets[0].0), dec(targets[targets.len() - 1].0));
@@ -1288,10 +1604,8 @@ fn pointer_scan(
         bloom[w] |= b;
     }
 
-    let mut nodes: Vec<Node> = Vec::new();
     // Level 1: a qword equal to a struct candidate's address.
-    let mut capped = false;
-    for_each_chunk(regions, buffer, 0, |_, address, bytes, limit| {
+    let (parts, _) = scan_parallel::<Vec<(usize, usize)>>(regions, workers, 0, |address, bytes, limit, out| {
         // SAFETY: the buffer is page aligned; `bytes` is a prefix of it.
         let q = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, bytes.len() / 8) };
         for (j, &v) in q[..limit / 8].iter().enumerate() {
@@ -1306,21 +1620,20 @@ fn pointer_scan(
             let e = enc(v);
             let mut at = targets.partition_point(|t| t.0 < e);
             while at < targets.len() && targets[at].0 == e {
-                if nodes.len() >= NODE_CAP {
-                    capped = true;
-                    return;
-                }
-                nodes.push(Node {
-                    loc: enc(address + j * 8),
-                    parent: NO_PARENT,
-                    delta: 0,
-                    group: targets[at].1,
-                    k: targets[at].2,
-                });
+                out.push((address + j * 8, at));
                 at += 1;
             }
         }
     });
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut capped = false;
+    for (loc, t) in parts.into_iter().flatten() {
+        if nodes.len() >= NODE_CAP {
+            capped = true;
+            break;
+        }
+        nodes.push(Node { loc: enc(loc), parent: NO_PARENT, delta: 0, group: targets[t].1, k: targets[t].2 });
+    }
     let in_image = |loc: usize| {
         let rva = dec(loc).wrapping_sub(config.base);
         config.writable_image.iter().any(|&(lo, hi)| rva >= lo && rva < hi)
@@ -1338,19 +1651,18 @@ fn pointer_scan(
         let (min_l, max_l) = (dec(locs[0].0), dec(locs[locs.len() - 1].0));
         let mut pages = vec![0u64; 1 << (LOWER_BITS - 6)];
         for &(l, _) in &locs {
-            for page in [dec(l) >> 12, (dec(l) >> 12).wrapping_sub(1)] {
-                let (w, b) = bloom_slot(page as u64);
+            let page = dec(l) >> 12;
+            for p in [page, page.wrapping_sub(1), page.wrapping_sub(2)] {
+                let (w, b) = bloom_slot(p as u64);
                 pages[w] |= b;
             }
         }
-        let before = nodes.len();
-        let mut capped = false;
-        for_each_chunk(regions, buffer, 0, |_, address, bytes, limit| {
+        let (parts, _) = scan_parallel::<Vec<Node>>(regions, workers, 0, |address, bytes, limit, out| {
             // SAFETY: the buffer is page aligned; `bytes` is a prefix of it.
             let q = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, bytes.len() / 8) };
             for (j, &v) in q[..limit / 8].iter().enumerate() {
                 let v = v as usize;
-                if v.saturating_add(0xFFF) < min_l || v > max_l {
+                if v.saturating_add(WINDOW) < min_l || v > max_l {
                     continue;
                 }
                 let (w, b) = bloom_slot(v as u64 >> 12);
@@ -1360,33 +1672,38 @@ fn pointer_scan(
                 let e = enc(v);
                 let mut at = locs.partition_point(|l| l.0 < e);
                 let mut taken = 0;
-                while at < locs.len() && locs[at].0 <= e + 0xFFF && taken < 4 {
-                    if nodes.len() - before >= NODE_CAP {
-                        capped = true;
-                        return;
-                    }
-                    let (pg, pk) = (nodes[locs[at].1 as usize].group, nodes[locs[at].1 as usize].k);
-                    nodes.push(Node {
+                while at < locs.len() && locs[at].0 < e + WINDOW && taken < 4 {
+                    let parent = &nodes[locs[at].1 as usize];
+                    out.push(Node {
                         loc: enc(address + j * 8),
                         parent: locs[at].1,
                         delta: (dec(locs[at].0) - v) as u32,
-                        group: pg,
-                        k: pk,
+                        group: parent.group,
+                        k: parent.k,
                     });
                     at += 1;
                     taken += 1;
                 }
             }
         });
-        let from = before;
+        let from = nodes.len();
+        let mut capped = false;
+        for n in parts.into_iter().flatten() {
+            if nodes.len() - from >= NODE_CAP {
+                capped = true;
+                break;
+            }
+            nodes.push(n);
+        }
         level_ranges.push((from, nodes.len()));
         let roots = (from..nodes.len()).filter(|&i| in_image(nodes[i].loc)).count();
         let _ = writeln!(
             report,
-            "pointer level {level}: {} qwords point into a block holding a level {} pointer within 0x1000 bytes{}; {roots} of them in the title's image",
+            "pointer level {level}: {} qwords point into a block holding a level {} pointer less than {WINDOW:#x} bytes in{}; {roots} of them in the title's image ({:.0} s so far)",
             nodes.len() - from,
             level - 1,
-            if capped { " (capped)" } else { "" }
+            if capped { " (capped)" } else { "" },
+            started.elapsed().as_secs_f32()
         );
         frontier = (from..nodes.len()).filter(|&i| !in_image(nodes[i].loc)).map(|i| i as u32).collect();
     }
@@ -1401,7 +1718,7 @@ fn pointer_scan(
                 continue;
             }
             let g = usize::from(n.group);
-            if counts[g] >= 40 {
+            if counts[g] >= 60 {
                 continue;
             }
             counts[g] += 1;
@@ -1424,22 +1741,20 @@ fn pointer_scan(
                 deltas,
                 16 * usize::from(n.k)
             );
-            known.groups[g].paths.push(player::Path {
-                rva,
-                deltas,
-                adjust: 16 * usize::from(n.k),
-            });
+            known.groups[g].paths.push(player::Path { rva, deltas, adjust: 16 * usize::from(n.k) });
         }
     }
     // What the struct start's first qword looks like (a vtable pointer is in the image).
     for (g, group) in known.groups.iter().enumerate() {
+        if !only.contains(&g) {
+            continue;
+        }
         let matrix = group.fixed.map_or(0, dec);
         let _ = writeln!(text, "group {g}: matrix {matrix:#x} {}", group.layout.name());
-        for k in 0..=32usize {
+        for k in 0..=64usize {
             let Some(start) = matrix.checked_sub(16 * k) else { break };
             if let Some(first) = mem::read_u64(start) {
-                let first = first as usize;
-                let rva = first.wrapping_sub(config.base);
+                let rva = (first as usize).wrapping_sub(config.base);
                 if rva < config.size {
                     let section = config.sections.iter().find(|(_, r, s)| rva >= *r && rva < r + s).map_or("", |(n, _, _)| n.as_str());
                     let _ = writeln!(text, "  start candidate -{:#x}: first qword is title+{rva:#x} {section}", 16 * k);
@@ -1448,10 +1763,6 @@ fn pointer_scan(
         }
     }
     write(dir, "pointers.txt", &text)?;
-    let _ = writeln!(
-        report,
-        "image-rooted paths per group: {counts:?} ({:.1} s)",
-        started.elapsed().as_secs_f32()
-    );
+    let _ = writeln!(report, "image-rooted paths per group: {counts:?} ({:.1} s)", started.elapsed().as_secs_f32());
     Ok(report)
 }

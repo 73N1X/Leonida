@@ -151,6 +151,8 @@ fall through ground that is not loaded yet. The menu items work only when a posi
    `LEONIDA_FIND_PLAYER` alone means `90,240`. Besides transforms (strict forms only, so props with an
    identity-like matrix drop out) it tracks position vectors (a float4 whose w is a flag word, or three
    doubles) in the map's bounds, scans on several threads, and drops candidates that never move while keys are held.
+   The best candidate is often a copy the game rewrites, so a write probe then tries every triple within 0.5 m of it
+   (+3 m, 400 ms each) and keeps the one that moves the copy; that group is what the teleport writes.
    Then it searches for pointers to the best ones from the title's image (up to `LEONIDA_PLAYER_LEVELS` = 3 levels).
    Everything is written under `%TEMP%\leonida-player\`: `summary.txt`, `candidates.txt`, `tracks.csv`,
    `comovers.txt`, `best.txt`, `pointers.txt` and `paths.txt`. The run that found them can teleport at once.
