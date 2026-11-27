@@ -31,6 +31,7 @@
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/command_list_epochs.h"
 #include "../src/value_write_sink.h"
 #include "../src/address_guard.h"
 #include "../src/arena_blocks.h"
@@ -412,7 +413,10 @@ public:
     // read-only binding's pages alone (guarded, so a write the title makes meanwhile faults and waits on the lock),
     // where opening them for a whole copy lost a write made between the opening and the copy; and of two copies of
     // the same bytes only the one that differs is written, where the last one won.
-    std::size_t write_back(std::uintptr_t from, std::uintptr_t to) {
+    //
+    // `only` (a retired window's copy, when it is freed): that copy alone goes back, where no live copy changed the
+    // bytes; the live copies' own results wait for their submissions' batches.
+    std::size_t write_back(std::uintptr_t from, std::uintptr_t to, const std::uint8_t* only = nullptr) {
         from = std::max(from, first_), to = std::min(to, last_);
         if (from >= to) return 0;
         AcquireSRWLockExclusive(&lock_);
@@ -454,22 +458,43 @@ public:
             if (!held((at - first_) / kPage)) {
                 const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
                 bool opened = false;
-                for (const Target& t : targets_) {
-                    const std::uintptr_t x = std::max(a, t.begin), y = std::min(b, t.end);
-                    if (x >= y || !t.shadow) continue;
-                    for (std::uintptr_t c = x; c < y;) {
-                        const std::uintptr_t e = std::min(y, (c + kPiece) & ~(kPiece - 1));
-                        const std::uint8_t* copy = t.shadow + (c - t.begin);
-                        if (std::memcmp(reinterpret_cast<const void*>(c), copy, e - c) != 0) {
+                std::vector<const Target*> over;  // the targets with bytes in [a, b)
+                for (const Target& t : targets_)
+                    if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
+                // Piece by piece, against the title's bytes as they were before any copy went back here: a copy that
+                // still holds them is not written over another's result. A retired window's copy (retire_target)
+                // goes back only where no live copy changed the piece: what a submission wrote in it is older than
+                // what a live copy holds (the range that replaced it serves every submission recorded since).
+                for (std::uintptr_t c = a; c < b && !over.empty();) {
+                    const std::uintptr_t e = std::min(b, (c + kPiece) & ~(kPiece - 1));
+                    std::uint8_t before[kPiece];
+                    bool saved = false, live = false;
+                    for (int pass = 0; pass < 2 && !live; ++pass)
+                        for (const Target* t : over) {
+                            if (t->retired != (pass == 1) || (only && pass == 1 && t->shadow != only)) continue;
+                            const std::uintptr_t x = std::max(c, t->begin), y = std::min(e, t->end);
+                            if (x >= y) continue;
+                            const std::uint8_t* copy = t->shadow + (x - t->begin);
+                            const void* now = saved ? static_cast<const void*>(before + (x - c))
+                                                    : reinterpret_cast<const void*>(x);
+                            if (std::memcmp(now, copy, y - x) == 0) continue;
+                            if (only && pass == 0) {  // a live copy changed it: the retired one stays out
+                                live = true;
+                                continue;
+                            }
+                            if (!saved) {
+                                std::memcpy(before, reinterpret_cast<const void*>(c), e - c);
+                                saved = true;
+                            }
                             if (!opened) {
                                 reopen_locked(at, at + pages * kPage);
                                 opened = true;
                             }
-                            std::memcpy(reinterpret_cast<void*>(c), copy, e - c);
-                            written += e - c;
+                            std::memcpy(reinterpret_cast<void*>(x), copy, y - x);
+                            written += y - x;
+                            live = live || pass == 0;
                         }
-                        c = e;
-                    }
+                    c = e;
                 }
             }
             at += pages * kPage;
@@ -835,6 +860,22 @@ public:
                 });
             va += n;
         }
+    }
+
+    // Under shadow_mutex: `shadow` is a retired window's copy (retire_orphan_windows). It is still refreshed, so it
+    // never holds bytes older than the title's but what the GPU wrote in it, and what it holds goes back only where
+    // no live copy changed the bytes (write_back). False when it isn't one of this tracker's.
+    bool retire_target(const std::uint8_t* shadow) {
+        AcquireSRWLockExclusive(&lock_);
+        bool found = false;
+        for (Target& t : targets_)
+            if (t.shadow == shadow) t.retired = found = true;
+        ReleaseSRWLockExclusive(&lock_);
+        return found;
+    }
+
+    bool has_target(const std::uint8_t* shadow) const {
+        return std::any_of(targets_.begin(), targets_.end(), [shadow](const Target& t) { return t.shadow == shadow; });
     }
 
     // Under shadow_mutex: `shadow` is no longer a target. Pages no other target covers are made writable again and
@@ -1237,6 +1278,7 @@ private:
     struct Target {
         std::uintptr_t begin, end;  // the title's bytes
         std::uint8_t* shadow;       // where begin's byte goes
+        bool retired = false;       // a window nothing answers from, kept until its submissions are copied back
     };
 
     static Kind classify(const MEMORY_BASIC_INFORMATION& region) {
@@ -2893,6 +2935,26 @@ struct DeviceState {
         for (std::size_t k = hits.size(); k-- > 1;) shadows.erase(shadows.begin() + std::ptrdiff_t(hits[k]));
         keep.fill(begin, end, shadow);
     }
+    void retire_shadow(const std::uint8_t* mapped) {
+        std::lock_guard lock(shadow_mutex);
+        for (const ShadowPagesPtr& s : shadows)
+            if (s->retire_target(mapped)) return;
+    }
+    // A retired window's memory is freed: what its copy holds that the title's pages do not, written by submissions
+    // that have all completed, goes back once more (where no live copy changed those bytes), then the copy leaves
+    // its tracker.
+    void free_retired_shadow(const std::uint8_t* mapped, std::uint64_t start, std::uint64_t size) {
+        std::lock_guard lock(shadow_mutex);
+        for (auto it = shadows.begin(); it != shadows.end(); ++it) {
+            ShadowPages& s = **it;
+            if (!s.has_target(mapped)) continue;
+            title_write_back_total += s.write_back(static_cast<std::uintptr_t>(start),
+                                                   static_cast<std::uintptr_t>(start + size), mapped);
+            s.remove_target(mapped);
+            if (!s.targets()) shadows.erase(it);
+            return;
+        }
+    }
     void remove_shadow(const std::uint8_t* mapped) {
         std::lock_guard lock(shadow_mutex);
         for (auto it = shadows.begin(); it != shadows.end(); ++it)
@@ -3024,13 +3086,17 @@ struct DeviceState {
     // Windows of the title's own memory in the GPU address arena (src/title_va_alias.h, docs/d3d12_vulkan.md
     // section 3.3 "Title-chosen addresses"): a root view or buffer V# that names the title's memory outside any
     // slot-133 buffer (a per-frame constant ring, #8862 section 3.5) gets a copy of the 64 KiB-aligned pages it
-    // covers, refreshed before every submission like a slot-133 shadow, and the address of that copy. Windows are
-    // kept until the device goes (the ring comes round to the same pages), up to LEONIDA_TITLE_WINDOWS_MB (64 MiB
-    // by default). A window that does not fit is not made: the range is backed by a geometry copy instead, or the
-    // view written with a zero-size range (src/title_window_plan.h).
+    // covers, refreshed before every submission like a slot-133 shadow, and the address of that copy. A window never
+    // covers bytes an existing range already serves (it stays inside the free span, in both views of a stream pool),
+    // and is kept while an address range still answers from it (the ring comes round to the same pages), up to
+    // LEONIDA_TITLE_WINDOWS_MB (64 MiB by default); one a newer range replaced everywhere is retired
+    // (retire_orphan_windows). A window that does not fit is not made: the range is backed by a geometry copy
+    // instead, or the view written with a zero-size range (src/title_window_plan.h).
     struct TitleWindow {
         std::uint64_t start;
         std::uint64_t shader_va;
+        std::uint64_t size;
+        std::uint8_t* mapped;  // the copy, as the tracker of its pages writes it
     };
     static constexpr std::uint64_t kTitleWindowAlign = 65536;
     static constexpr std::uint64_t kTitleWindowMax = 16ull << 20;  // the most one address pulls in
@@ -3059,9 +3125,10 @@ struct DeviceState {
     static constexpr std::size_t kTitleWriteBackBatches = 64; // pending batches before the oldest goes back unfenced
     static constexpr std::size_t kTitleWriteBackRanges = 8192;         // ranges kept per submission
     static constexpr std::uint64_t kTitleWriteBackBytes = 64ull << 20; // bytes copied back per submission
-    // The stream pools' mappings (title_gpu_views): one per readable run of a pool. A window is kept for the device's
-    // life; a geometry copy goes when its view is retired (the pages were freed, unmapped or remapped:
-    // drain_geometry_releases), and the next request for those pages makes a new one.
+    // The stream pools' mappings (title_gpu_views): one per readable run of a pool that no other mapping serves yet. A
+    // window goes once no address answers from it (retire_orphan_windows); a geometry copy goes when its view is
+    // retired (the pages were freed, unmapped or remapped: drain_geometry_releases), and the next request for those
+    // pages makes a new one.
     struct PoolSpan {
         std::uint64_t source;     // the readable side of the pair the copy is made from
         std::uint64_t twin;       // the extent's address in the pair's other view (0 when there is none)
@@ -3072,9 +3139,34 @@ struct DeviceState {
     std::vector<PoolSpan> pool_spans;
     std::atomic<std::size_t> pool_span_count{0};
     std::uint64_t pool_span_bytes = 0;
-    std::uint64_t pool_spans_retired = 0;  // geometry-copy extents whose view was retired (forget_pool_span)
+    std::uint64_t pool_spans_retired = 0;  // extents gone with their copy (forget_pool_span, retire_orphan_windows)
     std::uint64_t title_window_refusals = 0;  // windows neither the budget nor the arena allowed
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
+
+    // Title windows no address range answers from any more (retire_orphan_windows): the removed ranges' copies, as the
+    // alias table's listener records them, and the retired windows whose memory waits for the GPU: freed as a retired
+    // geometry view's is, once every replay in progress at the retirement has recorded its submissions (ticket
+    // kAfterExecutes until then, see stamp_retired_windows) and those have completed. A command list resolves its root
+    // views when they are recorded, so a list recorded before the retirement and executed (again) after it still
+    // names the window: the ticket is taken only once every list (and every copy a held batch or the async worker
+    // keeps) whose recording began before the retirement is gone (src/command_list_epochs.h). Its copy stays a target
+    // of its pages' tracker until then, still refreshed: what those submissions wrote in it goes back to the title's
+    // pages (write_back_titles, and once more when it is freed), not dropped with it.
+    struct RetiredWindow {
+        std::uint64_t start, shader_va, size, ticket, epoch;
+        std::uint8_t* mapped;
+        std::uint64_t lists;  // the command-list epoch of the retirement
+    };
+    static constexpr std::size_t kWindowAliasRemovals = 4096;  // kept before every window is looked at instead
+    std::mutex window_alias_removal_mutex;  // a leaf: taken in alias_changed, under the alias table's lock
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> window_alias_removals;  // (shader VA, bytes)
+    bool window_alias_removals_overflow = false;
+    std::atomic<bool> window_alias_removals_pending{false};
+    std::mutex retired_window_mutex;  // taken under title_window_mutex; only GeometryViews' execute_mutex_ under it
+    std::vector<RetiredWindow> retired_windows;
+    std::atomic<std::size_t> retired_window_count{0};
+    std::atomic<bool> retired_windows_unstamped{false};
+    std::uint64_t title_windows_retired = 0, title_window_bytes_retired = 0, window_retirements = 0;
 
     rt::d3d12::GeometryViews geometry;
     // A retired geometry view: its alias ranges go, and so does every answer made through it without one
@@ -3118,6 +3210,135 @@ struct DeviceState {
         pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
         ++pool_spans_retired;
     }
+    // After this submission's refresh (the windows' last copy is the one it made): a title window no address range
+    // answers from any more leaves the refresh. Its ranges went because a newer range was entered over them (a
+    // slot-133 buffer placed over the pages, a BVH input's exact copy, src/title_va_alias.h add), and a window nothing
+    // reaches is only cost: its tracker walks its pages at every refresh and its bytes count against
+    // LEONIDA_TITLE_WINDOWS_MB. Its stream-pool extent and its budget go at once; its copy leaves its tracker and its
+    // memory is freed later (retired_windows), and the retired windows due are freed here. Only windows whose copy a
+    // removed range answered from are looked at (alias_changed records those).
+    void retire_orphan_windows() {
+        if (!context || (!window_alias_removals_pending.load(std::memory_order_acquire) &&
+                         !retired_window_count.load(std::memory_order_acquire)))
+            return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;  // (shader VA, bytes)
+        bool every = false;
+        {
+            std::lock_guard lock(window_alias_removal_mutex);
+            removed.swap(window_alias_removals);
+            every = window_alias_removals_overflow;
+            window_alias_removals_overflow = false;
+            window_alias_removals_pending.store(false, std::memory_order_release);
+        }
+        stamp_retired_windows();  // lists reset or released since the last replay
+        const std::uint64_t completed = context->completed_retire_ticket();
+        std::lock_guard windows(title_window_mutex);
+        free_retired_windows(completed);
+        if (removed.empty() && !every) return;
+        std::sort(removed.begin(), removed.end());
+        std::uint64_t longest = 0;
+        for (const auto& r : removed) longest = std::max(longest, r.second);
+        const auto touched = [&](const TitleWindow& window) {  // a removed range answered from inside this copy
+            if (every) return true;
+            auto it = std::lower_bound(removed.begin(), removed.end(),
+                                       std::pair{window.shader_va + window.size, std::uint64_t(0)});
+            while (it != removed.begin()) {
+                --it;
+                if (window.shader_va - std::min(window.shader_va, it->first) >= longest) break;
+                if (it->first + it->second > window.shader_va) return true;
+            }
+            return false;
+        };
+        auto& aliases = leonida::title_va_aliases();
+        std::vector<std::uint64_t> gone;  // shader VAs of the windows retired, sorted below
+        for (const TitleWindow& window : title_windows)
+            if (touched(window) && !aliases.answers_into(window.shader_va, window.size))
+                gone.push_back(window.shader_va);
+        if (gone.empty()) return;
+        std::sort(gone.begin(), gone.end());
+        const auto is_gone = [&](std::uint64_t va) { return std::binary_search(gone.begin(), gone.end(), va); };
+        const std::size_t spans = pool_spans.size();
+        std::erase_if(pool_spans, [&](const PoolSpan& span) {
+            if (span.geometry || !is_gone(span.shader_va)) return false;
+            pool_span_bytes -= span.size;
+            return true;
+        });
+        pool_spans_retired += spans - pool_spans.size();
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        std::vector<RetiredWindow> retiring;
+        const std::uint64_t epoch = geometry.execute_epoch();
+        const std::uint64_t lists = leonida::command_list_epochs::advance();
+        std::uint64_t bytes = 0;
+        std::erase_if(title_windows, [&](const TitleWindow& window) {
+            if (!is_gone(window.shader_va)) return false;
+            retire_shadow(window.mapped);
+            retiring.push_back({window.start, window.shader_va, window.size, rt::d3d12::GeometryViews::kAfterExecutes,
+                                epoch, window.mapped, lists});
+            title_window_bytes -= window.size;
+            bytes += window.size;
+            return true;
+        });
+        title_window_count.store(title_windows.size(), std::memory_order_relaxed);
+        {
+            std::lock_guard retired(retired_window_mutex);
+            retired_windows.insert(retired_windows.end(), retiring.begin(), retiring.end());
+            retired_window_count.store(retired_windows.size(), std::memory_order_release);
+            retired_windows_unstamped.store(true, std::memory_order_release);
+        }
+        title_windows_retired += retiring.size();
+        title_window_bytes_retired += bytes;
+        ++window_retirements;
+        if (window_retirements <= 4 || !(window_retirements & (window_retirements - 1)))
+            std::fprintf(stderr, "[rt] d3d12: %zu title windows (%llu KiB) no address answers from any more were "
+                                 "retired (%zu windows, %llu KiB left; %llu retired, %llu KiB returned so far)\n",
+                         retiring.size(), static_cast<unsigned long long>(bytes >> 10), title_windows.size(),
+                         static_cast<unsigned long long>(title_window_bytes >> 10),
+                         static_cast<unsigned long long>(title_windows_retired),
+                         static_cast<unsigned long long>(title_window_bytes_retired >> 10));
+    }
+    // The memory of retired windows whose submissions have completed by `completed`; what their copies hold goes back
+    // once more first (free_retired_shadow). title_window_mutex held.
+    void free_retired_windows(std::uint64_t completed) {
+        std::vector<RetiredWindow> due;
+        {
+            std::lock_guard retired(retired_window_mutex);
+            std::erase_if(retired_windows, [&](const RetiredWindow& window) {
+                if (window.ticket == rt::d3d12::GeometryViews::kAfterExecutes || window.ticket > completed)
+                    return false;
+                due.push_back(window);
+                return true;
+            });
+            retired_window_count.store(retired_windows.size(), std::memory_order_release);
+        }
+        for (const RetiredWindow& window : due) {
+            free_retired_shadow(window.mapped, window.start, window.size);
+            if (window.shader_va < arena.size) {
+                arena_release(window.shader_va, window.size, arena_buffer);
+            } else {
+                backing(arena.address + window.shader_va, window.size, window.start, false);
+                external_windows.free(*this, window.shader_va, window.size);
+            }
+        }
+    }
+    // A replay has recorded its submissions, or a refresh runs: retired windows that only replays now finished and
+    // only lists now gone may name get the submissions recorded so far as their ticket (GeometryViews::execute_end
+    // does the same for its views, by replays alone).
+    void stamp_retired_windows() {
+        if (!retired_windows_unstamped.load(std::memory_order_acquire)) return;
+        // Under the lock: a window retired by a replay begun after `oldest` was read must not be stamped here.
+        std::lock_guard retired(retired_window_mutex);
+        const std::uint64_t oldest = geometry.oldest_execute();
+        // Before the ticket: a list released after this read has had its submissions counted in it.
+        const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
+        const std::uint64_t ticket = context->submitted_retire_ticket();
+        bool left = false;
+        for (RetiredWindow& window : retired_windows) {
+            if (window.ticket != rt::d3d12::GeometryViews::kAfterExecutes) continue;
+            if (window.epoch < oldest && window.lists <= oldest_list) window.ticket = ticket;
+            else left = true;
+        }
+        retired_windows_unstamped.store(left, std::memory_order_release);
+    }
     // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
     // A plain aggregate on purpose: a C++ thread_local with a destructor in gta6rt.exe adds TLS callbacks to the image
     // the loader's TLS index-0 move must not have (pe_loader.cpp reserve_tls_index0; VulkanContext::stage_xdxr_table
@@ -3132,14 +3353,14 @@ struct DeviceState {
         thread_local GeometryExecuteSerials serials;
         return serials;
     }
+    // Kept with geometry copies off too: a retired title window waits for the same replays (stamp_retired_windows).
     void geometry_execute_begin() {
-        if (!geometry.cap()) return;
         auto& serials = geometry_execute_serials();
         if (serials.count == GeometryExecuteSerials::kCapacity) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true))
-                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists nested more than %u deep; a geometry view retired "
-                                     "in the extra replay is not deferred to it\n",
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists nested more than %u deep; a geometry view or "
+                                     "title window retired in the extra replay is not deferred to it\n",
                              GeometryExecuteSerials::kCapacity);
             ++serials.skipped;
             return;
@@ -3147,7 +3368,6 @@ struct DeviceState {
         serials.serials[serials.count++] = geometry.execute_begin();
     }
     void geometry_execute_end() {
-        if (!geometry.cap()) return;
         auto& serials = geometry_execute_serials();
         if (serials.skipped != 0) {
             --serials.skipped;
@@ -3156,6 +3376,7 @@ struct DeviceState {
         if (serials.count == 0) return;
         const std::uint64_t serial = serials.serials[--serials.count];
         geometry.execute_end(serial, [this] { return context->submitted_retire_ticket(); });
+        stamp_retired_windows();
     }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
         using Result = rt::d3d12::GeometryCopy;
@@ -3258,7 +3479,7 @@ struct DeviceState {
         if (offset >= arena.size) backing(arena.address + offset, size, start, true);
         const auto* pages = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(start));
         add_shadow(pages, mapped, std::size_t(size));
-        title_windows.push_back({start, offset});
+        title_windows.push_back({start, offset, size, mapped});
         title_window_count.store(title_windows.size(), std::memory_order_relaxed);
         title_window_bytes += size;
         if (title_windows.size() <= 4 || !(title_windows.size() & (title_windows.size() - 1)))
@@ -3390,6 +3611,7 @@ struct DeviceState {
                                        view.size;
         const std::uint64_t run_end =
             readable_run_end(source & ~(kTitleWindowAlign - 1), std::min(pool_end, source + kPoolExtentMax));
+        // Up to the next mapping in either view at most, never over it.
         leonida::TitleWindowRange extent{};
         if (!leonida::title_pool_extent(source - offset, pool_end, source, run_end, kTitleWindowAlign, kPoolExtentMax,
                                         extent))
@@ -4024,6 +4246,15 @@ struct DeviceState {
             // What resolved through the range (by its base), and what names its copy (by the copy's address).
             self.note_slot_change(leonida::SlotChange::source_gone, title_va, bytes);
             self.note_slot_change(leonida::SlotChange::target_gone, self.arena.address + shader_va, bytes);
+            // A title window it answered from may be answered by nothing now (retire_orphan_windows).
+            if (self.title_window_count.load(std::memory_order_relaxed)) {
+                std::lock_guard lock(self.window_alias_removal_mutex);
+                if (self.window_alias_removals.size() < kWindowAliasRemovals)
+                    self.window_alias_removals.push_back({shader_va, bytes});
+                else
+                    self.window_alias_removals_overflow = true;
+                self.window_alias_removals_pending.store(true, std::memory_order_release);
+            }
         } else {
             self.note_slot_change(leonida::SlotChange::source_added, title_va, bytes);
         }
@@ -4386,12 +4617,14 @@ struct DeviceState {
             const auto geometry_spans = std::count_if(pool_spans.begin(), pool_spans.end(),
                                                       [](const PoolSpan& span) { return span.geometry; });
             std::fprintf(stderr,
-                         "[rt] d3d12: title memory: %zu windows (%llu KiB of a %llu MiB budget, %llu refused), %zu "
-                         "stream-pool extents (one mapping each, %llu KiB; %lld by geometry copy, %llu retired with "
-                         "their copy), %llu addresses given a zero-size view\n",
+                         "[rt] d3d12: title memory: %zu windows (%llu KiB of a %llu MiB budget, %llu refused, %llu "
+                         "retired once nothing reached them), %zu stream-pool extents (one mapping each, %llu KiB; "
+                         "%lld by geometry copy, %llu retired with their copy or window), %llu addresses given a "
+                         "zero-size view\n",
                          title_windows.size(), static_cast<unsigned long long>(title_window_bytes >> 10),
                          static_cast<unsigned long long>(title_window_cap >> 20),
-                         static_cast<unsigned long long>(title_window_refusals), pool_spans.size(),
+                         static_cast<unsigned long long>(title_window_refusals),
+                         static_cast<unsigned long long>(title_windows_retired), pool_spans.size(),
                          static_cast<unsigned long long>(pool_span_bytes >> 10),
                          static_cast<long long>(geometry_spans), static_cast<unsigned long long>(pool_spans_retired),
                          static_cast<unsigned long long>(unbacked_requests));
@@ -14445,6 +14678,7 @@ public:
             }
             state_.drain_geometry_releases();
             state_.refresh_shadows(full || per_frame < 2, full);
+            state_.retire_orphan_windows();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
             // thread (speed-27: 230-330 ms a refresh after the load, a VirtualQuery and VirtualProtect per written
@@ -21070,6 +21304,19 @@ std::uint64_t title_host_imports(ID3D12Device* device) {
     return d ? d->state().host_imports.load(std::memory_order_relaxed) : 0;
 }
 
+TitleWindows title_windows(ID3D12Device* device) {
+    TitleWindows windows;
+    auto* d = Device::from<Device>(device);
+    if (!d) return windows;
+    auto& state = d->state();
+    std::lock_guard lock(state.title_window_mutex);
+    windows.count = state.title_windows.size();
+    windows.bytes = state.title_window_bytes;
+    windows.retired = state.title_windows_retired;
+    std::lock_guard retired(state.retired_window_mutex);
+    windows.waiting = state.retired_windows.size();
+    return windows;
+}
 std::uint64_t title_shadow_trackers(ID3D12Device* device) {
     auto* d = Device::from<Device>(device);
     if (!d) return 0;
