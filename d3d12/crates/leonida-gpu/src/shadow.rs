@@ -820,19 +820,27 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(std::sync::Weak::upgrade).collect()
 }
 
-/// Ranges in order, those that overlap or touch as one.
+/// Ranges in order, those that overlap or touch as one, joined in the
+/// allocation they came in (ported from TaynanGT/Vice-Tay 876a02f, GPL-3.0).
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut last = 0;
+    for index in 1..ranges.len() {
+        let (from, to) = ranges[index];
+        if from <= ranges[last].1 {
+            ranges[last].1 = ranges[last].1.max(to);
+        } else {
+            last += 1;
+            ranges[last] = (from, to);
         }
     }
-    out
+    ranges.truncate(last + 1);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
