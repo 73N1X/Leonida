@@ -163,6 +163,10 @@ pub(crate) struct HostHeap {
     /// had taken them all, every later table of the frame searched every
     /// slot before it was refused.
     free: std::sync::atomic::AtomicU32,
+    /// Leonida: this heap's own number, never given twice: what a thread's
+    /// lease of dynamic slots is known by ([`HostHeap::dynamic`]). An
+    /// address would name the next heap made where a freed one lay.
+    lease_id: u64,
     /// The shortest table that found no run of free slots since slots were
     /// last given back (changed under `next`'s lock; `u32::MAX`: none).
     /// Until something is given back the free runs only shrink, so a table
@@ -1593,6 +1597,10 @@ impl HostHeap {
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
+            lease_id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count as usize),
@@ -1695,10 +1703,65 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Leonida: dynamic slots a thread leases at once, and the largest table
+/// served from a lease ([`HostHeap::dynamic`]).
+const LEASE: u32 = 512;
+const LEASE_MOST: u32 = 128;
+
+thread_local! {
+    /// This thread's lease: the heap (its `lease_id`; 0: none), the next
+    /// slot, the end. Plain data: nothing runs when the thread ends, and what
+    /// the lease still held then stays taken (at most [`LEASE`] slots).
+    static DYNAMIC_LEASE: std::cell::Cell<(u64, u32, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Whether dynamic slots come out of per-thread leases
+/// (`LEONIDA_DYNAMIC_LEASE=0`: one search under the lock each, as before).
+fn lease_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_DYNAMIC_LEASE").is_none_or(|v| v != "0"))
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
+    ///
+    /// Leonida: a table of up to [`LEASE_MOST`] slots comes out of this
+    /// thread's lease of [`LEASE`] slots, with no lock; the lock of the
+    /// search ([`HostHeap::dynamic_locked`]) is taken once a lease. Every
+    /// draw that makes a table asks for slots, from the eight threads that
+    /// translate lists: one search under one lock each was 11% of the whole
+    /// process's samples, three quarters of it waiting for that lock
+    /// (profile prof1, 440,561 samples). What a lease has not given out goes
+    /// back when the thread takes its next one.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        if n > LEASE_MOST || !lease_on() {
+            return self.dynamic_locked(n);
+        }
+        let heap = self.lease_id;
+        let (owner, next, end) = DYNAMIC_LEASE.get();
+        if owner == heap && end - next >= n {
+            DYNAMIC_LEASE.set((owner, next + n, end));
+            return Some(next);
+        }
+        // A new lease; what is left of the old one (of this heap) goes back.
+        // A whole lease when there is room for one, else just this table.
+        let (first, leased) = match self.dynamic_locked(LEASE) {
+            Some(first) => (first, LEASE),
+            None => (self.dynamic_locked(n)?, n),
+        };
+        if owner == heap && end > next {
+            self.release(next, end - next);
+        }
+        DYNAMIC_LEASE.set((heap, first + n, first + leased));
+        Some(first)
+    }
+
+    /// [`HostHeap::dynamic`] by the search under the lock.
+    fn dynamic_locked(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
@@ -5809,14 +5872,57 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
-        let b = heap.dynamic(60).unwrap();
+        let a = heap.dynamic_locked(heap.dynamic - 100).unwrap();
+        let b = heap.dynamic_locked(60).unwrap();
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
+        assert_eq!(heap.dynamic_locked(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!(heap.dynamic_locked(50), Some(4));
+        assert_eq!(heap.dynamic_locked(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Leonida: tables come out of a thread's lease one after the other;
+    /// what a lease has left goes back with the next one, and a heap made
+    /// later is not served from an older heap's lease.
+    #[test]
+    fn dynamic_slots_come_out_of_a_lease() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        if !lease_on() {
+            return;
+        }
+        let free = |h: &HostHeap| h.free.load(std::sync::atomic::Ordering::Relaxed);
+        let all = heap.dynamic;
+        let a = heap.dynamic(3).unwrap();
+        let b = heap.dynamic(5).unwrap();
+        assert_eq!((a, b), (4, 7));
+        assert_eq!(free(&heap), all - LEASE);
+        // A table too long for a lease is searched for by itself.
+        let long = heap.dynamic(LEASE_MOST + 1).unwrap();
+        assert_eq!(long, 4 + LEASE);
+        // The lease runs out: the next one starts behind the long table, and
+        // the old one's rest is free again.
+        let mut last = b;
+        let mut given = 8;
+        while given + LEASE_MOST <= LEASE {
+            last = heap.dynamic(LEASE_MOST).unwrap();
+            given += LEASE_MOST;
+        }
+        assert!(last < 4 + LEASE);
+        let next = heap.dynamic(LEASE_MOST).unwrap();
+        assert_eq!(next, 4 + LEASE + LEASE_MOST + 1);
+        assert_eq!(free(&heap), all - given - (LEASE_MOST + 1) - LEASE);
+        // Given back like any other slots.
+        heap.release(a, 3);
+        assert_eq!(free(&heap), all - given - (LEASE_MOST + 1) - LEASE + 3);
+        // Another heap: its first table is its own slot 4, not this lease's.
+        let Some(other) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_eq!(other.dynamic(2), Some(4));
+        assert_eq!(free(&other), other.dynamic - LEASE);
     }
 
     #[test]
@@ -5825,25 +5931,25 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             eprintln!("no host descriptor heap; skipped");
             return;
         };
-        let first = heap.dynamic(1).unwrap();
-        let left = heap.dynamic(2).unwrap();
-        let right = heap.dynamic(2).unwrap();
-        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
+        let first = heap.dynamic_locked(1).unwrap();
+        let left = heap.dynamic_locked(2).unwrap();
+        let right = heap.dynamic_locked(2).unwrap();
+        let rest = heap.dynamic_locked(heap.dynamic - 5).unwrap();
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
         heap.release(left, 2);
-        assert_eq!(heap.dynamic(2), Some(left));
+        assert_eq!(heap.dynamic_locked(2), Some(left));
         heap.release(left, 2);
         heap.release(right, 2);
-        assert_eq!(heap.dynamic(4), Some(left));
-        assert_eq!(heap.dynamic(1), None);
+        assert_eq!(heap.dynamic_locked(4), Some(left));
+        assert_eq!(heap.dynamic_locked(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
         heap.release(first, 1);
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
-        assert_eq!(heap.dynamic(2), None);
+        assert_eq!(heap.dynamic_locked(2), None);
     }
 }
 

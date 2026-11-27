@@ -28,7 +28,10 @@ pub(crate) fn listed(n: u64) -> bool {
                 .collect()
         })
         .contains(&n)
-        || n == KEY_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        || {
+            let first = KEY_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+            first != u64::MAX && n >= first && n <= KEY_LAST.load(std::sync::atomic::Ordering::Relaxed).max(first)
+        };
     // `LEONIDA_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -123,6 +126,9 @@ fn world_on() -> bool {
 
 /// LOCAL: the frame F9 asked for ([`frame_drew`]); `u64::MAX`: none.
 static KEY_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Leonida: the last frame of the run of frames asked for (a `dump` file
+/// that holds a number asks for that many in a row).
+static KEY_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The first frame that ran 500 draws or more (`LEONIDA_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
@@ -143,9 +149,28 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
         } < 0;
         if down && !WAS_DOWN.swap(true, Relaxed) {
             KEY_FRAME.store(frame + 1, Relaxed);
+            KEY_LAST.store(frame + 1, Relaxed);
             tracing::info!(frame = frame + 1, "F9: this frame is captured");
         } else if !down {
             WAS_DOWN.store(false, Relaxed);
+        }
+        // Leonida: a file named `dump` in the capture folder asks as F9 does,
+        // for a script whose window has no keyboard focus; it is removed as
+        // it is seen, so one file asks once. A number in it asks for that
+        // many frames in a row (at most 600): a fault that lasts one frame
+        // is caught with the frames around it, target by target.
+        if let Some(asked) = folder().map(|f| f.join("dump"))
+            && asked.exists()
+        {
+            let frames = std::fs::read_to_string(&asked)
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+                .map_or(1, |n| n.clamp(1, 600));
+            if std::fs::remove_file(&asked).is_ok() {
+                KEY_FRAME.store(frame + 1, Relaxed);
+                KEY_LAST.store(frame + frames, Relaxed);
+                tracing::info!(first = frame + 1, frames, "a dump file: these frames are captured");
+            }
         }
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
