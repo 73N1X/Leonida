@@ -289,8 +289,11 @@ pull requests.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
 - Aki-Developer: `aki-gta6/aki-runtime` (GPL-3.0), a sister port shared with the project. Taken from it into the Rust
-  D3D12 runtime: the count of dropped draws by reason in the frame line. Each commit names the `aki-runtime` commit it
-  is from.
+  D3D12 runtime: the count of dropped draws by reason in the frame line, descriptor slots given back as soon as the
+  card has run a submission, pixel colours held to the console's HDR range, the composer's clamp that keeps a NaN from
+  coming out black, two planes composed into 10 bits under frame generation, the paired form of wave64 programs tried
+  before the approximate ones (`LEONIDA_PAIRED_LANES=exact`), a pipeline's kept skip answer, and four small fixes it
+  carried from fxceless/victory-fork. Each commit names the `aki-runtime` commit it is from.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
 endorsed by them.
