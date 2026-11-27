@@ -3399,6 +3399,42 @@ impl HostHeap {
         view
     }
 
+    /// Leonida: every slot of a sampler heap against the title's records
+    /// (`records`: the heap's bytes as just read, `step` bytes a record). A
+    /// slot that does not show the sampler its record names is made from it;
+    /// how many were.
+    ///
+    /// A sampler gets into its host slot when the title's call writes the
+    /// record ([`super::mirror`]) or, in a placed heap, when the page it was
+    /// copied into as bytes is found written (`sync_heaps`). One that both
+    /// missed went on as the point stand-in ([`null_sampler`]) for the rest
+    /// of the run, and a table of colours read through a point sampler
+    /// comes out in bands: the posterized picture of some runs and not of
+    /// others (the upstream note at `null_sampler`). The heap is small, so
+    /// all of it is looked at.
+    pub(crate) fn samplers_again(&self, start: u64, step: u64, records: &[u8]) -> u32 {
+        if !self.sampler || step < 12 {
+            return 0;
+        }
+        let mut made = 0;
+        for index in 0..self.count {
+            let at = index as usize * step as usize;
+            let Some(words) = records.get(at..at + 12) else { break };
+            let word = |n: usize| u32::from_le_bytes([words[4 * n], words[4 * n + 1], words[4 * n + 2], words[4 * n + 3]]);
+            if word(0) != VIEW_TAG {
+                continue;
+            }
+            let key = u64::from(word(2)) << 32 | u64::from(word(1));
+            if self.made.get(index) == Some(key) {
+                continue;
+            }
+            // (`mirror` reads the record in place: it was read a moment ago.)
+            self.mirror(index, start + u64::from(index) * step, false);
+            made += u32::from(self.made.get(index) == Some(key));
+        }
+        made
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their

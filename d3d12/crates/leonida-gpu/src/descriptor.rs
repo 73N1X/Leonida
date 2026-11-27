@@ -284,6 +284,11 @@ impl Drop for SyncedHeaps {
     }
 }
 
+/// Leonida: sampler slots [`sync_heaps`] found showing something else than their
+/// record names, since the start.
+#[cfg(windows)]
+static SAMPLERS_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -307,6 +312,12 @@ pub(crate) fn sync_heaps() {
     let mut kinds = [0u64; 5];
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
+    // (Once in thirty frames, whichever submission comes first.)
+    let samplers_due = {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let last = LAST.load(Relaxed);
+        frame.wrapping_sub(last) >= 30 && LAST.compare_exchange(last, frame, Relaxed, Relaxed).is_ok()
+    };
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -320,6 +331,24 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // Leonida: a sampler heap is looked through whole every so often, for
+        // a record the calls and the written pages both missed
+        // (`HostHeap::samplers_again`; `LEONIDA_SAMPLERS_AGAIN=0`: not).
+        if heap.samplers() && samplers_due && crate::toggled!("LEONIDA_SAMPLERS_AGAIN") {
+            let mut records = vec![0u8; (u64::from(mirrored_count) * step) as usize];
+            if crate::host::read_into(start as *const u8, &mut records) {
+                let made = host.samplers_again(start, step, &records);
+                if made > 0 {
+                    let so_far = SAMPLERS_AGAIN.fetch_add(u64::from(made), Relaxed) + u64::from(made);
+                    tracing::warn!(
+                        made,
+                        so_far,
+                        frame,
+                        "sampler slots did not show the sampler their record names: made from it"
+                    );
+                }
+            }
+        }
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);

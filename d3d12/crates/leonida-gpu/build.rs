@@ -29,6 +29,10 @@ fn main() {
     let source = crates.join("leonida-shader/src");
     println!("cargo:rerun-if-changed={}", source.display());
     files(&source, &mut all);
+    // Leonida: not the translator's test modules (`*_tests.rs`, built only for `cargo test`). A new test changed
+    // the fingerprint, and every one of the title's 25,663 shaders was translated again (two minutes) and its
+    // pipelines made again, for a translator that emits the same code.
+    all.retain(|path| !path.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs")));
     all.sort();
     let mut hash = blake3::Hasher::new();
     for path in &all {
