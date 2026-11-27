@@ -182,7 +182,30 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
     // SAFETY: live parameters.
     unsafe { NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.Available"), &mut available) };
     if available == 0 {
-        tracing::warn!("DLSS: super sampling is not available on this card or driver");
+        // Why, in the SDK's own words: the result of loading the feature, and the driver it asks for.
+        let (mut result, mut driver, mut major, mut minor) = (0, 0, 0, 0);
+        // SAFETY: live parameters.
+        unsafe {
+            NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.FeatureInitResult"), &mut result);
+            NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.NeedsUpdatedDriver"), &mut driver);
+            NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.MinDriverVersionMajor"), &mut major);
+            NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.MinDriverVersionMinor"), &mut minor);
+        }
+        tracing::warn!(
+            feature_result = format_args!("{:#x}", result as u32),
+            needs_updated_driver = driver,
+            min_driver = format_args!("{major}.{minor}"),
+            dir = %dir.display(),
+            has_dll = dir.join("nvngx_dlss.dll").exists(),
+            "DLSS: super sampling is not available on this card or driver"
+        );
+        #[cfg(test)]
+        println!(
+            "DLSS not available: feature result {:#x}, needs updated driver {driver}, min driver {major}.{minor}, dir {} (dll there: {})",
+            result as u32,
+            dir.display(),
+            dir.join("nvngx_dlss.dll").exists()
+        );
         return None;
     }
     tracing::info!(dir = %dir.display(), "DLSS: started; the title's upscale is DLSS (LEONIDA_UPSCALE=dlss)");
@@ -325,4 +348,28 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
         );
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether DLSS starts on this machine, alone or (with `LEONIDA_PROBE_STREAMLINE=1`,
+    /// `LEONIDA_FRAME_GEN` and `LEONIDA_STREAMLINE_DIR`) after Streamline has started, as in the
+    /// game with frame generation. Needs an NVIDIA card and `LEONIDA_DLSS_DIR`:
+    /// `cargo test -p leonida-gpu --features dlss -- --ignored dlss_starts --nocapture`.
+    #[test]
+    #[ignore = "needs an NVIDIA card and the SDK files"]
+    fn dlss_starts_on_this_card() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: an out pointer for the default adapter's device.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.expect("a D3D12 device");
+        let device = device.expect("a device");
+        if std::env::var_os("LEONIDA_PROBE_STREAMLINE").is_some() {
+            println!("Streamline started first: {}", crate::fg::started_for_test(&device));
+        }
+        println!("DLSS available: {}", init(&device).is_some());
+    }
 }

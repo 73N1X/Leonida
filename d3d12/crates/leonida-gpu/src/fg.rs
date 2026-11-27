@@ -95,8 +95,20 @@ fn init(device: &ID3D12Device) -> anyhow::Result<State> {
     });
     let logs: Vec<u16> = std::env::temp_dir().join("leonida-sl").as_os_str().encode_wide_z();
     let _ = std::fs::create_dir_all(std::env::temp_dir().join("leonida-sl"));
+    // Streamline starts NGX for the process, and NGX looks for every feature in the folders it
+    // was started with: with the plugins' folder alone, DLSS started afterwards
+    // (`crate::dlss`, from its own folder) is "feature not found" (0xBAD00004; probe of
+    // 2026-11-27, `dlss::tests`). So the folder of nvngx_dlss.dll is named here as well.
+    let folders: Vec<Vec<u16>> = [Some(dir.clone()), std::env::var_os("LEONIDA_DLSS_DIR")]
+        .into_iter()
+        .flatten()
+        .map(|d| d.as_os_str().encode_wide_z())
+        .collect();
+    let folder_pointers: Vec<*const u16> = folders.iter().map(|f| f.as_ptr()).collect();
     let pref = sl::Preferences {
         logLevel: sl::LogLevel::eDefault,
+        pathsToPlugins: folder_pointers.as_ptr(),
+        numPathsToPlugins: folder_pointers.len() as u32,
         pathToLogsAndData: logs.as_ptr(),
         logMessageCallback: Some(sl::log_to_tracing),
         flags: sl::PreferenceFlags::MANUAL_HOOKING_FRAME_TAGS,
@@ -141,6 +153,21 @@ impl WideZ for std::ffi::OsStr {
     fn encode_wide_z(&self) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
         self.encode_wide().chain([0]).collect()
+    }
+}
+
+/// For `dlss::tests`: starts Streamline as [`start`] does (and leaves it started).
+#[cfg(test)]
+pub(crate) fn started_for_test(device: &ID3D12Device) -> bool {
+    match init(device) {
+        Ok(state) => {
+            std::mem::forget(state);
+            true
+        }
+        Err(e) => {
+            println!("Streamline did not start: {e}");
+            false
+        }
     }
 }
 
