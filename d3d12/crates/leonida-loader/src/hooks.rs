@@ -22,11 +22,11 @@ pub(crate) fn is_build_1_0_2_1(hash: &blake3::Hash) -> bool {
 pub(crate) const NO_WATCHDOG_ENV: &str = "LEONIDA_NO_WATCHDOG";
 
 /// One code patch: `rva` must hold exactly `expect` before `new` is written.
-struct Patch<'a> {
-    what: &'static str,
-    rva: usize,
-    expect: &'a [u8],
-    new: &'a [u8],
+pub(crate) struct Patch<'a> {
+    pub(crate) what: &'static str,
+    pub(crate) rva: usize,
+    pub(crate) expect: &'a [u8],
+    pub(crate) new: &'a [u8],
 }
 
 /// The title's watchdog thread ends the process on purpose when its main
@@ -397,7 +397,7 @@ pub(crate) unsafe fn game_patches(base: usize, info: &leonida_pe::ImageInfo) -> 
 
 /// # Safety
 /// See `disarm_watchdog`.
-unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
+pub(crate) unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
     let at = (base + p.rva) as *mut u8;
     // SAFETY: the offset is inside the mapped image of this exact build (.text, or .rdata for the mode table).
     let now = unsafe { std::slice::from_raw_parts(at, p.expect.len()) };

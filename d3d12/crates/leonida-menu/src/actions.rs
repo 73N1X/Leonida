@@ -7,6 +7,9 @@
 //! today is [`NotYet`], which answers every one with the reason, except the
 //! teleports: [`Player`] does those by writing the player's position into the
 //! title's memory (`knobs::PlayerHook`), when the runtime found where it is.
+//! With `LEONIDA_GAME_ACTIONS=1` the runtime also lends a `knobs::GameHook`:
+//! wanted level, time of day, weather and the title's own cheats, run by the
+//! title's own code on its own thread; [`Player`] asks it first.
 
 use crate::knobs::{self, NO_PLAYER};
 use crate::model::{Id, Value};
@@ -62,6 +65,9 @@ fn at(p: [f32; 3]) -> String {
 
 impl GameActions for Player {
     fn available(&self, id: Id) -> Result<(), String> {
+        if let Some(answer) = knobs::game().and_then(|game| (game.available)(id)) {
+            return answer;
+        }
         match id {
             "teleport.save" | "teleport.forward" => (hook()?.ready)(),
             "teleport.load" => {
@@ -81,12 +87,17 @@ impl GameActions for Player {
         }
     }
 
-    fn value(&self, _: Id) -> Value {
-        Value::None
+    fn value(&self, id: Id) -> Value {
+        knobs::game()
+            .and_then(|game| (game.value)(id))
+            .unwrap_or(Value::None)
     }
 
     fn apply(&mut self, id: Id, value: Value) -> Result<Option<String>, String> {
         self.available(id)?;
+        if let Some(answer) = knobs::game().and_then(|game| (game.apply)(id, value)) {
+            return answer;
+        }
         let hook = hook()?;
         match id {
             "teleport.save" => {
@@ -110,5 +121,48 @@ impl GameActions for Player {
             }
             _ => NotYet.apply(id, value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A game hook that owns the wanted level and nothing else.
+    fn available(id: &str) -> Option<Result<(), String>> {
+        (id == "player.wanted").then_some(Ok(()))
+    }
+    fn value(id: &str) -> Option<Value> {
+        (id == "player.wanted").then_some(Value::Number(2.0))
+    }
+    fn apply(id: &str, value: Value) -> Option<Result<Option<String>, String>> {
+        (id == "player.wanted").then(|| Ok(Some(format!("asked for {value:?}"))))
+    }
+
+    #[test]
+    fn the_game_hook_answers_its_items_and_the_rest_say_why_not() {
+        let _one = knobs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Without a hook every script feature says why it is not there.
+        let mut player = Player::default();
+        if knobs::game().is_none() {
+            assert_eq!(player.available("player.wanted"), Err(NOT_YET.into()));
+            assert_eq!(player.value("player.wanted"), Value::None);
+        }
+        knobs::provide_game(knobs::GameHook {
+            available,
+            value,
+            apply,
+        });
+        assert_eq!(player.available("player.wanted"), Ok(()));
+        assert_eq!(player.value("player.wanted"), Value::Number(2.0));
+        assert_eq!(
+            player.apply("player.wanted", Value::Number(3.0)),
+            Ok(Some("asked for Number(3.0)".into()))
+        );
+        // What the hook does not own goes on as before.
+        assert_eq!(player.available("player.god"), Err(NOT_YET.into()));
+        assert_eq!(player.value("player.god"), Value::None);
+        assert!(player.apply("player.god", Value::Bool(true)).is_err());
+        assert!(player.available("teleport.save").is_err() || knobs::player().is_some());
     }
 }

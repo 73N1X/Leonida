@@ -11,6 +11,8 @@ mod native_scan;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 #[cfg(windows)]
+mod game_actions;
+#[cfg(windows)]
 mod player;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod player_find;
