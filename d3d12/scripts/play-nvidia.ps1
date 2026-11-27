@@ -359,6 +359,36 @@ Get-ChildItem (Join-Path (Split-Path $leonida) '*.old-*') -ErrorAction SilentlyC
 $paths = 'LEONIDA_CONFIG', 'LEONIDA_GAME_DIR', 'LEONIDA_CACHE_DIR', 'LEONIDA_DATA_DIR'
 Get-ChildItem Env:LEONIDA_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+# The title's own graphics settings (storage\settings\settings.xml in the data folder). It writes the file with its
+# console defaults whenever it exits by itself: ray-traced dynamic shadows on (this layer builds no structure for
+# them by default), two samples of screen-space occlusion, motion blur, full detail and grass distances. The lighter
+# set below is aki-runtime's (Aki-Developer, Apply-LowVramSettings.ps1 and docs/session-2026-11-26.md there: the
+# card's wait went from 50-69 ms to about 10 on its machine). Here, Series X, the same road: 7,700-9,500 draws a
+# frame became 3,100-4,800 and the submitting thread's preparing 40-45 ms became 25-34 (2026-11-27).
+# The first file found is kept beside it as settings.xml.original. -More @{LEONIDA_TITLE_GRAPHICS='keep'} leaves the
+# file alone; copy the .original back over it for the console's own settings.
+$titleGraphics = if ($settings.LEONIDA_TITLE_GRAPHICS) { "$($settings.LEONIDA_TITLE_GRAPHICS)" } else { 'performance' }
+if (-not $DryRun -and $titleGraphics -ne 'keep' -and $env:LEONIDA_DATA_DIR) {
+    $lighter = [ordered]@{
+        rtDynamicShadows = 'false'; rtLODLightShadows = 'false'; ssroSampleCount = '0'; motionBlur = 'false'
+        shadowParticleShadows = 'false'; sharpenEnabled = 'false'; grassLod = '0.300000'; lodScale = '0.600000'
+        vehicleHDCount = '0'; directionalScreenSpaceShadowQuality = '0.000000'; worldHeightShadowQuality = '0.000000'
+        anisotropicFiltering = '16'; vSync = '0'
+    }
+    Get-ChildItem (Join-Path $env:LEONIDA_DATA_DIR '*\storage\settings\settings.xml') -ErrorAction SilentlyContinue | ForEach-Object {
+        $file = $_.FullName
+        $text = [IO.File]::ReadAllText($file)
+        $new = $text
+        foreach ($name in $lighter.Keys) {
+            $new = [regex]::Replace($new, "(<$name value=`")[^`"]*(`" />)", "`${1}$($lighter[$name])`${2}")
+        }
+        if ($new -ne $text) {
+            if (-not (Test-Path "$file.original")) { Copy-Item $file "$file.original" }
+            [IO.File]::WriteAllText($file, $new, (New-Object Text.UTF8Encoding $false))
+            Write-Host "The title's graphics settings: the lighter set written (LEONIDA_TITLE_GRAPHICS='keep' in -More leaves them; the first file is $file.original)."
+        }
+    }
+}
 # A shader cache of its own: one an earlier version of this fork filled does not fit this renderer's pipelines.
 $toml = Join-Path $root 'leonida.toml'
 if (-not $env:LEONIDA_CACHE_DIR -and -not ((Test-Path $toml) -and (Select-String -Path $toml -Pattern '^\s*cache_dir\s*=' -Quiet))) {
