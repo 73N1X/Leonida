@@ -480,6 +480,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // Magenta (green far below red and blue) is what the probes' memory held, not light.
+    // Ported from cocainebunnylaboratories/cblvictoryvi 1bf62e1 (after Belobug/VIctory-Belobug-AMD 81ebb7bd, GPL-3.0).
+    if (MAGENTA_DROP && was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
@@ -522,7 +525,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let mut root: Option<ID3D12RootSignature> = None;
     let mut resolve_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("#define {part}\n#define MAGENTA_DROP {}\n{SOURCE}", u32::from(crate::toggled!("LEONIDA_AMBIENT_MAGENTA"))), entry, s!("cs_5_1"))?;
         let root = if matches!(part, "PLACE" | "GATHER" | "RAISE") { &mut resolve_root } else { &mut root };
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
