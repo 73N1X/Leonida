@@ -45,6 +45,7 @@
 #include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/compile_gate_calibration.h"
 #include "../src/pipeline_cache_file.h"
 #include "../src/pipeline_profile.h"
 #include "../src/submit_phases.h"
@@ -1695,6 +1696,103 @@ std::filesystem::path pipeline_cache_heavy_path() {
     std::filesystem::path path = pipeline_cache_path();
     if (!path.empty()) path.replace_filename(L"pipeline_cache.heavy.bin");
     return path;
+}
+
+// LEONIDA_COMPILE_GATE unset or `auto` (src/compile_gate_policy.h): decides the compile gate for this GPU and driver
+// before the VulkanContext (and its SubmitMutex) exists. The verdict comes from compile_gate_calibration.txt beside
+// the pipeline cache, or from a calibration on `info.queue` (src/compile_gate_calibration.h), written there once.
+// Only in gta6rt's title process (compile_gate_policy::calibration_allowed): a build host, a test or anything else
+// that creates a device keeps the classic gate and never calibrates. A forced setting returns at once.
+void decide_auto_compile_gate(const VulkanDeviceInfo& info, PFN_vkGetDeviceProcAddr get_device,
+                              const leonida::cached_pso::Identity& identity) {
+    namespace policy = leonida::compile_gate_policy;
+    using leonida::CompileGateMode;
+    using leonida::SubmitMutex;
+    if (SubmitMutex::compile_gate_setting() != policy::Setting::automatic) return;
+    if (!policy::calibration_allowed.load() || compile_helper::build_host.load()) return;  // classic, as before `auto`
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const auto decide = [](CompileGateMode mode, const std::string& why) {
+            SubmitMutex::decide_auto_gate(mode);
+            std::fprintf(stderr, "[rt] compile-gate: auto: %s (%s; LEONIDA_COMPILE_GATE=classic|adaptive overrides)\n",
+                         mode == CompileGateMode::adaptive ? "adaptive" : "classic", why.c_str());
+        };
+        const auto utf8 = [](const std::filesystem::path& path) {
+            const std::wstring& wide = path.native();
+            const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), int(wide.size()), nullptr, 0, nullptr, nullptr);
+            std::string out(std::size_t(n > 0 ? n : 0), '\0');
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), int(wide.size()), out.data(), n, nullptr, nullptr);
+            return out;
+        };
+        if (!identity.vendor || !info.device || !info.queue || !get_device) {
+            decide(CompileGateMode::classic, "the GPU or its queue is not known, so no calibration");
+            return;
+        }
+        const std::string driver = policy::describe_driver(identity.vendor, identity.driver);
+        if (info.physical && info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(info.physical, &props);
+                if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                    decide(CompileGateMode::classic, driver + " is a CPU device, not calibrated");
+                    return;
+                }
+            }
+        }
+        policy::CacheKey key;
+        key.vendor = identity.vendor;
+        key.device = identity.device;
+        key.driver = identity.driver;
+        std::memcpy(key.uuid, identity.cache_uuid, sizeof key.uuid);
+        std::filesystem::path path = pipeline_cache_path();
+        if (!path.empty()) path.replace_filename(L"compile_gate_calibration.txt");
+        std::string text;
+        if (!path.empty()) {
+            std::ifstream in(path, std::ios::binary);
+            if (in) text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        char value[4] = {};
+        std::size_t length = 0;
+        const bool recalibrate =
+            getenv_s(&length, value, "LEONIDA_COMPILE_GATE_RECALIBRATE") == 0 && length > 1 && policy::recalibrate(value);
+        if (!recalibrate) {
+            if (const auto cached = policy::find_entry(text, key)) {
+                decide(policy::mode_for(cached->verdict.outcome),
+                       "cached calibration of " + driver + ": " + policy::describe_verdict(cached->verdict) + "; in " +
+                           utf8(path) + ", LEONIDA_COMPILE_GATE_RECALIBRATE=1 measures again");
+                return;
+            }
+        }
+        const auto seed = static_cast<std::uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()) | 1u;
+        const leonida::compile_gate_calibration::Result result =
+            leonida::compile_gate_calibration::calibrate(get_device, info.device, info.queue, info.queue_family, seed);
+        if (!result.ok) {
+            decide(CompileGateMode::classic, "calibration of " + driver + " failed: " + result.error + "; not cached");
+            return;
+        }
+        std::string where = "not cached (no pipeline cache folder)";
+        if (!policy::cache_verdict(result.verdict.outcome)) {
+            where = "not cached: the next launch measures again";
+        } else if (!path.empty()) {
+            const std::string updated = policy::replace_entry(text, {key, result.verdict});
+            std::filesystem::path temp = path;
+            temp += L".tmp";
+            bool written = false;
+            {
+                std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+                out.write(updated.data(), std::streamsize(updated.size()));
+                written = bool(out);
+            }
+            std::error_code ec;
+            if (written) std::filesystem::rename(temp, path, ec);
+            where = written && !ec ? "cached in " + utf8(path) : "not cached (" + utf8(path) + " could not be written)";
+        }
+        char took[64];
+        std::snprintf(took, sizeof took, " in %.1f s", result.total_ms / 1000.0);
+        decide(policy::mode_for(result.verdict.outcome), "calibrated on " + driver + took + ": " +
+                                                             policy::describe_verdict(result.verdict) + "; " + where);
+    });
 }
 
 // LEONIDA_HEAVY_PIPELINE_CACHE_MS: a compile at least this long schedules a write of the heavy cache; 0 turns the
@@ -11355,7 +11453,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         // gate: from the journal a build takes milliseconds and the warm-up worker makes them back to back, and
         // three warm boots lost the device in a vkQueueSubmit (no GPU fault, no TDR) while only the create was
         // gated. No file I/O in here.
-        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str());
+        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str(),
+                              leonida::SubmitMutex::CreateKind::compute, bytes);
         {
             const leonida::aftermath::ShaderName named(entry->name);
             if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return out;
@@ -13081,11 +13180,26 @@ private:
         const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
-        const auto result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
-            info.flags = f;
-            pipeline = VK_NULL_HANDLE;
-            return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr, &pipeline);
-        });
+        // Through the compile gate as a graphics create (a mesh pipeline is one): on NVIDIA 621.40 a vkQueueSubmit
+        // sat in the driver for as long as a mesh create was in it (54 s) and lost the device. Not with the classic
+        // gate (the default), which keeps graphics creates out of it as before.
+        const char* gate_name = nullptr;
+        for (const auto& source : sources_)
+            if (source.entry && source.slot == 0) gate_name = source.entry->name.c_str();
+        VkResult result = VK_ERROR_UNKNOWN;
+        {
+            std::optional<DriverTurn> turn;
+            if (leonida::SubmitMutex::compile_gate_graphics())
+                turn.emplace(device_.context->submit_mutex(), trigger,
+                             r.mesh ? "vkCreateGraphicsPipelines (mesh)" : "vkCreateGraphicsPipelines", true, gate_name,
+                             leonida::SubmitMutex::CreateKind::graphics, bytes);
+            result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
+                info.flags = f;
+                pipeline = VK_NULL_HANDLE;
+                return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr,
+                                                                     &pipeline);
+            });
+        }
         if (status) *status = result;
         profile.finish(int(result));
         trace.end(trigger, profile_shaders_.c_str(), unbound, bytes, result);
@@ -14618,6 +14732,8 @@ public:
             .first_instance = info.draw_indirect_first_instance, .multiple = info.multi_draw_indirect,
             .count_buffer = info.draw_indirect_count_enabled, .max_count = info.max_draw_indirect_count,
             .robust_index_view = info.robust_index_view, .require_clamp = leonida::indirect_clamp_enabled()};
+        // Before the context: its SubmitMutex takes the gate's mode and limits when it is made.
+        decide_auto_compile_gate(info, get_device, state_.pso_identity);
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
@@ -15148,7 +15264,7 @@ public:
                 // after it, so the generations flush() retires are free at once.
                 {
                     std::lock_guard submit(context.submit_mutex());
-                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex());  // the compile gate
+                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex(), false);  // the compile gate
                     context.observe_result(context.vk.vkDeviceWaitIdle(state_.info.device), "vkDeviceWaitIdle");
                 }
                 state_.bindless_idle_waits.fetch_add(1, std::memory_order_relaxed);
@@ -15468,7 +15584,7 @@ public:
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
-                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex());  // the compile gate
+                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex(), false);  // the compile gate
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }
