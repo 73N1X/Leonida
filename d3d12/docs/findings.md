@@ -137,7 +137,8 @@ Not packed, with the counts over the 2,703 (`translate_cdxil --census` prints `p
 <why>`): 1,237 groups of other than 32 threads, 41 dispatches counted in threads (the structure
 builder's), 28 console wave64 programs. **1,396 are packed** with `LEONIDA_GROUP_PACK=4` (1,395 at
 4, one at 2 for its group-shared memory): 1,229 of 32 x 1 x 1, 146 of 8 x 4, 15 of 4 x 8, 5 of
-4 x 4 x 2, one of 2 x 2 x 8; 77 use group-shared memory, 554 use over 128 registers. The programs
+4 x 4 x 2, one of 2 x 2 x 8; 77 use group-shared memory, 554 use over 128 registers. With `LEONIDA_GROUP_PACK=8`: 837 at 8, 558 at 4
+(the registers), one at 2, none refused by the validator. The programs
 `ffdb43445541c981`, `cb6adcc6da2613ff`, `5cf00dc39042edaf` and the tile lists'
 `2dc364df5d3278b8` and `940c2635dc1312f4` are among them. All of the packed translations pass
 `dxil.dll`'s validator.
