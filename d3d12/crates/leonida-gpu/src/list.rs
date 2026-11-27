@@ -917,6 +917,21 @@ impl Upscale {
     }
 }
 
+/// DLSS's quality mode (`PerfQualityValue`: 0 performance, 1 balanced, 2 quality, 3 ultra performance) for an
+/// upscale from `render` lines to `output` lines, by the modes' own ratios (2/3, 0.58, 1/2, 1/3): 2160 lines from
+/// 1440 are quality, from 1296 or 1253 balanced, from 1080 performance, from 720 ultra performance. Anything from
+/// 0.62 up is quality, as every upscale was before the mode followed the sizes (Series S: 720 lines to 1080).
+#[cfg_attr(not(all(windows, feature = "dlss")), allow(dead_code))]
+pub(crate) fn dlss_mode(render: u32, output: u32) -> i32 {
+    let ratio = f64::from(render) / f64::from(output.max(1));
+    match ratio {
+        r if r >= 0.62 => 2,
+        r if r >= 0.54 => 1,
+        r if r >= 0.42 => 0,
+        _ => 3,
+    }
+}
+
 /// The title's upscale in place of its own FidelityFX passes (slow translated
 /// for 32-lane cards): DLSS if asked for and it can, else a plain stretch of
 /// the colour input over the output (`crate::stretch`, from
@@ -982,6 +997,13 @@ pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
         }
         if !done {
             done = crate::stretch::record_stretch(&host.device, &list.list, to, from, up.render);
+            // Frame generation's inputs from a stretched upscale as well (a DLSS one notes them itself): the
+            // title's depth, motion vectors and jitter are the same whoever makes the output.
+            if done && crate::fg::active() {
+                // SAFETY: a live resource.
+                let colour = unsafe { from.GetDesc() };
+                crate::fg::tag_plain(up, [colour.Width as u32, colour.Height]);
+            }
         }
         if done {
             crate::texture::host_written(output);
@@ -2582,6 +2604,39 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn the_dlss_mode_follows_the_sizes() {
+        // Series X, 2160 lines out: 1440 quality, 1296 and 1253 balanced, 1080 performance, 720 ultra performance.
+        assert_eq!([1440, 1296, 1253, 1252, 1080, 720].map(|lines| dlss_mode(lines, 2160)), [2, 1, 1, 1, 0, 3]);
+        // Series S as before: 720 lines to 1080 are quality, and so is anything nearer to the output.
+        assert_eq!([720, 810, 1080].map(|lines| dlss_mode(lines, 1080)), [2, 2, 2]);
+        assert_eq!(dlss_mode(540, 1080), 0);
+        assert_eq!(dlss_mode(0, 0), 3);
+    }
+
+    #[test]
+    fn an_upscale_keeps_its_numbers_through_its_words() {
+        let up = Upscale {
+            colour: 1,
+            depth: 2,
+            motion: 3,
+            exposure: 4,
+            output: 5,
+            render: [2560, 1440],
+            jitter: [0.25, -0.5],
+            motion_scale: [2560.0, 1440.0],
+            reset: true,
+            pre_exposure: 1.5,
+            near: 1000.0,
+            far: 0.1,
+            frame_ms: 91.0,
+            dlss: true,
+        };
+        let back = Upscale::from_words(&up.to_words()).expect("eleven words");
+        assert_eq!(format!("{back:?}"), format!("{up:?}"));
+        assert!(Upscale::from_words(&up.to_words()[..10]).is_none());
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

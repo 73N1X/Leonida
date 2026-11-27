@@ -15,12 +15,19 @@
 #                default: the one start made that way on 2026-11-27 ended 2.4 s in with the title's own breakpoint
 #                (0x80000003 in its main loop), and the next start without it ran. Not looked into yet.
 # -NoDlss        the picture is stretched instead of going through DLSS
+# -Dlss          DLSS makes the output, on Series X too: quality (rendered at 1440 lines of the 2160), balanced
+#                (1296), performance (1080) or ultra (720). Leave -Resolution out with it.
+# -FrameGen      DLSS frame generation: 2 shows twice the frames rendered (up to 6 where the card does more). On
+#                Series X it needs the DLSS upscale and turns -Dlss quality on unless a mode is given.
+# -Aspect        the window's shape: 21:9, 32:9, 16:9, W:H or auto (the screen's). The game still draws 16:9, shown
+#                centred with black bars (-PresentScale fit, the default with -Aspect) or stretched (stretch).
 # -Resolution    the older path: the game renders at this height and the title's own upscaler does the rest
 # -RayTracing    the title's real ray tracing (slower; shaders build for minutes the first time)
 # -Capture       F9 in the game saves that frame and the pictures it drew
 # -NoPrecompile  start at once: by default every shader is translated and the pipelines earlier runs drew with are
 #                made before the title starts (minutes the first time, seconds after)
 # -Log           the runtime's log goes to a file under %LOCALAPPDATA%\Leonida\logs
+# -DryRun        prints the settings this start would run with and stops: nothing is built or started
 #
 # Builds d3d12/ when it is missing (d3d12\scripts\build-nvidia.ps1: the diag profile, with DLSS when NVIDIA's files
 # are there), keeps the caches and saves under -Data, and hands everything else to d3d12\scripts\play-nvidia.ps1:
@@ -32,6 +39,10 @@ param(
     [switch]$SeriesS,
     [switch]$Quality,
     [ValidateSet('', '2160', '1440', '1080', '720', '540', '480')][string]$Resolution = '',
+    [ValidateSet('', 'quality', 'balanced', 'performance', 'ultra')][string]$Dlss = '',
+    [ValidateSet(0, 2, 3, 4, 5, 6)][int]$FrameGen = 0,
+    [string]$Aspect = '',
+    [ValidateSet('', 'fit', 'stretch')][string]$PresentScale = '',
     [string]$Adapter = '',
     [hashtable]$More = @{},
     [switch]$Rebuild,
@@ -41,7 +52,8 @@ param(
     [switch]$RayTracing,
     [switch]$Capture,
     [switch]$NoPrecompile,
-    [switch]$Log
+    [switch]$Log,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,7 +62,7 @@ $runtime = Join-Path $repo "d3d12"
 $exe = Join-Path $runtime "target\diag\leonida.exe"
 $title = Join-Path $Game "game_scarlett_master.exe"
 if (-not (Test-Path $title)) { throw "missing: $title" }
-if ($Rebuild -or -not (Test-Path $exe)) {
+if (-not $DryRun -and ($Rebuild -or -not (Test-Path $exe))) {
     & (Join-Path $runtime "scripts\build-nvidia.ps1")
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 }
@@ -66,9 +78,14 @@ $launch = @{ Exe = $title; Build = 'diag'; NoSmoothMotion = (-not $SmoothMotion)
 # Leonida: the Series X profile is the default (the user's call: 1080p-1440p as on the bigger consoles).
 if (-not $SeriesS) {
     $launch.SeriesX = $true
-    if (-not $Resolution) { $Resolution = '1440' }
+    # 1440 lines and the title's own upscaler, unless DLSS (which frame generation brings with it) makes the output.
+    if (-not $Resolution -and -not $Dlss -and -not $FrameGen) { $Resolution = '1440' }
 }
-foreach ($switch in 'Quality', 'NoDlss', 'RayTracing', 'Capture', 'NoPrecompile', 'Log') {
+if ($Dlss) { $launch.Dlss = $Dlss }
+if ($FrameGen) { $launch.FrameGen = $FrameGen }
+if ($Aspect) { $launch.Aspect = $Aspect }
+if ($PresentScale) { $launch.PresentScale = $PresentScale }
+foreach ($switch in 'Quality', 'NoDlss', 'RayTracing', 'Capture', 'NoPrecompile', 'Log', 'DryRun') {
     if ($PSBoundParameters[$switch]) { $launch[$switch] = $true }
 }
 if ($Resolution) { $launch.Resolution = $Resolution }

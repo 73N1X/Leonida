@@ -154,6 +154,14 @@ pub extern "system" fn CreateWindowExA(
 /// chain stretches). `LEONIDA_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    // Leonida: `LEONIDA_ASPECT` gives a top-level window another shape at the height the title asks for (an
+    // ultrawide monitor); what is shown in it is the presenter's business (`leonida_gpu::aspect`).
+    let asked = (width, height);
+    let (width, height) = match leonida_gpu::aspect::asked() {
+        Some(aspect) if parent.is_null() => leonida_gpu::aspect::widened(width, height, aspect),
+        _ => asked,
+    };
+    let shaped = (width, height) != asked;
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -161,9 +169,12 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
     if !parent.is_null() || known == 0 || fitted == (width, height) {
+        if shaped {
+            tracing::info!(?asked, to = ?(width, height), "title window given the shape LEONIDA_ASPECT asks for");
+        }
         return (x, y, width, height);
     }
-    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
+    tracing::info!(?asked, width, height, to = ?fitted, ?limit, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;

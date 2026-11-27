@@ -10,7 +10,17 @@
 # -NoSmoothMotion  run target\<build>\leonida.exe itself. By default a copy named leonida_sm.exe is started instead,
 #                  so a Smooth Motion profile set for that exe in the NVIDIA App applies every time.
 # -NoDlss          no DLSS: the picture is stretched (fast, softer)
-# -SeriesX         the Series X profile instead (much slower; no DLSS there)
+# -SeriesX         the Series X profile instead (much slower). Without -Dlss or -FrameGen the title's own upscaler
+#                  makes its 3840x2160 output, as before.
+# -Dlss            DLSS makes the output, from a render height by mode: quality (2/3 of the output's lines: 1440 on
+#                  Series X, the game's own 720 on Series S), balanced (0.6: 1296), performance (1/2: 1080) or ultra
+#                  (1/3: 720). On Series X the title is made to upscale through FidelityFX as on Series S
+#                  (LEONIDA_FSR_UPSCALER), which is where DLSS takes over.
+# -FrameGen        DLSS frame generation: 2 (twice the frames shown), up to 6 where the card does more (RTX 40: 2).
+#                  It takes depth and motion vectors from the DLSS upscale, so on Series X it turns -Dlss quality on
+#                  unless a mode is given.
+# -Aspect          the window's shape: 21:9, 32:9, 16:9, W:H or auto (the screen's). The game still draws 16:9.
+# -PresentScale    fit (the 16:9 picture centred, black bars beside it: the default with -Aspect) or stretch
 # -Quality         fewer stretched/jumping bodies, slower (relay stage 1, no card steps)
 # -RayTracing      the title's real ray tracing (the structure builder runs). Shaders build for minutes the
 #                  first time, and DLSS frame generation is left off with it (the two together do not work yet).
@@ -30,6 +40,8 @@
 # -WindowsBarMB    maximum MiB of title memory windows in CPU-mapped VRAM (by default 3072 on PCs with under
 #                  24 GB of RAM, else 0; -WindowsBarMB 0 turns it off).
 # -More            other settings: -More @{LEONIDA_PANEL='1'}
+# -DryRun          prints the settings this start would run with (after the F1 menu's saved ones) and stops: nothing
+#                  is built or started
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -39,6 +51,10 @@ param(
     [switch]$Quality,
     [switch]$RayTracing,
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
+    [ValidateSet('quality', 'balanced', 'performance', 'ultra')][string]$Dlss,
+    [ValidateRange(2, 6)][int]$FrameGen,
+    [ValidatePattern('^(auto|\d+(\.\d+)?([:x/]\d+(\.\d+)?)?)$')][string]$Aspect,
+    [ValidateSet('fit', 'stretch')][string]$PresentScale,
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$DlssDir,
@@ -47,10 +63,13 @@ param(
     [switch]$Log,
     [switch]$Capture,
     [hashtable]$More = @{},
-    [uint32]$WindowsBarMB
+    [uint32]$WindowsBarMB,
+    [switch]$DryRun
 )
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
+if ($Dlss -and $Resolution) { Write-Host '-Dlss sets the render height by its mode: leave -Resolution out with it.'; return }
+if ($Dlss -and $NoDlss) { Write-Host '-Dlss and -NoDlss: one or the other.'; return }
 $Exe = (Resolve-Path $Exe).Path
 
 # NVIDIA's own files: where they are (Get-NVIDIA-DLSS.cmd puts them in nvidia-sdk\). Nothing is downloaded here.
@@ -59,7 +78,8 @@ if (-not $StreamlineDir) { $StreamlineDir = $env:LEONIDA_STREAMLINE_DIR }
 $sdkDlss = Join-Path $root 'nvidia-sdk\DLSS'
 $sdkDlssLib = Join-Path $sdkDlss 'lib\Windows_x86_64\x64\nvsdk_ngx_d.lib'
 $sdkStreamline = Join-Path $root 'nvidia-sdk\Streamline\bin\x64'
-$wantDlss = -not $NoDlss -and -not $SeriesX -and -not $Resolution
+# DLSS by default on Series S; on Series X when -Dlss or -FrameGen asks for it.
+$wantDlss = -not $NoDlss -and -not $Resolution -and (-not $SeriesX -or $Dlss -or $FrameGen)
 if (-not $DlssDir -and (Test-Path (Join-Path $sdkDlss 'lib\Windows_x86_64\rel\nvngx_dlss.dll'))) { $DlssDir = Join-Path $sdkDlss 'lib\Windows_x86_64\rel' }
 if (-not $StreamlineDir -and (Test-Path (Join-Path $sdkStreamline 'sl.interposer.dll'))) { $StreamlineDir = $sdkStreamline }
 if ($wantDlss -and -not $DlssDir) {
@@ -72,15 +92,17 @@ $leonida = Join-Path $root "target\$Build\leonida.exe"
 $built = Join-Path $root "target\$Build\built-with.txt"
 $hasDlss = (Test-Path $built) -and ((Get-Content $built -Raw) -match 'dlss')
 $canDlss = $wantDlss -and (Test-Path $sdkDlssLib)
-if ($Build -eq 'diag' -and (-not (Test-Path $leonida) -or ($canDlss -and -not $hasDlss -and (Test-Path $built)))) {
+if (-not $DryRun -and $Build -eq 'diag' -and (-not (Test-Path $leonida) -or ($canDlss -and -not $hasDlss -and (Test-Path $built)))) {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Host 'No build and no cargo: install Rust (README.md), then start this again.'; return }
     Write-Host 'Building the layer (a few minutes the first time) ...'
     & (Join-Path $PSScriptRoot 'build-nvidia.ps1')
     $hasDlss = (Test-Path $built) -and ((Get-Content $built -Raw) -match 'dlss')
 }
-if (-not (Test-Path $leonida)) { Write-Host "No $leonida. Build it first (scripts\build-nvidia.ps1)."; return }
+if (-not $DryRun -and -not (Test-Path $leonida)) { Write-Host "No $leonida. Build it first (scripts\build-nvidia.ps1)."; return }
 # A build nobody noted the making of (cargo by hand) is taken at its word: with DLSS if the files are there.
-$dlss = $wantDlss -and $DlssDir -and ($hasDlss -or -not (Test-Path $built))
+# $dlssCan: DLSS can run (its files and a build with it), whoever asks for it: this start, or the F1 menu later.
+$dlssCan = -not $NoDlss -and $DlssDir -and ($hasDlss -or -not (Test-Path $built))
+$dlssOn = $wantDlss -and $dlssCan
 
 $settings = @{
     # The play set. Textures are waited for: one loaded once at the start could stay empty for the run otherwise.
@@ -132,17 +154,28 @@ $settings = @{
     LEONIDA_WC_NO_BACK = '1'
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
+# The render scale of each DLSS mode (rendered lines over output lines; the layer picks DLSS's own mode by it).
+$dlssScale = @{ quality = '0.6667'; balanced = '0.6'; performance = '0.5'; ultra = '0.3333' }
+if ($DlssDir) { $settings.LEONIDA_DLSS_DIR = $DlssDir }
 if ($Resolution) {
     # The older path: a render scale and the title's own upscaler (rendered height over output height).
     $outHeight = if ($SeriesX) { 2160 } else { 1080 }
     if ([int]$Resolution -gt $outHeight) { Write-Host "That console outputs ${outHeight}p: ${Resolution}p is above it."; return }
     $settings.LEONIDA_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
     $settings.LEONIDA_OWN_UPSCALER = '1'
-} elseif ($dlss) {
-    $settings.LEONIDA_UPSCALE = 'dlss'; $settings.LEONIDA_DLSS_DIR = $DlssDir
+} elseif ($dlssOn) {
+    $settings.LEONIDA_UPSCALE = 'dlss'
+    # Series S renders 2/3 of its output by itself: quality needs no scale there. Series X renders 1.0 through
+    # FidelityFX unless told (the scale is set below, quality if no mode was given).
+    if ($Dlss -and ($SeriesX -or $Dlss -ne 'quality')) { $settings.LEONIDA_RENDER_SCALE = $dlssScale[$Dlss] }
 } elseif (-not $SeriesX) {
     $settings.LEONIDA_UPSCALE = 'stretch'
+    if ($Dlss -and $Dlss -ne 'quality') { $settings.LEONIDA_RENDER_SCALE = $dlssScale[$Dlss] }
 }
+if ($Dlss -and -not $dlssOn) { Write-Host "-Dlss ${Dlss}: no DLSS here (its files, or a build with it): the title's picture is not made by DLSS." }
+if ($FrameGen) { $settings.LEONIDA_FRAME_GEN = "$FrameGen" }
+if ($Aspect) { $settings.LEONIDA_ASPECT = $Aspect }
+if ($PresentScale) { $settings.LEONIDA_PRESENT_SCALE = $PresentScale }
 if ($StreamlineDir) { $settings.LEONIDA_STREAMLINE_DIR = $StreamlineDir }
 if ($Quality) { $settings.LEONIDA_RELAY = '1'; $settings.LEONIDA_CARD_STEPS = '0' }
 if ($RayTracing) {
@@ -207,8 +240,11 @@ if (Test-Path $menuFile) {
 # Leonida: the runs write down the pipelines the title creates (pipeline/known.rs), for the precompile below.
 if (-not $NoPrecompile) { $settings.LEONIDA_PIPELINE_BOOK = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
-# DLSS only where it can be: a menu choice of it without the files or the build falls back to the stretch.
-if ($settings.LEONIDA_UPSCALE -eq 'dlss' -and -not $dlss) { $settings.LEONIDA_UPSCALE = 'stretch' }
+# DLSS only where it can be: a menu choice of it without the files or the build falls back to the stretch
+# (Series X: to the title's own upscaler, which is sharper than a stretch to 3840x2160).
+if ($settings.LEONIDA_UPSCALE -eq 'dlss' -and -not $dlssCan) {
+    if ($console -eq 'series-x') { $settings.Remove('LEONIDA_UPSCALE') } else { $settings.LEONIDA_UPSCALE = 'stretch' }
+}
 # DLSS frame generation and real ray tracing do not work together yet (0.1 frames a second): with ray tracing
 # on, frame generation is left off and Smooth Motion can do the extra frames.
 if ($settings.LEONIDA_BVH_BUILDER -eq '1' -and $settings.LEONIDA_FRAME_GEN -and $settings.LEONIDA_FG_WITH_RT -ne '1') {
@@ -218,6 +254,28 @@ if ($settings.LEONIDA_BVH_BUILDER -eq '1' -and $settings.LEONIDA_FRAME_GEN -and 
 if ($settings.LEONIDA_FRAME_GEN -and -not $StreamlineDir) {
     Write-Host 'Frame generation needs the Streamline files (Get-NVIDIA-DLSS.cmd): left off.'
     $settings.Remove('LEONIDA_FRAME_GEN')
+}
+# Series X: the title upscales with its own upscaler, as passes that hand nothing over. DLSS (or the stretch)
+# stands in for its FidelityFX upscale instead, which the title is made to use (LEONIDA_FSR_UPSCALER, the loader's
+# hooks.rs), and frame generation takes its depth and motion vectors from that same upscale: it needs it too.
+if ($console -eq 'series-x') {
+    $generating = $settings.LEONIDA_FRAME_GEN -and $settings.LEONIDA_FRAME_GEN -ne '1'
+    if ($generating -and $settings.LEONIDA_UPSCALE -notin 'dlss', 'stretch') {
+        if ($dlssCan) {
+            Write-Host 'Series X: frame generation takes depth and motion vectors from the DLSS upscale, so DLSS makes the picture.'
+            $settings.LEONIDA_UPSCALE = 'dlss'
+        } else {
+            Write-Host 'Series X: frame generation needs the DLSS upscale (its files and a build with it): left off.'
+            $settings.Remove('LEONIDA_FRAME_GEN')
+        }
+    }
+    if ($settings.LEONIDA_UPSCALE -in 'dlss', 'stretch') {
+        $settings.LEONIDA_FSR_UPSCALER = '1'; $settings.Remove('LEONIDA_OWN_UPSCALER')
+        # Through FidelityFX the title renders 1.0 of its output there: 1440 lines (quality) unless a scale is set.
+        if (-not $settings.LEONIDA_RENDER_SCALE) { $settings.LEONIDA_RENDER_SCALE = $dlssScale.quality }
+    } else {
+        $settings.Remove('LEONIDA_FSR_UPSCALER')
+    }
 }
 # Smooth Motion is a second frame generator: off while DLSS frame generation is on.
 if ($settings.LEONIDA_FRAME_GEN -and $settings.LEONIDA_FRAME_GEN -ne '1') { $smooth = $false }
@@ -230,20 +288,30 @@ $again = @("-Exe '$($Exe -replace "'", "''")'", "-Build $Build")
 foreach ($s in 'NoSmoothMotion', 'NoDlss', 'SeriesX', 'Quality', 'RayTracing', 'NoPrecompile', 'Log', 'Capture') {
     if ($PSBoundParameters[$s]) { $again += "-$s" }
 }
-foreach ($s in 'Resolution', 'Adapter', 'DlssDir', 'StreamlineDir') {
+foreach ($s in 'Resolution', 'Dlss', 'FrameGen', 'Aspect', 'PresentScale', 'Adapter', 'DlssDir', 'StreamlineDir') {
     if ($PSBoundParameters[$s]) { $again += "-$s '$($PSBoundParameters[$s] -replace "'", "''")'" }
 }
 if ($PSBoundParameters.ContainsKey('WindowsBarMB')) { $again += "-WindowsBarMB $WindowsBarMB" }
 $settings.LEONIDA_MENU_ARGS = $again -join ' '
 
-$picture = if ($settings.LEONIDA_RENDER_SCALE) { "render scale $($settings.LEONIDA_RENDER_SCALE), the title's upscaler" }
-    elseif ($settings.LEONIDA_UPSCALE -eq 'dlss') { 'DLSS' }
-    elseif ($settings.LEONIDA_UPSCALE -eq 'stretch') { 'stretched (no DLSS)' }
+$scaled = if ($settings.LEONIDA_RENDER_SCALE) { " from render scale $($settings.LEONIDA_RENDER_SCALE)" } else { '' }
+# With the title's own upscaler forced, DLSS and the stretch are never asked: the title upscales by itself.
+$own = $settings.LEONIDA_OWN_UPSCALER -and $settings.LEONIDA_OWN_UPSCALER -ne '0'
+$picture = if ($own -and $settings.LEONIDA_RENDER_SCALE) { "render scale $($settings.LEONIDA_RENDER_SCALE), the title's upscaler" }
+    elseif ($own) { "the title's upscaler" }
+    elseif ($settings.LEONIDA_UPSCALE -eq 'dlss') { "DLSS$scaled" }
+    elseif ($settings.LEONIDA_UPSCALE -eq 'stretch') { "stretched$scaled (no DLSS)" }
+    elseif ($settings.LEONIDA_RENDER_SCALE) { "render scale $($settings.LEONIDA_RENDER_SCALE), the title's upscaler" }
     else { "the title's upscaler" }
 $extras = ''
+if ($settings.LEONIDA_ASPECT) { $extras += ", window $($settings.LEONIDA_ASPECT)" }
 if ($settings.LEONIDA_FRAME_GEN) { $extras += ", frame generation $($settings.LEONIDA_FRAME_GEN)x" }
 if ($settings.LEONIDA_BVH_BUILDER -eq '1') { $extras += ', ray tracing' }
 Write-Host "Series $(if ($console -eq 'series-x') { 'X' } else { 'S' }), $picture$extras. F1 in the game: settings."
+if ($DryRun) {
+    $settings.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Output "$($_.Name)=$($_.Value)" }
+    return
+}
 
 if ($smooth) {
     # A copy under the name the NVIDIA App's Smooth Motion profile is set for, refreshed when the build changes.

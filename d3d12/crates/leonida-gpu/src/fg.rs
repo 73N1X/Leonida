@@ -7,8 +7,12 @@
 //! - [`start`] (from the presenter, before its swap chain): `slInit`, `slSetD3DDevice`, Reflex
 //!   low latency, and the factory upgraded to Streamline's proxy, so that the swap chain made
 //!   from it is the proxy that generates frames at `Present`.
-//! - [`tag`] (from the DLSS upscale, `crate::dlss::record`): the frame's constants and its depth
-//!   and motion vectors (copied by Streamline on that list: `eOnlyValidNow`).
+//! - [`tag`] (from the DLSS upscale, `crate::dlss::record`, or [`tag_plain`] from a stretched one):
+//!   the frame's constants and its depth and motion vectors (handed over at the present,
+//!   `eValidUntilPresent`). Both come from the title's FidelityFX dispatch, so frames are generated
+//!   where the title upscales through it: Series S, and Series X with `LEONIDA_FSR_UPSCALER=1`
+//!   (leonida-loader's `hooks.rs`). The title's own temporal upscaler hands nothing over: with it
+//!   no frame is tagged and none is generated.
 //! - [`present_start`] / [`present_end`] around the proxy's `Present`.
 //!
 //! The title gives no camera matrices: they are made from a 60 degree field of view, the
@@ -195,9 +199,28 @@ pub(crate) fn tag(render: [u32; 2], jitter: [f32; 2], mv_pixels: [f32; 2], near:
         return;
     }
     let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+    if latest.is_none() {
+        tracing::info!(?render, ?jitter, ?mv_pixels, near, far, "frame generation: the first upscale's numbers (its depth and motion vectors are tagged from now on)");
+    }
     let (depth, motion) = latest.as_ref().map_or((0, 0), |l| (l.depth, l.motion));
     *latest = Some(Latest { depth, motion, render, jitter, mv_pixels, near, far, reset });
     TAGGED.store(true, Ordering::Relaxed);
+}
+
+/// [`tag`] and [`note_titles`] for an upscale that was stretched, not made by DLSS (`crate::stretch`): the render
+/// size is the title's, or the colour texture's (`colour`) when it gives none.
+pub(crate) fn tag_plain(up: &crate::list::Upscale, colour: [u32; 2]) {
+    let side = |asked: u32, held: u32| if asked == 0 { held } else { asked.min(held) };
+    let scale = |s: f32| if s == 0.0 { 1.0 } else { s };
+    tag(
+        [side(up.render[0], colour[0]), side(up.render[1], colour[1])],
+        up.jitter,
+        [scale(up.motion_scale[0]), scale(up.motion_scale[1])],
+        up.near,
+        up.far,
+        up.reset,
+    );
+    note_titles(up.depth, up.motion);
 }
 
 /// The title's depth and motion vectors the DLSS upscale read (`crate::list::upscale_now`).
@@ -209,6 +232,21 @@ pub(crate) fn note_titles(depth: u64, motion: u64) {
     if let Some(l) = latest.as_mut() {
         (l.depth, l.motion) = (depth as usize, motion as usize);
     }
+}
+
+/// Where the title's picture is in the swap chain's buffer when bars go around it (`crate::aspect`): left, top,
+/// width, height. None: it is the whole buffer.
+static PICTURE: Mutex<Option<[u32; 4]>> = Mutex::new(None);
+/// A box was given at some time: from then on every present says where the picture is, the whole buffer too.
+static BOXED: AtomicBool = AtomicBool::new(false);
+
+/// From the presenter, before [`present_start`]: where in the buffer about to be presented the picture is.
+pub(crate) fn picture_box(place: Option<[u32; 4]>) {
+    if place.is_none() && !BOXED.load(Ordering::Relaxed) {
+        return;
+    }
+    BOXED.store(true, Ordering::Relaxed);
+    *PICTURE.lock().unwrap_or_else(|e| e.into_inner()) = place;
 }
 
 fn constants(l: &Latest) -> sl::Constants {
@@ -301,6 +339,12 @@ pub(crate) fn present_start() {
     let fresh = TAGGED.swap(false, Ordering::Relaxed);
     {
         let latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+        // Said once: generation is on and nothing has come from an upscale yet.
+        if latest.is_none() && index == 600 {
+            tracing::warn!(
+                "frame generation: no upscale has handed over depth and motion vectors in 600 presents, and no frame is generated until one does. In the world that means the title is not upscaling through FidelityFX (Series X: LEONIDA_FSR_UPSCALER=1 with LEONIDA_UPSCALE=dlss)"
+            );
+        }
         let found = latest.as_ref().and_then(|l| {
             // Only a title resource that is still one, and only its copy as it is: the handles
             // are a frame old at a present with no new upscale, and the title may have let the
@@ -322,10 +366,16 @@ pub(crate) fn present_start() {
             let mut depth_res = sl::Resource::d3d12_tex2d(depth.texture.as_raw(), depth_state);
             let mut motion_res = sl::Resource::d3d12_tex2d(motion.texture.as_raw(), motion_state);
             let extent = Some(sl::Extent { top: 0, left: 0, width: l.render[0], height: l.render[1] });
-            let tags = [
+            let mut tags = vec![
                 sl::ResourceTag::new(&mut depth_res, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, extent),
                 sl::ResourceTag::new(&mut motion_res, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, extent),
             ];
+            // With bars around the picture: the part of the back buffer the depth and motion vectors are of
+            // (no resource, only the extent; all zero is the whole buffer again).
+            if BOXED.load(Ordering::Relaxed) {
+                let place = PICTURE.lock().unwrap_or_else(|e| e.into_inner()).map(|[left, top, width, height]| sl::Extent { top, left, width, height });
+                tags.push(sl::ResourceTag::new(std::ptr::null_mut(), sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, place));
+            }
             // SAFETY: live resources (their host copies are held through the call), in the
             // states they will be in at the present; no list needed for eValidUntilPresent.
             let t = unsafe { s.sl.set_tag_for_frame(token, &VIEWPORT, &tags, std::ptr::null_mut()) };
