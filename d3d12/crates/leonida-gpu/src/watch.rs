@@ -56,7 +56,11 @@ fn parts_on() -> bool {
 
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard {
+            written: BTreeMap::new(),
+            max_written: 0,
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -68,7 +72,9 @@ impl Shard {
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let latest = before.max(now);
+        self.written.insert(page, latest);
+        self.max_written = self.max_written.max(latest);
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -133,6 +139,10 @@ struct Notes([RwLock<Shard>; SHARDS]);
 struct Shard {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// The largest asking in `written` (notes only go up, so it never falls):
+    /// a part whose largest is not past a floor holds nothing newer than it.
+    /// Ported from maren-halv/VIctory-DXR 79a92c7 (GPL-3.0).
+    max_written: u64,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -181,6 +191,22 @@ impl Notes {
             // Ranges of many pieces: each part once, in the parts' order, not
             // the pages' (`range` sorts what it collects).
             None => (0..SHARDS).all(|shard| self.read(shard).written.range(first..last).all(|(&p, &w)| each(p, w))),
+        }
+    }
+
+    /// Whether `pred` holds for every note of pages `[first, last)` newer than
+    /// `floor`, in no order: a part whose largest note is not newer is passed
+    /// over without a look. (maren-halv/VIctory-DXR 79a92c7, GPL-3.0.)
+    fn all_newer(&self, first: usize, last: usize, floor: u64, mut pred: impl FnMut(usize, u64) -> bool) -> bool {
+        match pieces(first, last) {
+            Some(mut pieces) => pieces.all(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.max_written <= floor || s.written.range(from..to).all(|(&p, &w)| w <= floor || pred(p, w))
+            }),
+            None => (0..SHARDS).all(|shard| {
+                let s = self.read(shard);
+                s.max_written <= floor || s.written.range(first..last).all(|(&p, &w)| w <= floor || pred(p, w))
+            }),
         }
     }
 
@@ -1377,8 +1403,21 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+    // A note at or under the oldest taking (or the whole range's) is covered
+    // by every page's own, so a part with nothing newer is not looked at.
+    let floor = if ranged != 0 {
+        ranged
+    } else {
+        let mut oldest = u64::MAX;
+        for &at in taken {
+            if at == 0 {
+                return false;
+            }
+            oldest = oldest.min(at);
+        }
+        oldest
+    };
+    j.notes.all_newer(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -5919,6 +5958,28 @@ mod port7_tests {
 
     /// Noted out of order (shared noters' numbers may come in any order): a
     /// page's note, and its parts', only go up.
+    #[test]
+    fn a_part_keeps_its_largest_note_and_a_clean_one_is_passed_over() {
+        let mut s = Shard::new();
+        assert_eq!(s.max_written, 0);
+        s.note(3, WHOLE, 9);
+        s.note(4, WHOLE, 5);
+        s.note(3, WHOLE, 7);
+        assert_eq!(s.max_written, 9);
+        let mut notes = Notes::new();
+        notes.shard_mut(3).note(3, WHOLE, 9);
+        let mut seen = Vec::new();
+        assert!(notes.all_newer(0, 8, 9, |p, w| {
+            seen.push((p, w));
+            false
+        }));
+        assert!(seen.is_empty(), "nothing is newer than 9");
+        assert!(!notes.all_newer(0, 8, 8, |_, _| false));
+        assert!(notes.all_newer(0, usize::MAX / 2, 9, |_, _| false));
+        assert!(!notes.all_newer(0, usize::MAX / 2, 8, |_, _| false));
+        assert!(notes.all_newer(0, 8, 8, |p, w| (p, w) == (3, 9)));
+    }
+
     #[test]
     fn notes_only_go_up() {
         let mut s = Shard::new();
