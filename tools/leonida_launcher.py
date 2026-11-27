@@ -243,6 +243,35 @@ def set_mod_enabled(manifest_path: str, enabled: bool) -> None:
     _mods_module().set_enabled_in_manifest(manifest_path, enabled)
 
 
+# ---------------------------------------------------------------- saves
+
+def _saves_module():
+    """tools/leonida_saves.py, loaded by path like the mod manager."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leonida_saves.py")
+    spec = importlib.util.spec_from_file_location("leonida_saves", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("leonida_saves", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def data_root(settings: dict) -> str:
+    """The data folder in use: the setting, else the default of scripts/play-d3d12.ps1 (<local>/Leonida/d3d12)."""
+    return settings.get("data_dir", "").strip() or os.path.join(local_data_dir(), "Leonida", "d3d12")
+
+
+def game_running(windows: bool = WINDOWS) -> bool:
+    """Whether a runtime process (leonida.exe or its Smooth Motion copy) is running, started here or not."""
+    try:
+        if windows:
+            out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                                 creationflags=subprocess.CREATE_NO_WINDOW, check=False).stdout.lower()
+            return '"leonida.exe"' in out or '"leonida_sm.exe"' in out
+        return subprocess.run(["pgrep", "-f", "leonida(_sm)?[.]exe"], capture_output=True, check=False).returncode == 0
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------- processes
 
 def stop_tree(process: subprocess.Popen) -> None:
@@ -316,7 +345,7 @@ def run_gui() -> int:
         return 1
 
     class Launcher:
-        PAGES = ("Play", "Settings", "Mods", "Tools", "About")
+        PAGES = ("Play", "Settings", "Mods", "Saves", "Tools", "About")
 
         def __init__(self, root):
             self.root = root
@@ -348,6 +377,7 @@ def run_gui() -> int:
             self.build_play()
             self.build_settings()
             self.build_mods()
+            self.build_saves()
             self.build_tools()
             self.build_about()
             self.show("Play")
@@ -414,6 +444,8 @@ def run_gui() -> int:
                 label.configure(bg=PANEL if key == name else NAV, fg=TEXT if key == name else MUTED)
             if name == "Mods":
                 self.refresh_mods()
+            if name == "Saves":
+                self.refresh_saves()
             if name == "Play":
                 self.refresh_hero()
 
@@ -735,6 +767,216 @@ def run_gui() -> int:
                 subprocess.Popen(command, cwd=REPO)
             except OSError as exc:
                 messagebox.showerror("Mods", f"Could not open the mod manager: {exc}")
+
+        # ---- Saves
+        def build_saves(self):
+            self.saves = _saves_module()
+            page = self.pages["Saves"]
+            page.columnconfigure(0, weight=1)
+            page.rowconfigure(0, weight=1)
+            inner = ttk.Frame(page, padding=(28, 22))
+            inner.grid(row=0, column=0, sticky="nsew")
+            inner.columnconfigure(0, weight=1)
+            inner.rowconfigure(2, weight=1)
+            ttk.Label(inner, text="Saves", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
+            self.saves_note = tk.StringVar()
+            ttk.Label(inner, textvariable=self.saves_note, style="Muted.TLabel", wraplength=800).grid(
+                row=1, column=0, sticky="w", pady=(2, 10))
+            self.stree = ttk.Treeview(inner, columns=("size", "modified", "version"), selectmode="browse")
+            self.stree.heading("#0", text="Container / blob")
+            self.stree.column("#0", width=330)
+            for column, title, width in (("size", "Size", 90), ("modified", "Modified", 160),
+                                         ("version", "Version", 70)):
+                self.stree.heading(column, text=title)
+                self.stree.column(column, width=width, anchor="w")
+            self.stree.grid(row=2, column=0, sticky="nsew")
+            self.stree.bind("<<TreeviewSelect>>", lambda _e: self.describe_selection())
+            self.save_info = tk.StringVar()
+            ttk.Label(inner, textvariable=self.save_info, style="Muted.TLabel", wraplength=800).grid(
+                row=3, column=0, sticky="w", pady=(8, 0))
+            rows = ((("Back up all", self.save_backup_all), ("Back up selected", self.save_backup_one),
+                     ("Restore ...", self.save_restore), ("Duplicate ...", self.save_duplicate),
+                     ("Delete", self.save_delete)),
+                    (("Export blob ...", self.save_export), ("Import blob ...", self.save_import),
+                     ("View bytes", self.save_view), ("Backups folder", self.save_open_backups),
+                     ("Refresh", self.refresh_saves)))
+            for number, buttons in enumerate(rows):
+                row = ttk.Frame(inner)
+                row.grid(row=4 + number, column=0, sticky="w", pady=(10 if number == 0 else 6, 0))
+                for text, command in buttons:
+                    ttk.Button(row, text=text, command=command).pack(side="left", padx=(0, 6))
+            self.save_items: dict = {}
+
+        def saves_paths(self):
+            data = data_root(self.settings)
+            return data, self.saves.saves_root(data), self.saves.backups_dir(data)
+
+        def refresh_saves(self):
+            _data, root, _backups = self.saves_paths()
+            self.stree.delete(*self.stree.get_children())
+            self.save_items.clear()
+            containers = self.saves.scan(root)
+            for index, c in enumerate(containers):
+                iid = f"c{index}"
+                self.save_items[iid] = (c, None)
+                self.stree.insert("", "end", iid=iid, open=True, text=c.name or c.folder,
+                                  values=(self.fmt_size(c.size), self.fmt_time(c.modified),
+                                          f"v{c.version}" if c.version else c.problem))
+                for blob in c.blobs:
+                    bid = f"{iid}b{blob.index}"
+                    self.save_items[bid] = (c, blob)
+                    self.stree.insert(iid, "end", iid=bid, text=blob.name,
+                                      values=(self.fmt_size(blob.size), self.fmt_time(blob.modified),
+                                              f"v{c.version}"))
+            self.saves_note.set(f"{len(containers)} container(s) in {root}" if containers else
+                                f"No saves found in {root}. They appear after the game has saved once.")
+            self.save_info.set("")
+
+        @staticmethod
+        def fmt_size(n):
+            return f"{n / 1024:.1f} KB" if n >= 1024 else f"{n} B"
+
+        @staticmethod
+        def fmt_time(t):
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else ""
+
+        def selected(self, want_blob=False):
+            chosen = self.stree.selection()
+            if not chosen:
+                messagebox.showinfo("Saves", "Select a container or a blob first.")
+                return None
+            container, blob = self.save_items[chosen[0]]
+            if want_blob and blob is None:
+                messagebox.showinfo("Saves", "Select a blob (a row under a container).")
+                return None
+            return container, blob
+
+        def describe_selection(self):
+            chosen = self.stree.selection()
+            if not chosen or chosen[0] not in self.save_items:
+                return
+            container, blob = self.save_items[chosen[0]]
+            if blob is None:
+                self.save_info.set(f"{container.name}: {len(container.blobs)} blob(s), newest version "
+                                   f"v{container.version}, folder {container.folder}")
+                return
+            try:
+                with open(blob.path, "rb") as f:
+                    self.save_info.set(self.saves.explain(self.saves.describe(f.read())))
+            except OSError as exc:
+                self.save_info.set(str(exc))
+
+        def guarded(self, action):
+            """Runs a save action unless the game (or anything started here) is running."""
+            if self.process is not None or game_running():
+                messagebox.showwarning("Saves", "The game is running. Close it before changing saves.")
+                return
+            try:
+                action()
+            except (self.saves.SaveError, OSError) as exc:
+                messagebox.showerror("Saves", str(exc))
+            self.refresh_saves()
+
+        def save_backup_all(self):
+            def go():
+                _d, root, backups = self.saves_paths()
+                messagebox.showinfo("Saves", "Backed up to " + self.saves.backup(root, backups))
+            self.guarded(go)
+
+        def save_backup_one(self):
+            def go():
+                got = self.selected()
+                if got:
+                    _d, root, backups = self.saves_paths()
+                    messagebox.showinfo("Saves", "Backed up to " + self.saves.backup(root, backups, [got[0]]))
+            self.guarded(go)
+
+        def save_restore(self):
+            def go():
+                _d, root, backups = self.saves_paths()
+                zip_path = filedialog.askopenfilename(title="Restore from a backup",
+                                                      initialdir=backups if os.path.isdir(backups) else None,
+                                                      filetypes=[("Save backups", "*.zip")])
+                if not zip_path:
+                    return
+                names = sorted(self.saves.zip_containers(zip_path))
+                if not messagebox.askyesno("Restore", f"Restore {len(names)} container(s) from\n{zip_path}?\n\n"
+                                           "The same containers now in your saves are replaced. The current "
+                                           "saves are backed up first."):
+                    return
+                before = self.saves.restore(root, backups, zip_path)
+                messagebox.showinfo("Saves", "Restored." + (f"\nPrevious state: {before}" if before else ""))
+            self.guarded(go)
+
+        def save_duplicate(self):
+            def go():
+                got = self.selected()
+                if not got:
+                    return
+                from tkinter import simpledialog
+                name = simpledialog.askstring("Duplicate", "Name of the copy (letters, digits, _ . -):",
+                                              initialvalue=got[0].name + "_copy")
+                if name:
+                    self.saves.duplicate(self.saves_paths()[1], got[0], name.strip())
+            self.guarded(go)
+
+        def save_delete(self):
+            def go():
+                got = self.selected()
+                if got and messagebox.askyesno(
+                        "Delete", f"Delete {got[0].name}?\n\nIt is moved to the backups folder "
+                        "(save-backups, deleted), not erased."):
+                    messagebox.showinfo("Saves", "Moved to " + self.saves.delete(got[0], self.saves_paths()[2]))
+            self.guarded(go)
+
+        def save_export(self):
+            def go():
+                got = self.selected(want_blob=True)
+                if got:
+                    target = filedialog.asksaveasfilename(
+                        initialfile=f"{got[0].name}-{got[1].name}.bin".replace(" ", "_"))
+                    if target:
+                        self.saves.export_blob(got[1], target)
+            self.guarded(go)
+
+        def save_import(self):
+            def go():
+                got = self.selected(want_blob=True)
+                if not got:
+                    return
+                source = filedialog.askopenfilename(title="Blob file to import")
+                if source and messagebox.askyesno(
+                        "Import", f"Replace '{got[1].name}' of {got[0].name} with this file?\n\nThe container is "
+                        "backed up first and the change is written as a new version. The header blob is not "
+                        "changed: a size that no longer matches it can make the title reject the save."):
+                    _d, root, backups = self.saves_paths()
+                    number, _saved = self.saves.import_blob(root, backups, got[0], got[1], source)
+                    messagebox.showinfo("Saves", f"Written as v{number}.")
+            self.guarded(go)
+
+        def save_view(self):
+            got = self.selected(want_blob=True)
+            if not got:
+                return
+            try:
+                with open(got[1].path, "rb") as f:
+                    data = f.read()
+            except OSError as exc:
+                messagebox.showerror("Saves", str(exc))
+                return
+            window = tk.Toplevel(self.root)
+            window.title(f"{got[0].name} / {got[1].name} (read only)")
+            window.configure(bg=BG)
+            window.geometry("820x560")
+            ttk.Label(window, text=self.saves.explain(self.saves.describe(data)), wraplength=780).pack(
+                anchor="w", padx=12, pady=8)
+            box = tk.Text(window, bg=NAV, fg=TEXT, relief="flat", font=("Consolas" if WINDOWS else "monospace", 9))
+            box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+            box.insert("end", self.saves.hexdump(data) + "\n\nStrings:\n" + "\n".join(self.saves.strings(data)))
+            box.configure(state="disabled")
+
+        def save_open_backups(self):
+            self.open(self.saves_paths()[2])
 
         # ---- Tools
         def build_tools(self):
