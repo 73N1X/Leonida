@@ -984,6 +984,9 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`LEONIDA_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // The listed static samplers, before anything else makes one: their
+        // places in the driver's table are then the same in every run.
+        crate::pipeline::places::start(&device);
         // `LEONIDA_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
