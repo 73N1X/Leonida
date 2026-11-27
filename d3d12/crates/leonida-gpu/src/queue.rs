@@ -1118,6 +1118,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::capture::dump_volumes(frame);
         if crate::capture::listed(frame) {
             before_sync();
             crate::capture::dump_targets(frame);

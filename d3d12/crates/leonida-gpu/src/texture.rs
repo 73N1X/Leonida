@@ -757,6 +757,8 @@ pub(crate) struct Digest(u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After leonida-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
+    #[cfg(feature = "diagnostics")]
+    crate::capture::note_volume(resource);
     let first = if crate::resource::held_only() { first } else { 0 };
     let host_written = HOST_WRITTEN
         .lock()

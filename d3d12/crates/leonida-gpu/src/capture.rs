@@ -549,6 +549,200 @@ fn dump_one(
     }
 }
 
+/// With `LEONIDA_DUMP_VOLUMES` set (and `LEONIDA_CAPTURE=<folder>`): the first
+/// time each 33x33x33 or 64x64x64 R16G16B16A16_FLOAT 3D texture is sampled
+/// by a list, and again [`VOLUME_AGAIN`] frames later, its texels are read
+/// back at that frame's present and saved as raw little-endian half floats
+/// (RGBA, x fastest, then y, then z) to
+/// `volume-<w>x<h>x<d>-<frame>-<n>.bin`, with one log line of statistics
+/// ([`VolumeStats`]; `tools/volume_stats.py` prints the same of a file).
+/// Colour-grading tables are such volumes: a table whose neighbouring
+/// entries are equal in runs posterizes whatever it grades.
+const VOLUME_AGAIN: u64 = 600;
+
+struct Volume {
+    resource: usize,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    n: usize,
+    first: Option<u64>,
+    again: bool,
+}
+
+static VOLUMES: std::sync::Mutex<Vec<Volume>> = std::sync::Mutex::new(Vec::new());
+
+fn volumes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("LEONIDA_DUMP_VOLUMES"))
+}
+
+/// Whether a texture of this description is one of the colour tables.
+fn is_table(d: &D3D12_RESOURCE_DESC) -> bool {
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        && d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+        && d.Width == u64::from(d.Height)
+        && u32::from(d.DepthOrArraySize) == d.Height
+        && matches!(d.Height, 33 | 64)
+}
+
+/// Notes a title texture a list is about to sample.
+pub(crate) fn note_volume(resource: crate::object::This) {
+    if resource.is_null() || !volumes_on() {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else { return };
+    // SAFETY: a live resource.
+    if !is_table(&unsafe { copy.texture.GetDesc() }) {
+        return;
+    }
+    let mut volumes = VOLUMES.lock().unwrap_or_else(|e| e.into_inner());
+    if volumes.iter().any(|v| v.resource == resource as usize && v.copy.serial == copy.serial) {
+        return;
+    }
+    let n = volumes.len();
+    volumes.push(Volume { resource: resource as usize, copy, n, first: None, again: false });
+}
+
+/// At the present of frame `frame`: saves the volumes noted, and those first
+/// saved [`VOLUME_AGAIN`] frames ago.
+pub(crate) fn dump_volumes(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !volumes_on() {
+        return;
+    }
+    let due: Vec<_> = {
+        let mut volumes = VOLUMES.lock().unwrap_or_else(|e| e.into_inner());
+        volumes
+            .iter_mut()
+            .filter_map(|v| {
+                match v.first {
+                    None => v.first = Some(frame),
+                    Some(first) if !v.again && frame >= first + VOLUME_AGAIN => v.again = true,
+                    _ => return None,
+                }
+                Some((v.n, v.resource, v.copy.clone()))
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    crate::queue::before_sync();
+    let Some(host) = crate::host::host() else { return };
+    for (n, resource, copy) in due {
+        let texture = &copy.texture;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, copy.state.load(Relaxed)) as i32);
+        let Ok(list) = host.new_list() else { continue };
+        let to = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: an open list of ours and a live texture.
+        let read = unsafe {
+            if state != to {
+                list.list.ResourceBarrier(&[crate::host::transition(texture, state, to)]);
+            }
+            let read = read_back(&host.device, &list.list, texture);
+            if state != to {
+                list.list.ResourceBarrier(&[crate::host::transition(texture, to, state)]);
+            }
+            read
+        };
+        list.close();
+        host.execute(&[&list]);
+        let Some((buffer, footprint)) = read else { continue };
+        let f = footprint.Footprint;
+        let (w, h, depth) = (f.Width as usize, f.Height as usize, f.Depth as usize);
+        let pitch = f.RowPitch as usize;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy finished; the mapping spans every row of every slice.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * h * depth);
+            let mut halves = Vec::with_capacity(w * h * depth * 4);
+            for z in 0..depth {
+                for y in 0..h {
+                    let row = &rows[(z * h + y) * pitch..][..w * 8];
+                    halves.extend(row.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+                }
+            }
+            buffer.Unmap(0, None);
+            let stats = VolumeStats::of(&halves, w, h, depth);
+            if let Some(folder) = folder() {
+                let path = folder.join(format!("volume-{w}x{h}x{depth}-{frame}-{n}.bin"));
+                let bytes: Vec<u8> = halves.iter().flat_map(|v| v.to_le_bytes()).collect();
+                match std::fs::write(&path, bytes) {
+                    Ok(()) => tracing::info!(path = %path.display(), "volume saved"),
+                    Err(e) => tracing::warn!(error = %e, path = %path.display(), "volume not saved"),
+                }
+            }
+            tracing::info!(
+                frame,
+                n,
+                ?resource,
+                width = w,
+                height = h,
+                depth,
+                state = copy.state.load(Relaxed),
+                flags = d.Flags.0,
+                distinct = stats.distinct,
+                texels = stats.texels,
+                zero = stats.zero,
+                equal_x = stats.equal[0],
+                equal_y = stats.equal[1],
+                equal_z = stats.equal[2],
+                stepped = ?stats.stepped(),
+                "volume read back (distinct texels, share of equal neighbour pairs per axis)"
+            );
+        }
+    }
+}
+
+/// What a volume of RGBA half floats (x fastest) holds.
+#[derive(Debug, PartialEq)]
+pub(crate) struct VolumeStats {
+    pub(crate) texels: usize,
+    pub(crate) distinct: usize,
+    /// Texels whose four halves are all +0.
+    pub(crate) zero: usize,
+    /// For x, y and z: the share of neighbour pairs that are bit-for-bit equal.
+    pub(crate) equal: [f64; 3],
+}
+
+impl VolumeStats {
+    pub(crate) fn of(halves: &[u16], w: usize, h: usize, d: usize) -> VolumeStats {
+        let texel = |i: usize| -> [u16; 4] { halves[i * 4..i * 4 + 4].try_into().unwrap_or([0; 4]) };
+        let texels = w * h * d;
+        let mut seen = std::collections::HashSet::new();
+        let mut zero = 0;
+        for i in 0..texels {
+            let t = texel(i);
+            zero += usize::from(t == [0; 4]);
+            seen.insert(t);
+        }
+        let strides = [1, w, w * h];
+        let dims = [w, h, d];
+        let mut equal = [0.0; 3];
+        for axis in 0..3 {
+            let (mut pairs, mut same) = (0usize, 0usize);
+            for i in 0..texels {
+                let at = [i % w, i / w % h, i / (w * h)];
+                if at[axis] + 1 < dims[axis] {
+                    pairs += 1;
+                    same += usize::from(texel(i) == texel(i + strides[axis]));
+                }
+            }
+            equal[axis] = if pairs == 0 { 0.0 } else { same as f64 / pairs as f64 };
+        }
+        VolumeStats { texels, distinct: seen.len(), zero, equal }
+    }
+
+    /// Whether an axis has runs of equal neighbours (over a tenth of its pairs).
+    pub(crate) fn stepped(&self) -> [bool; 3] {
+        self.equal.map(|e| e > 0.1)
+    }
+}
+
 /// Logs which values a stencil plane read back by [`read_back_of`] holds
 /// (the most common first), how many texels have each of its bits, and the
 /// box of the texels with bit 3 (0x08).
@@ -917,6 +1111,22 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn volume_stats_tell_a_stepped_table_from_a_smooth_one() {
+        use super::VolumeStats;
+        let (w, h, d) = (4, 3, 2);
+        let smooth: Vec<u16> = (0..w * h * d).flat_map(|i| [i as u16 + 1, 1, 2, 3]).collect();
+        let s = VolumeStats::of(&smooth, w, h, d);
+        assert_eq!((s.texels, s.distinct, s.zero), (24, 24, 0));
+        assert_eq!(s.stepped(), [false; 3]);
+        // Rows of [a a b b], each row different: x pairs 2 of 3 equal.
+        let stepped: Vec<u16> = (0..w * h * d).flat_map(|i| [((i % w) / 2 + i / w * 10) as u16, 0, 0, 0]).collect();
+        let s = VolumeStats::of(&stepped, w, h, d);
+        assert!((s.equal[0] - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(s.equal[1], 0.0);
+        assert_eq!(s.stepped(), [true, false, false]);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
