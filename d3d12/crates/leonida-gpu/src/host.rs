@@ -443,6 +443,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        trim_spare_backs();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -2045,6 +2046,149 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Whether a list's read-back buffers are kept, when the list is reset, for
+/// the next read backs of their sizes (`LEONIDA_READ_BACK_POOL=0`: each is
+/// made for its read back and let go with its list, as before; `LEONIDA_AB`
+/// can name it).
+///
+/// A read back is recorded into a buffer of ours in read-back memory: a
+/// texture the title copies into a buffer of its own (`crate::list`), or a
+/// texture shaders wrote that the title reads on the CPU, copied when the
+/// list closes (`crate::texback`). Each buffer was a committed resource made
+/// for the one copy, on the thread that records, and released when its list
+/// was reset. In a CPU profile of the threads that record lists (Series X
+/// profile, about 9,500 draws a frame, 2026-11-27) [`Host::read_back_buffer`]
+/// was 5 % of their running time, and the closing of lists, which makes the
+/// second kind, 5 % of the submitting thread's.
+///
+/// With the switch a buffer is made in whole 64 KiB ([`read_back_size`]; the
+/// card gives a buffer of its own whole 64 KiB either way), a list's buffers
+/// go to a table when the list is reset or dropped ([`give_read_backs`]),
+/// and a read back takes one of its size from there before one is made.
+///
+/// Why a buffer in the table is nobody's: a list's read-backs are read when
+/// its submission has run ([`read_backs`], which copies the texels out under
+/// the list's lock), a list is reset only after its last submission
+/// finished, and the buffers go to the table only then, each only if the
+/// list's reference to it is the last ([`sole`]). What differs for who reads
+/// one: the bytes its copy did not write (the padding of rows) are what the
+/// buffer held before, not zeros.
+fn read_back_pool() -> bool {
+    crate::toggled!("LEONIDA_READ_BACK_POOL")
+}
+
+/// The bytes a read-back buffer for `size` bytes is made with when such
+/// buffers are kept ([`read_back_pool`]): whole 64 KiB, so that read backs of
+/// nearly one size share their buffers.
+fn read_back_size(size: u64) -> u64 {
+    size.max(1).next_multiple_of(1 << 16)
+}
+
+/// The most bytes of read-back buffers kept while no list holds them; with
+/// little memory in the PC (`crate::residency::limited_host_ram`).
+const SPARE_BACKS_MOST: u64 = 64 << 20;
+const SPARE_BACKS_FEW: u64 = 16 << 20;
+
+/// A read-back buffer no list holds.
+struct SpareBack(ID3D12Resource);
+
+// SAFETY: a D3D12 resource (free-threaded) that nothing else names.
+unsafe impl Send for SpareBack {}
+
+/// Read-back buffers no list holds ([`read_back_pool`]).
+static SPARE_BACKS: Mutex<Spare<SpareBack>> = Mutex::new(Spare::new());
+
+/// Since the last frame-rate line: read-back buffers made, taken from the
+/// table, kept there at a list's reset, and let go there (the table full, a
+/// buffer something else still names, or one not made in whole 64 KiB).
+static BACKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether this reference to `buffer` is the only one.
+fn sole(buffer: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    // SAFETY: a live resource: a reference is taken and given back at once,
+    // and giving it back says how many are left.
+    unsafe {
+        let unknown = &Interface::vtable(buffer).base__.base__.base__.base__;
+        (unknown.AddRef)(buffer.as_raw());
+        (unknown.Release)(buffer.as_raw()) == 1
+    }
+}
+
+/// A list is done with its read-back `buffers` (it was reset after its
+/// submissions ran, or dropped): kept for the next read backs of their
+/// sizes ([`read_back_pool`]), or let go as before.
+fn give_read_backs(buffers: Vec<ID3D12Resource>) {
+    if buffers.is_empty() || !read_back_pool() {
+        return;
+    }
+    let most = if crate::residency::limited_host_ram() { SPARE_BACKS_FEW } else { SPARE_BACKS_MOST };
+    // (Asked of each before the table is taken.)
+    let sized: Vec<(ID3D12Resource, Option<u64>)> = buffers
+        .into_iter()
+        .map(|buffer| {
+            // SAFETY: a live buffer.
+            let size = unsafe { buffer.GetDesc() }.Width;
+            let ours = size == read_back_size(size) && sole(&buffer);
+            (buffer, ours.then_some(size))
+        })
+        .collect();
+    let mut gone = Vec::new();
+    {
+        let mut spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in sized {
+            let back = match size {
+                Some(size) => spare.give(SpareBack(buffer), size, most).map(|back| back.0),
+                None => Some(buffer),
+            };
+            match back {
+                None => {
+                    BACKS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                Some(buffer) => {
+                    BACKS[3].fetch_add(1, Ordering::Relaxed);
+                    gone.push(buffer);
+                }
+            }
+        }
+    }
+    // Released outside the lock.
+    drop(gone);
+}
+
+/// Lets go of the read-back buffers kept while host memory is pressured.
+fn trim_spare_backs() {
+    let freed = {
+        let mut spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    drop(freed);
+}
+
+/// For the frame-rate line: what [`read_back_pool`] did per frame, if there
+/// were read backs.
+fn read_backs_line(frames: f64) {
+    let b: Vec<u64> = BACKS.iter().map(|b| b.swap(0, Ordering::Relaxed)).collect();
+    if b.iter().all(|&n| n == 0) {
+        return;
+    }
+    let (kept, bytes) = {
+        let spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        (spare.kept.len(), spare.bytes)
+    };
+    tracing::info!(
+        "read-back buffers per frame: {:.1} made, {:.1} taken from those kept; at their lists' resets {:.1} kept and {:.1} let go; \
+         {kept} kept now, {:.1} MB (LEONIDA_READ_BACK_POOL=0: one made for each read back, as before; now {})",
+        b[0] as f64 / frames,
+        b[1] as f64 / frames,
+        b[2] as f64 / frames,
+        b[3] as f64 / frames,
+        bytes as f64 / (1 << 20) as f64,
+        if read_back_pool() { "on" } else { "off" }
+    );
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -2580,6 +2724,16 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        // (Most lists read nothing back.)
+        if !(self.backs.is_empty() && self.texture_backs.is_empty()) {
+            give_read_backs(
+                self.backs
+                    .drain(..)
+                    .map(|(buffer, ..)| buffer)
+                    .chain(self.texture_backs.drain(..).map(crate::texback::Back::into_buffer))
+                    .collect(),
+            );
+        }
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -4018,6 +4172,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    read_backs_line(frames);
     crate::draw::waits_line(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
@@ -8192,6 +8347,64 @@ impl std::hash::Hasher for AddressHash {
 }
 
 #[cfg(test)]
+mod read_back_pool_tests {
+    use super::*;
+    use windows::core::Interface;
+
+    #[test]
+    fn a_read_back_buffer_is_made_in_whole_64_kib() {
+        assert_eq!(read_back_size(0), 1 << 16);
+        assert_eq!(read_back_size(1), 1 << 16);
+        assert_eq!(read_back_size(512), 1 << 16);
+        assert_eq!(read_back_size(1 << 16), 1 << 16);
+        assert_eq!(read_back_size((1 << 16) + 1), 2 << 16);
+        assert_eq!(read_back_size(350_000), 6 << 16);
+    }
+
+    /// A list's read-back buffer is the next read back's of its size once
+    /// the list is reset, and not before; one something else still names
+    /// when the list is reset is not kept.
+    #[test]
+    fn a_reset_lists_read_back_buffer_is_the_next_read_backs() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; the read-back buffers' table not tested");
+            return;
+        };
+        if !read_back_pool() {
+            return;
+        }
+        // (A size no other test reads back: the table is the process's.)
+        let size = (7 << 16) - 100;
+        let mut title = [0u8; 64];
+        let list = host.new_list().unwrap();
+        let buffer = host.read_back_buffer(size).unwrap();
+        // SAFETY: a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, 7 << 16);
+        let first = buffer.as_raw() as usize;
+        list.defer_read_back(buffer, title.as_mut_ptr(), [16, 2, 32]);
+        // The list holds it: another read back gets another buffer.
+        let other = host.read_back_buffer(size).unwrap();
+        assert_ne!(other.as_raw() as usize, first);
+        list.close();
+        list.reset();
+        // Nobody's now: the next read back of that size takes it, once.
+        let again = host.read_back_buffer(size - 4096).unwrap();
+        assert_eq!(again.as_raw() as usize, first);
+        let third = host.read_back_buffer(size).unwrap();
+        assert_ne!(third.as_raw() as usize, first);
+        // Still named elsewhere when its list is reset: let go, not kept.
+        let named = again.clone();
+        list.defer_read_back(again, title.as_mut_ptr(), [16, 2, 32]);
+        list.close();
+        list.reset();
+        assert!(sole(&named));
+        let fourth = host.read_back_buffer(size).unwrap();
+        assert_ne!(fourth.as_raw() as usize, first);
+        drop((other, third, fourth, named));
+    }
+}
+
+#[cfg(test)]
 mod address_hash_tests {
     use super::AddressHash;
     use std::hash::{BuildHasher, BuildHasherDefault};
@@ -9805,10 +10018,26 @@ impl Host {
         &self.queue
     }
 
-    /// A buffer in the upload heap, mapped for writing.
-    /// A buffer of `size` bytes the card writes and we read (a read back),
-    /// in the state copies into it need.
+    /// A buffer of at least `size` bytes the card writes and we read (a read
+    /// back), in the state copies into it need: one a list was done with, if
+    /// one of its size is kept ([`read_back_pool`]), else a new one.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        if !read_back_pool() {
+            return self.new_read_back_buffer(size);
+        }
+        let size = read_back_size(size);
+        let kept = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner()).take(size);
+        if let Some(SpareBack(buffer)) = kept {
+            BACKS[1].fetch_add(1, Ordering::Relaxed);
+            return Some(buffer);
+        }
+        self.new_read_back_buffer(size)
+    }
+
+    /// A new buffer of `size` bytes in read-back memory, in the state copies
+    /// into it need.
+    fn new_read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        BACKS[0].fetch_add(1, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
