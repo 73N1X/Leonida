@@ -921,6 +921,10 @@ class Analysis:
                     put_t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
             for d in dests:
                 put(d, put_t)
+            # v_cmpx in DPP form (SHADER-VOPCX-DPP) writes EXEC and prints no destination: it is an EXEC write like
+            # any v_cmpx, and never a uniform vote, as a lane whose DPP source is invalid compares 0.
+            if "exec" in defs:
+                self.exec_write(n, i, ins, op, a, dests, srcs, st, ev, violation, idiom, put_t, vote=False)
             return
 
         # --- exec writes and mask producers
@@ -1244,18 +1248,24 @@ class Analysis:
         against 0 (the first lane of the mask the rank counts)."""
         T = st["t"]
         tag, tj = None, t_src
+        # A waterfall needs equality of the entire unmodified descriptor word.
+        # Floating equality merges the two signed zeros. Halfword comparisons and
+        # SDWA/DPP can select lanes whose original descriptor words differ, too.
+        whole_word = (op in ("v_cmp_eq_i32", "v_cmp_eq_u32")
+                      and not ins["op"].endswith(("_sdwa", "_dpp")) and not ins.get("mods")
+                      and not any(x.get("abs") or x.get("neg") for x in srcs))
         if "_eq_" in op and len(srcs) == 2:
             for sc, vv in ((srcs[0], srcs[1]), (srcs[1], srcs[0])):
                 r = _regs(sc)
                 g = st["g"].get(r[0]) if r else None
-                if g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1] and not vv.get("neg"):
+                if whole_word and g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1]:
                     tag, tj = ("wfmask", g[1]), self.rd(st, ins, vv) | (T.get(r[0], 0) & ~WFS)
                     idiom("waterfall")
                 elif g and g[0] == "rank" and sc.get("k") == "vgpr" and vv.get("k") == "imm" and vv["v"] == 0 and                         (T.get(r[0], 0) & ~TAG_BITS) == 0:
                     tag, tj = ("elect", g[1]), ELECT
         return tag, tj
 
-    def exec_write(self, n, i, ins, op, a, dests, srcs, st, ev, violation, idiom, t_src):
+    def exec_write(self, n, i, ins, op, a, dests, srcs, st, ev, violation, idiom, t_src, vote=True):
         T = st["t"]
         site = ("n", n, i)
         old = st["x"]
@@ -1286,7 +1296,9 @@ class Analysis:
             # s_mov / s_and / s_or / s_xor / s_andn2 ... with EXEC as the destination, or v_cmpx
             srcregs = [x for x in srcs if _regs(x) != ["exec"]]
             x0 = srcregs[0] if srcregs else None
-            if op.startswith("v_cmpx"):
+            if op.startswith("v_cmpx") and not vote:
+                mg, mt = None, t_src
+            elif op.startswith("v_cmpx"):
                 mg, mt = self.cmp_tag(st, ins, "v_cmp" + op[len("v_cmpx"):], srcs, t_src, idiom)
                 if mg:
                     mt = 0
