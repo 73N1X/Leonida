@@ -1154,7 +1154,7 @@ if(BUILD_TESTING)
     endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8 /EHsc)  # a handler that throws
     set_target_properties(tiny_atexit PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
