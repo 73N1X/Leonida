@@ -3484,10 +3484,11 @@ if(TARGET Vulkan::Headers)
     target_compile_options(xbox_present_test PRIVATE /W4 /permissive- /utf-8)
     # Needs a Vulkan GPU and a window; exits 77 (skipped) without a Vulkan device.
     add_test(NAME xbox_present COMMAND xbox_present_test)
-    # The test pins plane 1's composition on its overlay flag (section 4.5). The runtime's default blends plane 1 over
-    # plane 0 whatever its flags (696d00286: the retail title presents both planes with Flags 0);
-    # LEONIDA_PRESENT_PLANE1=0 is that rule's switch back.
-    set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_PRESENT_PLANE1=0")
+    # Each process sets its mode before the runtime caches the plane-1 policy. Cover the actual default as
+    # well as the opt-out, instead of pinning every run to the flag-only path.
+    add_test(NAME xbox_present_plane1_flag_only COMMAND xbox_present_test --plane1-flag-only)
+    # Both executions write the same temporary trace file; do not run them concurrently.
+    set_tests_properties(xbox_present xbox_present_plane1_flag_only PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
     # The presentation the device proxy makes on the title's first PresentX, driven through the device's frame-event
     # slots and the queue's PresentX slot. The proxy is compiled into this test with LEONIDA_VULKAN_DEVICE, as in

@@ -8,6 +8,7 @@
 // errors (null, unknown, stale, repeated), suspend/resume with re-registration, statistics, and a real-time loop at
 // 60 Hz. An HDR10 swapchain is only checked where the surface lists an ST.2084 format (else logged as skipped).
 // Needs a window and a Vulkan GPU with presentation.
+// With no arguments, tests the runtime default. --plane1-flag-only selects LEONIDA_PRESENT_PLANE1=0.
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
@@ -286,7 +287,18 @@ bool frame_matches(const Frame& frame, const Ref_plane* planes, int count, bool 
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool flag_only = argc == 2 && std::strcmp(argv[1], "--plane1-flag-only") == 0;
+    if (argc != 1 && !flag_only) {
+        std::fprintf(stderr, "usage: xbox_present_test [--plane1-flag-only]\n");
+        return 1;
+    }
+    // The runtime caches this policy on first use. Pin it before making either presenter, and run the modes
+    // in separate processes so an inherited environment cannot silently change what the default test covers.
+    EXPECT(SetEnvironmentVariableW(L"LEONIDA_PRESENT_PLANE1", flag_only ? L"0" : nullptr) ||
+           (!flag_only && GetLastError() == ERROR_ENVVAR_NOT_FOUND));
+    std::printf("plane 1 contract: %s\n", flag_only ? "overlay flag required" : "composed by default");
+
     {
         // The callback's narrow exception must match the sRGB swapchain VUID, including its follow-ons, and nothing else.
         VkDebugUtilsMessengerCallbackDataEXT data{};
@@ -621,8 +633,8 @@ int main() {
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         std::printf("1 plane, sRGB source (swapchain follows): ok\n");
 
-        // 2 planes sharing a token, both SDR: plane 1 is an overlay (section 4.5), and an opaque one covers plane 0.
-        // (The plane composition has its own checks further down.)
+        // An opaque, unflagged SDR plane 1 covers plane 0 by default. The explicit flag-only mode keeps the
+        // old plain-blit behavior. The flagged overlays and full composition model are checked further down.
         Source second;
         EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, second));
         EXPECT(fill(second, green));
@@ -630,9 +642,12 @@ int main() {
         rt::d3d12::XboxPresentPlaneParameters two[2] = {plane_of(rgba, token), plane_of(second, token)};
         const std::uint64_t composed_before = xbox.presenter().composed_presents();
         EXPECT(xbox.PresentX(2, two, nullptr) == S_OK);
-        EXPECT(xbox.presenter().composed_presents() == composed_before);  // plane 1 without the overlay flag: not composed
+        EXPECT(xbox.presenter().composed_presents() == composed_before + (flag_only ? 0 : 1));
         EXPECT(grab(frame));
-        EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));  // plane 0 only, by the plain blit
+        const Px unflagged_expected = flag_only ? Px{51, 153, 230} : Px{0, 255, 0};
+        EXPECT(region_is(frame, 0, 0, width, height, unflagged_expected));
+        std::printf("2 unflagged SDR planes: %s: pixels and compose count match\n",
+                    flag_only ? "plane 0 only" : "plane 1 composed");
         // Planes with different tokens, or more than two planes, are refused.
         EXPECT(next_token(token));
         two[0] = plane_of(rgba, token);
