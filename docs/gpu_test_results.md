@@ -11,6 +11,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | NVIDIA GeForce RTX 3080 Ti (Ampere), subgroup 32..32 | NVIDIA 616.92, Windows 11 26300.9974 | `d478a92` | not run; pre-disassembled subset | run via run_gpu_tests.py | **Subset:** 81/97 passed, 16 skipped (native); 97/97 passed (`LEONIDA_W64_EMULATE=1`); Python assembler, no spirv-val | none in the subset | [local note](../gpu-test-results/RTX3080Ti-61692.txt) |
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](../gpu-test-results/RX9070GRE.txt) |
 | AMD Radeon RX 9070 XT (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 26200.9974 | `58be9cd` | exit 0 (native and emulated) | 219/222 pass, 3 skipped (mesh fixtures build.py does not build) | 236/252 passed, 16 skipped, 0 failed (native and `LEONIDA_W64_EMULATE=1`) | none | [local note](../gpu-test-results/RX9070XT.txt) |
+| AMD Radeon RX 9070 XT (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.2.6-arch3.1, Vulkan 1.4.354, CachyOS | `5e95fa2` | stops at `cs_dpp_cmp` on main; 297/297 translated and valid with #1444 | 227/231 pass, 4 skipped (with #1444) | 243/263 passed, 19 skipped, 1 failed (native and emulated); 244/263, 0 failed with #1518 | `cs_imgatomic_ext` (fixture's old volume T#, fixed by #1518) | [local note](../gpu-test-results/RX9070XT-RADV.txt) |
 | AMD Radeon RX 9070 (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), 32.0.32029.2010, Vulkan 1.4.359, Windows 11 26200.9974 | `d0da7da` | not run | not run | 231/249 passed, 16 skipped, 2 failed (native and `LEONIDA_W64_EMULATE=1` alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe`: the fixtures' expectation (#98); `ms_wave_info_s3` passes | [local note](../gpu-test-results/RX9070.txt) |
 | AMD Radeon RX 9060 XT (RDNA4, GFX1200), subgroup 32..64 | AMD 26.11.2 (LLPC), 32.0.32029.2010, Vulkan 1.4.359, Windows 11 26300.9974 | `73516a2` | stops at `cs_dpp_cmp` on main; exit 0 with #1444 (native and emulated) | 230/234 pass, 3 skipped, 1 failed with #1444 and #1518 (`cs_texture_uav`, #2261) | 247/268 passed, 19 skipped, 2 failed (native and `LEONIDA_W64_EMULATE=1` alike) | `cs_imgatomic_ext` (#1518) and `cs_texture_uav` (#2261), both pass with those applied | [local note](../gpu-test-results/RX9060XT.txt) |
 | AMD Radeon Graphics, Ryzen 5 7600X iGPU (RDNA2, gfx1036), subgroup 32..64 | AMD 26.11.2, 32.0.21045.29003, Vulkan 1.4.315, Windows 11 26200.9974 | `d0da7da` | not run | not run | 224/249 passed, 23 skipped, 2 failed (native and `LEONIDA_W64_EMULATE=1` alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe`: the fixtures' expectation (#98) | [local note](../gpu-test-results/Raphael-7600X-Win.txt) |
@@ -43,6 +44,44 @@ Every pixel test other than the flaky mesh fixture was exact (4096/4096).
 
 AI-assisted (Hermes Agent): built `main` at `05961f0`, ran `build.py`, `check.py` and
 `run_gpu_tests.py` (native and emulated) on this GPU, and verified the isolated reruns of the one failure.
+
+## AMD Radeon RX 9070 XT (RADV) — 2026-11-25
+
+```
+GPU:        AMD Radeon RX 9070 XT (RDNA4 / GFX1201, Navi 48, PCI 1002:7550), subgroup 32..64
+Driver:     RADV (Mesa 26.2.6-arch3.1), Vulkan 1.4.354
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64)
+OS:         CachyOS, kernel 7.3.4-1-cachyos
+Commit:     5e95fa2f46d5df1a8397d5ee871add369031d8b6 (main, 2026-11-25)
+Tools:      llvm-mc 23.1.5 (native), SPIRV-Tools v2026.4, CMake 4.5.1 + Ninja 1.13.2, GCC 16.2.1, Python 3.14.10
+run_gpu_tests.py: 273 shaders: 273 translated, 273 pass spirv-val
+            native:                 243/263 passed, 19 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/263 passed, 19 skipped, 1 failed
+            with #1518 applied:     244/263 passed, 19 skipped, 0 failed (native and emulated)
+Failed:     cs_imgatomic_ext: 6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101.
+            Native and emulated, and 3 of 3 isolated --filter reruns. Not a driver fault: the fixture still
+            builds the old 0x55 volume T# words that vk_store_test no longer keys on (#1518). With #1518
+            applied, cs_imgatomic, cs_imgatomic3d and cs_imgatomic_ext all pass (64 words exact), native and
+            emulated.
+build.py:   on main, stops at cs_dpp_cmp.asm ("dpp variant of this instruction is not supported"), so check.py
+            has no modules and reports 0 of 230 pass. With #1444 applied (and #1518): 297 shaders: 297
+            translated, 297 pass spirv-val, native and emulated (6 mesh fixtures not built, as documented)
+check.py:   with #1444 and #1518 applied: 227 of 231 pass, 4 skipped, native and LEONIDA_W64_EMULATE=1 alike
+            (skips: ms_w64x_ballot, ms_wave_info_s3, ms_v5_workgroup built only by run_gpu_tests.py;
+            cs_texture_uav needs the Windows D3D12 runtime)
+Skipped:    run_gpu_tests.py's 19 skips are the documented "run by d3d12_*_test / w64_graphics.py" and Windows
+            D3D12 runtime cases: cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, cs_texture_uav,
+            ps_live_width, ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post,
+            ps_m3_query, ps_quad_flat, vs_m15, vs_m2, vs_m3, vs_quad_inst.
+```
+
+Setup: `cmake -S runtime -B <build> -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_VULKAN_HEADERS_FETCH=ON`;
+ctest 93/93 passed (two skips). `ms_wave_info_s3`, which fails on the AMD proprietary driver in the entry below,
+passed in every run here. On `main`, `build.py` stops at `cs_dpp_cmp.asm`, so `check.py` has nothing to run;
+the `build.py` and `check.py` figures are with #1444 (and #1518) applied.
+
+AI-assisted (Claude Code): built `main` at `5e95fa2`, ran `run_gpu_tests.py`, `build.py` and `check.py` (native and
+emulated) on this GPU, reran the one failure in isolation, and reran with #1518 and #1444 applied.
 
 ## AMD Radeon RX 9070 XT — 2026-11-24
 
